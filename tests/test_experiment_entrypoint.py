@@ -1,3 +1,4 @@
+# 批量实验入口测试：确保脚本按路径直接执行时也能导入项目包。
 import subprocess
 import sys
 from pathlib import Path
@@ -25,4 +26,3 @@ def test_run_slope_sweep_script_works_when_executed_by_path(tmp_path: Path):
 
     assert result.returncode == 0, result.stderr
     assert (tmp_path / "summary.csv").exists()
-

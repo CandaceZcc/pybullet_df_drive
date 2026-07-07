@@ -1,5 +1,7 @@
 <?xml version="1.0"?>
+<!-- 简化差速底盘模型：包含车体、左右轮和一个辅助支撑轮。 -->
 <robot name="diff_drive">
+  <!-- base_link 是机器人主体，质量和惯量会影响后续动力学扩展。 -->
   <link name="base_link">
     <inertial>
       <origin xyz="0 0 0" rpy="0 0 0"/>
@@ -23,6 +25,7 @@
     </collision>
   </link>
 
+  <!-- 左轮：continuous joint 会在 robot.py 中被速度控制。 -->
   <link name="left_wheel">
     <inertial>
       <origin xyz="0 0 0" rpy="0 0 0"/>
@@ -46,6 +49,7 @@
     </collision>
   </link>
 
+  <!-- 右轮：与左轮对称布置，通过不同轮速实现转向。 -->
   <link name="right_wheel">
     <inertial>
       <origin xyz="0 0 0" rpy="0 0 0"/>
@@ -69,6 +73,7 @@
     </collision>
   </link>
 
+  <!-- 辅助支撑轮：当前用于保持模型稳定，后续可替换成更真实结构。 -->
   <link name="caster">
     <inertial>
       <origin xyz="0 0 0" rpy="0 0 0"/>
@@ -92,6 +97,7 @@
     </collision>
   </link>
 
+  <!-- 左轮关节名必须和 robot.py 中查找的名字一致。 -->
   <joint name="left_wheel_joint" type="continuous">
     <parent link="base_link"/>
     <child link="left_wheel"/>
@@ -99,6 +105,7 @@
     <axis xyz="0 1 0"/>
   </joint>
 
+  <!-- 右轮关节名必须和 robot.py 中查找的名字一致。 -->
   <joint name="right_wheel_joint" type="continuous">
     <parent link="base_link"/>
     <child link="right_wheel"/>

@@ -1,3 +1,4 @@
+# 项目主入口：解析命令行参数，选择自动仿真或 GUI 手动控制模式。
 from __future__ import annotations
 
 import argparse
@@ -5,16 +6,24 @@ from pathlib import Path
 from typing import Sequence
 
 from slope_sim.config import load_config
+from slope_sim.manual_demo import run_manual_demo
 from slope_sim.simulation import run_experiment
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    """定义命令行参数，支持配置覆盖、GUI 和手动控制开关。"""
     parser = argparse.ArgumentParser(description="Run a PyBullet differential-drive slope simulation.")
     parser.add_argument("--config", default="configs/experiment.yaml", help="Path to an experiment YAML file.")
     parser.add_argument("--mode", choices=["direct", "gui"], default=None, help="PyBullet connection mode.")
     parser.add_argument("--gui", action="store_true", help="Shortcut for --mode gui.")
+    parser.add_argument("--manual", action="store_true", help="Use PyBullet GUI keyboard control.")
     parser.add_argument("--slope-deg", type=float, default=None, help="Slope angle in degrees.")
-    parser.add_argument("--duration-sec", type=float, default=None, help="Simulation duration in seconds.")
+    parser.add_argument(
+        "--duration-sec",
+        type=float,
+        default=None,
+        help="Simulation duration in seconds; manual mode runs until q/Esc unless this is passed.",
+    )
     parser.add_argument("--time-step", type=float, default=None, help="Simulation time step in seconds.")
     parser.add_argument("--target-linear-velocity", type=float, default=None, help="Target body velocity in m/s.")
     parser.add_argument("--target-angular-velocity", type=float, default=None, help="Target yaw rate in rad/s.")
@@ -24,6 +33,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    """程序主流程：加载配置、运行仿真、打印输出文件和误差指标。"""
     args = parse_args(argv)
     overrides = {
         "mode": args.mode,
@@ -37,7 +47,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "figure_dir": args.figure_dir,
     }
     config = load_config(args.config, overrides=overrides)
-    result = run_experiment(config)
+    # 手动模式必须使用 PyBullet GUI；普通实验仍走 DIRECT/GUI 自动仿真路径。
+    if args.manual:
+        result = run_manual_demo(config, duration_limit_sec=args.duration_sec)
+    else:
+        result = run_experiment(config)
     print(f"log: {result.log_path}")
     print(f"figure: {result.figure_path}")
     for name, value in result.metrics.items():
@@ -47,4 +61,3 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

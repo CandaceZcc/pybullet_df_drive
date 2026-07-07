@@ -1,3 +1,4 @@
+# 配置测试：确保 YAML 配置、命令行覆盖和非法参数检查都可用。
 from pathlib import Path
 
 from slope_sim.config import ExperimentConfig, load_config
@@ -45,4 +46,3 @@ def test_experiment_config_rejects_invalid_mode():
         assert "mode" in str(exc)
     else:
         raise AssertionError("invalid mode should fail")
-

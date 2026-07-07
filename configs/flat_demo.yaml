@@ -1,6 +1,6 @@
-# 通用实验配置：默认运行 5 度斜坡，用于自动仿真和批量实验。
+# 阶段 1 平地演示配置：坡度为 0，适合 DIRECT 快速验证和 GUI 手动控制。
 mode: direct
-slope_deg: 5.0
+slope_deg: 0.0
 duration_sec: 5.0
 time_step: 0.004166666666666667
 wheel_base: 0.5

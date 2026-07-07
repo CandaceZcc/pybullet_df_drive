@@ -1,3 +1,4 @@
+# 自动仿真模块：运行一次固定速度实验，记录轨迹、绘图并计算误差。
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -19,18 +20,22 @@ from slope_sim.scene import create_slope_scene
 
 @dataclass(frozen=True)
 class SimulationResult:
+    """一次仿真的输出结果，包含日志、图像和误差指标。"""
+
     log_path: Path
     figure_path: Path
     metrics: dict[str, float]
 
 
 def run_experiment(config: ExperimentConfig) -> SimulationResult:
+    """运行一次自动仿真实验，并返回日志、图像和误差指标。"""
     connection_mode = p.GUI if config.mode == "gui" else p.DIRECT
     client_id = p.connect(connection_mode)
     if client_id < 0:
         raise RuntimeError(f"Failed to connect to PyBullet in {config.mode} mode")
 
     try:
+        # PyBullet 客户端内创建场景和机器人，DIRECT 模式也能无窗口运行。
         create_slope_scene(client_id, config.slope_deg, config.time_step)
         robot = DifferentialDriveRobot(
             client_id=client_id,
@@ -41,6 +46,7 @@ def run_experiment(config: ExperimentConfig) -> SimulationResult:
         logger = CsvSimulationLogger(config.log_dir, prefix=f"slope_{config.slope_deg:g}")
         steps = max(1, int(config.duration_sec / config.time_step))
 
+        # 当前阶段使用固定 v/w 命令；后续路径跟踪会在这里替换成控制器输出。
         robot.command_twist(config.target_linear_velocity, config.target_angular_velocity)
         for step in range(steps):
             t = step * config.time_step
@@ -58,6 +64,7 @@ def run_experiment(config: ExperimentConfig) -> SimulationResult:
 
         log_path = logger.close()
     finally:
+        # 确保异常时也释放 PyBullet 连接。
         p.disconnect(client_id)
 
     frame = pd.read_csv(log_path)
@@ -67,6 +74,7 @@ def run_experiment(config: ExperimentConfig) -> SimulationResult:
 
 
 def plot_trajectory(frame: pd.DataFrame, figure_dir: str | Path, prefix: str = "run") -> Path:
+    """将参考轨迹、真实轨迹和估计轨迹画到同一张图中。"""
     figure_dir = Path(figure_dir)
     figure_dir.mkdir(parents=True, exist_ok=True)
     figure_path = figure_dir / f"{prefix}_trajectory.png"
@@ -85,4 +93,3 @@ def plot_trajectory(frame: pd.DataFrame, figure_dir: str | Path, prefix: str = "
     fig.savefig(figure_path, dpi=150)
     plt.close(fig)
     return figure_path
-

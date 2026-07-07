@@ -1,3 +1,4 @@
+# 环境检查脚本：确认依赖包可导入，并验证 PyBullet DIRECT 模式能连接。
 from __future__ import annotations
 
 import os
@@ -12,6 +13,7 @@ import yaml
 
 
 def main() -> int:
+    """打印关键依赖版本，并用 DIRECT 模式做最小连接测试。"""
     print(f"python: {sys.version.split()[0]}")
     print(f"executable: {sys.executable}")
     print(f"pybullet_api_version: {p.getAPIVersion()}")
@@ -33,4 +35,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

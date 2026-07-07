@@ -1,3 +1,4 @@
+# 日志分析入口：读取 CSV 轨迹日志，重新生成误差指标和轨迹图。
 from __future__ import annotations
 
 import argparse
@@ -11,6 +12,7 @@ from slope_sim.simulation import plot_trajectory
 
 
 def analyze_log(log_path: str | Path, figure_dir: str | Path = "results/figures") -> tuple[dict[str, float], Path]:
+    """分析单个 CSV 日志，并输出指标字典和轨迹图路径。"""
     frame = pd.read_csv(log_path)
     metrics = compute_tracking_metrics(frame, final_reference_yaw=0.0)
     figure_path = plot_trajectory(frame, figure_dir, prefix=Path(log_path).stem)
@@ -18,6 +20,7 @@ def analyze_log(log_path: str | Path, figure_dir: str | Path = "results/figures"
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    """定义日志分析脚本的命令行参数。"""
     parser = argparse.ArgumentParser(description="Analyze a slope simulation CSV log.")
     parser.add_argument("--log", required=True, type=Path, help="Path to a CSV log.")
     parser.add_argument("--figure-dir", default=Path("results/figures"), type=Path, help="Output figure directory.")
@@ -25,6 +28,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    """命令行入口：读取日志、生成图表、打印误差指标。"""
     args = parse_args(argv)
     metrics, figure_path = analyze_log(args.log, args.figure_dir)
     print(f"figure: {figure_path}")
@@ -35,4 +39,3 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

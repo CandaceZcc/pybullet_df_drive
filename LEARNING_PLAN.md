@@ -41,7 +41,7 @@ DIRECT connected: 0
 运行：
 
 ```bash
-python main.py --slope-deg 0 --duration-sec 1 --mode direct
+python main.py --config configs/flat_demo.yaml --duration-sec 1 --mode direct
 ```
 
 成功标志：
@@ -53,6 +53,21 @@ endpoint_error: ...
 ```
 
 这一阶段完成后，说明项目入口、PyBullet DIRECT、机器人模型、日志和画图流程已经连通。
+
+如果在 Ubuntu 本机 X11 桌面，可以运行手动控制窗口：
+
+```bash
+python main.py --config configs/flat_demo.yaml --gui --manual
+```
+
+手动控制：
+
+- 上/下方向键：前进 / 后退。
+- 左/右方向键：左转 / 右转。
+- 空格：停车。
+- `q` 或 `Esc`：退出。
+- PyBullet 窗口滑条：调整最大线速度和最大角速度。
+- 手动模式默认不会按配置里的 `duration_sec` 自动退出；需要固定时长时再加 `--duration-sec 60`。
 
 ## 阶段 2：运行单一斜坡
 

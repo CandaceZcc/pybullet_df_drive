@@ -1,3 +1,4 @@
+# 仿真 smoke 测试：用一次短 DIRECT 仿真验证日志和图像能生成。
 from pathlib import Path
 
 import pandas as pd
@@ -25,4 +26,3 @@ def test_run_experiment_direct_generates_log_and_figure(tmp_path: Path):
     frame = pd.read_csv(result.log_path)
     assert len(frame) > 0
     assert {"x", "y", "z", "roll", "pitch", "yaw"}.issubset(frame.columns)
-

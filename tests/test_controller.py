@@ -1,3 +1,4 @@
+# 控制器测试：保护差速车 v/w 到左右轮速度的数学转换。
 import pytest
 
 from slope_sim.controller import wheel_speeds_from_twist
@@ -21,4 +22,3 @@ def test_wheel_speeds_from_twist_rejects_non_positive_geometry():
 
     with pytest.raises(ValueError, match="wheel_radius"):
         wheel_speeds_from_twist(1.0, 0.0, wheel_base=0.5, wheel_radius=-0.1)
-

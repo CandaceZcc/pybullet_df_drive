@@ -69,6 +69,29 @@ mean_tracking_error: ...
 python main.py --gui --slope-deg 5
 ```
 
+## 阶段 1：平地演示
+
+运行平地差速车：
+
+```bash
+python main.py --config configs/flat_demo.yaml --duration-sec 1 --mode direct
+```
+
+如果在 Ubuntu 本机 X11 桌面，可以打开 PyBullet 窗口，用方向键手动控制。手动模式默认不会按配置里的 `duration_sec` 自动退出：
+
+```bash
+python main.py --config configs/flat_demo.yaml --gui --manual
+```
+
+手动控制说明：
+
+- 上/下方向键：前进 / 后退。
+- 左/右方向键：左转 / 右转。
+- 空格：停车。
+- `q` 或 `Esc`：退出。
+- PyBullet 窗口里的滑条可以调整最大线速度和最大角速度。
+- 如果需要固定运行 60 秒后自动退出，可以显式加 `--duration-sec 60`。
+
 ## 批量测试坡度
 
 ```bash
@@ -97,6 +120,7 @@ python analysis.py --log "$LOG"
 ```text
 slope_sim/                 核心仿真代码
 configs/experiment.yaml    默认实验参数
+configs/flat_demo.yaml     阶段 1 平地演示参数
 urdf/diff_drive.urdf       简化差速底盘模型
 experiments/               批量实验脚本
 results/logs/              CSV 日志
@@ -127,4 +151,10 @@ references/repos/
 
 ```text
 LEARNING_PLAN.md
+```
+
+每个文件的作用和参数位置见：
+
+```text
+ARCHITECTURE.md
 ```

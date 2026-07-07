@@ -1,3 +1,4 @@
+# 配置模块：定义一次实验需要的参数，并负责从 YAML 与命令行覆盖项中加载配置。
 from __future__ import annotations
 
 from dataclasses import dataclass, fields
@@ -9,6 +10,8 @@ import yaml
 
 @dataclass(frozen=True)
 class ExperimentConfig:
+    """单次仿真实验的完整参数集合。"""
+
     mode: str = "direct"
     slope_deg: float = 5.0
     duration_sec: float = 5.0
@@ -21,6 +24,7 @@ class ExperimentConfig:
     figure_dir: Path = Path("results/figures")
 
     def __post_init__(self) -> None:
+        """在配置创建后做基础合法性检查，尽早发现错误参数。"""
         mode = self.mode.lower()
         if mode not in {"direct", "gui"}:
             raise ValueError("mode must be 'direct' or 'gui'")
@@ -39,6 +43,7 @@ class ExperimentConfig:
 
 
 def load_config(path: str | Path = "configs/experiment.yaml", overrides: dict[str, Any] | None = None) -> ExperimentConfig:
+    """读取 YAML 配置，并用命令行参数覆盖其中的字段。"""
     config_path = Path(path)
     data: dict[str, Any] = {}
     if config_path.exists():
@@ -50,6 +55,7 @@ def load_config(path: str | Path = "configs/experiment.yaml", overrides: dict[st
     for key, value in (overrides or {}).items():
         if value is None:
             continue
+        # --gui 是命令行快捷开关，对应配置中的 mode: gui。
         if key == "gui":
             if value:
                 data["mode"] = "gui"
@@ -62,4 +68,3 @@ def load_config(path: str | Path = "configs/experiment.yaml", overrides: dict[st
         raise ValueError(f"Unknown config keys: {', '.join(unknown)}")
 
     return ExperimentConfig(**data)
-

@@ -1,3 +1,4 @@
+# 日志测试：确保 CSV 输出字段稳定，便于后续分析脚本读取。
 from pathlib import Path
 
 import pandas as pd
@@ -41,4 +42,3 @@ def test_csv_logger_writes_robot_state_rows(tmp_path: Path):
     ]
     assert frame.iloc[0]["x"] == 1.0
     assert frame.iloc[0]["reference_y"] == 2.5
-

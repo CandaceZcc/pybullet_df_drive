@@ -1,3 +1,4 @@
+# 指标测试：确保轨迹误差和航向误差计算符合预期。
 import pandas as pd
 import pytest
 
@@ -21,4 +22,3 @@ def test_compute_tracking_metrics_from_logged_trajectory():
     assert metrics["mean_tracking_error"] == pytest.approx(1.0 / 3.0)
     assert metrics["max_tracking_error"] == pytest.approx(1.0)
     assert metrics["heading_error"] == pytest.approx(0.1)
-
