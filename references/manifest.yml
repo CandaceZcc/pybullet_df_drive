@@ -40,4 +40,16 @@ repositories:
     focus:
       - terrain setup
       - two-wheel slope examples
-
+  - name: pybullet_sim
+    url: https://github.com/padawanabhi/pybullet_sim.git
+    branch: main
+    commit: 2953e3c4f6ada30f538e1f6cc83b90fd1768bcee
+    purpose: Differential-drive robot simulation with sensor streams, obstacle environments, navigation, and RL training patterns.
+    focus:
+      - scripts/diff_drive_robot.py
+      - scripts/03_sensor_streams.py
+      - scripts/04_sensor_logger.py
+      - scripts/05_environment_builder.py
+      - scripts/06_navigate_environment.py
+      - scripts/10_advanced_navigation.py
+      - scripts/pybullet_nav_env.py
