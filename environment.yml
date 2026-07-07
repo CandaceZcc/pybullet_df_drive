@@ -1,0 +1,15 @@
+name: slope-sim
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pybullet
+  - numpy
+  - matplotlib
+  - pandas
+  - scipy
+  - pyyaml
+  - pytest
+  - jupyterlab
+  - ipykernel
+

@@ -1,0 +1,11 @@
+mode: direct
+slope_deg: 5.0
+duration_sec: 5.0
+time_step: 0.004166666666666667
+wheel_base: 0.5
+wheel_radius: 0.1
+target_linear_velocity: 0.4
+target_angular_velocity: 0.0
+log_dir: results/logs
+figure_dir: results/figures
+

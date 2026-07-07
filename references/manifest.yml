@@ -1,0 +1,43 @@
+repositories:
+  - name: pybullet_diffdrive
+    url: https://github.com/thedeepestreality/pybullet_diffdrive.git
+    branch: main
+    commit: f6582502d0e1b0345951f0f825ec2c4e9d25ba4d
+    purpose: Minimal differential-drive PyBullet URDF and wheel-control example.
+    focus:
+      - diff_drive.urdf
+      - run.py
+  - name: PythonRobotics
+    url: https://github.com/AtsushiSakai/PythonRobotics.git
+    branch: master
+    commit: b38c510e083d69a5755d98d0680bd50f3d9a91fa
+    purpose: Path tracking and planning algorithms.
+    focus:
+      - Pure Pursuit
+      - Stanley Control
+      - Dynamic Window Approach
+  - name: PybulletRobotics
+    url: https://github.com/akinami3/PybulletRobotics.git
+    branch: main
+    commit: 3dea8e5eaeb89c49015dc0cdda09167d9f9ada5e
+    purpose: PyBullet mobile robot learning examples.
+    focus:
+      - PybulletBasic
+      - MobileRobot
+  - name: bullet3
+    url: https://github.com/bulletphysics/bullet3.git
+    branch: master
+    commit: 63c4d67e337017f9d8b298c900e9aabdb69296e7
+    purpose: Official PyBullet examples, URDFs, and joint-control patterns.
+    focus:
+      - examples/pybullet/examples/racecar_differential.py
+      - examples/pybullet/gym/pybullet_data/racecar
+  - name: Two-Wheel-Robot-DeepRL
+    url: https://github.com/ngzhili/Two-Wheel-Robot-DeepRL.git
+    branch: main
+    commit: 4e603a4c2d2d1618b9d8c4d571fdfc4888668d78
+    purpose: Slope and terrain setup reference.
+    focus:
+      - terrain setup
+      - two-wheel slope examples
+

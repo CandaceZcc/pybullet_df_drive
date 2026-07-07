@@ -1,0 +1,10 @@
+[project]
+name = "pybullet-df-drive"
+version = "0.1.0"
+description = "Lightweight PyBullet slope simulation for a differential-drive mobile base."
+requires-python = ">=3.10,<3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
