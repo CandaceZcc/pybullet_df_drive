@@ -27,6 +27,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--time-step", type=float, default=None, help="Simulation time step in seconds.")
     parser.add_argument("--target-linear-velocity", type=float, default=None, help="Target body velocity in m/s.")
     parser.add_argument("--target-angular-velocity", type=float, default=None, help="Target yaw rate in rad/s.")
+    parser.add_argument("--robot-model", choices=["diff_drive", "tracked_proxy"], default=None, help="Robot URDF model.")
+    parser.add_argument("--drive-model", choices=["kinematic", "physics"], default=None, help="Robot motion model.")
+    parser.add_argument("--no-dashboard", action="store_true", help="Disable the PySide6 telemetry dashboard.")
+    parser.add_argument("--dashboard-update-hz", type=float, default=None, help="Telemetry dashboard display refresh rate.")
+    parser.add_argument("--dashboard-smoothing-alpha", type=float, default=None, help="Dashboard feedback smoothing alpha.")
+    parser.add_argument("--lidar", action="store_true", help="Enable the simple ray-cast LiDAR.")
+    parser.add_argument("--lidar-debug-draw", action="store_true", help="Draw LiDAR rays in the PyBullet GUI.")
+    parser.add_argument("--ground-friction", type=float, default=None, help="Ground lateral friction coefficient.")
+    parser.add_argument("--wheel-friction", type=float, default=None, help="Wheel/track lateral friction coefficient.")
     parser.add_argument("--log-dir", type=Path, default=None, help="Directory for CSV logs.")
     parser.add_argument("--figure-dir", type=Path, default=None, help="Directory for generated figures.")
     return parser.parse_args(argv)
@@ -43,6 +52,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         "time_step": args.time_step,
         "target_linear_velocity": args.target_linear_velocity,
         "target_angular_velocity": args.target_angular_velocity,
+        "robot_model": args.robot_model,
+        "drive_model": args.drive_model,
+        "no_dashboard": args.no_dashboard,
+        "dashboard_update_hz": args.dashboard_update_hz,
+        "dashboard_smoothing_alpha": args.dashboard_smoothing_alpha,
+        "lidar": args.lidar,
+        "lidar_debug_draw": args.lidar_debug_draw if args.lidar_debug_draw else None,
+        "ground_friction": args.ground_friction,
+        "wheel_friction": args.wheel_friction,
         "log_dir": args.log_dir,
         "figure_dir": args.figure_dir,
     }

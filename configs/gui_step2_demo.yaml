@@ -1,0 +1,27 @@
+# Step 2 GUI 演示配置：使用 tracked_proxy、物理驱动、LiDAR 和实时 Dashboard。
+mode: gui
+slope_deg: 0.0
+duration_sec: 5.0
+time_step: 0.004166666666666667
+wheel_base: 0.5
+wheel_radius: 0.08
+target_linear_velocity: 0.35
+target_angular_velocity: 0.0
+robot_model: tracked_proxy
+drive_model: physics
+dashboard_enabled: true
+dashboard_update_hz: 5.0
+dashboard_smoothing_alpha: 0.25
+camera_distance: 6.5
+camera_yaw: 42.0
+camera_pitch: -38.0
+camera_target: [1.2, 0.0, 0.2]
+lidar_enabled: true
+lidar_ray_count: 31
+lidar_max_distance: 5.0
+lidar_fov_deg: 180.0
+lidar_debug_draw: false
+ground_lateral_friction: 1.0
+drive_lateral_friction: 1.0
+log_dir: results/logs
+figure_dir: results/figures

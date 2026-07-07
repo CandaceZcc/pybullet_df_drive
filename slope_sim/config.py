@@ -20,6 +20,22 @@ class ExperimentConfig:
     wheel_radius: float = 0.1
     target_linear_velocity: float = 0.4
     target_angular_velocity: float = 0.0
+    robot_model: str = "diff_drive"
+    drive_model: str = "kinematic"
+    dashboard_enabled: bool = True
+    dashboard_update_hz: float = 5.0
+    dashboard_smoothing_alpha: float = 0.35
+    camera_distance: float = 6.0
+    camera_yaw: float = 45.0
+    camera_pitch: float = -35.0
+    camera_target: tuple[float, float, float] = (0.8, 0.0, 0.0)
+    lidar_enabled: bool = False
+    lidar_ray_count: int = 31
+    lidar_max_distance: float = 4.0
+    lidar_fov_deg: float = 180.0
+    lidar_debug_draw: bool = False
+    ground_lateral_friction: float = 1.0
+    drive_lateral_friction: float = 1.0
     log_dir: Path = Path("results/logs")
     figure_dir: Path = Path("results/figures")
 
@@ -28,6 +44,12 @@ class ExperimentConfig:
         mode = self.mode.lower()
         if mode not in {"direct", "gui"}:
             raise ValueError("mode must be 'direct' or 'gui'")
+        robot_model = self.robot_model.lower()
+        if robot_model not in {"diff_drive", "tracked_proxy"}:
+            raise ValueError("robot_model must be 'diff_drive' or 'tracked_proxy'")
+        drive_model = self.drive_model.lower()
+        if drive_model not in {"kinematic", "physics"}:
+            raise ValueError("drive_model must be 'kinematic' or 'physics'")
         if self.duration_sec <= 0:
             raise ValueError("duration_sec must be positive")
         if self.time_step <= 0:
@@ -36,8 +58,29 @@ class ExperimentConfig:
             raise ValueError("wheel_base must be positive")
         if self.wheel_radius <= 0:
             raise ValueError("wheel_radius must be positive")
+        if self.dashboard_update_hz <= 0:
+            raise ValueError("dashboard_update_hz must be positive")
+        if not 0.0 < self.dashboard_smoothing_alpha <= 1.0:
+            raise ValueError("dashboard_smoothing_alpha must be in (0, 1]")
+        if self.camera_distance <= 0:
+            raise ValueError("camera_distance must be positive")
+        if len(self.camera_target) != 3:
+            raise ValueError("camera_target must contain three numbers")
+        if self.lidar_ray_count <= 0:
+            raise ValueError("lidar_ray_count must be positive")
+        if self.lidar_max_distance <= 0:
+            raise ValueError("lidar_max_distance must be positive")
+        if self.lidar_fov_deg <= 0:
+            raise ValueError("lidar_fov_deg must be positive")
+        if self.ground_lateral_friction <= 0:
+            raise ValueError("ground_lateral_friction must be positive")
+        if self.drive_lateral_friction <= 0:
+            raise ValueError("drive_lateral_friction must be positive")
 
         object.__setattr__(self, "mode", mode)
+        object.__setattr__(self, "robot_model", robot_model)
+        object.__setattr__(self, "drive_model", drive_model)
+        object.__setattr__(self, "camera_target", tuple(float(value) for value in self.camera_target))
         object.__setattr__(self, "log_dir", Path(self.log_dir))
         object.__setattr__(self, "figure_dir", Path(self.figure_dir))
 
@@ -59,6 +102,20 @@ def load_config(path: str | Path = "configs/experiment.yaml", overrides: dict[st
         if key == "gui":
             if value:
                 data["mode"] = "gui"
+            continue
+        if key == "no_dashboard":
+            if value:
+                data["dashboard_enabled"] = False
+            continue
+        if key == "lidar":
+            if value:
+                data["lidar_enabled"] = True
+            continue
+        if key == "ground_friction":
+            data["ground_lateral_friction"] = value
+            continue
+        if key == "wheel_friction":
+            data["drive_lateral_friction"] = value
             continue
         data[key] = value
 

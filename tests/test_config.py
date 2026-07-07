@@ -17,6 +17,22 @@ def test_load_config_reads_yaml_and_applies_overrides(tmp_path: Path):
                 "wheel_radius: 0.08",
                 "target_linear_velocity: 0.6",
                 "target_angular_velocity: 0.1",
+                "robot_model: tracked_proxy",
+                "drive_model: physics",
+                "dashboard_enabled: false",
+                "dashboard_update_hz: 4.0",
+                "dashboard_smoothing_alpha: 0.2",
+                "camera_distance: 7.5",
+                "camera_yaw: 35.0",
+                "camera_pitch: -45.0",
+                "camera_target: [1.0, 0.5, 0.2]",
+                "lidar_enabled: true",
+                "lidar_ray_count: 17",
+                "lidar_max_distance: 4.0",
+                "lidar_fov_deg: 120.0",
+                "lidar_debug_draw: true",
+                "ground_lateral_friction: 0.9",
+                "drive_lateral_friction: 0.7",
                 "log_dir: custom/logs",
                 "figure_dir: custom/figures",
             ]
@@ -35,6 +51,22 @@ def test_load_config_reads_yaml_and_applies_overrides(tmp_path: Path):
     assert config.wheel_radius == 0.08
     assert config.target_linear_velocity == 0.6
     assert config.target_angular_velocity == 0.1
+    assert config.robot_model == "tracked_proxy"
+    assert config.drive_model == "physics"
+    assert config.dashboard_enabled is False
+    assert config.dashboard_update_hz == 4.0
+    assert config.dashboard_smoothing_alpha == 0.2
+    assert config.camera_distance == 7.5
+    assert config.camera_yaw == 35.0
+    assert config.camera_pitch == -45.0
+    assert config.camera_target == (1.0, 0.5, 0.2)
+    assert config.lidar_enabled is True
+    assert config.lidar_ray_count == 17
+    assert config.lidar_max_distance == 4.0
+    assert config.lidar_fov_deg == 120.0
+    assert config.lidar_debug_draw is True
+    assert config.ground_lateral_friction == 0.9
+    assert config.drive_lateral_friction == 0.7
     assert config.log_dir == Path("custom/logs")
     assert config.figure_dir == Path("custom/figures")
 
@@ -46,3 +78,13 @@ def test_experiment_config_rejects_invalid_mode():
         assert "mode" in str(exc)
     else:
         raise AssertionError("invalid mode should fail")
+
+
+def test_experiment_config_rejects_invalid_robot_or_drive_model():
+    for kwargs in ({"robot_model": "tank"}, {"drive_model": "magic"}):
+        try:
+            ExperimentConfig(**kwargs)
+        except ValueError as exc:
+            assert "model" in str(exc)
+        else:
+            raise AssertionError(f"invalid config should fail: {kwargs}")

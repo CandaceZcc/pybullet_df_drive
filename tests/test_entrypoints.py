@@ -10,12 +10,45 @@ from slope_sim.simulation import SimulationResult
 
 
 def test_main_parse_args_supports_gui_and_slope():
-    args = parse_args(["--gui", "--manual", "--slope-deg", "10", "--duration-sec", "2"])
+    args = parse_args(
+        [
+            "--gui",
+            "--manual",
+            "--slope-deg",
+            "10",
+            "--duration-sec",
+            "2",
+            "--robot-model",
+            "tracked_proxy",
+            "--drive-model",
+            "physics",
+            "--no-dashboard",
+            "--dashboard-update-hz",
+            "4",
+            "--dashboard-smoothing-alpha",
+            "0.2",
+            "--lidar",
+            "--lidar-debug-draw",
+            "--ground-friction",
+            "0.8",
+            "--wheel-friction",
+            "0.6",
+        ]
+    )
 
     assert args.gui is True
     assert args.manual is True
     assert args.slope_deg == 10.0
     assert args.duration_sec == 2.0
+    assert args.robot_model == "tracked_proxy"
+    assert args.drive_model == "physics"
+    assert args.no_dashboard is True
+    assert args.dashboard_update_hz == 4.0
+    assert args.dashboard_smoothing_alpha == 0.2
+    assert args.lidar is True
+    assert args.lidar_debug_draw is True
+    assert args.ground_friction == 0.8
+    assert args.wheel_friction == 0.6
 
 
 def test_manual_mode_runs_until_quit_unless_duration_is_explicit(tmp_path: Path, monkeypatch):

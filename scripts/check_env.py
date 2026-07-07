@@ -8,6 +8,7 @@ import matplotlib
 import numpy
 import pandas
 import pybullet as p
+from PySide6 import QtCore
 import scipy
 import yaml
 
@@ -20,6 +21,7 @@ def main() -> int:
     print(f"numpy: {numpy.__version__}")
     print(f"matplotlib: {matplotlib.__version__}")
     print(f"pandas: {pandas.__version__}")
+    print(f"pyside6: {QtCore.__version__}")
     print(f"scipy: {scipy.__version__}")
     print(f"pyyaml: {yaml.__version__}")
     print(f"XDG_SESSION_TYPE: {os.environ.get('XDG_SESSION_TYPE', 'unset')}")

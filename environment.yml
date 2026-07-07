@@ -9,7 +9,7 @@ dependencies:
   - pandas
   - scipy
   - pyyaml
+  - pyside6
   - pytest
   - jupyterlab
   - ipykernel
-

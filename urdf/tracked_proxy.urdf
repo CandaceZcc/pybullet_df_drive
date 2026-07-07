@@ -1,0 +1,156 @@
+<?xml version="1.0"?>
+<!-- 履带近似模型：左右多滚轮模拟履带接触，外观条只负责视觉表达。 -->
+<robot name="tracked_proxy">
+  <link name="base_link">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="7.0"/>
+      <inertia ixx="0.16" ixy="0" ixz="0" iyy="0.18" iyz="0" izz="0.22"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0.02" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.62 0.34 0.14"/>
+      </geometry>
+      <material name="body_green">
+        <color rgba="0.1 0.55 0.25 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0.02" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.62 0.34 0.14"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <!-- 左右履带外观条：固定在车体上，不参与连续履带物理。 -->
+  <link name="left_track_visual">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="0.02"/>
+      <inertia ixx="0.0001" ixy="0" ixz="0" iyy="0.0001" iyz="0" izz="0.0001"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.58 0.075 0.055"/>
+      </geometry>
+      <material name="track_dark">
+        <color rgba="0.04 0.04 0.04 1"/>
+      </material>
+    </visual>
+  </link>
+  <joint name="left_track_visual_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="left_track_visual"/>
+    <origin xyz="0 0.255 -0.075" rpy="0 0 0"/>
+  </joint>
+
+  <link name="right_track_visual">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="0.02"/>
+      <inertia ixx="0.0001" ixy="0" ixz="0" iyy="0.0001" iyz="0" izz="0.0001"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.58 0.075 0.055"/>
+      </geometry>
+      <material name="track_dark">
+        <color rgba="0.04 0.04 0.04 1"/>
+      </material>
+    </visual>
+  </link>
+  <joint name="right_track_visual_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="right_track_visual"/>
+    <origin xyz="0 -0.255 -0.075" rpy="0 0 0"/>
+  </joint>
+
+  <!-- 中间滚轮是左右驱动轮，关节名保持和 diff_drive 兼容。 -->
+  <link name="left_wheel">
+    <inertial><origin xyz="0 0 0" rpy="0 0 0"/><mass value="0.45"/><inertia ixx="0.003" ixy="0" ixz="0" iyy="0.003" iyz="0" izz="0.003"/></inertial>
+    <visual><origin xyz="0 0 0" rpy="1.57079632679 0 0"/><geometry><cylinder radius="0.08" length="0.05"/></geometry><material name="wheel_red"><color rgba="0.85 0.1 0.1 1"/></material></visual>
+    <collision><origin xyz="0 0 0" rpy="1.57079632679 0 0"/><geometry><cylinder radius="0.08" length="0.05"/></geometry></collision>
+  </link>
+  <joint name="left_wheel_joint" type="continuous">
+    <parent link="base_link"/>
+    <child link="left_wheel"/>
+    <origin xyz="0 0.255 -0.08" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+  </joint>
+
+  <link name="right_wheel">
+    <inertial><origin xyz="0 0 0" rpy="0 0 0"/><mass value="0.45"/><inertia ixx="0.003" ixy="0" ixz="0" iyy="0.003" iyz="0" izz="0.003"/></inertial>
+    <visual><origin xyz="0 0 0" rpy="1.57079632679 0 0"/><geometry><cylinder radius="0.08" length="0.05"/></geometry><material name="wheel_red"><color rgba="0.85 0.1 0.1 1"/></material></visual>
+    <collision><origin xyz="0 0 0" rpy="1.57079632679 0 0"/><geometry><cylinder radius="0.08" length="0.05"/></geometry></collision>
+  </link>
+  <joint name="right_wheel_joint" type="continuous">
+    <parent link="base_link"/>
+    <child link="right_wheel"/>
+    <origin xyz="0 -0.255 -0.08" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+  </joint>
+
+  <!-- 前后滚轮是被动接触轮，用于扩大履带接触区域。 -->
+  <link name="left_front_roller">
+    <inertial><origin xyz="0 0 0" rpy="0 0 0"/><mass value="0.25"/><inertia ixx="0.0015" ixy="0" ixz="0" iyy="0.0015" iyz="0" izz="0.0015"/></inertial>
+    <visual><origin xyz="0 0 0" rpy="1.57079632679 0 0"/><geometry><cylinder radius="0.07" length="0.045"/></geometry><material name="roller_dark"><color rgba="0.02 0.02 0.02 1"/></material></visual>
+    <collision><origin xyz="0 0 0" rpy="1.57079632679 0 0"/><geometry><cylinder radius="0.07" length="0.045"/></geometry></collision>
+  </link>
+  <joint name="left_front_roller_joint" type="continuous">
+    <parent link="base_link"/>
+    <child link="left_front_roller"/>
+    <origin xyz="0.21 0.255 -0.09" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+  </joint>
+
+  <link name="left_back_roller">
+    <inertial><origin xyz="0 0 0" rpy="0 0 0"/><mass value="0.25"/><inertia ixx="0.0015" ixy="0" ixz="0" iyy="0.0015" iyz="0" izz="0.0015"/></inertial>
+    <visual><origin xyz="0 0 0" rpy="1.57079632679 0 0"/><geometry><cylinder radius="0.07" length="0.045"/></geometry><material name="roller_dark"><color rgba="0.02 0.02 0.02 1"/></material></visual>
+    <collision><origin xyz="0 0 0" rpy="1.57079632679 0 0"/><geometry><cylinder radius="0.07" length="0.045"/></geometry></collision>
+  </link>
+  <joint name="left_back_roller_joint" type="continuous">
+    <parent link="base_link"/>
+    <child link="left_back_roller"/>
+    <origin xyz="-0.21 0.255 -0.09" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+  </joint>
+
+  <link name="right_front_roller">
+    <inertial><origin xyz="0 0 0" rpy="0 0 0"/><mass value="0.25"/><inertia ixx="0.0015" ixy="0" ixz="0" iyy="0.0015" iyz="0" izz="0.0015"/></inertial>
+    <visual><origin xyz="0 0 0" rpy="1.57079632679 0 0"/><geometry><cylinder radius="0.07" length="0.045"/></geometry><material name="roller_dark"><color rgba="0.02 0.02 0.02 1"/></material></visual>
+    <collision><origin xyz="0 0 0" rpy="1.57079632679 0 0"/><geometry><cylinder radius="0.07" length="0.045"/></geometry></collision>
+  </link>
+  <joint name="right_front_roller_joint" type="continuous">
+    <parent link="base_link"/>
+    <child link="right_front_roller"/>
+    <origin xyz="0.21 -0.255 -0.09" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+  </joint>
+
+  <link name="right_back_roller">
+    <inertial><origin xyz="0 0 0" rpy="0 0 0"/><mass value="0.25"/><inertia ixx="0.0015" ixy="0" ixz="0" iyy="0.0015" iyz="0" izz="0.0015"/></inertial>
+    <visual><origin xyz="0 0 0" rpy="1.57079632679 0 0"/><geometry><cylinder radius="0.07" length="0.045"/></geometry><material name="roller_dark"><color rgba="0.02 0.02 0.02 1"/></material></visual>
+    <collision><origin xyz="0 0 0" rpy="1.57079632679 0 0"/><geometry><cylinder radius="0.07" length="0.045"/></geometry></collision>
+  </link>
+  <joint name="right_back_roller_joint" type="continuous">
+    <parent link="base_link"/>
+    <child link="right_back_roller"/>
+    <origin xyz="-0.21 -0.255 -0.09" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+  </joint>
+
+  <!-- LiDAR 安装点：V1 用 base pose 近似读取，link 名保留给后续精确挂载。 -->
+  <link name="lidar_link">
+    <inertial><origin xyz="0 0 0" rpy="0 0 0"/><mass value="0.02"/><inertia ixx="0.0001" ixy="0" ixz="0" iyy="0.0001" iyz="0" izz="0.0001"/></inertial>
+    <visual><origin xyz="0 0 0" rpy="0 0 0"/><geometry><box size="0.05 0.05 0.035"/></geometry><material name="sensor_blue"><color rgba="0.1 0.25 0.95 1"/></material></visual>
+  </link>
+  <joint name="lidar_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="lidar_link"/>
+    <origin xyz="0.26 0 0.13" rpy="0 0 0"/>
+  </joint>
+</robot>

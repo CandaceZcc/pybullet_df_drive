@@ -15,7 +15,8 @@ from slope_sim.config import ExperimentConfig
 from slope_sim.logger import CsvSimulationLogger
 from slope_sim.metrics import compute_tracking_metrics
 from slope_sim.robot import DifferentialDriveRobot
-from slope_sim.scene import create_slope_scene
+from slope_sim.scene import configure_gui_visualizer, create_slope_scene
+from slope_sim.sensors import LidarSummary, read_lidar
 
 
 @dataclass(frozen=True)
@@ -36,21 +37,44 @@ def run_experiment(config: ExperimentConfig) -> SimulationResult:
 
     try:
         # PyBullet 客户端内创建场景和机器人，DIRECT 模式也能无窗口运行。
-        create_slope_scene(client_id, config.slope_deg, config.time_step)
+        create_slope_scene(client_id, config.slope_deg, config.time_step, config.ground_lateral_friction)
+        if config.mode == "gui":
+            configure_gui_visualizer(
+                client_id,
+                config.camera_distance,
+                config.camera_yaw,
+                config.camera_pitch,
+                config.camera_target,
+            )
         robot = DifferentialDriveRobot(
             client_id=client_id,
-            urdf_path=Path("urdf/diff_drive.urdf"),
+            urdf_path=_robot_urdf_path(config.robot_model),
             wheel_base=config.wheel_base,
             wheel_radius=config.wheel_radius,
+            base_height=_robot_base_height(config.robot_model),
         )
+        robot.apply_drive_friction(config.drive_lateral_friction)
         logger = CsvSimulationLogger(config.log_dir, prefix=f"slope_{config.slope_deg:g}")
         steps = max(1, int(config.duration_sec / config.time_step))
 
         # 当前阶段使用固定 v/w 命令；后续路径跟踪会在这里替换成控制器输出。
-        robot.command_twist(config.target_linear_velocity, config.target_angular_velocity)
         for step in range(steps):
             t = step * config.time_step
-            state = robot.step_kinematic(dt=config.time_step, slope_deg=config.slope_deg, t=t)
+            robot.command_twist(config.target_linear_velocity, config.target_angular_velocity)
+            if config.drive_model == "physics":
+                p.stepSimulation(physicsClientId=client_id)
+                lidar_summary = _read_lidar_for_robot(client_id, robot, config)
+                state = robot.read_physics_state(
+                    t=t,
+                    command_linear_velocity=config.target_linear_velocity,
+                    command_angular_velocity=config.target_angular_velocity,
+                    ground_lateral_friction=config.ground_lateral_friction,
+                    drive_lateral_friction=config.drive_lateral_friction,
+                    lidar_summary=lidar_summary,
+                )
+            else:
+                state = robot.step_kinematic(dt=config.time_step, slope_deg=config.slope_deg, t=t)
+                p.stepSimulation(physicsClientId=client_id)
             reference_x = config.target_linear_velocity * t
             reference_y = 0.0
             logger.record(
@@ -60,7 +84,6 @@ def run_experiment(config: ExperimentConfig) -> SimulationResult:
                 estimated_x=state.x,
                 estimated_y=state.y,
             )
-            p.stepSimulation(physicsClientId=client_id)
 
         log_path = logger.close()
     finally:
@@ -71,6 +94,39 @@ def run_experiment(config: ExperimentConfig) -> SimulationResult:
     metrics = compute_tracking_metrics(frame, final_reference_yaw=0.0)
     figure_path = plot_trajectory(frame, config.figure_dir, prefix=f"slope_{config.slope_deg:g}")
     return SimulationResult(log_path=log_path, figure_path=figure_path, metrics=metrics)
+
+
+def _robot_urdf_path(robot_model: str) -> Path:
+    """根据配置选择机器人 URDF。"""
+    if robot_model == "tracked_proxy":
+        return Path("urdf/tracked_proxy.urdf")
+    return Path("urdf/diff_drive.urdf")
+
+
+def _robot_base_height(robot_model: str) -> float:
+    """根据机器人模型选择贴近地面的初始车体高度。"""
+    if robot_model == "tracked_proxy":
+        return 0.16
+    return 0.18
+
+
+def _read_lidar_for_robot(client_id: int, robot: DifferentialDriveRobot, config: ExperimentConfig) -> LidarSummary:
+    """从机器人车体附近发射简化 LiDAR 射线。"""
+    if not config.lidar_enabled:
+        return LidarSummary()
+    position, orientation = p.getBasePositionAndOrientation(robot.robot_id, physicsClientId=client_id)
+    yaw = p.getEulerFromQuaternion(orientation)[2]
+    origin = (float(position[0]), float(position[1]), float(position[2]) + 0.12)
+    return read_lidar(
+        client_id,
+        origin,
+        yaw,
+        config.lidar_ray_count,
+        config.lidar_max_distance,
+        config.lidar_fov_deg,
+        draw_debug=config.mode == "gui" and config.lidar_debug_draw,
+        life_time=max(config.time_step * 2.0, 0.05),
+    )
 
 
 def plot_trajectory(frame: pd.DataFrame, figure_dir: str | Path, prefix: str = "run") -> Path:
