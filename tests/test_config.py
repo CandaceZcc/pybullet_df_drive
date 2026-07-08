@@ -33,6 +33,7 @@ def test_load_config_reads_yaml_and_applies_overrides(tmp_path: Path):
                 "lidar_debug_draw: true",
                 "ground_lateral_friction: 0.9",
                 "drive_lateral_friction: 0.7",
+                "support_lateral_friction: 0.04",
                 "log_dir: custom/logs",
                 "figure_dir: custom/figures",
             ]
@@ -67,6 +68,7 @@ def test_load_config_reads_yaml_and_applies_overrides(tmp_path: Path):
     assert config.lidar_debug_draw is True
     assert config.ground_lateral_friction == 0.9
     assert config.drive_lateral_friction == 0.7
+    assert config.support_lateral_friction == 0.04
     assert config.log_dir == Path("custom/logs")
     assert config.figure_dir == Path("custom/figures")
 

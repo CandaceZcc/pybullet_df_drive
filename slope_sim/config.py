@@ -35,7 +35,8 @@ class ExperimentConfig:
     lidar_fov_deg: float = 180.0
     lidar_debug_draw: bool = False
     ground_lateral_friction: float = 1.0
-    drive_lateral_friction: float = 1.0
+    drive_lateral_friction: float = 2.0
+    support_lateral_friction: float = 0.03
     log_dir: Path = Path("results/logs")
     figure_dir: Path = Path("results/figures")
 
@@ -76,6 +77,8 @@ class ExperimentConfig:
             raise ValueError("ground_lateral_friction must be positive")
         if self.drive_lateral_friction <= 0:
             raise ValueError("drive_lateral_friction must be positive")
+        if self.support_lateral_friction <= 0:
+            raise ValueError("support_lateral_friction must be positive")
 
         object.__setattr__(self, "mode", mode)
         object.__setattr__(self, "robot_model", robot_model)
@@ -116,6 +119,9 @@ def load_config(path: str | Path = "configs/experiment.yaml", overrides: dict[st
             continue
         if key == "wheel_friction":
             data["drive_lateral_friction"] = value
+            continue
+        if key == "support_friction":
+            data["support_lateral_friction"] = value
             continue
         data[key] = value
 

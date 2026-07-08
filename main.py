@@ -36,6 +36,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--lidar-debug-draw", action="store_true", help="Draw LiDAR rays in the PyBullet GUI.")
     parser.add_argument("--ground-friction", type=float, default=None, help="Ground lateral friction coefficient.")
     parser.add_argument("--wheel-friction", type=float, default=None, help="Wheel/track lateral friction coefficient.")
+    parser.add_argument("--support-friction", type=float, default=None, help="Caster/support lateral friction coefficient.")
     parser.add_argument("--log-dir", type=Path, default=None, help="Directory for CSV logs.")
     parser.add_argument("--figure-dir", type=Path, default=None, help="Directory for generated figures.")
     return parser.parse_args(argv)
@@ -61,6 +62,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "lidar_debug_draw": args.lidar_debug_draw if args.lidar_debug_draw else None,
         "ground_friction": args.ground_friction,
         "wheel_friction": args.wheel_friction,
+        "support_friction": args.support_friction,
         "log_dir": args.log_dir,
         "figure_dir": args.figure_dir,
     }

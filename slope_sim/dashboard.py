@@ -20,6 +20,10 @@ SMOOTHED_TELEMETRY_FIELDS = frozenset(
         "yaw_rate",
         "left_actual_drive_speed",
         "right_actual_drive_speed",
+        "left_track_surface_speed",
+        "right_track_surface_speed",
+        "left_body_track_speed",
+        "right_body_track_speed",
         "left_contact_normal_force",
         "right_contact_normal_force",
         "left_slip_ratio",
@@ -81,6 +85,14 @@ def dashboard_rows(telemetry: RobotTelemetry) -> list[tuple[str, str]]:
         (
             "左右实际驱动速度",
             f"{_fmt(telemetry.left_actual_drive_speed)} / {_fmt(telemetry.right_actual_drive_speed)} rad/s",
+        ),
+        (
+            "驱动表面速度",
+            f"{_fmt(telemetry.left_track_surface_speed)} / {_fmt(telemetry.right_track_surface_speed)} m/s",
+        ),
+        (
+            "驱动局部车速",
+            f"{_fmt(telemetry.left_body_track_speed)} / {_fmt(telemetry.right_body_track_speed)} m/s",
         ),
         ("左右打滑率", f"{_fmt(telemetry.left_slip_ratio)} / {_fmt(telemetry.right_slip_ratio)}"),
         ("接触法向力", f"{_fmt(telemetry.left_contact_normal_force)} / {_fmt(telemetry.right_contact_normal_force)} N"),

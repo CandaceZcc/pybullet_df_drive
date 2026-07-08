@@ -4,6 +4,12 @@
 
 当前仓库已经跑通了 PyBullet 基础流程：平地/斜坡场景、简化差速底盘、DIRECT 仿真、GUI 手动控制、CSV 日志和轨迹图。接下来要从“运动学演示”逐步升级到“物理接触 + 传感器 + 自动巡航”。
 
+当前实现路线更新：
+
+- 默认演示回到 `diff_drive + physics`，使用二轮差速加单后低摩擦支撑轮，先保证直行、转向和 GUI 手动控制稳定。
+- `tracked_proxy` 保留为履带近似实验模型，但不再作为 Step 2 默认模型。
+- 履带物理暂时从主线任务降级为后续研究项，当前主线优先推进数据反馈、传感器、障碍物和自动巡航。
+
 ## 新需求拆解
 
 mentor 明确的需求可以拆成 4 条主线：
@@ -41,6 +47,19 @@ urdf/simple_two_wheel_car.urdf
 - DWA：用局部轨迹预测做避障和自动巡航。
 
 注意：这个参考仓库本身定位是“学习机器人算法”，不直接等于工程级履带车仿真。我们应该借鉴它的模块和思路，而不是整仓库照搬。
+
+履带物理 V2 阶段优先参考：
+
+```text
+references/repos/bullet3/examples/pybullet/examples/snake.py
+references/repos/bullet3/examples/pybullet/examples/racecar_differential.py
+references/repos/pybullet_sim/scripts/diff_drive_robot.py
+references/repos/pybullet_sim/scripts/06_navigate_environment.py
+```
+
+- Bullet `snake.py`：参考 `anisotropicFriction`，用各向异性摩擦模拟“前后方向牵引强、横向允许滑移”的履带接触。
+- Bullet `racecar_differential.py`：参考多个轮/关节联动的思路，避免只驱动一个轮导致履带转向被被动滚轮拖住。
+- `pybullet_sim`：参考传感器、目标导航、障碍环境和 Gym 环境封装，不直接迁移其平地轮式动力学。
 
 ## 小车可能用到的参数清单
 
@@ -125,6 +144,10 @@ left_target_drive_speed
 right_target_drive_speed
 left_actual_drive_speed
 right_actual_drive_speed
+left_track_surface_speed
+right_track_surface_speed
+left_body_track_speed
+right_body_track_speed
 left_drive_position
 right_drive_position
 left_motor_torque
@@ -144,6 +167,8 @@ right_actual_track_speed
 
 - 目标速度：控制器希望左/右侧达到的速度。
 - 实际速度：PyBullet 中关节真实反馈速度。
+- 履带表面速度：同侧驱动轮和滚轮按有效半径换算后的平均线速度。
+- 履带局部车速：车体在左右履带位置上的局部前向速度，转向时不能直接用车体中心速度代替。
 - 驱动位置：轮子或履带驱动轮累计转角，可用于里程计。
 - 电机力矩：后续估算负载或能耗时会用到。
 
@@ -200,6 +225,15 @@ getContactPoints()
 ```text
 drive_surface_speed = drive_radius * drive_angular_speed
 slip_ratio = (drive_surface_speed - body_forward_speed) / max(abs(drive_surface_speed), small_value)
+```
+
+履带物理 V2 的打滑估计改为左右履带局部速度：
+
+```text
+left_body_track_speed = body_forward_speed - yaw_rate * wheel_base / 2
+right_body_track_speed = body_forward_speed + yaw_rate * wheel_base / 2
+left_slip_ratio = (left_track_surface_speed - left_body_track_speed) / max(abs(left_track_surface_speed), small_value)
+right_slip_ratio = (right_track_surface_speed - right_body_track_speed) / max(abs(right_track_surface_speed), small_value)
 ```
 
 注意：这里的打滑是估计指标，不等同于真实轮胎实验台测得的精确滑移率，但足够用于比较坡度、摩擦和控制器效果。
@@ -394,23 +428,22 @@ figure: results/figures/slope_0_trajectory.png
 
 目标：让机器人真正依赖 PyBullet 的轮子关节和地面接触运动，为后续摩擦、打滑和履带近似打基础。
 
-当前问题：
+当前进度：
 
-- 现在的 `robot.step_kinematic()` 主要是运动学推进，轨迹稳定但不能真实反映轮地摩擦和打滑。
-- 如果要记录轮胎速度、摩擦和打滑，必须逐步转向 PyBullet 物理推进。
+- 已支持 `drive_model: physics`，通过 `setJointMotorControl2()` 控制左右驱动轮。
+- `diff_drive` 已调整为左右轮中心距 `0.5m`，与配置中的 `wheel_base` 对齐。
+- 默认 GUI demo 使用二轮差速 + 单后低摩擦支撑轮，作为后续传感器和自动巡航的稳定底座。
 
-开发任务：
+后续开发任务：
 
-- 增加 `physics` 运行模式或配置项。
-- 使用 `setJointMotorControl2(..., VELOCITY_CONTROL, targetVelocity=...)` 控制左右轮。
-- 每步用 `p.stepSimulation()` 推进。
-- 用 `getJointState()` 读取左右轮实际角速度。
-- 保留当前运动学模式，方便和物理模式对比。
+- 继续保留 `kinematic` 模式，方便和物理模式对比。
+- 观察不同坡度和摩擦下的轮速、接触力、打滑率变化。
+- 后续如果模型抖动，优先检查轮距、出生高度、支撑轮摩擦和接触点数量。
 
 建议开发后运行：
 
 ```bash
-python main.py --config configs/flat_demo.yaml --duration-sec 2 --mode direct --drive-model physics_wheel
+python main.py --config configs/gui_step2_demo.yaml --mode direct --duration-sec 2 --drive-model physics --robot-model diff_drive
 ```
 
 成功标志：
@@ -419,8 +452,7 @@ python main.py --config configs/flat_demo.yaml --duration-sec 2 --mode direct --
 - CSV 能持续记录 `x, y, z, roll, pitch, yaw`。
 - 车辆能在平地前进和转向。
 - 物理模式下不再依赖 `resetBasePositionAndOrientation` 每步硬改位置。
-
-注意：`--drive-model` 当前还没有，需要这一阶段开发。
+- GUI 手动模式下直行不明显左右摇晃，转向能连续响应。
 
 ## 阶段 3：加入摩擦、接触和打滑数据反馈
 
@@ -529,10 +561,18 @@ python main.py --config configs/dam_slope.yaml --duration-sec 3 --mode direct
 
 目标：让模型更接近真实“两条履带”的车。
 
+当前进度：
+
+- 已有 `tracked_proxy`，不是完整连续履带，而是“中间驱动轮 + 前后滚轮 + 履带外观条”的工程近似。
+- V2 目标是让同侧所有滚轮按同一条履带线速度联动，并用各向异性摩擦改善 skid-steer 转向。
+- 诊断后发现：当前多滚轮接触的直行 yaw 抖动明显，不适合作为默认教学/实验底座。
+- 当前不引入连续履带链条作为硬依赖；`tracked_proxy` 保留为后续研究项。
+
 推荐路线：
 
 - 第一版：仍使用左右差速输入，但把变量名从 `wheel_base/wheel_radius` 逐步抽象成 `track_width/drive_radius`。
 - 第二版：每侧用多个小轮或滚轮近似履带接触，左右两侧统一控制。
+- V2 校准版：同侧所有滚轮联动、按半径换算角速度、使用各向异性摩擦解决转向卡顿。
 - 第三版：每侧加入长条接触块或更细的履带外观，但控制仍是左右履带速度。
 
 可行性判断：
@@ -544,16 +584,43 @@ python main.py --config configs/dam_slope.yaml --duration-sec 3 --mode direct
 建议开发后运行：
 
 ```bash
-python main.py --config configs/dam_slope.yaml --robot tracked --duration-sec 3 --mode direct
+python main.py --config configs/gui_step2_demo.yaml --robot-model tracked_proxy --drive-model physics --duration-sec 3 --mode direct
 ```
 
 成功标志：
 
-- 配置中可以选择 `diff_wheel` 或 `tracked`。
-- 履带近似模型能在坡面上稳定前进。
+- 配置中可以选择 `diff_drive` 或 `tracked_proxy`。
+- 履带近似模型只作为实验对比，不影响默认二轮差速演示稳定运行。
 - 日志中使用 `left_track_speed/right_track_speed` 或兼容字段。
 
-注意：`--robot tracked` 当前还没有，需要这一阶段开发。
+注意：当前命令行使用的是 `--robot-model tracked_proxy`，不是旧写法 `--robot tracked`。
+
+## 阶段 5.5：履带物理 V2 与转向校准（暂停作为主线）
+
+目标：修复 `tracked_proxy` 前进转向和原地转向卡顿，让实际 `yaw_rate` 能明显响应角速度命令。
+
+实施内容：
+
+- 同侧驱动轮、前滚轮、后滚轮全部参与速度控制。
+- 控制器输出先转成履带线速度，再按每个滚轮有效半径换算角速度。
+- 对履带接触件使用各向异性摩擦，保留前后牵引，允许横向滑移。
+- 记录左右履带表面速度、左右履带局部车速，并用它们重新计算左右打滑率。
+
+成功标志：
+
+```text
+v=0, w=0.8       原地转向尾段 yaw_rate 接近 0.8 rad/s
+v=0.35, w=0.8    前进转向不再卡死，yaw 持续变化
+v=0.35, w=0      直行时左右打滑率接近 0
+```
+
+当前判断：V2 能改善转向卡死，但直行视觉效果和 yaw 抖动仍不理想。因此默认路线回到二轮差速稳定底盘，履带 V2 暂时作为后续专题，不阻塞 Step 2 之后的传感器和巡航功能。
+
+可运行命令：
+
+```bash
+python main.py --config configs/gui_step2_demo.yaml --mode direct --duration-sec 1.5 --drive-model physics --robot-model tracked_proxy --target-angular-velocity 0.8
+```
 
 ## 阶段 6：接入基础传感器
 
@@ -767,19 +834,19 @@ python main.py \
 
 ## 实际可行方向
 
-最可行的路线是：**先承认履带车可以用左右差速控制近似，再把重点放在数据反馈、传感器和巡航算法上。**
+最可行的路线是：**先用稳定二轮差速底盘跑通数据反馈、传感器和巡航算法，再把履带作为单独物理建模专题推进。**
 
 短期可行：
 
-- 保留现有差速车基础。
-- 加物理轮地接触模式。
+- 保留现有稳定二轮差速基础。
+- 使用 `diff_drive + physics` 作为默认 GUI 和手动控制模型。
 - 加轮速、接触力、摩擦和打滑估计日志。
 - 用 `rayTestBatch` 做 LiDAR，先实现简单避障。
 
 中期可行：
 
 - 做大坝斜坡几何场景。
-- 用多轮或长接触块近似两条履带。
+- 在二轮差速功能稳定后，再单独评估多轮或长接触块近似两条履带。
 - 迁移 DWA 做局部避障和目标点巡航。
 
 长期再考虑：

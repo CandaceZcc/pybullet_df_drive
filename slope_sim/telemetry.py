@@ -22,6 +22,12 @@ def slip_ratio(drive_surface_speed: float, body_forward_speed: float, small_valu
     return (drive_surface_speed - body_forward_speed) / max(abs(drive_surface_speed), small_value)
 
 
+def track_body_speeds(body_forward_speed: float, yaw_rate: float, track_width: float) -> tuple[float, float]:
+    """把车体中心前向速度换算为左右履带位置的局部前向速度。"""
+    half_width = track_width / 2.0
+    return body_forward_speed - yaw_rate * half_width, body_forward_speed + yaw_rate * half_width
+
+
 @dataclass(frozen=True)
 class RobotTelemetry:
     """单个仿真时刻的小车完整遥测数据。"""
@@ -55,6 +61,10 @@ class RobotTelemetry:
     right_target_drive_speed: float = 0.0
     left_actual_drive_speed: float = 0.0
     right_actual_drive_speed: float = 0.0
+    left_track_surface_speed: float = 0.0
+    right_track_surface_speed: float = 0.0
+    left_body_track_speed: float = 0.0
+    right_body_track_speed: float = 0.0
     left_drive_position: float = 0.0
     right_drive_position: float = 0.0
     left_motor_torque: float = 0.0

@@ -61,7 +61,7 @@ def run_manual_demo(config: ExperimentConfig, *, duration_limit_sec: float | Non
             wheel_radius=config.wheel_radius,
             base_height=_robot_base_height(config.robot_model),
         )
-        robot.apply_drive_friction(config.drive_lateral_friction)
+        robot.apply_drive_friction(config.drive_lateral_friction, config.support_lateral_friction)
         logger = CsvSimulationLogger(config.log_dir, prefix=f"manual_flat_{config.slope_deg:g}")
 
         linear_slider = None

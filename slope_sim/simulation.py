@@ -53,7 +53,7 @@ def run_experiment(config: ExperimentConfig) -> SimulationResult:
             wheel_radius=config.wheel_radius,
             base_height=_robot_base_height(config.robot_model),
         )
-        robot.apply_drive_friction(config.drive_lateral_friction)
+        robot.apply_drive_friction(config.drive_lateral_friction, config.support_lateral_friction)
         logger = CsvSimulationLogger(config.log_dir, prefix=f"slope_{config.slope_deg:g}")
         steps = max(1, int(config.duration_sec / config.time_step))
 
@@ -107,7 +107,7 @@ def _robot_base_height(robot_model: str) -> float:
     """根据机器人模型选择贴近地面的初始车体高度。"""
     if robot_model == "tracked_proxy":
         return 0.16
-    return 0.18
+    return 0.14
 
 
 def _read_lidar_for_robot(client_id: int, robot: DifferentialDriveRobot, config: ExperimentConfig) -> LidarSummary:
