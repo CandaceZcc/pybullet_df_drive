@@ -8,7 +8,21 @@
 
 - `diff_drive + physics` 保留为平地教学、基础控制和 GUI 手动演示底座；当前是后驱布局，驱动轮在车体后方、单支撑轮在前方，形成更大的三角支撑。
 - `tracked_proxy` 保留为坡面姿态、履带打滑和大坝斜坡实验底座；它不是连续履带，但更适合观察坡面 pitch/roll。
-- 当前主线同时推进两套模型：二轮模型保证入门稳定性，履带代理保证坡面数据更可靠；阶段 3 斜坡反馈 build 使用 `configs/step3_feedback.yaml` 和 `twr_slope_5deg` 参考坡面。
+- 当前主线同时推进两套模型：二轮模型保证入门稳定性，履带代理保证坡面数据更可靠；阶段 3 斜坡反馈 build 使用 `configs/step3_feedback.yaml` 和 `twr_slope_5deg` 参考坡面，阶段 4 大坝 GUI build 使用 `configs/step4_dam_gui.yaml` 和 `dam_slope` 分段大坝场景。
+
+截至当前进度，已经完成的内容：
+
+- 阶段 1-3：平地/斜坡基础流程、物理驱动、履带代理、摩擦/接触/打滑反馈、速度/加速度/地形法向日志、反馈图和诊断摘要。
+- 阶段 4 第一版：`dam_slope` 大坝场景已经落地，包含坝脚、上坡、坝顶、下坡、出口平地、左右侧栏、相机跟随、Dashboard 曲线截图、车型切换和越界保护。
+- 阶段 4 调参：Step 4 默认履带各向异性摩擦已调为 `[2.0, 0.2, 0.05]`，直行稳定性比 `[2.0, 0.05, 0.05]` 更好；终点墙已移除，越界保护提前 `0.5m` 触发，避免顶墙空转。
+- 阶段 4 手动控制优化：已加入手动命令斜坡限制，Step 4 默认线速度加速度限制为 `1.5m/s^2`、角速度加速度限制为 `4.0rad/s^2`，用于减少松键急停/反向造成的打滑和接触力尖峰。
+- 阶段 6 的基础传感器已部分完成：LiDAR 距离摘要、地形 probe、越界状态、速度传感、加速度和 Dashboard 显示已经接入；自动避障控制器还没有实现。
+
+当前尚未完成：
+
+- Pure Pursuit / DWA / reactive avoidance 等自动巡航控制器。
+- 障碍物场景、任务 waypoint、全局路径和任务完成率统计。
+- heightfield 起伏地形和更真实的连续履带物理。
 
 ## 新需求拆解
 
@@ -239,7 +253,7 @@ left_slip_ratio = clamp((left_track_surface_speed - left_body_track_speed) / lef
 right_slip_ratio = clamp((right_track_surface_speed - right_body_track_speed) / right_reference_speed, -1, 1)
 ```
 
-当轮/履带表面速度和车体局部速度都低于约 `0.03 m/s` 时，打滑率记为 0，并在 Dashboard 中标记为“低速”。注意：这里的打滑是带符号估计指标，不等同于真实轮胎实验台测得的精确滑移率；负数表示驱动表面速度低于车体局部速度。
+当轮/履带表面速度和车体局部速度都低于约 `0.03 m/s` 时，打滑率记为 0，并在 Dashboard 中标记为“低速”。注意：这里的 `slip_ratio` 是带符号估计指标，不等同于真实轮胎实验台测得的精确滑移率；负数表示驱动表面速度低于车体局部速度。判断“打滑是否严重”时优先看绝对值 `abs(slip_ratio)`，接近 0 表示轮/履带表面速度和车体局部速度基本一致。
 
 ### 5. 地形和环境状态
 
@@ -547,35 +561,44 @@ python main.py \
 - 改变摩擦系数后，打滑指标和轨迹表现会变化。
 - 能画出 `slip_ratio`、`slip_speed`、接触力和摩擦力随时间变化的图。
 
-注意：PyBullet 不一定直接给出“真实工程意义上的轮胎摩擦系数使用量”。更稳妥的做法是记录“设置的摩擦系数 + 接触法向力 + 接触摩擦力 + 打滑估计 + 速度误差”，作为实验指标。这里的签名打滑率是带正负号的趋势指标；有效接触点是法向力大于阈值的 PyBullet 接触求解点，不等于真实履带接触面积。
+注意：PyBullet 不一定直接给出“真实工程意义上的轮胎摩擦系数使用量”。更稳妥的做法是记录“设置的摩擦系数 + 接触法向力 + 接触摩擦力 + 打滑估计 + 速度误差”，作为实验指标。这里的带符号打滑率是带正负号的趋势指标；Dashboard 曲线页会用绝对值显示打滑严重度；有效接触点是法向力大于阈值的 PyBullet 接触求解点，不等于真实履带接触面积。
 
 ## 阶段 4：建立大坝斜坡场景
 
 目标：把“单一斜坡”扩展为“大坝斜坡的大体建模”。
 
-建议从简单到复杂：
+当前进度：
+
+- 已新增 `terrain_model: dam_slope`，由坝脚入口平地、上坡、坝顶平台、下坡和出口平地组成。
+- 已支持配置字段：`dam_toe_length`、`dam_slope_length`、`dam_crest_length`、`dam_exit_length`、`dam_width`、`dam_wall_height`、`terrain_guard_enabled`。
+- GUI build `configs/step4_dam_gui.yaml` 已接入相机跟随、Dashboard、LiDAR、车型切换、左右侧栏和越界保护。
+- 终点墙已移除，出口保持开放；越界保护在物理边缘前 `0.5m` 触发，避免车体顶墙空转或刚过边缘才停车。
+- 当前 `tracked_proxy` 直行调参使用 `track_anisotropic_friction: [2.0, 0.2, 0.05]` 和 `track_drive_mode: all_rollers`。
+- 当前手动控制会按配置中的 `manual_linear_acceleration_limit` / `manual_angular_acceleration_limit` 平滑命令，避免从高速前进瞬间切到 0 或反向。
+
+当前仍要注意：
+
+- 大坝场景目前由多个静态 box 拼接，适合教学和趋势观察，不等于真实连续地形。
+- `tracked_proxy` 是多滚轮履带近似，接触点数量和接触面积不是一回事。
+- 手动测试时如果把最大线速度调到 `0.8m/s`，可以完整验证直行稳定性和出口越界保护；正式演示可先用 `0.25-0.5m/s` 更容易观察。
+
+后续从简单到复杂：
 
 1. 单一长斜坡：验证坡度、姿态、轮地接触和打滑。
 2. 坝脚 + 坝坡 + 坝顶平台：更接近真实大坝横截面。
 3. 加边界、护栏、巡检障碍物：给自动避障准备场景。
 4. 分段坡面或 heightfield：模拟起伏和不平整。
 
-建议配置字段：
+当前实际配置文件：
 
-```yaml
-terrain:
-  type: dam_slope
-  slope_deg: 25
-  slope_length: 8.0
-  crest_length: 3.0
-  toe_length: 2.0
-  width: 4.0
+```text
+configs/step4_dam_gui.yaml
 ```
 
-建议开发后运行：
+当前可运行：
 
 ```bash
-python main.py --config configs/dam_slope.yaml --duration-sec 3 --mode direct
+python main.py --config configs/step4_dam_gui.yaml --gui --manual
 ```
 
 成功标志：
@@ -583,6 +606,8 @@ python main.py --config configs/dam_slope.yaml --duration-sec 3 --mode direct
 - 场景能看到坝脚、坡面和坝顶平台。
 - 机器人在坡面上运行时 `z`、`pitch`、接触力和打滑指标有变化。
 - 日志和图表仍能生成。
+- 只按前进时，车辆能跑完整个大坝路径，并在出口保护边界附近停车，不再顶着终点墙空转。
+- Dashboard 中“速度/命令”“打滑”“接触”“轨迹”曲线能用于判断漂移、打滑和接触冲击。
 
 ## 阶段 5：从二轮近似升级到履带近似
 
@@ -592,6 +617,7 @@ python main.py --config configs/dam_slope.yaml --duration-sec 3 --mode direct
 
 - 已有 `tracked_proxy`，不是完整连续履带，而是“中间驱动轮 + 前后滚轮 + 履带外观条”的工程近似。
 - 同侧所有滚轮已按同一条履带线速度联动，并用各向异性摩擦改善 skid-steer 转向。
+- Step 4 当前默认使用 `track_anisotropic_friction: [2.0, 0.2, 0.05]`；这是直行稳定性和转向响应之间的折中。
 - 当前不引入连续履带链条作为硬依赖；`tracked_proxy` 作为坡面姿态和履带打滑实验底座保留。
 
 推荐路线：
@@ -642,37 +668,54 @@ v=0.35, w=0      直行时左右打滑率接近 0
 
 当前判断：V2 已能作为坡面姿态和履带打滑实验底座使用；`diff_drive` 仍保留为平地教学和基础控制底座。两套模型需要分别用回归测试保护，避免转向卡顿、倒车翘头和打滑率尖峰再次出现。
 
+Step 4 最近一次调参结论：
+
+- `track_anisotropic_friction_y=0.05` 时，0.8m/s 直行会明显横漂，容易贴近侧栏。
+- `track_anisotropic_friction_y=0.2` 时，直行横漂显著收敛，仍保留可用的差速转向响应。
+- `center_only` 模式虽然减少漂移，但几乎不前进，打滑率过高，当前不作为默认方案。
+- 大坝终点不应使用前向硬墙阻挡；应靠越界保护停车，否则会出现履带持续空转、打滑率接近 1 的假象。
+- 17:14 保存的曲线显示，高速松键急停会制造短时 yaw_rate、接触力和打滑尖峰；加入命令斜坡限制后，重放同一命令序列时急停窗口的 yaw_rate 和打滑峰值明显下降。
+
 可运行命令：
 
 ```bash
 python main.py --config configs/gui_step2_demo.yaml --mode direct --duration-sec 1.5 --drive-model physics --robot-model tracked_proxy --target-angular-velocity 0.8
+python main.py --config configs/step4_dam_gui.yaml --mode direct --duration-sec 3 --target-linear-velocity 0.8
 ```
 
 ## 阶段 6：接入基础传感器
 
 目标：让机器人不只“知道真值”，还通过传感器感知环境，为自动巡航做准备。
 
-建议先做这些传感器：
+当前进度：
+
+- 轮速/履带速度：已来自 `getJointState()`，并记录目标速度、实际速度、履带表面速度和局部车速。
+- IMU 近似：已记录车体姿态、角速度和由速度差分得到的线加速度/角加速度。
+- LiDAR/超声波近似：已用 `rayTestBatch` 记录 `lidar_min_distance`、`lidar_front_distance`、`lidar_left_distance`、`lidar_right_distance`。
+- 地形感知：已用 raycast 记录 `terrain_probe_valid`、`out_of_bounds`、`local_ground_height` 和地形法向。
+- Dashboard 已显示主要传感器/命令数据，并可以保存曲线截图。
+
+后续建议补这些传感器能力：
 
 - 轮速编码器：来自 `getJointState()`。
 - IMU：来自车体姿态、角速度和线加速度估计。
 - LiDAR/超声波：参考 `PybulletRobotics` 的 `rayTestBatch`。
-- Bumper：参考其 force/bumper 思路，用接触力或碰撞检测判断。
+- Bumper：当前 `bumper_contact` 还偏粗糙，后续要区分“正常接地接触”和“障碍物/墙体碰撞”。
 - 相机：参考 `getCameraImage`，后续用于巡线或识别标记。
 
-建议开发后运行：
+当前可运行：
 
 ```bash
-python main.py --config configs/dam_slope.yaml --sensors lidar imu encoder --duration-sec 3 --mode direct
+python main.py --config configs/step4_dam_gui.yaml --mode direct --duration-sec 3
 ```
 
 成功标志：
 
-- CSV 中有传感器字段。
-- GUI 模式下可以显示 LiDAR 射线或障碍物命中点。
-- 障碍物距离小于阈值时能被检测到。
+- CSV 中有速度传感、加速度、LiDAR 距离、地形高度、地形法向和越界状态字段。
+- GUI 模式下可以通过 `--lidar-debug-draw` 显示 LiDAR 射线。
+- 靠近侧栏或终点边界时，LiDAR 距离和 `out_of_bounds` 能反映环境状态。
 
-注意：`--sensors` 当前还没有，需要这一阶段开发。
+注意：`--sensors` 当前还没有；现在通过配置中的 `lidar_enabled` 或命令行 `--lidar` 控制 LiDAR。
 
 ## 阶段 7：实现最小自动避障
 
@@ -688,11 +731,11 @@ python main.py --config configs/dam_slope.yaml --sensors lidar imu encoder --dur
 危险距离内：停车或后退
 ```
 
-建议开发后运行：
+未来接口草案，当前 `--controller` 还没有，需要这一阶段开发后才能运行：
 
 ```bash
 python main.py \
-  --config configs/dam_slope.yaml \
+  --config configs/step4_dam_gui.yaml \
   --controller reactive_avoidance \
   --duration-sec 10 \
   --mode direct
@@ -734,11 +777,11 @@ DWA 的输出：
 下一步角速度 w
 ```
 
-建议开发后运行：
+未来接口草案，当前 `--controller` 和 `--goal` 还没有，需要这一阶段开发后才能运行：
 
 ```bash
 python main.py \
-  --config configs/dam_slope.yaml \
+  --config configs/step4_dam_gui.yaml \
   --controller dwa \
   --goal 6 1 \
   --duration-sec 15 \
@@ -770,11 +813,11 @@ references/repos/PybulletRobotics/MobileRobot/mobile_robot_global_path_planning_
 references/repos/PythonRobotics/PathTracking/
 ```
 
-建议开发后运行：
+未来接口草案，当前 `--controller`、`--mission` 和任务配置还没有，需要这一阶段开发后才能运行：
 
 ```bash
 python main.py \
-  --config configs/dam_slope.yaml \
+  --config configs/step4_dam_gui.yaml \
   --controller dwa \
   --mission configs/missions/dam_patrol.yaml \
   --duration-sec 30 \
@@ -839,12 +882,18 @@ python experiments/run_dam_sweep.py \
 - DWA 或 waypoint 巡航。
 - 自动生成日志、图表和汇总报告。
 
-推荐演示命令：
+当前可演示命令：
+
+```bash
+python main.py --config configs/step4_dam_gui.yaml --gui --manual
+```
+
+未来最终演示命令草案，当前 `--controller`、`--mission` 还没有：
 
 ```bash
 python main.py \
-  --config configs/dam_slope.yaml \
-  --robot tracked \
+  --config configs/step4_dam_gui.yaml \
+  --robot-model tracked_proxy \
   --controller dwa \
   --mission configs/missions/dam_patrol.yaml \
   --duration-sec 30 \
@@ -865,14 +914,15 @@ python main.py \
 短期可行：
 
 - 保留现有稳定二轮差速基础。
-- 使用 `diff_drive + physics` 作为默认 GUI 和手动控制模型。
-- 加轮速、接触力、摩擦和打滑估计日志。
-- 用 `rayTestBatch` 做 LiDAR，先实现简单避障。
+- 使用 `diff_drive + physics` 作为平地教学和基础控制模型。
+- 使用 `tracked_proxy + physics + dam_slope` 作为大坝坡面手动演示模型。
+- 继续完善轮速、接触力、摩擦、打滑、LiDAR、越界和 Dashboard 诊断。
+- 下一步优先做简单反应式避障，而不是直接上复杂 DWA。
 
 中期可行：
 
-- 做大坝斜坡几何场景。
-- 在二轮差速功能稳定后，再单独评估多轮或长接触块近似两条履带。
+- 基于当前大坝斜坡几何场景，加入障碍物和巡检点。
+- 继续校准多滚轮履带代理，必要时增加接触块或更平滑的地形表示。
 - 迁移 DWA 做局部避障和目标点巡航。
 
 长期再考虑：

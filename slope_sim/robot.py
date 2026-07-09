@@ -13,7 +13,7 @@ from slope_sim.telemetry import RobotTelemetry, TerrainProbe, body_frame_velocit
 
 
 TRACK_ROLLER_RADIUS = 0.07
-TRACK_ANISOTROPIC_FRICTION = [2.0, 0.05, 0.05]
+DEFAULT_TRACK_ANISOTROPIC_FRICTION = (2.0, 0.05, 0.05)
 CONTACT_FORCE_EPSILON = 1e-6
 
 
@@ -63,12 +63,18 @@ class DifferentialDriveRobot:
         start_x: float = 0.0,
         start_y: float = 0.0,
         base_height: float = 0.18,
+        drive_motor_force: float = 5.0,
+        track_anisotropic_friction: tuple[float, float, float] = DEFAULT_TRACK_ANISOTROPIC_FRICTION,
+        track_drive_mode: str = "all_rollers",
     ) -> None:
         """加载机器人模型，并初始化运动学状态。"""
         self.client_id = client_id
         self.wheel_base = wheel_base
         self.wheel_radius = wheel_radius
         self.base_height = base_height
+        self.drive_motor_force = drive_motor_force
+        self.track_anisotropic_friction = tuple(float(value) for value in track_anisotropic_friction)
+        self.track_drive_mode = track_drive_mode
         self.x = start_x
         self.y = start_y
         self.yaw = 0.0
@@ -91,7 +97,7 @@ class DifferentialDriveRobot:
         self.left_joint, self.right_joint = self._find_wheel_joints()
         self.drive_center_x = self._drive_center_x()
         self.left_drive_joints, self.right_drive_joints = self._build_drive_joints()
-        self.uses_tracked_proxy = len(self.left_drive_joints) > 1 or len(self.right_drive_joints) > 1
+        self.uses_tracked_proxy = self._has_tracked_proxy_rollers()
         self.left_contact_links, self.right_contact_links = self._find_drive_side_links()
         self.support_links = self._find_support_links()
         self._disable_passive_drive_joints()
@@ -112,6 +118,8 @@ class DifferentialDriveRobot:
         """为左右两侧创建驱动组；tracked_proxy 会把前后滚轮也纳入履带联动。"""
         left = [DriveJoint(self.left_joint, self.wheel_radius)]
         right = [DriveJoint(self.right_joint, self.wheel_radius)]
+        if self.track_drive_mode == "center_only":
+            return left, right
         for joint_name in ("left_front_roller_joint", "left_back_roller_joint"):
             if joint_name in self.joint_name_to_index:
                 left.append(DriveJoint(self.joint_name_to_index[joint_name], TRACK_ROLLER_RADIUS))
@@ -119,6 +127,16 @@ class DifferentialDriveRobot:
             if joint_name in self.joint_name_to_index:
                 right.append(DriveJoint(self.joint_name_to_index[joint_name], TRACK_ROLLER_RADIUS))
         return left, right
+
+    def _has_tracked_proxy_rollers(self) -> bool:
+        """判断 URDF 是否是带前后滚轮的履带代理，即使滚轮不参与驱动也算履带。"""
+        roller_names = {
+            "left_front_roller_joint",
+            "left_back_roller_joint",
+            "right_front_roller_joint",
+            "right_back_roller_joint",
+        }
+        return bool(roller_names & set(self.joint_name_to_index))
 
     def _drive_center_x(self) -> float:
         """读取左右主驱动轮在车体坐标下的 x 位置，侧滑估计用它修正参考点。"""
@@ -180,7 +198,7 @@ class DifferentialDriveRobot:
             }
             if self.uses_tracked_proxy:
                 # 履带车转向依赖横向滑移；各向异性摩擦让前后方向牵引强、横向更容易滑。
-                kwargs["anisotropicFriction"] = TRACK_ANISOTROPIC_FRICTION
+                kwargs["anisotropicFriction"] = self.track_anisotropic_friction
                 kwargs["frictionAnchor"] = 1
             p.changeDynamics(self.robot_id, link_index, **kwargs)
         for link_index in self.support_links:
@@ -228,7 +246,7 @@ class DifferentialDriveRobot:
                 drive.joint_index,
                 controlMode=p.VELOCITY_CONTROL,
                 targetVelocity=self.physics_drive_sign * speed,
-                force=5.0,
+                force=self.drive_motor_force,
                 physicsClientId=self.client_id,
             )
         return self.left_wheel_speed, self.right_wheel_speed
@@ -320,6 +338,7 @@ class DifferentialDriveRobot:
         ground_rolling_friction: float = 0.02,
         ground_spinning_friction: float = 0.0,
         support_lateral_friction: float = 0.03,
+        robot_model: str = "diff_drive",
         terrain_type: str = "box_slope",
         terrain_probe: TerrainProbe | None = None,
         lidar_summary: LidarSummary | None = None,
@@ -356,7 +375,7 @@ class DifferentialDriveRobot:
         right_slip_valid = slip_is_valid(right_track_surface_speed, right_body_track_speed)
         lidar = lidar_summary or LidarSummary()
         terrain = terrain_probe or TerrainProbe()
-        anisotropic = TRACK_ANISOTROPIC_FRICTION if self.uses_tracked_proxy else [0.0, 0.0, 0.0]
+        anisotropic = self.track_anisotropic_friction if self.uses_tracked_proxy else (0.0, 0.0, 0.0)
 
         return RobotState(
             t=t,
@@ -410,6 +429,7 @@ class DifferentialDriveRobot:
             ground_spinning_friction=ground_spinning_friction,
             drive_lateral_friction=drive_lateral_friction,
             support_lateral_friction=support_lateral_friction,
+            drive_motor_force=self.drive_motor_force,
             track_anisotropic_friction_x=anisotropic[0],
             track_anisotropic_friction_y=anisotropic[1],
             track_anisotropic_friction_z=anisotropic[2],
@@ -427,7 +447,10 @@ class DifferentialDriveRobot:
             left_slip_ratio=slip_ratio(left_track_surface_speed, left_body_track_speed),
             right_slip_ratio=slip_ratio(right_track_surface_speed, right_body_track_speed),
             body_lateral_slip_speed=body_lateral,
+            robot_model=robot_model,
             terrain_type=terrain_type,
+            terrain_probe_valid=terrain.terrain_probe_valid,
+            out_of_bounds=terrain.out_of_bounds,
             local_ground_height=terrain.local_ground_height,
             local_terrain_normal_x=terrain.local_terrain_normal_x,
             local_terrain_normal_y=terrain.local_terrain_normal_y,

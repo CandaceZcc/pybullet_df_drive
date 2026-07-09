@@ -43,6 +43,14 @@ def test_main_parse_args_supports_gui_and_slope():
             "0.6",
             "--support-friction",
             "0.03",
+            "--drive-motor-force",
+            "2.5",
+            "--track-anisotropic-friction",
+            "2.0",
+            "0.2",
+            "0.05",
+            "--track-drive-mode",
+            "center_only",
         ]
     )
 
@@ -64,6 +72,9 @@ def test_main_parse_args_supports_gui_and_slope():
     assert args.ground_spinning_friction == 0.04
     assert args.wheel_friction == 0.6
     assert args.support_friction == 0.03
+    assert args.drive_motor_force == 2.5
+    assert args.track_anisotropic_friction == [2.0, 0.2, 0.05]
+    assert args.track_drive_mode == "center_only"
 
 
 def test_manual_mode_runs_until_quit_unless_duration_is_explicit(tmp_path: Path, monkeypatch):

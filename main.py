@@ -35,12 +35,22 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dashboard-smoothing-alpha", type=float, default=None, help="Dashboard feedback smoothing alpha.")
     parser.add_argument("--lidar", action="store_true", help="Enable the simple ray-cast LiDAR.")
     parser.add_argument("--lidar-debug-draw", action="store_true", help="Draw LiDAR rays in the PyBullet GUI.")
-    parser.add_argument("--terrain-model", choices=["box_slope", "twr_slope_5deg"], default=None, help="Terrain model.")
+    parser.add_argument("--terrain-model", choices=["box_slope", "twr_slope_5deg", "dam_slope"], default=None, help="Terrain model.")
     parser.add_argument("--ground-friction", type=float, default=None, help="Ground lateral friction coefficient.")
     parser.add_argument("--ground-rolling-friction", type=float, default=None, help="Ground rolling friction coefficient.")
     parser.add_argument("--ground-spinning-friction", type=float, default=None, help="Ground spinning friction coefficient.")
     parser.add_argument("--wheel-friction", type=float, default=None, help="Wheel/track lateral friction coefficient.")
     parser.add_argument("--support-friction", type=float, default=None, help="Caster/support lateral friction coefficient.")
+    parser.add_argument("--drive-motor-force", type=float, default=None, help="Velocity motor force for each driven wheel/roller.")
+    parser.add_argument(
+        "--track-anisotropic-friction",
+        nargs=3,
+        type=float,
+        default=None,
+        metavar=("FX", "FY", "FZ"),
+        help="Tracked proxy anisotropic friction vector.",
+    )
+    parser.add_argument("--track-drive-mode", choices=["all_rollers", "center_only"], default=None, help="Tracked proxy driven roller mode.")
     parser.add_argument("--log-dir", type=Path, default=None, help="Directory for CSV logs.")
     parser.add_argument("--figure-dir", type=Path, default=None, help="Directory for generated figures.")
     return parser.parse_args(argv)
@@ -71,6 +81,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "ground_spinning_friction": args.ground_spinning_friction,
         "wheel_friction": args.wheel_friction,
         "support_friction": args.support_friction,
+        "drive_motor_force": args.drive_motor_force,
+        "track_anisotropic_friction": args.track_anisotropic_friction,
+        "track_drive_mode": args.track_drive_mode,
         "log_dir": args.log_dir,
         "figure_dir": args.figure_dir,
     }
@@ -84,8 +97,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"figure: {result.figure_path}")
     for figure_path in result.feedback_figure_paths:
         print(f"feedback_figure: {figure_path}")
+    if result.diagnostic_summary_path is not None:
+        print(f"diagnostic_summary: {result.diagnostic_summary_path}")
     for name, value in result.metrics.items():
         print(f"{name}: {value:.6f}")
+    if result.diagnostic_summary is not None:
+        for name, value in result.diagnostic_summary.items():
+            print(f"diagnostic_{name}: {value:.6f}")
     return 0
 
 

@@ -12,10 +12,11 @@ import pandas as pd
 import pybullet as p
 
 from slope_sim.config import ExperimentConfig
+from slope_sim.diagnostics import compute_diagnostic_summary, write_diagnostic_summary
 from slope_sim.logger import CsvSimulationLogger
 from slope_sim.metrics import compute_tracking_metrics
 from slope_sim.robot import DifferentialDriveRobot
-from slope_sim.scene import configure_gui_visualizer, create_slope_scene, probe_terrain
+from slope_sim.scene import SceneInfo, configure_gui_visualizer, create_slope_scene, probe_terrain, update_follow_camera
 from slope_sim.sensors import LidarSummary, read_lidar
 
 
@@ -27,6 +28,8 @@ class SimulationResult:
     figure_path: Path
     metrics: dict[str, float]
     feedback_figure_paths: tuple[Path, ...] = ()
+    diagnostic_summary: dict[str, float] | None = None
+    diagnostic_summary_path: Path | None = None
 
 
 def run_experiment(config: ExperimentConfig) -> SimulationResult:
@@ -46,6 +49,13 @@ def run_experiment(config: ExperimentConfig) -> SimulationResult:
             config.ground_rolling_friction,
             config.ground_spinning_friction,
             config.terrain_model,
+            config.dam_toe_length,
+            config.dam_slope_length,
+            config.dam_crest_length,
+            config.dam_exit_length,
+            config.dam_width,
+            config.dam_wall_height,
+            config.terrain_guard_enabled,
         )
         if config.mode == "gui":
             configure_gui_visualizer(
@@ -60,7 +70,12 @@ def run_experiment(config: ExperimentConfig) -> SimulationResult:
             urdf_path=_robot_urdf_path(config.robot_model),
             wheel_base=config.wheel_base,
             wheel_radius=config.wheel_radius,
-            base_height=_robot_base_height(config.robot_model),
+            start_x=scene.spawn_position[0],
+            start_y=scene.spawn_position[1],
+            base_height=scene.spawn_position[2] + _robot_base_height(config.robot_model),
+            drive_motor_force=config.drive_motor_force,
+            track_anisotropic_friction=config.track_anisotropic_friction,
+            track_drive_mode=config.track_drive_mode,
         )
         robot.apply_drive_friction(config.drive_lateral_friction, config.support_lateral_friction)
         logger = CsvSimulationLogger(config.log_dir, prefix=f"slope_{config.slope_deg:g}")
@@ -82,15 +97,25 @@ def run_experiment(config: ExperimentConfig) -> SimulationResult:
                     ground_rolling_friction=config.ground_rolling_friction,
                     ground_spinning_friction=config.ground_spinning_friction,
                     support_lateral_friction=config.support_lateral_friction,
+                    robot_model=config.robot_model,
                     terrain_type=scene.terrain_type,
-                    terrain_probe=_probe_terrain_for_robot(client_id, robot),
+                    terrain_probe=_probe_terrain_for_robot(client_id, robot, scene),
                     lidar_summary=lidar_summary,
                 )
             else:
                 state = robot.step_kinematic(dt=config.time_step, slope_deg=config.slope_deg, t=t)
                 p.stepSimulation(physicsClientId=client_id)
-            reference_x = config.target_linear_velocity * t
-            reference_y = 0.0
+            if config.mode == "gui" and config.camera_follow_enabled:
+                update_follow_camera(
+                    client_id,
+                    robot.robot_id,
+                    config.camera_distance,
+                    config.camera_pitch,
+                    config.camera_yaw,
+                    config.camera_follow_view,
+                )
+            reference_x = scene.spawn_position[0] + config.target_linear_velocity * t
+            reference_y = scene.spawn_position[1]
             logger.record(
                 state,
                 reference_x=reference_x,
@@ -105,6 +130,8 @@ def run_experiment(config: ExperimentConfig) -> SimulationResult:
         p.disconnect(client_id)
 
     frame = pd.read_csv(log_path)
+    diagnostic_summary = compute_diagnostic_summary(frame)
+    diagnostic_summary_path = write_diagnostic_summary(log_path, diagnostic_summary)
     metrics = compute_tracking_metrics(frame, final_reference_yaw=0.0)
     figure_path = plot_trajectory(frame, config.figure_dir, prefix=f"slope_{config.slope_deg:g}")
     feedback_figure_paths = plot_feedback_figures(frame, config.figure_dir, prefix=f"slope_{config.slope_deg:g}")
@@ -113,6 +140,8 @@ def run_experiment(config: ExperimentConfig) -> SimulationResult:
         figure_path=figure_path,
         metrics=metrics,
         feedback_figure_paths=feedback_figure_paths,
+        diagnostic_summary=diagnostic_summary.to_dict(),
+        diagnostic_summary_path=diagnostic_summary_path,
     )
 
 
@@ -149,10 +178,10 @@ def _read_lidar_for_robot(client_id: int, robot: DifferentialDriveRobot, config:
     )
 
 
-def _probe_terrain_for_robot(client_id: int, robot: DifferentialDriveRobot):
+def _probe_terrain_for_robot(client_id: int, robot: DifferentialDriveRobot, scene: SceneInfo | None = None):
     """用机器人当前位置做一次向下地形探测。"""
     position, _orientation = p.getBasePositionAndOrientation(robot.robot_id, physicsClientId=client_id)
-    return probe_terrain(client_id, float(position[0]), float(position[1]))
+    return probe_terrain(client_id, float(position[0]), float(position[1]), bounds=None if scene is None else scene.bounds)
 
 
 def plot_trajectory(frame: pd.DataFrame, figure_dir: str | Path, prefix: str = "run") -> Path:

@@ -76,6 +76,39 @@ def test_run_experiment_physics_tracked_proxy_records_telemetry(tmp_path: Path):
     assert abs(tail["right_slip_ratio"].mean()) < 0.15
 
 
+def test_run_experiment_tracked_proxy_on_dam_slope_records_bounds_telemetry(tmp_path: Path):
+    result = run_experiment(
+        ExperimentConfig(
+            mode="direct",
+            robot_model="tracked_proxy",
+            drive_model="physics",
+            terrain_model="dam_slope",
+            slope_deg=10.0,
+            duration_sec=0.4,
+            time_step=1.0 / 240.0,
+            wheel_radius=0.08,
+            target_linear_velocity=0.1,
+            target_angular_velocity=0.0,
+            ground_lateral_friction=0.8,
+            log_dir=tmp_path / "logs",
+            figure_dir=tmp_path / "figures",
+        )
+    )
+
+    frame = pd.read_csv(result.log_path)
+
+    assert {
+        "terrain_type",
+        "robot_model",
+        "terrain_probe_valid",
+        "out_of_bounds",
+    }.issubset(frame.columns)
+    assert set(frame["terrain_type"]) == {"dam_slope"}
+    assert set(frame["robot_model"]) == {"tracked_proxy"}
+    assert frame["terrain_probe_valid"].all()
+    assert not frame["out_of_bounds"].any()
+
+
 def test_tracked_proxy_physics_turns_in_place_without_locking(tmp_path: Path):
     result = run_experiment(
         ExperimentConfig(

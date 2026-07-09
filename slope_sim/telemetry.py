@@ -39,6 +39,8 @@ def track_body_speeds(body_forward_speed: float, yaw_rate: float, track_width: f
 class TerrainProbe:
     """机器人当前位置下方的地形探测结果。"""
 
+    terrain_probe_valid: bool = False
+    out_of_bounds: bool = False
     local_ground_height: float = math.nan
     local_terrain_normal_x: float = 0.0
     local_terrain_normal_y: float = 0.0
@@ -100,6 +102,7 @@ class RobotTelemetry:
     ground_spinning_friction: float = 0.0
     drive_lateral_friction: float = 1.0
     support_lateral_friction: float = 0.03
+    drive_motor_force: float = 5.0
     track_anisotropic_friction_x: float = 0.0
     track_anisotropic_friction_y: float = 0.0
     track_anisotropic_friction_z: float = 0.0
@@ -117,7 +120,10 @@ class RobotTelemetry:
     left_slip_valid: bool = True
     right_slip_valid: bool = True
     body_lateral_slip_speed: float = 0.0
+    robot_model: str = "diff_drive"
     terrain_type: str = "box_slope"
+    terrain_probe_valid: bool = False
+    out_of_bounds: bool = False
     local_ground_height: float = math.nan
     local_terrain_normal_x: float = 0.0
     local_terrain_normal_y: float = 0.0
