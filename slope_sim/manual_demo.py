@@ -15,9 +15,11 @@ from slope_sim.robot import DifferentialDriveRobot
 from slope_sim.scene import configure_gui_visualizer, create_slope_scene
 from slope_sim.simulation import (
     SimulationResult,
+    _probe_terrain_for_robot,
     _read_lidar_for_robot,
     _robot_base_height,
     _robot_urdf_path,
+    plot_feedback_figures,
     plot_trajectory,
 )
 
@@ -46,7 +48,15 @@ def run_manual_demo(config: ExperimentConfig, *, duration_limit_sec: float | Non
     dashboard: TelemetryDashboard | None = None
     try:
         # 场景和机器人仍复用自动仿真的构建逻辑，避免两套世界配置不一致。
-        create_slope_scene(client_id, config.slope_deg, config.time_step, config.ground_lateral_friction)
+        scene = create_slope_scene(
+            client_id,
+            config.slope_deg,
+            config.time_step,
+            config.ground_lateral_friction,
+            config.ground_rolling_friction,
+            config.ground_spinning_friction,
+            config.terrain_model,
+        )
         configure_gui_visualizer(
             client_id,
             config.camera_distance,
@@ -109,6 +119,11 @@ def run_manual_demo(config: ExperimentConfig, *, duration_limit_sec: float | Non
                     command_angular_velocity=command.angular_velocity,
                     ground_lateral_friction=config.ground_lateral_friction,
                     drive_lateral_friction=config.drive_lateral_friction,
+                    ground_rolling_friction=config.ground_rolling_friction,
+                    ground_spinning_friction=config.ground_spinning_friction,
+                    support_lateral_friction=config.support_lateral_friction,
+                    terrain_type=scene.terrain_type,
+                    terrain_probe=_probe_terrain_for_robot(client_id, robot),
                     lidar_summary=lidar_summary,
                 )
             else:
@@ -140,4 +155,5 @@ def run_manual_demo(config: ExperimentConfig, *, duration_limit_sec: float | Non
     frame = pd.read_csv(log_path)
     metrics = compute_tracking_metrics(frame, final_reference_yaw=0.0)
     figure_path = plot_trajectory(frame, config.figure_dir, prefix=f"manual_flat_{config.slope_deg:g}")
-    return SimulationResult(log_path=log_path, figure_path=figure_path, metrics=metrics)
+    feedback_figure_paths = plot_feedback_figures(frame, config.figure_dir, prefix=f"manual_flat_{config.slope_deg:g}")
+    return SimulationResult(log_path=log_path, figure_path=figure_path, metrics=metrics, feedback_figure_paths=feedback_figure_paths)

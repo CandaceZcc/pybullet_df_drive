@@ -22,3 +22,18 @@ def test_gui_step2_demo_uses_stable_diff_drive_physics():
     assert config.wheel_base == 0.5
     assert config.wheel_radius == 0.1
     assert config.support_lateral_friction == 0.03
+
+
+def test_step3_feedback_config_uses_tracked_proxy_on_twr_slope():
+    config = load_config(Path("configs/step3_feedback.yaml"))
+
+    assert config.mode == "direct"
+    assert config.robot_model == "tracked_proxy"
+    assert config.drive_model == "physics"
+    assert config.terrain_model == "twr_slope_5deg"
+    assert config.slope_deg == 5.0
+    assert config.wheel_radius == 0.08
+    assert config.lidar_enabled is True
+    assert config.ground_lateral_friction > 0.0
+    assert config.ground_rolling_friction > 0.0
+    assert config.ground_spinning_friction >= 0.0

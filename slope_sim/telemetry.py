@@ -15,17 +15,34 @@ def body_frame_velocity(world_velocity: tuple[float, float, float], yaw: float) 
     return forward, lateral, vz
 
 
-def slip_ratio(drive_surface_speed: float, body_forward_speed: float, small_value: float = 1e-6) -> float:
-    """用驱动表面速度和车体前向速度估计打滑率。"""
-    if abs(drive_surface_speed) < small_value:
+def slip_is_valid(drive_surface_speed: float, body_forward_speed: float, low_speed_threshold: float = 0.03) -> bool:
+    """判断当前速度是否足够高；低速时打滑率容易被分母放大。"""
+    return max(abs(drive_surface_speed), abs(body_forward_speed)) >= low_speed_threshold
+
+
+def slip_ratio(drive_surface_speed: float, body_forward_speed: float, small_value: float = 0.03) -> float:
+    """用带符号比例估计打滑率，并限制急停低速时的尖峰。"""
+    reference_speed = max(abs(drive_surface_speed), abs(body_forward_speed))
+    if reference_speed < small_value:
         return 0.0
-    return (drive_surface_speed - body_forward_speed) / max(abs(drive_surface_speed), small_value)
+    ratio = (drive_surface_speed - body_forward_speed) / reference_speed
+    return max(-1.0, min(1.0, ratio))
 
 
 def track_body_speeds(body_forward_speed: float, yaw_rate: float, track_width: float) -> tuple[float, float]:
     """把车体中心前向速度换算为左右履带位置的局部前向速度。"""
     half_width = track_width / 2.0
     return body_forward_speed - yaw_rate * half_width, body_forward_speed + yaw_rate * half_width
+
+
+@dataclass(frozen=True)
+class TerrainProbe:
+    """机器人当前位置下方的地形探测结果。"""
+
+    local_ground_height: float = math.nan
+    local_terrain_normal_x: float = 0.0
+    local_terrain_normal_y: float = 0.0
+    local_terrain_normal_z: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -53,6 +70,15 @@ class RobotTelemetry:
     angular_velocity_y: float = 0.0
     angular_velocity_z: float = 0.0
     yaw_rate: float = 0.0
+    velocity_sensor_vx: float = 0.0
+    velocity_sensor_vy: float = 0.0
+    velocity_sensor_vz: float = 0.0
+    velocity_sensor_body_forward_speed: float = 0.0
+    velocity_sensor_yaw_rate: float = 0.0
+    linear_acceleration_x: float = 0.0
+    linear_acceleration_y: float = 0.0
+    linear_acceleration_z: float = 0.0
+    angular_acceleration_z: float = 0.0
     linear_velocity: float = 0.0
     angular_velocity: float = 0.0
     command_linear_velocity: float = 0.0
@@ -70,13 +96,32 @@ class RobotTelemetry:
     left_motor_torque: float = 0.0
     right_motor_torque: float = 0.0
     ground_lateral_friction: float = 1.0
+    ground_rolling_friction: float = 0.02
+    ground_spinning_friction: float = 0.0
     drive_lateral_friction: float = 1.0
+    support_lateral_friction: float = 0.03
+    track_anisotropic_friction_x: float = 0.0
+    track_anisotropic_friction_y: float = 0.0
+    track_anisotropic_friction_z: float = 0.0
     left_contact_normal_force: float = 0.0
     right_contact_normal_force: float = 0.0
+    left_contact_friction_force: float = 0.0
+    right_contact_friction_force: float = 0.0
+    left_contact_count: int = 0
+    right_contact_count: int = 0
     contact_count: int = 0
     left_slip_ratio: float = 0.0
     right_slip_ratio: float = 0.0
+    left_slip_speed: float = 0.0
+    right_slip_speed: float = 0.0
+    left_slip_valid: bool = True
+    right_slip_valid: bool = True
     body_lateral_slip_speed: float = 0.0
+    terrain_type: str = "box_slope"
+    local_ground_height: float = math.nan
+    local_terrain_normal_x: float = 0.0
+    local_terrain_normal_y: float = 0.0
+    local_terrain_normal_z: float = 1.0
     lidar_min_distance: float = math.nan
     lidar_front_distance: float = math.nan
     lidar_left_distance: float = math.nan
@@ -90,7 +135,7 @@ class RobotTelemetry:
         reference_y: float = 0.0,
         estimated_x: float | None = None,
         estimated_y: float | None = None,
-    ) -> dict[str, float | int | bool]:
+    ) -> dict[str, object]:
         """转换成 CSV 行，并补齐旧分析脚本需要的参考/估计轨迹字段。"""
         row = asdict(self)
         row["reference_x"] = reference_x

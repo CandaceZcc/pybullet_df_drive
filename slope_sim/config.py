@@ -34,7 +34,10 @@ class ExperimentConfig:
     lidar_max_distance: float = 4.0
     lidar_fov_deg: float = 180.0
     lidar_debug_draw: bool = False
+    terrain_model: str = "box_slope"
     ground_lateral_friction: float = 1.0
+    ground_rolling_friction: float = 0.02
+    ground_spinning_friction: float = 0.0
     drive_lateral_friction: float = 2.0
     support_lateral_friction: float = 0.03
     log_dir: Path = Path("results/logs")
@@ -51,6 +54,11 @@ class ExperimentConfig:
         drive_model = self.drive_model.lower()
         if drive_model not in {"kinematic", "physics"}:
             raise ValueError("drive_model must be 'kinematic' or 'physics'")
+        terrain_model = self.terrain_model.lower()
+        if terrain_model not in {"box_slope", "twr_slope_5deg"}:
+            raise ValueError("terrain_model must be 'box_slope' or 'twr_slope_5deg'")
+        if terrain_model == "twr_slope_5deg" and abs(float(self.slope_deg) - 5.0) > 1e-9:
+            raise ValueError("terrain_model 'twr_slope_5deg' requires slope_deg: 5.0")
         if self.duration_sec <= 0:
             raise ValueError("duration_sec must be positive")
         if self.time_step <= 0:
@@ -75,6 +83,10 @@ class ExperimentConfig:
             raise ValueError("lidar_fov_deg must be positive")
         if self.ground_lateral_friction <= 0:
             raise ValueError("ground_lateral_friction must be positive")
+        if self.ground_rolling_friction <= 0:
+            raise ValueError("ground_rolling_friction must be positive")
+        if self.ground_spinning_friction < 0:
+            raise ValueError("ground_spinning_friction must be non-negative")
         if self.drive_lateral_friction <= 0:
             raise ValueError("drive_lateral_friction must be positive")
         if self.support_lateral_friction <= 0:
@@ -83,6 +95,7 @@ class ExperimentConfig:
         object.__setattr__(self, "mode", mode)
         object.__setattr__(self, "robot_model", robot_model)
         object.__setattr__(self, "drive_model", drive_model)
+        object.__setattr__(self, "terrain_model", terrain_model)
         object.__setattr__(self, "camera_target", tuple(float(value) for value in self.camera_target))
         object.__setattr__(self, "log_dir", Path(self.log_dir))
         object.__setattr__(self, "figure_dir", Path(self.figure_dir))

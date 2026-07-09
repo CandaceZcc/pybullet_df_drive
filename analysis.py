@@ -8,7 +8,7 @@ from typing import Sequence
 import pandas as pd
 
 from slope_sim.metrics import compute_tracking_metrics
-from slope_sim.simulation import plot_trajectory
+from slope_sim.simulation import plot_feedback_figures, plot_trajectory
 
 
 def analyze_log(log_path: str | Path, figure_dir: str | Path = "results/figures") -> tuple[dict[str, float], Path]:
@@ -16,6 +16,7 @@ def analyze_log(log_path: str | Path, figure_dir: str | Path = "results/figures"
     frame = pd.read_csv(log_path)
     metrics = compute_tracking_metrics(frame, final_reference_yaw=0.0)
     figure_path = plot_trajectory(frame, figure_dir, prefix=Path(log_path).stem)
+    plot_feedback_figures(frame, figure_dir, prefix=Path(log_path).stem)
     return metrics, figure_path
 
 

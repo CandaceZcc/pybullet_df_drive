@@ -1,6 +1,8 @@
 # 配置测试：确保 YAML 配置、命令行覆盖和非法参数检查都可用。
 from pathlib import Path
 
+import pytest
+
 from slope_sim.config import ExperimentConfig, load_config
 
 
@@ -31,7 +33,10 @@ def test_load_config_reads_yaml_and_applies_overrides(tmp_path: Path):
                 "lidar_max_distance: 4.0",
                 "lidar_fov_deg: 120.0",
                 "lidar_debug_draw: true",
+                "terrain_model: box_slope",
                 "ground_lateral_friction: 0.9",
+                "ground_rolling_friction: 0.03",
+                "ground_spinning_friction: 0.04",
                 "drive_lateral_friction: 0.7",
                 "support_lateral_friction: 0.04",
                 "log_dir: custom/logs",
@@ -66,7 +71,10 @@ def test_load_config_reads_yaml_and_applies_overrides(tmp_path: Path):
     assert config.lidar_max_distance == 4.0
     assert config.lidar_fov_deg == 120.0
     assert config.lidar_debug_draw is True
+    assert config.terrain_model == "box_slope"
     assert config.ground_lateral_friction == 0.9
+    assert config.ground_rolling_friction == 0.03
+    assert config.ground_spinning_friction == 0.04
     assert config.drive_lateral_friction == 0.7
     assert config.support_lateral_friction == 0.04
     assert config.log_dir == Path("custom/logs")
@@ -90,3 +98,13 @@ def test_experiment_config_rejects_invalid_robot_or_drive_model():
             assert "model" in str(exc)
         else:
             raise AssertionError(f"invalid config should fail: {kwargs}")
+
+
+def test_experiment_config_rejects_invalid_terrain_model():
+    with pytest.raises(ValueError, match="terrain_model"):
+        ExperimentConfig(terrain_model="heightfield")
+
+
+def test_twr_slope_terrain_requires_five_degrees():
+    with pytest.raises(ValueError, match="twr_slope_5deg"):
+        ExperimentConfig(terrain_model="twr_slope_5deg", slope_deg=8.0)

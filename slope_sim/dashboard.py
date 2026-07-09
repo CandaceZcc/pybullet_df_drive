@@ -18,6 +18,15 @@ SMOOTHED_TELEMETRY_FIELDS = frozenset(
         "yaw",
         "body_forward_speed",
         "yaw_rate",
+        "velocity_sensor_vx",
+        "velocity_sensor_vy",
+        "velocity_sensor_vz",
+        "velocity_sensor_body_forward_speed",
+        "velocity_sensor_yaw_rate",
+        "linear_acceleration_x",
+        "linear_acceleration_y",
+        "linear_acceleration_z",
+        "angular_acceleration_z",
         "left_actual_drive_speed",
         "right_actual_drive_speed",
         "left_track_surface_speed",
@@ -26,8 +35,16 @@ SMOOTHED_TELEMETRY_FIELDS = frozenset(
         "right_body_track_speed",
         "left_contact_normal_force",
         "right_contact_normal_force",
+        "left_contact_friction_force",
+        "right_contact_friction_force",
         "left_slip_ratio",
         "right_slip_ratio",
+        "left_slip_speed",
+        "right_slip_speed",
+        "local_ground_height",
+        "local_terrain_normal_x",
+        "local_terrain_normal_y",
+        "local_terrain_normal_z",
         "lidar_min_distance",
     }
 )
@@ -37,6 +54,25 @@ def _fmt(value: float, unit: str = "", digits: int = 2) -> str:
     if isinstance(value, float) and math.isnan(value):
         return "--"
     return f"{value:.{digits}f}{unit}"
+
+
+def _fmt_signed(value: float, unit: str = "", digits: int = 2) -> str:
+    if isinstance(value, float) and math.isnan(value):
+        return "--"
+    return f"{value:+.{digits}f}{unit}"
+
+
+def _fmt_slip(value: float, valid: bool) -> str:
+    if not valid:
+        return "低速"
+    return _fmt_signed(value)
+
+
+def dashboard_window_size(available_width: int, available_height: int) -> tuple[int, int]:
+    """根据屏幕可用区域给侧边栏一个保守初始大小。"""
+    width = min(520, max(320, int(available_width * 0.45)))
+    height = min(1200, max(280, int(available_height * 0.90)))
+    return width, height
 
 
 def should_refresh_dashboard(last_update_time: float | None, now: float, update_hz: float) -> bool:
@@ -71,37 +107,108 @@ def smooth_telemetry(previous: RobotTelemetry | None, current: RobotTelemetry, a
     return replace(current, **smoothed_values)
 
 
-def dashboard_rows(telemetry: RobotTelemetry) -> list[tuple[str, str]]:
-    """把遥测数据转换成侧边栏显示行，便于单元测试和 GUI 复用。"""
+def dashboard_groups(telemetry: RobotTelemetry) -> list[tuple[str, list[tuple[str, str]]]]:
+    """把遥测数据按主题分组，侧窗和单元测试共用同一套显示规则。"""
     return [
-        ("位置 x/y/z", f"{_fmt(telemetry.x)} / {_fmt(telemetry.y)} / {_fmt(telemetry.z)} m"),
         (
-            "姿态 roll/pitch/yaw",
-            f"{_fmt(math.degrees(telemetry.roll), digits=1)} / "
-            f"{_fmt(math.degrees(telemetry.pitch), digits=1)} / "
-            f"{_fmt(math.degrees(telemetry.yaw), digits=1)} deg",
-        ),
-        ("车体速度 / yaw_rate", f"{_fmt(telemetry.body_forward_speed)} m/s / {_fmt(telemetry.yaw_rate)} rad/s"),
-        (
-            "左右实际驱动速度",
-            f"{_fmt(telemetry.left_actual_drive_speed)} / {_fmt(telemetry.right_actual_drive_speed)} rad/s",
-        ),
-        (
-            "驱动表面速度",
-            f"{_fmt(telemetry.left_track_surface_speed)} / {_fmt(telemetry.right_track_surface_speed)} m/s",
+            "位姿",
+            [
+                ("位置 x/y/z", f"{_fmt(telemetry.x)} / {_fmt(telemetry.y)} / {_fmt(telemetry.z)} m"),
+                (
+                    "姿态 roll/pitch/yaw",
+                    f"{_fmt(math.degrees(telemetry.roll), digits=1)} / "
+                    f"{_fmt(math.degrees(telemetry.pitch), digits=1)} / "
+                    f"{_fmt(math.degrees(telemetry.yaw), digits=1)} deg",
+                ),
+            ],
         ),
         (
-            "驱动局部车速",
-            f"{_fmt(telemetry.left_body_track_speed)} / {_fmt(telemetry.right_body_track_speed)} m/s",
+            "速度",
+            [
+                ("车体速度 / yaw_rate", f"{_fmt(telemetry.body_forward_speed)} m/s / {_fmt(telemetry.yaw_rate)} rad/s"),
+                (
+                    "左右实际驱动速度",
+                    f"{_fmt(telemetry.left_actual_drive_speed)} / {_fmt(telemetry.right_actual_drive_speed)} rad/s",
+                ),
+                (
+                    "驱动表面速度",
+                    f"{_fmt(telemetry.left_track_surface_speed)} / {_fmt(telemetry.right_track_surface_speed)} m/s",
+                ),
+                (
+                    "驱动局部车速",
+                    f"{_fmt(telemetry.left_body_track_speed)} / {_fmt(telemetry.right_body_track_speed)} m/s",
+                ),
+            ],
         ),
-        ("左右打滑率", f"{_fmt(telemetry.left_slip_ratio)} / {_fmt(telemetry.right_slip_ratio)}"),
-        ("接触法向力", f"{_fmt(telemetry.left_contact_normal_force)} / {_fmt(telemetry.right_contact_normal_force)} N"),
-        ("最近障碍距离", f"{_fmt(telemetry.lidar_min_distance)} m"),
         (
-            "当前命令 v/w",
-            f"{_fmt(telemetry.command_linear_velocity)} m/s / {_fmt(telemetry.command_angular_velocity)} rad/s",
+            "速度传感",
+            [
+                (
+                    "速度传感 vx/vy/vz",
+                    f"{_fmt(telemetry.velocity_sensor_vx)} / {_fmt(telemetry.velocity_sensor_vy)} / {_fmt(telemetry.velocity_sensor_vz)} m/s",
+                ),
+                (
+                    "速度传感前向/yaw",
+                    f"{_fmt(telemetry.velocity_sensor_body_forward_speed)} m/s / {_fmt(telemetry.velocity_sensor_yaw_rate)} rad/s",
+                ),
+                (
+                    "加速度 xyz",
+                    f"{_fmt(telemetry.linear_acceleration_x)} / {_fmt(telemetry.linear_acceleration_y)} / {_fmt(telemetry.linear_acceleration_z)} m/s^2",
+                ),
+                ("角加速度 z", f"{_fmt(telemetry.angular_acceleration_z)} rad/s^2"),
+            ],
+        ),
+        (
+            "接触 / 打滑",
+            [
+                ("签名打滑率", f"{_fmt_slip(telemetry.left_slip_ratio, telemetry.left_slip_valid)} / {_fmt_slip(telemetry.right_slip_ratio, telemetry.right_slip_valid)}"),
+                ("打滑速度差", f"{_fmt_signed(telemetry.left_slip_speed)} / {_fmt_signed(telemetry.right_slip_speed)} m/s"),
+                ("接触法向力", f"{_fmt(telemetry.left_contact_normal_force)} / {_fmt(telemetry.right_contact_normal_force)} N"),
+                ("接触摩擦力", f"{_fmt(telemetry.left_contact_friction_force)} / {_fmt(telemetry.right_contact_friction_force)} N"),
+                ("有效接触点", f"{telemetry.left_contact_count} / {telemetry.right_contact_count}"),
+            ],
+        ),
+        (
+            "地形 / 摩擦",
+            [
+                ("地形类型", telemetry.terrain_type),
+                ("地面高度 / 法向 z", f"{_fmt(telemetry.local_ground_height)} m / {_fmt(telemetry.local_terrain_normal_z)}"),
+                (
+                    "地形法向 x/y/z",
+                    f"{_fmt(telemetry.local_terrain_normal_x)} / {_fmt(telemetry.local_terrain_normal_y)} / {_fmt(telemetry.local_terrain_normal_z)}",
+                ),
+                (
+                    "地面摩擦 lat/roll/spin",
+                    f"{_fmt(telemetry.ground_lateral_friction)} / {_fmt(telemetry.ground_rolling_friction)} / {_fmt(telemetry.ground_spinning_friction)}",
+                ),
+                ("驱动/支撑摩擦", f"{_fmt(telemetry.drive_lateral_friction)} / {_fmt(telemetry.support_lateral_friction)}"),
+                (
+                    "履带各向异性摩擦",
+                    f"{_fmt(telemetry.track_anisotropic_friction_x)} / "
+                    f"{_fmt(telemetry.track_anisotropic_friction_y)} / "
+                    f"{_fmt(telemetry.track_anisotropic_friction_z)}",
+                ),
+            ],
+        ),
+        (
+            "传感器 / 命令",
+            [
+                ("最近障碍距离", f"{_fmt(telemetry.lidar_min_distance)} m"),
+                (
+                    "当前命令 v/w",
+                    f"{_fmt(telemetry.command_linear_velocity)} m/s / {_fmt(telemetry.command_angular_velocity)} rad/s",
+                ),
+            ],
         ),
     ]
+
+
+def dashboard_rows(telemetry: RobotTelemetry) -> list[tuple[str, str]]:
+    """把分组遥测展平成旧接口需要的行列表。"""
+    rows: list[tuple[str, str]] = []
+    for _group_name, group_rows in dashboard_groups(telemetry):
+        rows.extend(group_rows)
+    return rows
 
 
 @dataclass(frozen=True)
@@ -140,8 +247,13 @@ class TelemetryDashboard:
         self.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
         self.window = QtWidgets.QWidget()
         self.window.setWindowTitle("Step 2 Telemetry Dashboard")
-        self.window.setMinimumWidth(390)
+        self.window.setMinimumWidth(320)
         self.window.setFocusPolicy(QtCore.Qt.StrongFocus)
+        screen = self.app.primaryScreen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            width, height = dashboard_window_size(available.width(), available.height())
+            self.window.resize(width, height)
 
         layout = QtWidgets.QVBoxLayout(self.window)
         title = QtWidgets.QLabel("实时小车数据反馈")
@@ -152,21 +264,39 @@ class TelemetryDashboard:
         layout.addWidget(title)
 
         self.labels: dict[str, object] = {}
-        grid = QtWidgets.QGridLayout()
         label_font = QtGui.QFont()
-        label_font.setPointSize(12)
+        label_font.setPointSize(11)
         value_font = QtGui.QFont("Monospace")
-        value_font.setPointSize(12)
+        value_font.setPointSize(11)
         value_font.setStyleHint(QtGui.QFont.Monospace)
-        for row, (name, value) in enumerate(dashboard_rows(RobotTelemetry())):
-            name_label = QtWidgets.QLabel(name)
-            value_label = QtWidgets.QLabel(value)
-            name_label.setFont(label_font)
-            value_label.setFont(value_font)
-            grid.addWidget(name_label, row, 0)
-            grid.addWidget(value_label, row, 1)
-            self.labels[name] = value_label
-        layout.addLayout(grid)
+        group_font = QtGui.QFont()
+        group_font.setPointSize(12)
+        group_font.setBold(True)
+
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        content = QtWidgets.QWidget()
+        content_layout = QtWidgets.QVBoxLayout(content)
+        for group_name, rows in dashboard_groups(RobotTelemetry()):
+            group_label = QtWidgets.QLabel(group_name)
+            group_label.setFont(group_font)
+            content_layout.addWidget(group_label)
+            grid = QtWidgets.QGridLayout()
+            grid.setColumnStretch(1, 1)
+            for row, (name, value) in enumerate(rows):
+                name_label = QtWidgets.QLabel(name)
+                value_label = QtWidgets.QLabel(value)
+                name_label.setFont(label_font)
+                value_label.setFont(value_font)
+                name_label.setWordWrap(True)
+                value_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+                grid.addWidget(name_label, row, 0)
+                grid.addWidget(value_label, row, 1)
+                self.labels[name] = value_label
+            content_layout.addLayout(grid)
+        content_layout.addStretch(1)
+        scroll.setWidget(content)
+        layout.addWidget(scroll, stretch=1)
 
         self.linear_spin = QtWidgets.QDoubleSpinBox()
         self.linear_spin.setRange(0.0, 2.0)

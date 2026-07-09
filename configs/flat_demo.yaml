@@ -7,5 +7,11 @@ wheel_base: 0.5
 wheel_radius: 0.1
 target_linear_velocity: 0.4
 target_angular_velocity: 0.0
+terrain_model: box_slope
+ground_lateral_friction: 1.0
+ground_rolling_friction: 0.02
+ground_spinning_friction: 0.0
+drive_lateral_friction: 2.0
+support_lateral_friction: 0.03
 log_dir: results/logs
 figure_dir: results/figures

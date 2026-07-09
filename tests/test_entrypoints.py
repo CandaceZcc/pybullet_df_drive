@@ -18,6 +18,8 @@ def test_main_parse_args_supports_gui_and_slope():
             "10",
             "--duration-sec",
             "2",
+            "--wheel-radius",
+            "0.08",
             "--robot-model",
             "tracked_proxy",
             "--drive-model",
@@ -29,8 +31,14 @@ def test_main_parse_args_supports_gui_and_slope():
             "0.2",
             "--lidar",
             "--lidar-debug-draw",
+            "--terrain-model",
+            "twr_slope_5deg",
             "--ground-friction",
             "0.8",
+            "--ground-rolling-friction",
+            "0.03",
+            "--ground-spinning-friction",
+            "0.04",
             "--wheel-friction",
             "0.6",
             "--support-friction",
@@ -42,6 +50,7 @@ def test_main_parse_args_supports_gui_and_slope():
     assert args.manual is True
     assert args.slope_deg == 10.0
     assert args.duration_sec == 2.0
+    assert args.wheel_radius == 0.08
     assert args.robot_model == "tracked_proxy"
     assert args.drive_model == "physics"
     assert args.no_dashboard is True
@@ -49,7 +58,10 @@ def test_main_parse_args_supports_gui_and_slope():
     assert args.dashboard_smoothing_alpha == 0.2
     assert args.lidar is True
     assert args.lidar_debug_draw is True
+    assert args.terrain_model == "twr_slope_5deg"
     assert args.ground_friction == 0.8
+    assert args.ground_rolling_friction == 0.03
+    assert args.ground_spinning_friction == 0.04
     assert args.wheel_friction == 0.6
     assert args.support_friction == 0.03
 
@@ -101,6 +113,14 @@ def test_analyze_log_generates_metrics_and_figure(tmp_path: Path):
             "reference_y": [0.0, 0.0],
             "estimated_x": [0.0, 1.0],
             "estimated_y": [0.0, 0.0],
+            "left_slip_ratio": [0.0, 0.1],
+            "right_slip_ratio": [0.0, -0.1],
+            "left_slip_speed": [0.0, 0.02],
+            "right_slip_speed": [0.0, -0.02],
+            "left_contact_normal_force": [1.0, 2.0],
+            "right_contact_normal_force": [1.1, 2.1],
+            "left_contact_friction_force": [0.2, 0.3],
+            "right_contact_friction_force": [0.2, 0.4],
         }
     ).to_csv(log_path, index=False)
 
@@ -108,3 +128,5 @@ def test_analyze_log_generates_metrics_and_figure(tmp_path: Path):
 
     assert metrics["endpoint_error"] > 0.0
     assert figure_path.exists()
+    assert (tmp_path / "figures" / "run_slip.png").exists()
+    assert (tmp_path / "figures" / "run_contact.png").exists()

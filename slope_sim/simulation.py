@@ -15,7 +15,7 @@ from slope_sim.config import ExperimentConfig
 from slope_sim.logger import CsvSimulationLogger
 from slope_sim.metrics import compute_tracking_metrics
 from slope_sim.robot import DifferentialDriveRobot
-from slope_sim.scene import configure_gui_visualizer, create_slope_scene
+from slope_sim.scene import configure_gui_visualizer, create_slope_scene, probe_terrain
 from slope_sim.sensors import LidarSummary, read_lidar
 
 
@@ -26,6 +26,7 @@ class SimulationResult:
     log_path: Path
     figure_path: Path
     metrics: dict[str, float]
+    feedback_figure_paths: tuple[Path, ...] = ()
 
 
 def run_experiment(config: ExperimentConfig) -> SimulationResult:
@@ -37,7 +38,15 @@ def run_experiment(config: ExperimentConfig) -> SimulationResult:
 
     try:
         # PyBullet 客户端内创建场景和机器人，DIRECT 模式也能无窗口运行。
-        create_slope_scene(client_id, config.slope_deg, config.time_step, config.ground_lateral_friction)
+        scene = create_slope_scene(
+            client_id,
+            config.slope_deg,
+            config.time_step,
+            config.ground_lateral_friction,
+            config.ground_rolling_friction,
+            config.ground_spinning_friction,
+            config.terrain_model,
+        )
         if config.mode == "gui":
             configure_gui_visualizer(
                 client_id,
@@ -70,6 +79,11 @@ def run_experiment(config: ExperimentConfig) -> SimulationResult:
                     command_angular_velocity=config.target_angular_velocity,
                     ground_lateral_friction=config.ground_lateral_friction,
                     drive_lateral_friction=config.drive_lateral_friction,
+                    ground_rolling_friction=config.ground_rolling_friction,
+                    ground_spinning_friction=config.ground_spinning_friction,
+                    support_lateral_friction=config.support_lateral_friction,
+                    terrain_type=scene.terrain_type,
+                    terrain_probe=_probe_terrain_for_robot(client_id, robot),
                     lidar_summary=lidar_summary,
                 )
             else:
@@ -93,7 +107,13 @@ def run_experiment(config: ExperimentConfig) -> SimulationResult:
     frame = pd.read_csv(log_path)
     metrics = compute_tracking_metrics(frame, final_reference_yaw=0.0)
     figure_path = plot_trajectory(frame, config.figure_dir, prefix=f"slope_{config.slope_deg:g}")
-    return SimulationResult(log_path=log_path, figure_path=figure_path, metrics=metrics)
+    feedback_figure_paths = plot_feedback_figures(frame, config.figure_dir, prefix=f"slope_{config.slope_deg:g}")
+    return SimulationResult(
+        log_path=log_path,
+        figure_path=figure_path,
+        metrics=metrics,
+        feedback_figure_paths=feedback_figure_paths,
+    )
 
 
 def _robot_urdf_path(robot_model: str) -> Path:
@@ -129,6 +149,12 @@ def _read_lidar_for_robot(client_id: int, robot: DifferentialDriveRobot, config:
     )
 
 
+def _probe_terrain_for_robot(client_id: int, robot: DifferentialDriveRobot):
+    """用机器人当前位置做一次向下地形探测。"""
+    position, _orientation = p.getBasePositionAndOrientation(robot.robot_id, physicsClientId=client_id)
+    return probe_terrain(client_id, float(position[0]), float(position[1]))
+
+
 def plot_trajectory(frame: pd.DataFrame, figure_dir: str | Path, prefix: str = "run") -> Path:
     """将参考轨迹、真实轨迹和估计轨迹画到同一张图中。"""
     figure_dir = Path(figure_dir)
@@ -149,3 +175,57 @@ def plot_trajectory(frame: pd.DataFrame, figure_dir: str | Path, prefix: str = "
     fig.savefig(figure_path, dpi=150)
     plt.close(fig)
     return figure_path
+
+
+def plot_feedback_figures(frame: pd.DataFrame, figure_dir: str | Path, prefix: str = "run") -> tuple[Path, ...]:
+    """生成阶段三反馈图：打滑曲线和接触/摩擦力曲线。"""
+    figure_dir = Path(figure_dir)
+    figure_dir.mkdir(parents=True, exist_ok=True)
+    paths: list[Path] = []
+    time_axis = frame["t"] if "t" in frame.columns else pd.Series(range(len(frame)))
+
+    if {"left_slip_ratio", "right_slip_ratio", "left_slip_speed", "right_slip_speed"}.issubset(frame.columns):
+        slip_path = figure_dir / f"{prefix}_slip.png"
+        fig, axes = plt.subplots(2, 1, figsize=(7.0, 5.0), sharex=True)
+        axes[0].plot(time_axis, frame["left_slip_ratio"], label="left ratio")
+        axes[0].plot(time_axis, frame["right_slip_ratio"], label="right ratio")
+        axes[0].set_ylabel("slip ratio")
+        axes[0].grid(True, alpha=0.3)
+        axes[0].legend()
+        axes[1].plot(time_axis, frame["left_slip_speed"], label="left speed")
+        axes[1].plot(time_axis, frame["right_slip_speed"], label="right speed")
+        axes[1].set_xlabel("t [s]" if "t" in frame.columns else "sample")
+        axes[1].set_ylabel("slip speed [m/s]")
+        axes[1].grid(True, alpha=0.3)
+        axes[1].legend()
+        fig.tight_layout()
+        fig.savefig(slip_path, dpi=150)
+        plt.close(fig)
+        paths.append(slip_path)
+
+    contact_columns = {
+        "left_contact_normal_force",
+        "right_contact_normal_force",
+        "left_contact_friction_force",
+        "right_contact_friction_force",
+    }
+    if contact_columns.issubset(frame.columns):
+        contact_path = figure_dir / f"{prefix}_contact.png"
+        fig, axes = plt.subplots(2, 1, figsize=(7.0, 5.0), sharex=True)
+        axes[0].plot(time_axis, frame["left_contact_normal_force"], label="left normal")
+        axes[0].plot(time_axis, frame["right_contact_normal_force"], label="right normal")
+        axes[0].set_ylabel("normal force [N]")
+        axes[0].grid(True, alpha=0.3)
+        axes[0].legend()
+        axes[1].plot(time_axis, frame["left_contact_friction_force"], label="left friction")
+        axes[1].plot(time_axis, frame["right_contact_friction_force"], label="right friction")
+        axes[1].set_xlabel("t [s]" if "t" in frame.columns else "sample")
+        axes[1].set_ylabel("friction force [N]")
+        axes[1].grid(True, alpha=0.3)
+        axes[1].legend()
+        fig.tight_layout()
+        fig.savefig(contact_path, dpi=150)
+        plt.close(fig)
+        paths.append(contact_path)
+
+    return tuple(paths)

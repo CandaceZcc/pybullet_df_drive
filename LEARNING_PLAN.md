@@ -6,9 +6,9 @@
 
 当前实现路线更新：
 
-- 默认演示回到 `diff_drive + physics`，使用二轮差速加单后低摩擦支撑轮，先保证直行、转向和 GUI 手动控制稳定。
-- `tracked_proxy` 保留为履带近似实验模型，但不再作为 Step 2 默认模型。
-- 履带物理暂时从主线任务降级为后续研究项，当前主线优先推进数据反馈、传感器、障碍物和自动巡航。
+- `diff_drive + physics` 保留为平地教学、基础控制和 GUI 手动演示底座；当前是后驱布局，驱动轮在车体后方、单支撑轮在前方，形成更大的三角支撑。
+- `tracked_proxy` 保留为坡面姿态、履带打滑和大坝斜坡实验底座；它不是连续履带，但更适合观察坡面 pitch/roll。
+- 当前主线同时推进两套模型：二轮模型保证入门稳定性，履带代理保证坡面数据更可靠；阶段 3 斜坡反馈 build 使用 `configs/step3_feedback.yaml` 和 `twr_slope_5deg` 参考坡面。
 
 ## 新需求拆解
 
@@ -224,7 +224,8 @@ getContactPoints()
 
 ```text
 drive_surface_speed = drive_radius * drive_angular_speed
-slip_ratio = (drive_surface_speed - body_forward_speed) / max(abs(drive_surface_speed), small_value)
+reference_speed = max(abs(drive_surface_speed), abs(body_forward_speed))
+slip_ratio = clamp((drive_surface_speed - body_forward_speed) / reference_speed, -1, 1)
 ```
 
 履带物理 V2 的打滑估计改为左右履带局部速度：
@@ -232,11 +233,13 @@ slip_ratio = (drive_surface_speed - body_forward_speed) / max(abs(drive_surface_
 ```text
 left_body_track_speed = body_forward_speed - yaw_rate * wheel_base / 2
 right_body_track_speed = body_forward_speed + yaw_rate * wheel_base / 2
-left_slip_ratio = (left_track_surface_speed - left_body_track_speed) / max(abs(left_track_surface_speed), small_value)
-right_slip_ratio = (right_track_surface_speed - right_body_track_speed) / max(abs(right_track_surface_speed), small_value)
+left_reference_speed = max(abs(left_track_surface_speed), abs(left_body_track_speed))
+right_reference_speed = max(abs(right_track_surface_speed), abs(right_body_track_speed))
+left_slip_ratio = clamp((left_track_surface_speed - left_body_track_speed) / left_reference_speed, -1, 1)
+right_slip_ratio = clamp((right_track_surface_speed - right_body_track_speed) / right_reference_speed, -1, 1)
 ```
 
-注意：这里的打滑是估计指标，不等同于真实轮胎实验台测得的精确滑移率，但足够用于比较坡度、摩擦和控制器效果。
+当轮/履带表面速度和车体局部速度都低于约 `0.03 m/s` 时，打滑率记为 0，并在 Dashboard 中标记为“低速”。注意：这里的打滑是带符号估计指标，不等同于真实轮胎实验台测得的精确滑移率；负数表示驱动表面速度低于车体局部速度。
 
 ### 5. 地形和环境状态
 
@@ -432,13 +435,14 @@ figure: results/figures/slope_0_trajectory.png
 
 - 已支持 `drive_model: physics`，通过 `setJointMotorControl2()` 控制左右驱动轮。
 - `diff_drive` 已调整为左右轮中心距 `0.5m`，与配置中的 `wheel_base` 对齐。
-- 默认 GUI demo 使用二轮差速 + 单后低摩擦支撑轮，作为后续传感器和自动巡航的稳定底座。
+- 默认 GUI demo 使用后驱二轮差速 + 单前低摩擦支撑轮，作为平地教学、基础控制和手动演示底座。
+- `diff_drive` 的驱动轮位于 `x=-0.12`，支撑轮位于 `x=+0.30`，前后支撑距离约 `0.42m`；坡面姿态实验仍优先使用 `tracked_proxy`。
 
 后续开发任务：
 
 - 继续保留 `kinematic` 模式，方便和物理模式对比。
 - 观察不同坡度和摩擦下的轮速、接触力、打滑率变化。
-- 后续如果模型抖动，优先检查轮距、出生高度、支撑轮摩擦和接触点数量。
+- 后续如果模型抖动，优先检查轮距、出生高度、支撑轮摩擦、驱动轴参考点和接触点数量。
 
 建议开发后运行：
 
@@ -473,6 +477,12 @@ vy
 vz
 body_forward_speed
 yaw_rate
+velocity_sensor_body_forward_speed
+velocity_sensor_yaw_rate
+linear_acceleration_x
+linear_acceleration_y
+linear_acceleration_z
+angular_acceleration_z
 left_target_wheel_speed
 right_target_wheel_speed
 left_actual_wheel_speed
@@ -480,9 +490,21 @@ right_actual_wheel_speed
 left_contact_normal_force
 right_contact_normal_force
 ground_lateral_friction
+ground_rolling_friction
+ground_spinning_friction
 wheel_lateral_friction
+support_lateral_friction
 left_slip_ratio
 right_slip_ratio
+left_slip_speed
+right_slip_speed
+left_slip_valid
+right_slip_valid
+terrain_type
+local_ground_height
+local_terrain_normal_x
+local_terrain_normal_y
+local_terrain_normal_z
 nearest_obstacle_distance
 command_linear_velocity
 command_angular_velocity
@@ -498,17 +520,21 @@ command_angular_velocity
 
 ```text
 wheel_surface_speed = wheel_radius * wheel_angular_speed
-slip_ratio = (wheel_surface_speed - body_forward_speed) / max(abs(wheel_surface_speed), small_value)
+reference_speed = max(abs(wheel_surface_speed), abs(body_forward_speed))
+slip_ratio = clamp((wheel_surface_speed - body_forward_speed) / reference_speed, -1, 1)
 ```
 
 建议开发后运行：
 
 ```bash
 python main.py \
-  --slope-deg 5 \
+  --config configs/step3_feedback.yaml \
   --duration-sec 3 \
   --mode direct \
-  --drive-model physics_wheel \
+  --drive-model physics \
+  --terrain-model twr_slope_5deg \
+  --robot-model tracked_proxy \
+  --wheel-radius 0.08 \
   --wheel-friction 0.8 \
   --ground-friction 0.8
 ```
@@ -516,11 +542,12 @@ python main.py \
 成功标志：
 
 - CSV 中能看到实际轮速、车体速度、接触力和打滑估计。
+- CSV 中能看到速度传感、加速度、地形高度、地形法向和摩擦配置。
 - CSV 中能看到三维位置和姿态角，尤其是坡面上的 `z`、`roll`、`pitch`。
 - 改变摩擦系数后，打滑指标和轨迹表现会变化。
-- 能画出 `slip_ratio` 随时间变化的图。
+- 能画出 `slip_ratio`、`slip_speed`、接触力和摩擦力随时间变化的图。
 
-注意：PyBullet 不一定直接给出“真实工程意义上的轮胎摩擦系数使用量”。更稳妥的做法是记录“设置的摩擦系数 + 接触法向力 + 打滑估计 + 速度误差”，作为实验指标。
+注意：PyBullet 不一定直接给出“真实工程意义上的轮胎摩擦系数使用量”。更稳妥的做法是记录“设置的摩擦系数 + 接触法向力 + 接触摩擦力 + 打滑估计 + 速度误差”，作为实验指标。这里的签名打滑率是带正负号的趋势指标；有效接触点是法向力大于阈值的 PyBullet 接触求解点，不等于真实履带接触面积。
 
 ## 阶段 4：建立大坝斜坡场景
 
@@ -564,9 +591,8 @@ python main.py --config configs/dam_slope.yaml --duration-sec 3 --mode direct
 当前进度：
 
 - 已有 `tracked_proxy`，不是完整连续履带，而是“中间驱动轮 + 前后滚轮 + 履带外观条”的工程近似。
-- V2 目标是让同侧所有滚轮按同一条履带线速度联动，并用各向异性摩擦改善 skid-steer 转向。
-- 诊断后发现：当前多滚轮接触的直行 yaw 抖动明显，不适合作为默认教学/实验底座。
-- 当前不引入连续履带链条作为硬依赖；`tracked_proxy` 保留为后续研究项。
+- 同侧所有滚轮已按同一条履带线速度联动，并用各向异性摩擦改善 skid-steer 转向。
+- 当前不引入连续履带链条作为硬依赖；`tracked_proxy` 作为坡面姿态和履带打滑实验底座保留。
 
 推荐路线：
 
@@ -595,7 +621,7 @@ python main.py --config configs/gui_step2_demo.yaml --robot-model tracked_proxy 
 
 注意：当前命令行使用的是 `--robot-model tracked_proxy`，不是旧写法 `--robot tracked`。
 
-## 阶段 5.5：履带物理 V2 与转向校准（暂停作为主线）
+## 阶段 5.5：履带物理 V2 与转向校准
 
 目标：修复 `tracked_proxy` 前进转向和原地转向卡顿，让实际 `yaw_rate` 能明显响应角速度命令。
 
@@ -614,7 +640,7 @@ v=0.35, w=0.8    前进转向不再卡死，yaw 持续变化
 v=0.35, w=0      直行时左右打滑率接近 0
 ```
 
-当前判断：V2 能改善转向卡死，但直行视觉效果和 yaw 抖动仍不理想。因此默认路线回到二轮差速稳定底盘，履带 V2 暂时作为后续专题，不阻塞 Step 2 之后的传感器和巡航功能。
+当前判断：V2 已能作为坡面姿态和履带打滑实验底座使用；`diff_drive` 仍保留为平地教学和基础控制底座。两套模型需要分别用回归测试保护，避免转向卡顿、倒车翘头和打滑率尖峰再次出现。
 
 可运行命令：
 

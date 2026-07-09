@@ -4,14 +4,14 @@
   <!-- base_link 是机器人主体，质量和惯量会影响后续动力学扩展。 -->
   <link name="base_link">
     <inertial>
-      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <origin xyz="0 0 -0.015" rpy="0 0 0"/>
       <mass value="4.0"/>
-      <inertia ixx="0.08" ixy="0" ixz="0" iyy="0.08" iyz="0" izz="0.10"/>
+      <inertia ixx="0.08" ixy="0" ixz="0" iyy="0.16" iyz="0" izz="0.22"/>
     </inertial>
     <visual>
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry>
-        <box size="0.50 0.45 0.12"/>
+        <box size="0.68 0.45 0.12"/>
       </geometry>
       <material name="blue">
         <color rgba="0.1 0.24 0.65 1"/>
@@ -20,7 +20,7 @@
     <collision>
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry>
-        <box size="0.50 0.45 0.12"/>
+        <box size="0.68 0.45 0.12"/>
       </geometry>
     </collision>
   </link>
@@ -73,7 +73,7 @@
     </collision>
   </link>
 
-  <!-- 辅助支撑轮：当前用于保持模型稳定，后续可替换成更真实结构。 -->
+  <!-- 辅助支撑轮：放在车体前方；左右驱动轮在后方形成后驱三角支撑。 -->
   <link name="caster">
     <inertial>
       <origin xyz="0 0 0" rpy="0 0 0"/>
@@ -101,7 +101,7 @@
   <joint name="left_wheel_joint" type="continuous">
     <parent link="base_link"/>
     <child link="left_wheel"/>
-    <origin xyz="0 0.25 -0.04" rpy="0 0 0"/>
+    <origin xyz="-0.12 0.25 -0.04" rpy="0 0 0"/>
     <axis xyz="0 1 0"/>
   </joint>
 
@@ -109,13 +109,13 @@
   <joint name="right_wheel_joint" type="continuous">
     <parent link="base_link"/>
     <child link="right_wheel"/>
-    <origin xyz="0 -0.25 -0.04" rpy="0 0 0"/>
+    <origin xyz="-0.12 -0.25 -0.04" rpy="0 0 0"/>
     <axis xyz="0 1 0"/>
   </joint>
 
   <joint name="caster_joint" type="fixed">
     <parent link="base_link"/>
     <child link="caster"/>
-    <origin xyz="-0.22 0 -0.10" rpy="0 0 0"/>
+    <origin xyz="0.30 0 -0.10" rpy="0 0 0"/>
   </joint>
 </robot>
