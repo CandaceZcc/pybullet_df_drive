@@ -1,22 +1,15 @@
-# Step 4 大坝斜坡 GUI 配置：dam_slope、相机跟随、越界保护和车型切换。
+# 阶段一高尔夫起伏 GUI 配置：用于观察主动转向车和连续起伏地形。
 mode: gui
-slope_deg: 10.0
+slope_deg: 0.0
 duration_sec: 3.0
 time_step: 0.004166666666666667
-wheel_base: 0.5
-wheel_radius: 0.08
 target_linear_velocity: 0.25
 target_angular_velocity: 0.0
-robot_model: tracked_proxy
+robot_model: active_steering_4wd
 drive_model: physics
-terrain_model: dam_slope
-dam_toe_length: 2.0
-dam_slope_length: 8.0
-dam_crest_length: 3.0
-dam_exit_length: 2.0
-dam_width: 4.0
-dam_wall_height: 0.35
-terrain_guard_enabled: true
+terrain_model: golf_heightfield
+golf_seed: 41
+golf_relief: medium
 dashboard_enabled: true
 dashboard_update_hz: 5.0
 dashboard_smoothing_alpha: 0.25
@@ -30,7 +23,6 @@ camera_pitch: -35.0
 camera_target: [1.0, 0.0, 0.2]
 camera_follow_enabled: true
 camera_follow_view: front
-gui_model_switch_enabled: true
 lidar_enabled: true
 lidar_ray_count: 31
 lidar_max_distance: 5.0
@@ -42,7 +34,5 @@ ground_spinning_friction: 0.0
 drive_lateral_friction: 2.0
 support_lateral_friction: 0.03
 drive_motor_force: 5.0
-track_anisotropic_friction: [2.0, 0.2, 0.05]
-track_drive_mode: all_rollers
 log_dir: results/logs
 figure_dir: results/figures

@@ -1,19 +1,30 @@
-# 场景模块：创建平地、简单斜坡或参考仓库坡面，并设置基础物理参数。
+# 场景模块：创建阶段一平面、三段式下坡和高尔夫 heightfield，并设置物理参数。
 from __future__ import annotations
 
 import math
+import random
 from dataclasses import dataclass
-from pathlib import Path
 
 import pybullet as p
 
 from slope_sim.telemetry import TerrainProbe
 
 
-TWR_SLOPE_URDF = Path("urdf/terrain/twr_slope_5deg.urdf")
-TWR_SLOPE_SCALE = 2.5
-TWR_SLOPE_BASE_POSITION = (6.0, 0.0, -1.194)
-DAM_EDGE_GUARD_MARGIN = 0.5
+STAGE1_TERRAIN_MODELS = ("flat", "slope", "golf_heightfield")
+STAGE1_TERRAIN_LENGTH = 20.0
+STAGE1_TERRAIN_WIDTH = 12.0
+SLOPE_UPPER_LENGTH = 4.0
+SLOPE_RAMP_LENGTH = 8.0
+SLOPE_LOWER_LENGTH = 6.0
+SLOPE_SEAM_OVERLAP = 0.04
+TERRAIN_THICKNESS = 0.08
+GOLF_HEIGHTFIELD_ROWS = 96
+GOLF_HEIGHTFIELD_COLUMNS = 96
+GOLF_HEIGHTFIELD_CELL_SIZE = 0.14
+GOLF_RELIEF_AMPLITUDES = {"low": 0.10, "medium": 0.20, "high": 0.32}
+# 廊道中心仍保留大部分丘洼，避免把高尔夫地形变成无语义的平面。
+GOLF_CORRIDOR_FEATURE_FLOOR = 0.813
+GOLF_CORRIDOR_DETAIL_FLOOR = 0.18
 
 
 @dataclass(frozen=True)
@@ -39,12 +50,176 @@ class SceneInfo:
     slope_deg: float
     body_ids: tuple[int, ...] = ()
     spawn_position: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    spawn_orientation: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 1.0)
     bounds: TerrainBounds | None = None
 
     def __post_init__(self) -> None:
         """兼容旧调用：未显式传 body_ids 时，主地形就是唯一地形体。"""
         if not self.body_ids:
             object.__setattr__(self, "body_ids", (self.body_id,))
+
+
+def terrain_model_names() -> tuple[str, ...]:
+    """返回阶段一可从配置和命令行选择的三类场地。"""
+    return STAGE1_TERRAIN_MODELS
+
+
+def golf_corridor_center(seed: int, normalized_x: float) -> float:
+    """返回指定横坐标处的平滑行车廊道中心，且不受其他地形抽样影响。"""
+    corridor_rng = random.Random(int(seed) ^ 0x5F3759DF)
+    phase = corridor_rng.uniform(-math.pi, math.pi)
+    return 0.24 * math.sin(0.85 * math.pi * normalized_x + phase)
+
+
+def generate_golf_heightfield(
+    seed: int,
+    relief: str,
+    *,
+    rows: int = GOLF_HEIGHTFIELD_ROWS,
+    columns: int = GOLF_HEIGHTFIELD_COLUMNS,
+) -> tuple[float, ...]:
+    """生成含多尺度丘洼和平滑行车廊道的可复现连续高度数组。"""
+    relief_name = relief.lower()
+    if relief_name not in GOLF_RELIEF_AMPLITUDES:
+        raise ValueError("golf_relief must be 'low', 'medium', or 'high'")
+    if rows < 4 or columns < 4:
+        raise ValueError("heightfield rows and columns must be at least 4")
+    amplitude = GOLF_RELIEF_AMPLITUDES[relief_name]
+    rng = random.Random(int(seed))
+    phase_x = rng.uniform(-math.pi, math.pi)
+    phase_y = rng.uniform(-math.pi, math.pi)
+    corridor_phase = random.Random(int(seed) ^ 0x5F3759DF).uniform(-math.pi, math.pi)
+    hills = [
+        (
+            rng.uniform(-0.78, 0.78),
+            rng.uniform(-0.78, 0.78),
+            rng.uniform(0.16, 0.40),
+            rng.uniform(0.14, 0.34),
+            rng.uniform(0.28, 0.72),
+        )
+        for _ in range(8)
+    ]
+    basins = [
+        (
+            rng.uniform(-0.72, 0.72),
+            rng.uniform(-0.72, 0.72),
+            rng.uniform(0.18, 0.38),
+            rng.uniform(0.16, 0.34),
+            rng.uniform(0.18, 0.42),
+        )
+        for _ in range(4)
+    ]
+    heights: list[float] = []
+    for row in range(rows):
+        y = -1.0 + 2.0 * row / (rows - 1)
+        for column in range(columns):
+            x = -1.0 + 2.0 * column / (columns - 1)
+            broad = 0.30 * math.sin(0.85 * math.pi * x + phase_x)
+            broad += 0.24 * math.cos(0.75 * math.pi * y + phase_y)
+            broad += 0.12 * x * y
+
+            # 椭圆高斯丘洼提供不同方向的局部尺度，避免规则波纹感。
+            features = 0.0
+            for center_x, center_y, sigma_x, sigma_y, height_scale in hills:
+                radius_sq = ((x - center_x) / sigma_x) ** 2 + ((y - center_y) / sigma_y) ** 2
+                features += height_scale * math.exp(-0.5 * radius_sq)
+            for center_x, center_y, sigma_x, sigma_y, depth_scale in basins:
+                radius_sq = ((x - center_x) / sigma_x) ** 2 + ((y - center_y) / sigma_y) ** 2
+                features -= depth_scale * math.exp(-0.5 * radius_sq)
+
+            detail = 0.10 * math.sin(2.4 * math.pi * x + 0.5 * phase_y)
+            detail += 0.08 * math.cos(2.1 * math.pi * y - 0.5 * phase_x)
+            corridor_center = 0.24 * math.sin(0.85 * math.pi * x + corridor_phase)
+            corridor_distance = abs(y - corridor_center)
+            corridor_weight = 1.0 - math.exp(-((corridor_distance / 0.20) ** 2))
+
+            # 廊道保留 broad 和横坡，仅适度减弱局部丘洼与小尺度波。
+            feature_weight = GOLF_CORRIDOR_FEATURE_FLOOR + (1.0 - GOLF_CORRIDOR_FEATURE_FLOOR) * corridor_weight
+            detail_weight = GOLF_CORRIDOR_DETAIL_FLOOR + (1.0 - GOLF_CORRIDOR_DETAIL_FLOOR) * corridor_weight
+            rolling = broad + features * feature_weight + detail * detail_weight
+            heights.append(amplitude * rolling)
+    # 整体平移不改变坡形，把最低点抬到零以上便于 GUI 观察和出生高度计算。
+    minimum = min(heights)
+    return tuple(height - minimum for height in heights)
+
+
+def _create_golf_heightfield_scene(
+    client_id: int,
+    ground_lateral_friction: float,
+    ground_rolling_friction: float,
+    ground_spinning_friction: float,
+    golf_seed: int,
+    golf_relief: str,
+) -> SceneInfo:
+    """用 PyBullet GEOM_HEIGHTFIELD 创建高尔夫球场式连续缓坡和小丘。"""
+    heightfield_data = generate_golf_heightfield(golf_seed, golf_relief)
+    collision = p.createCollisionShape(
+        shapeType=p.GEOM_HEIGHTFIELD,
+        meshScale=[GOLF_HEIGHTFIELD_CELL_SIZE, GOLF_HEIGHTFIELD_CELL_SIZE, 1.0],
+        # heightfieldData 保持 y-major；PyBullet 的 Rows 是 x 快轴样本数。
+        heightfieldData=heightfield_data,
+        numHeightfieldRows=GOLF_HEIGHTFIELD_COLUMNS,
+        numHeightfieldColumns=GOLF_HEIGHTFIELD_ROWS,
+        flags=p.GEOM_CONCAVE_INTERNAL_EDGE,
+        physicsClientId=client_id,
+    )
+    body_id = p.createMultiBody(
+        baseMass=0.0,
+        baseCollisionShapeIndex=collision,
+        basePosition=[0.0, 0.0, 0.0],
+        physicsClientId=client_id,
+    )
+    p.changeVisualShape(
+        body_id,
+        -1,
+        rgbaColor=[0.18, 0.58, 0.16, 1.0],
+        physicsClientId=client_id,
+    )
+    _apply_terrain_friction(
+        client_id,
+        body_id,
+        ground_lateral_friction,
+        ground_rolling_friction,
+        ground_spinning_friction,
+    )
+    half_x = (GOLF_HEIGHTFIELD_COLUMNS - 1) * GOLF_HEIGHTFIELD_CELL_SIZE / 2.0
+    half_y = (GOLF_HEIGHTFIELD_ROWS - 1) * GOLF_HEIGHTFIELD_CELL_SIZE / 2.0
+    bounds = TerrainBounds(-half_x, half_x, -half_y, half_y)
+    spawn_x = -3.5
+    spawn_z = _raycast_ground_height(client_id, spawn_x, 0.0)
+    spawn_normal = _raycast_ground_normal(client_id, spawn_x, 0.0)
+    return SceneInfo(
+        body_id=body_id,
+        terrain_type="golf_heightfield",
+        slope_deg=0.0,
+        spawn_position=(spawn_x, 0.0, spawn_z),
+        spawn_orientation=_orientation_from_ground_normal(spawn_normal),
+        bounds=bounds,
+    )
+
+
+def _raycast_ground_height(client_id: int, x: float, y: float) -> float:
+    """场地创建后用真实碰撞面计算安全出生高度。"""
+    hit = p.rayTest((x, y, 20.0), (x, y, -20.0), physicsClientId=client_id)[0]
+    if hit[0] < 0:
+        raise RuntimeError(f"terrain has no collision surface at spawn ({x}, {y})")
+    return float(hit[3][2])
+
+
+def _raycast_ground_normal(client_id: int, x: float, y: float) -> tuple[float, float, float]:
+    """读取出生点碰撞三角面的世界法向。"""
+    hit = p.rayTest((x, y, 20.0), (x, y, -20.0), physicsClientId=client_id)[0]
+    if hit[0] < 0:
+        raise RuntimeError(f"terrain has no collision normal at spawn ({x}, {y})")
+    return tuple(float(value) for value in hit[4])
+
+
+def _orientation_from_ground_normal(normal: tuple[float, float, float]) -> tuple[float, float, float, float]:
+    """在车头保持世界 +X 的前提下，让车体 +Z 轴贴合局部地形法向。"""
+    nx, ny, nz = normal
+    pitch = math.atan2(nx, nz)
+    roll = -math.atan2(ny, math.sqrt(nx * nx + nz * nz))
+    return tuple(float(value) for value in p.getQuaternionFromEuler([roll, pitch, 0.0]))
 
 
 def create_slope_scene(
@@ -54,93 +229,94 @@ def create_slope_scene(
     ground_lateral_friction: float = 1.0,
     ground_rolling_friction: float = 0.02,
     ground_spinning_friction: float = 0.0,
-    terrain_model: str = "box_slope",
-    dam_toe_length: float = 2.0,
-    dam_slope_length: float = 8.0,
-    dam_crest_length: float = 3.0,
-    dam_exit_length: float = 2.0,
-    dam_width: float = 4.0,
-    dam_wall_height: float = 0.35,
-    terrain_guard_enabled: bool = True,
+    terrain_model: str = "flat",
+    golf_seed: int = 0,
+    golf_relief: str = "medium",
 ) -> SceneInfo:
     """创建一个地面场景，并返回地形元信息。"""
     p.resetSimulation(physicsClientId=client_id)
     p.setGravity(0.0, 0.0, -9.81, physicsClientId=client_id)
     p.setTimeStep(time_step, physicsClientId=client_id)
 
-    if terrain_model == "twr_slope_5deg":
-        if abs(slope_deg - 5.0) > 1e-9:
-            raise ValueError("terrain_model 'twr_slope_5deg' requires slope_deg: 5.0")
-        body_id = _create_twr_slope_scene(
+    terrain_model = terrain_model.lower()
+    if terrain_model not in STAGE1_TERRAIN_MODELS:
+        choices = ", ".join(STAGE1_TERRAIN_MODELS)
+        raise ValueError(f"terrain_model must be one of: {choices}")
+    if terrain_model == "golf_heightfield":
+        return _create_golf_heightfield_scene(
             client_id,
             ground_lateral_friction,
             ground_rolling_friction,
             ground_spinning_friction,
+            golf_seed,
+            golf_relief,
         )
-        return SceneInfo(body_id=body_id, terrain_type=terrain_model, slope_deg=slope_deg)
-    if terrain_model == "dam_slope":
-        return _create_dam_slope_scene(
+    if terrain_model == "slope":
+        return _create_segmented_slope_scene(
             client_id,
             slope_deg,
             ground_lateral_friction,
             ground_rolling_friction,
             ground_spinning_friction,
-            dam_toe_length,
-            dam_slope_length,
-            dam_crest_length,
-            dam_exit_length,
-            dam_width,
-            dam_wall_height,
-            terrain_guard_enabled,
         )
-    if terrain_model != "box_slope":
-        raise ValueError("terrain_model must be 'box_slope', 'twr_slope_5deg', or 'dam_slope'")
-    body_id = _create_box_slope_scene(
+    actual_slope_deg = 0.0
+    body_id = _create_planar_scene(
         client_id,
-        slope_deg,
+        actual_slope_deg,
         ground_lateral_friction,
         ground_rolling_friction,
         ground_spinning_friction,
     )
-    return SceneInfo(body_id=body_id, terrain_type=terrain_model, slope_deg=slope_deg)
+    bounds = TerrainBounds(
+        min_x=-STAGE1_TERRAIN_LENGTH / 2.0,
+        max_x=STAGE1_TERRAIN_LENGTH / 2.0,
+        min_y=-STAGE1_TERRAIN_WIDTH / 2.0,
+        max_y=STAGE1_TERRAIN_WIDTH / 2.0,
+    )
+    spawn_x = -3.5
+    spawn_z = _raycast_ground_height(client_id, spawn_x, 0.0)
+    spawn_orientation = p.getQuaternionFromEuler([0.0, -math.radians(actual_slope_deg), 0.0])
+    return SceneInfo(
+        body_id=body_id,
+        terrain_type=terrain_model,
+        slope_deg=actual_slope_deg,
+        spawn_position=(spawn_x, 0.0, spawn_z),
+        spawn_orientation=tuple(float(value) for value in spawn_orientation),
+        bounds=bounds,
+    )
 
 
-def _create_dam_slope_scene(
+def _create_static_terrain_box(
     client_id: int,
-    slope_deg: float,
+    half_extents: tuple[float, float, float],
+    position: tuple[float, float, float],
+    orientation: tuple[float, float, float, float],
+    color: tuple[float, float, float, float],
     ground_lateral_friction: float,
     ground_rolling_friction: float,
     ground_spinning_friction: float,
-    dam_toe_length: float,
-    dam_slope_length: float,
-    dam_crest_length: float,
-    dam_exit_length: float,
-    dam_width: float,
-    dam_wall_height: float,
-    terrain_guard_enabled: bool,
-) -> SceneInfo:
-    """用多个静态 box 拼出入口、上坡、坝顶、下坡和出口平地。"""
-    slope_rad = math.radians(abs(slope_deg))
-    crest_height = dam_slope_length * math.tan(slope_rad)
-    x0 = 0.0
-    x1 = x0 + dam_toe_length
-    x2 = x1 + dam_slope_length
-    x3 = x2 + dam_crest_length
-    x4 = x3 + dam_slope_length
-    x5 = x4 + dam_exit_length
-    thickness = 0.08
-
-    body_ids = [
-        _create_dam_surface_segment(client_id, x0, x1, 0.0, 0.0, dam_width, thickness, [0.32, 0.50, 0.28, 1.0]),
-        _create_dam_surface_segment(client_id, x1, x2, 0.0, crest_height, dam_width, thickness, [0.38, 0.56, 0.32, 1.0]),
-        _create_dam_surface_segment(client_id, x2, x3, crest_height, crest_height, dam_width, thickness, [0.40, 0.58, 0.34, 1.0]),
-        _create_dam_surface_segment(client_id, x3, x4, crest_height, 0.0, dam_width, thickness, [0.38, 0.56, 0.32, 1.0]),
-        _create_dam_surface_segment(client_id, x4, x5, 0.0, 0.0, dam_width, thickness, [0.32, 0.50, 0.28, 1.0]),
-    ]
-    if terrain_guard_enabled:
-        body_ids.extend(_create_dam_guard_rails(client_id, x5, dam_width, crest_height, dam_wall_height))
-
-    for body_id in body_ids:
+) -> int:
+    """创建统一的静态地形箱；摩擦设置失败时不留半成品刚体。"""
+    collision = p.createCollisionShape(
+        p.GEOM_BOX,
+        halfExtents=half_extents,
+        physicsClientId=client_id,
+    )
+    visual = p.createVisualShape(
+        p.GEOM_BOX,
+        halfExtents=half_extents,
+        rgbaColor=color,
+        physicsClientId=client_id,
+    )
+    body_id = p.createMultiBody(
+        baseMass=0.0,
+        baseCollisionShapeIndex=collision,
+        baseVisualShapeIndex=visual,
+        basePosition=position,
+        baseOrientation=orientation,
+        physicsClientId=client_id,
+    )
+    try:
         _apply_terrain_friction(
             client_id,
             body_id,
@@ -148,166 +324,121 @@ def _create_dam_slope_scene(
             ground_rolling_friction,
             ground_spinning_friction,
         )
+    except Exception:
+        p.removeBody(body_id, physicsClientId=client_id)
+        raise
+    return body_id
 
-    # 越界保护比物理边缘提前触发，避免手动模式中车体中心刚越过边缘才停车。
-    edge_guard_margin = min(DAM_EDGE_GUARD_MARGIN, dam_toe_length / 2.0, dam_exit_length / 2.0)
-    bounds = TerrainBounds(
-        min_x=x0 + edge_guard_margin,
-        max_x=x5 - edge_guard_margin,
-        min_y=-dam_width / 2.0,
-        max_y=dam_width / 2.0,
+
+def _create_segmented_slope_scene(
+    client_id: int,
+    slope_deg: float,
+    ground_lateral_friction: float,
+    ground_rolling_friction: float,
+    ground_spinning_friction: float,
+) -> SceneInfo:
+    """沿 +X 创建高位平台、直线下坡和低位平台。"""
+    slope_rad = math.radians(slope_deg)
+    drop = SLOPE_RAMP_LENGTH * math.sin(slope_rad)
+    horizontal_ramp = SLOPE_RAMP_LENGTH * math.cos(slope_rad)
+    ramp_start_x = -horizontal_ramp / 2.0
+    ramp_end_x = horizontal_ramp / 2.0
+    upper_center_x = ramp_start_x - SLOPE_UPPER_LENGTH / 2.0 + SLOPE_SEAM_OVERLAP / 2.0
+    lower_center_x = ramp_end_x + SLOPE_LOWER_LENGTH / 2.0 - SLOPE_SEAM_OVERLAP / 2.0
+    flat_orientation = (0.0, 0.0, 0.0, 1.0)
+    ramp_orientation = tuple(float(value) for value in p.getQuaternionFromEuler((0.0, slope_rad, 0.0)))
+    friction = (
+        ground_lateral_friction,
+        ground_rolling_friction,
+        ground_spinning_friction,
     )
-    spawn_position = (dam_toe_length / 2.0, 0.0, 0.0)
+    created_body_ids: list[int] = []
+
+    try:
+        # 薄箱的上表面是可行驶面，接缝处轻微重叠避免射线和车轮落空。
+        upper_id = _create_static_terrain_box(
+            client_id,
+            (
+                (SLOPE_UPPER_LENGTH + SLOPE_SEAM_OVERLAP) / 2.0,
+                STAGE1_TERRAIN_WIDTH / 2.0,
+                TERRAIN_THICKNESS / 2.0,
+            ),
+            (upper_center_x, 0.0, drop - TERRAIN_THICKNESS / 2.0),
+            flat_orientation,
+            (0.32, 0.56, 0.25, 1.0),
+            *friction,
+        )
+        created_body_ids.append(upper_id)
+        ramp_id = _create_static_terrain_box(
+            client_id,
+            (SLOPE_RAMP_LENGTH / 2.0, STAGE1_TERRAIN_WIDTH / 2.0, TERRAIN_THICKNESS / 2.0),
+            (
+                -math.sin(slope_rad) * TERRAIN_THICKNESS / 2.0,
+                0.0,
+                drop / 2.0 - math.cos(slope_rad) * TERRAIN_THICKNESS / 2.0,
+            ),
+            ramp_orientation,
+            (0.48, 0.63, 0.27, 1.0),
+            *friction,
+        )
+        created_body_ids.append(ramp_id)
+        lower_id = _create_static_terrain_box(
+            client_id,
+            (
+                (SLOPE_LOWER_LENGTH + SLOPE_SEAM_OVERLAP) / 2.0,
+                STAGE1_TERRAIN_WIDTH / 2.0,
+                TERRAIN_THICKNESS / 2.0,
+            ),
+            (lower_center_x, 0.0, -TERRAIN_THICKNESS / 2.0),
+            flat_orientation,
+            (0.27, 0.49, 0.22, 1.0),
+            *friction,
+        )
+        created_body_ids.append(lower_id)
+    except Exception:
+        # 后续段失败时按创建反序回滚，避免场景内留下孤立地形。
+        for body_id in reversed(created_body_ids):
+            p.removeBody(body_id, physicsClientId=client_id)
+        raise
+
+    bounds = TerrainBounds(
+        min_x=ramp_start_x - SLOPE_UPPER_LENGTH,
+        max_x=ramp_end_x + SLOPE_LOWER_LENGTH,
+        min_y=-STAGE1_TERRAIN_WIDTH / 2.0,
+        max_y=STAGE1_TERRAIN_WIDTH / 2.0,
+    )
     return SceneInfo(
-        body_id=body_ids[0],
-        body_ids=tuple(body_ids),
-        terrain_type="dam_slope",
+        body_id=ramp_id,
+        body_ids=(upper_id, ramp_id, lower_id),
+        terrain_type="slope",
         slope_deg=slope_deg,
-        spawn_position=spawn_position,
+        spawn_position=(upper_center_x, 0.0, drop),
+        spawn_orientation=flat_orientation,
         bounds=bounds,
     )
 
 
-def _create_dam_surface_segment(
-    client_id: int,
-    x_start: float,
-    x_end: float,
-    z_start: float,
-    z_end: float,
-    width: float,
-    thickness: float,
-    color: list[float],
-) -> int:
-    """创建一个顶面连接两端高度的静态地形块。"""
-    dx = x_end - x_start
-    dz = z_end - z_start
-    surface_angle = math.atan2(dz, dx)
-    surface_length = math.hypot(dx, dz)
-    center_x = (x_start + x_end) / 2.0 + math.sin(surface_angle) * thickness / 2.0
-    center_z = (z_start + z_end) / 2.0 - math.cos(surface_angle) * thickness / 2.0
-    collision = p.createCollisionShape(
-        p.GEOM_BOX,
-        halfExtents=[surface_length / 2.0, width / 2.0, thickness / 2.0],
-        physicsClientId=client_id,
-    )
-    visual = p.createVisualShape(
-        p.GEOM_BOX,
-        halfExtents=[surface_length / 2.0, width / 2.0, thickness / 2.0],
-        rgbaColor=color,
-        physicsClientId=client_id,
-    )
-    return p.createMultiBody(
-        baseMass=0.0,
-        baseCollisionShapeIndex=collision,
-        baseVisualShapeIndex=visual,
-        basePosition=[center_x, 0.0, center_z],
-        baseOrientation=p.getQuaternionFromEuler([0.0, -surface_angle, 0.0]),
-        physicsClientId=client_id,
-    )
-
-
-def _create_dam_guard_rails(
-    client_id: int,
-    total_length: float,
-    width: float,
-    crest_height: float,
-    wall_height: float,
-) -> list[int]:
-    """创建左右静态护栏，终点保持开放以便越界保护接管。"""
-    rail_thickness = 0.12
-    side_height = crest_height + wall_height
-    side_collision = p.createCollisionShape(
-        p.GEOM_BOX,
-        halfExtents=[total_length / 2.0, rail_thickness / 2.0, side_height / 2.0],
-        physicsClientId=client_id,
-    )
-    side_visual = p.createVisualShape(
-        p.GEOM_BOX,
-        halfExtents=[total_length / 2.0, rail_thickness / 2.0, side_height / 2.0],
-        rgbaColor=[0.45, 0.45, 0.45, 1.0],
-        physicsClientId=client_id,
-    )
-    body_ids: list[int] = []
-    for side in (-1.0, 1.0):
-        body_ids.append(
-            p.createMultiBody(
-                baseMass=0.0,
-                baseCollisionShapeIndex=side_collision,
-                baseVisualShapeIndex=side_visual,
-                basePosition=[total_length / 2.0, side * (width / 2.0 + rail_thickness / 2.0), side_height / 2.0],
-                physicsClientId=client_id,
-            )
-        )
-    return body_ids
-
-
-def _create_box_slope_scene(
+def _create_planar_scene(
     client_id: int,
     slope_deg: float,
     ground_lateral_friction: float,
     ground_rolling_friction: float,
     ground_spinning_friction: float,
 ) -> int:
-    """创建项目原有的单个长方体坡面。"""
+    """创建水平或按指定角度倾斜的连续静态场地。"""
     slope_rad = math.radians(slope_deg)
-    # 使用一个静态长方体作为地面；0 度时就是平地，非 0 度时就是斜坡。
-    length = 64.0
-    width = 32.0
-    thickness = 0.08
-    collision = p.createCollisionShape(
-        p.GEOM_BOX,
-        halfExtents=[length / 2.0, width / 2.0, thickness / 2.0],
-        physicsClientId=client_id,
-    )
-    visual = p.createVisualShape(
-        p.GEOM_BOX,
-        halfExtents=[length / 2.0, width / 2.0, thickness / 2.0],
-        rgbaColor=[0.35, 0.55, 0.28, 1.0],
-        physicsClientId=client_id,
-    )
     orientation = p.getQuaternionFromEuler([0.0, -slope_rad, 0.0])
-    # 静态刚体质量为 0，用作不会被机器人推走的地面；地面居中放置，避免机器人出生在边缘。
-    body_id = p.createMultiBody(
-        baseMass=0.0,
-        baseCollisionShapeIndex=collision,
-        baseVisualShapeIndex=visual,
-        basePosition=[0.0, 0.0, -thickness / 2.0],
-        baseOrientation=orientation,
-        physicsClientId=client_id,
-    )
-    _apply_terrain_friction(
+    # flat 仍保持单一静态箱体，但复用与分段坡面相同的安全工厂。
+    return _create_static_terrain_box(
         client_id,
-        body_id,
+        (STAGE1_TERRAIN_LENGTH / 2.0, STAGE1_TERRAIN_WIDTH / 2.0, TERRAIN_THICKNESS / 2.0),
+        (0.0, 0.0, -TERRAIN_THICKNESS / 2.0),
+        tuple(float(value) for value in orientation),
+        (0.35, 0.55, 0.28, 1.0),
         ground_lateral_friction,
         ground_rolling_friction,
         ground_spinning_friction,
     )
-    return body_id
-
-
-def _create_twr_slope_scene(
-    client_id: int,
-    ground_lateral_friction: float,
-    ground_rolling_friction: float,
-    ground_spinning_friction: float,
-) -> int:
-    """加载 Two-Wheel-Robot-DeepRL 风格的 5 度双坡 URDF。"""
-    body_id = p.loadURDF(
-        str(TWR_SLOPE_URDF),
-        TWR_SLOPE_BASE_POSITION,
-        [0.0, 0.0, 0.0, 1.0],
-        useFixedBase=True,
-        globalScaling=TWR_SLOPE_SCALE,
-        physicsClientId=client_id,
-    )
-    _apply_terrain_friction(
-        client_id,
-        body_id,
-        ground_lateral_friction,
-        ground_rolling_friction,
-        ground_spinning_friction,
-    )
-    return body_id
 
 
 def _apply_terrain_friction(
@@ -335,12 +466,13 @@ def probe_terrain(
     y: float,
     ray_height: float = 8.0,
     bounds: TerrainBounds | None = None,
+    ray_start_z: float | None = None,
 ) -> TerrainProbe:
     """从机器人当前位置向下发射射线，估计局部地面高度和法向。"""
     if bounds is not None and not bounds.contains(x, y):
         return TerrainProbe(terrain_probe_valid=False, out_of_bounds=True)
     hit = p.rayTest(
-        (x, y, ray_height),
+        (x, y, ray_height if ray_start_z is None else ray_start_z),
         (x, y, -ray_height),
         physicsClientId=client_id,
     )[0]
@@ -382,13 +514,14 @@ def configure_gui_visualizer(
     )
 
 
-def camera_follow_yaw(camera_follow_view: str, camera_yaw: float) -> float:
-    """根据跟随视角选择 debug camera yaw；custom 保留配置值。"""
+def camera_follow_yaw(camera_follow_view: str, camera_yaw: float, robot_yaw: float) -> float:
+    """按车体朝向计算跟随相机 yaw；custom 保留配置的世界坐标 yaw。"""
     view = camera_follow_view.lower()
+    heading_deg = math.degrees(robot_yaw)
     if view == "front":
-        return -90.0
+        return heading_deg - 90.0
     if view == "side":
-        return 0.0
+        return heading_deg
     return camera_yaw
 
 
@@ -400,11 +533,13 @@ def update_follow_camera(
     camera_yaw: float,
     camera_follow_view: str,
 ) -> None:
-    """把 PyBullet GUI debug camera 的 target 绑定到机器人 base 位置。"""
-    position, _orientation = p.getBasePositionAndOrientation(robot_id, physicsClientId=client_id)
+    """按活动车体的实时位置和 yaw 更新 PyBullet GUI 跟随相机。"""
+    position, orientation = p.getBasePositionAndOrientation(robot_id, physicsClientId=client_id)
+    # PyBullet 返回四元数，欧拉角第三项是绕世界 Z 轴的车体 yaw。
+    _roll, _pitch, robot_yaw = p.getEulerFromQuaternion(orientation)
     p.resetDebugVisualizerCamera(
         cameraDistance=camera_distance,
-        cameraYaw=camera_follow_yaw(camera_follow_view, camera_yaw),
+        cameraYaw=camera_follow_yaw(camera_follow_view, camera_yaw, robot_yaw),
         cameraPitch=camera_pitch,
         cameraTargetPosition=(float(position[0]), float(position[1]), float(position[2])),
         physicsClientId=client_id,

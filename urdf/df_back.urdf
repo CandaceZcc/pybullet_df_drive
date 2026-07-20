@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<!-- 后置驱动差速车：后部左右驱动轮，前部低摩擦球形支撑轮。 -->
+<robot name="df_back">
+  <material name="body_blue"><color rgba="0.10 0.30 0.78 1"/></material>
+  <material name="wheel_dark"><color rgba="0.04 0.04 0.04 1"/></material>
+  <material name="sensor_cyan"><color rgba="0.05 0.65 0.78 1"/></material>
+  <material name="support_gray"><color rgba="0.45 0.45 0.45 1"/></material>
+  <link name="base_link">
+    <inertial><origin xyz="-0.03 0 -0.015"/><mass value="5.0"/><inertia ixx="0.12" ixy="0" ixz="0" iyy="0.24" iyz="0" izz="0.30"/></inertial>
+    <visual><origin xyz="0 0 0.01"/><geometry><box size="0.72 0.44 0.14"/></geometry><material name="body_blue"/></visual>
+    <collision><origin xyz="0 0 0.01"/><geometry><box size="0.72 0.44 0.14"/></geometry></collision>
+  </link>
+  <link name="left_drive_wheel"><inertial><mass value="0.40"/><inertia ixx="0.0025" ixy="0" ixz="0" iyy="0.0025" iyz="0" izz="0.0025"/></inertial><visual><origin rpy="1.57079632679 0 0"/><geometry><cylinder radius="0.10" length="0.055"/></geometry><material name="wheel_dark"/></visual><collision><origin rpy="1.57079632679 0 0"/><geometry><cylinder radius="0.10" length="0.055"/></geometry></collision></link>
+  <joint name="left_drive_wheel_joint" type="continuous"><parent link="base_link"/><child link="left_drive_wheel"/><origin xyz="-0.22 0.25 -0.04"/><axis xyz="0 1 0"/></joint>
+  <link name="right_drive_wheel"><inertial><mass value="0.40"/><inertia ixx="0.0025" ixy="0" ixz="0" iyy="0.0025" iyz="0" izz="0.0025"/></inertial><visual><origin rpy="1.57079632679 0 0"/><geometry><cylinder radius="0.10" length="0.055"/></geometry><material name="wheel_dark"/></visual><collision><origin rpy="1.57079632679 0 0"/><geometry><cylinder radius="0.10" length="0.055"/></geometry></collision></link>
+  <joint name="right_drive_wheel_joint" type="continuous"><parent link="base_link"/><child link="right_drive_wheel"/><origin xyz="-0.22 -0.25 -0.04"/><axis xyz="0 1 0"/></joint>
+  <link name="front_support"><inertial><mass value="0.08"/><inertia ixx="0.00015" ixy="0" ixz="0" iyy="0.00015" iyz="0" izz="0.00015"/></inertial><visual><geometry><sphere radius="0.045"/></geometry><material name="support_gray"/></visual><collision><geometry><sphere radius="0.045"/></geometry></collision></link>
+  <joint name="front_support_joint" type="fixed"><parent link="base_link"/><child link="front_support"/><origin xyz="0.30 0 -0.095"/></joint>
+  <link name="sensor_deck"><inertial><mass value="0.05"/><inertia ixx="0.0002" ixy="0" ixz="0" iyy="0.0002" iyz="0" izz="0.0002"/></inertial><visual><geometry><box size="0.46 0.20 0.035"/></geometry><material name="sensor_cyan"/></visual></link>
+  <joint name="sensor_deck_joint" type="fixed"><parent link="base_link"/><child link="sensor_deck"/><origin xyz="0 0 0.105"/></joint>
+  <link name="lidar_front_mount"><inertial><mass value="0.01"/><inertia ixx="0.00001" ixy="0" ixz="0" iyy="0.00001" iyz="0" izz="0.00001"/></inertial><visual><geometry><box size="0.06 0.12 0.055"/></geometry><material name="sensor_cyan"/></visual></link>
+  <joint name="lidar_front_mount_joint" type="fixed"><parent link="base_link"/><child link="lidar_front_mount"/><origin xyz="0.34 0 0.105"/></joint>
+  <link name="lidar_rear_mount"><inertial><mass value="0.01"/><inertia ixx="0.00001" ixy="0" ixz="0" iyy="0.00001" iyz="0" izz="0.00001"/></inertial><visual><geometry><box size="0.06 0.12 0.055"/></geometry><material name="sensor_cyan"/></visual></link>
+  <joint name="lidar_rear_mount_joint" type="fixed"><parent link="base_link"/><child link="lidar_rear_mount"/><origin xyz="-0.34 0 0.105"/></joint>
+</robot>

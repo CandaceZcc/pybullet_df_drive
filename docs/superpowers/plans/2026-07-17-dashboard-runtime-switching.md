@@ -1,6 +1,6 @@
 # Dashboard Runtime Switching Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> 状态说明：本计划已完成自动验证并进入阶段一补充交付门禁；后续会话只需读取交付报告，不要继续按本计划派生实现线程。
 
 **Goal:** 在 GUI 手动仿真不退出的情况下，通过 Dashboard 的显式应用按钮安全切换四种车型和三种场地。
 
@@ -18,7 +18,7 @@
 - Modify: `slope_sim/dashboard.py:1-845`
 - Test: `tests/test_dashboard.py`
 
-- [ ] **Step 1: 写出仅点击应用按钮才发送一次请求的失败测试**
+- [x] **Step 1: 写出仅点击应用按钮才发送一次请求的失败测试**
 
 ```python
 def test_dashboard_model_switch_requires_apply_and_is_one_shot(monkeypatch):
@@ -61,7 +61,7 @@ def test_dashboard_terrain_switch_requires_apply_and_captures_parameters(monkeyp
         dashboard.close()
 ```
 
-- [ ] **Step 2: 运行聚焦测试并确认 RED**
+- [x] **Step 2: 运行聚焦测试并确认 RED**
 
 Run:
 
@@ -71,7 +71,7 @@ conda run -n slope-sim python -m pytest tests/test_dashboard.py::test_dashboard_
 
 Expected: 因 `TerrainSelection`、`terrain_switch_enabled` 或应用请求方法不存在而失败。
 
-- [ ] **Step 3: 实现不可变场地选择、一次性请求和 Dashboard 控件**
+- [x] **Step 3: 实现不可变场地选择、一次性请求和 Dashboard 控件**
 
 在 `slope_sim/dashboard.py` 中增加：
 
@@ -137,7 +137,7 @@ def request_terrain_switch(self) -> None:
 
 `current_command()` 读取后立刻清空这两个字段；`sync_active_selection()` 用实际活动状态同步控件；`show_switch_status()` 更新成功或失败文本。
 
-- [ ] **Step 4: 运行 Dashboard 测试并确认 GREEN**
+- [x] **Step 4: 运行 Dashboard 测试并确认 GREEN**
 
 Run:
 
@@ -154,7 +154,7 @@ Expected: `tests/test_dashboard.py` 全部通过，差异检查无输出。
 - Modify: `slope_sim/manual_demo.py:1-330`
 - Test: `tests/test_manual_demo.py`
 
-- [ ] **Step 1: 写出真实 PyBullet 车型、场地和回滚失败测试**
+- [x] **Step 1: 写出真实 PyBullet 车型、场地和回滚失败测试**
 
 ```python
 def test_apply_manual_switch_replaces_robot_without_rebuilding_terrain():
@@ -230,7 +230,7 @@ def test_failed_terrain_switch_rolls_back_to_previous_world(monkeypatch):
         p.disconnect(client_id)
 ```
 
-- [ ] **Step 2: 运行聚焦测试并确认 RED**
+- [x] **Step 2: 运行聚焦测试并确认 RED**
 
 Run:
 
@@ -240,7 +240,7 @@ conda run -n slope-sim python -m pytest tests/test_manual_demo.py -k 'apply_manu
 
 Expected: 因 `load_manual_world` 和 `apply_manual_switch_request` 不存在而失败。
 
-- [ ] **Step 3: 实现活动世界、车型替换和场地回滚事务**
+- [x] **Step 3: 实现活动世界、车型替换和场地回滚事务**
 
 在 `slope_sim/manual_demo.py` 中增加：
 
@@ -298,7 +298,7 @@ def apply_manual_switch_request(
 
 所有关键函数写简短中文 docstring；`load_manual_robot()` 在创建后续步骤失败时删除半成品车体。
 
-- [ ] **Step 4: 运行手动事务测试并确认 GREEN**
+- [x] **Step 4: 运行手动事务测试并确认 GREEN**
 
 Run:
 
@@ -317,7 +317,7 @@ Expected: `tests/test_manual_demo.py` 全部通过，差异检查无输出。
 - Test: `tests/test_manual_demo.py`
 - Test: `tests/test_dashboard.py`
 
-- [ ] **Step 1: 写出命令传播、优先级和历史清理的失败测试**
+- [x] **Step 1: 写出命令传播、优先级和历史清理的失败测试**
 
 ```python
 def test_merge_manual_commands_preserves_terrain_switch_request():
@@ -353,7 +353,7 @@ def test_terrain_switch_takes_priority_over_model_switch_and_reset():
         p.disconnect(client_id)
 ```
 
-- [ ] **Step 2: 运行聚焦测试并确认 RED**
+- [x] **Step 2: 运行聚焦测试并确认 RED**
 
 Run:
 
@@ -363,7 +363,7 @@ conda run -n slope-sim python -m pytest tests/test_manual_demo.py -k 'preserves_
 
 Expected: 地形请求未传播或切换接口尚未满足优先级断言。
 
-- [ ] **Step 3: 在 `run_manual_demo()` 中使用活动世界**
+- [x] **Step 3: 在 `run_manual_demo()` 中使用活动世界**
 
 初始化时创建 `TerrainSelection` 和 `ActiveManualWorld`，并给 Dashboard 开启两类切换控件：
 
@@ -390,7 +390,7 @@ dashboard = TelemetryDashboard(
 
 更新 `merge_manual_commands()` 和 `limit_manual_command_step()`，保证 `requested_terrain` 不丢失，且切换帧不混入 PyBullet 窗口键盘速度。
 
-- [ ] **Step 4: 运行 Dashboard 与手动模式回归测试**
+- [x] **Step 4: 运行 Dashboard 与手动模式回归测试**
 
 Run:
 
@@ -410,11 +410,11 @@ Expected: 两个测试文件全部通过，差异检查无输出。
 - Modify: `docs/阶段一交付报告.md`
 - Modify: `docs/superpowers/specs/2026-07-16-dashboard-runtime-switching-design.md`
 
-- [ ] **Step 1: 更新用户操作与架构说明**
+- [x] **Step 1: 更新用户操作与架构说明**
 
 文档必须明确：选择后点击应用；场地切换会执行 `resetSimulation()` 并重载当前车型；失败会回滚；CSV 时间连续但曲线清空；障碍物仍不在本次范围。
 
-- [ ] **Step 2: 运行全量测试、矩阵和静态检查**
+- [x] **Step 2: 运行全量测试、矩阵和静态检查**
 
 Run:
 
@@ -427,11 +427,10 @@ git diff --check
 
 Expected: 全量 pytest 通过，4×3 矩阵 12 项全部 `PASS`，编译和差异检查退出码为 0。
 
-- [ ] **Step 3: 启动独立审查线程**
+- [x] **Step 3: 启动独立审查线程**
 
 审查线程只读代码和测试，不修改文件，从需求完整性、逻辑正确性、边界情况、代码质量、测试覆盖和实际运行结果六个方面报告问题。主线程对确认的问题补失败测试、修复并重新执行 Step 2。
 
-- [ ] **Step 4: 报告 GUI 验证边界**
+- [x] **Step 4: 报告 GUI 验证边界**
 
 如果当前会话无 `DISPLAY`，明确说明自动测试和 DIRECT 事务已验证，但按钮视觉布局与真实窗口交互仍需要用户在桌面会话按更新后的人工清单验收。
-

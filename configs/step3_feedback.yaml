@@ -1,24 +1,24 @@
-# Step 3 反馈配置：使用履带代理、参考 5 度坡面、LiDAR 和完整摩擦/打滑遥测。
+# 阶段一斜面反馈配置：使用中置差速车和可调连续斜面。
 mode: direct
 slope_deg: 5.0
 duration_sec: 3.0
 time_step: 0.004166666666666667
-wheel_base: 0.5
-wheel_radius: 0.08
 target_linear_velocity: 0.25
 target_angular_velocity: 0.0
-robot_model: tracked_proxy
+robot_model: df_mid
 drive_model: physics
-terrain_model: twr_slope_5deg
+terrain_model: slope
 dashboard_enabled: true
 dashboard_update_hz: 5.0
 dashboard_smoothing_alpha: 0.25
 dashboard_plot_update_hz: 5.0
 dashboard_plot_window_sec: 20.0
-camera_distance: 7.0
-camera_yaw: 42.0
-camera_pitch: -36.0
-camera_target: [0.8, 0.0, 0.2]
+camera_distance: 6.0
+camera_yaw: 45.0
+camera_pitch: -35.0
+camera_target: [0.8, 0.0, 0.0]
+camera_follow_enabled: true
+camera_follow_view: front
 lidar_enabled: true
 lidar_ray_count: 31
 lidar_max_distance: 5.0
@@ -30,7 +30,7 @@ ground_spinning_friction: 0.0
 drive_lateral_friction: 2.0
 support_lateral_friction: 0.03
 drive_motor_force: 5.0
-track_anisotropic_friction: [2.0, 0.05, 0.05]
-track_drive_mode: all_rollers
+golf_seed: 0
+golf_relief: medium
 log_dir: results/logs
 figure_dir: results/figures

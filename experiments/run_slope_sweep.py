@@ -39,6 +39,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.config,
                 overrides={
                     "mode": "direct",
+                    "terrain_model": "slope",
                     "slope_deg": slope,
                     "duration_sec": args.duration_sec,
                 },

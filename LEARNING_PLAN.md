@@ -1,28 +1,14 @@
-# 大坝斜坡履带机器人 3D 仿真器学习计划
+# 【历史归档】大坝斜坡履带机器人 3D 仿真器学习计划
 
-本计划根据 mentor 新需求更新：目标不再只是“差速轮小车在斜坡上跑通”，而是逐步做成一个面向大坝斜坡场景的轻量级移动机器人仿真器。最终需要支持运行时三维位姿反馈、轮胎/履带速度与打滑指标、摩擦设置、传感器、障碍物避让和自动巡航。
+> 本文完整保留 2026-07-16 阶段一需求重构前的学习与调参记录。正文中的“当前”“可运行”和所有旧命令都只描述当时的提交，不能作为当前工作树入口。`tracked_proxy`、`diff_drive`、`dam_slope`、`twr_slope_5deg` 和 `configs/step4_dam_gui.yaml` 已从当前运行路径删除。
+>
+> 当前四种轮式车型、三类场地、命令和验收状态只以 `README.md`、`ARCHITECTURE.md`、`3d仿真平台需求规格.md` 和 `docs/阶段一交付报告.md` 为准。
 
-当前仓库已经跑通了 PyBullet 基础流程：平地/斜坡场景、简化差速底盘、DIRECT 仿真、GUI 手动控制、CSV 日志和轨迹图。接下来要从“运动学演示”逐步升级到“物理接触 + 传感器 + 自动巡航”。
+## 历史记录摘要
 
-当前实现路线更新：
+旧路线曾使用 `diff_drive` 和 `tracked_proxy` 研究平地、斜坡、大坝分段坡面、摩擦、接触、打滑、LiDAR 摘要和 Dashboard。相关内容现仅用于解释项目演进和 PyBullet 学习过程，不再代表产品路线，也不承诺其中命令在当前代码上运行。
 
-- `diff_drive + physics` 保留为平地教学、基础控制和 GUI 手动演示底座；当前是后驱布局，驱动轮在车体后方、单支撑轮在前方，形成更大的三角支撑。
-- `tracked_proxy` 保留为坡面姿态、履带打滑和大坝斜坡实验底座；它不是连续履带，但更适合观察坡面 pitch/roll。
-- 当前主线同时推进两套模型：二轮模型保证入门稳定性，履带代理保证坡面数据更可靠；阶段 3 斜坡反馈 build 使用 `configs/step3_feedback.yaml` 和 `twr_slope_5deg` 参考坡面，阶段 4 大坝 GUI build 使用 `configs/step4_dam_gui.yaml` 和 `dam_slope` 分段大坝场景。
-
-截至当前进度，已经完成的内容：
-
-- 阶段 1-3：平地/斜坡基础流程、物理驱动、履带代理、摩擦/接触/打滑反馈、速度/加速度/地形法向日志、反馈图和诊断摘要。
-- 阶段 4 第一版：`dam_slope` 大坝场景已经落地，包含坝脚、上坡、坝顶、下坡、出口平地、左右侧栏、相机跟随、Dashboard 曲线截图、车型切换和越界保护。
-- 阶段 4 调参：Step 4 默认履带各向异性摩擦已调为 `[2.0, 0.2, 0.05]`，直行稳定性比 `[2.0, 0.05, 0.05]` 更好；终点墙已移除，越界保护提前 `0.5m` 触发，避免顶墙空转。
-- 阶段 4 手动控制优化：已加入手动命令斜坡限制，Step 4 默认线速度加速度限制为 `1.5m/s^2`、角速度加速度限制为 `4.0rad/s^2`，用于减少松键急停/反向造成的打滑和接触力尖峰。
-- 阶段 6 的基础传感器已部分完成：LiDAR 距离摘要、地形 probe、越界状态、速度传感、加速度和 Dashboard 显示已经接入；自动避障控制器还没有实现。
-
-当前尚未完成：
-
-- Pure Pursuit / DWA / reactive avoidance 等自动巡航控制器。
-- 障碍物场景、任务 waypoint、全局路径和任务完成率统计。
-- heightfield 起伏地形和更真实的连续履带物理。
+## 历史正文（以下命令仅适用于旧提交）
 
 ## 新需求拆解
 
@@ -399,7 +385,7 @@ command_linear_velocity, command_angular_velocity
 
 目标：确认 Python、Conda、PyBullet 和 DIRECT 模式可用。
 
-当前可运行：
+历史记录中的命令（可能已失效；当前入口见 `README.md`）：
 
 ```bash
 conda activate slope-sim
@@ -420,7 +406,7 @@ pytest 全部通过
 
 目标：保留一个最小可运行版本，作为后续所有复杂功能的回归基线。
 
-当前可运行：
+历史记录中的命令（可能已失效；当前入口见 `README.md`）：
 
 ```bash
 python main.py --config configs/flat_demo.yaml --duration-sec 1 --mode direct
@@ -571,7 +557,7 @@ python main.py \
 
 - 已新增 `terrain_model: dam_slope`，由坝脚入口平地、上坡、坝顶平台、下坡和出口平地组成。
 - 已支持配置字段：`dam_toe_length`、`dam_slope_length`、`dam_crest_length`、`dam_exit_length`、`dam_width`、`dam_wall_height`、`terrain_guard_enabled`。
-- GUI build `configs/step4_dam_gui.yaml` 已接入相机跟随、Dashboard、LiDAR、车型切换、左右侧栏和越界保护。
+- GUI build `configs/step4_dam_gui.yaml` 已接入相机跟随、Dashboard、LiDAR、车型切换、左右侧栏和越界保护；曲线页已实现，但 Linux 控制稳定性仍在修复。
 - 终点墙已移除，出口保持开放；越界保护在物理边缘前 `0.5m` 触发，避免车体顶墙空转或刚过边缘才停车。
 - 当前 `tracked_proxy` 直行调参使用 `track_anisotropic_friction: [2.0, 0.2, 0.05]` 和 `track_drive_mode: all_rollers`。
 - 当前手动控制会按配置中的 `manual_linear_acceleration_limit` / `manual_angular_acceleration_limit` 平滑命令，避免从高速前进瞬间切到 0 或反向。
@@ -581,6 +567,7 @@ python main.py \
 - 大坝场景目前由多个静态 box 拼接，适合教学和趋势观察，不等于真实连续地形。
 - `tracked_proxy` 是多滚轮履带近似，接触点数量和接触面积不是一回事。
 - 手动测试时如果把最大线速度调到 `0.8m/s`，可以完整验证直行稳定性和出口越界保护；正式演示可先用 `0.25-0.5m/s` 更容易观察。
+- Dashboard 曲线和 PyBullet 仿真当前运行在同一 Python 主循环中；修复完成前，不把“打开曲线页后持续手动驾驶”视为已验收能力。
 
 后续从简单到复杂：
 
@@ -589,13 +576,13 @@ python main.py \
 3. 加边界、护栏、巡检障碍物：给自动避障准备场景。
 4. 分段坡面或 heightfield：模拟起伏和不平整。
 
-当前实际配置文件：
+历史配置文件（当前工作树已删除）：
 
 ```text
 configs/step4_dam_gui.yaml
 ```
 
-当前可运行：
+历史命令（当前工作树不可运行）：
 
 ```bash
 python main.py --config configs/step4_dam_gui.yaml --gui --manual
@@ -607,7 +594,7 @@ python main.py --config configs/step4_dam_gui.yaml --gui --manual
 - 机器人在坡面上运行时 `z`、`pitch`、接触力和打滑指标有变化。
 - 日志和图表仍能生成。
 - 只按前进时，车辆能跑完整个大坝路径，并在出口保护边界附近停车，不再顶着终点墙空转。
-- Dashboard 中“速度/命令”“打滑”“接触”“轨迹”曲线能用于判断漂移、打滑和接触冲击。
+- Dashboard 中“速度/命令”“打滑”“接触”“轨迹”曲线能用于判断漂移、打滑和接触冲击，并且打开任一曲线页后按钮、方向键和日志记录仍持续响应。
 
 ## 阶段 5：从二轮近似升级到履带近似
 
@@ -668,6 +655,8 @@ v=0.35, w=0      直行时左右打滑率接近 0
 
 当前判断：V2 已能作为坡面姿态和履带打滑实验底座使用；`diff_drive` 仍保留为平地教学和基础控制底座。两套模型需要分别用回归测试保护，避免转向卡顿、倒车翘头和打滑率尖峰再次出现。
 
+当前冻结期额外要求：履带物理参数和命令斜坡限制保持不变，先证明 Dashboard 曲线重绘不会阻塞手动控制，避免把 GUI 卡顿误判成履带动力不足或车辆断控。
+
 Step 4 最近一次调参结论：
 
 - `track_anisotropic_friction_y=0.05` 时，0.8m/s 直行会明显横漂，容易贴近侧栏。
@@ -693,7 +682,7 @@ python main.py --config configs/step4_dam_gui.yaml --mode direct --duration-sec 
 - IMU 近似：已记录车体姿态、角速度和由速度差分得到的线加速度/角加速度。
 - LiDAR/超声波近似：已用 `rayTestBatch` 记录 `lidar_min_distance`、`lidar_front_distance`、`lidar_left_distance`、`lidar_right_distance`。
 - 地形感知：已用 raycast 记录 `terrain_probe_valid`、`out_of_bounds`、`local_ground_height` 和地形法向。
-- Dashboard 已显示主要传感器/命令数据，并可以保存曲线截图。
+- Dashboard 已显示主要传感器/命令数据并可以保存曲线截图；实时曲线页的 Linux 控制稳定性修复完成后才算正式验收。
 
 后续建议补这些传感器能力：
 
@@ -703,7 +692,7 @@ python main.py --config configs/step4_dam_gui.yaml --mode direct --duration-sec 
 - Bumper：当前 `bumper_contact` 还偏粗糙，后续要区分“正常接地接触”和“障碍物/墙体碰撞”。
 - 相机：参考 `getCameraImage`，后续用于巡线或识别标记。
 
-当前可运行：
+历史命令（当前工作树不可运行）：
 
 ```bash
 python main.py --config configs/step4_dam_gui.yaml --mode direct --duration-sec 3
@@ -714,6 +703,7 @@ python main.py --config configs/step4_dam_gui.yaml --mode direct --duration-sec 
 - CSV 中有速度传感、加速度、LiDAR 距离、地形高度、地形法向和越界状态字段。
 - GUI 模式下可以通过 `--lidar-debug-draw` 显示 LiDAR 射线。
 - 靠近侧栏或终点边界时，LiDAR 距离和 `out_of_bounds` 能反映环境状态。
+- 打开任一 Dashboard 曲线页后，遥测、控制命令和 CSV 日志仍连续更新。
 
 注意：`--sensors` 当前还没有；现在通过配置中的 `lidar_enabled` 或命令行 `--lidar` 控制 LiDAR。
 
@@ -917,7 +907,7 @@ python main.py \
 - 使用 `diff_drive + physics` 作为平地教学和基础控制模型。
 - 使用 `tracked_proxy + physics + dam_slope` 作为大坝坡面手动演示模型。
 - 继续完善轮速、接触力、摩擦、打滑、LiDAR、越界和 Dashboard 诊断。
-- 下一步优先做简单反应式避障，而不是直接上复杂 DWA。
+- GUI 稳定性冻结解除后，再优先做简单反应式避障，而不是直接上复杂 DWA。
 
 中期可行：
 

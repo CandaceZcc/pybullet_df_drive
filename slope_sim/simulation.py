@@ -15,7 +15,8 @@ from slope_sim.config import ExperimentConfig
 from slope_sim.diagnostics import compute_diagnostic_summary, write_diagnostic_summary
 from slope_sim.logger import CsvSimulationLogger
 from slope_sim.metrics import compute_tracking_metrics
-from slope_sim.robot import DifferentialDriveRobot
+from slope_sim.model_registry import get_robot_model
+from slope_sim.robot import DifferentialDriveRobot, create_robot
 from slope_sim.scene import SceneInfo, configure_gui_visualizer, create_slope_scene, probe_terrain, update_follow_camera
 from slope_sim.sensors import LidarSummary, read_lidar
 
@@ -49,13 +50,8 @@ def run_experiment(config: ExperimentConfig) -> SimulationResult:
             config.ground_rolling_friction,
             config.ground_spinning_friction,
             config.terrain_model,
-            config.dam_toe_length,
-            config.dam_slope_length,
-            config.dam_crest_length,
-            config.dam_exit_length,
-            config.dam_width,
-            config.dam_wall_height,
-            config.terrain_guard_enabled,
+            golf_seed=config.golf_seed,
+            golf_relief=config.golf_relief,
         )
         if config.mode == "gui":
             configure_gui_visualizer(
@@ -65,17 +61,14 @@ def run_experiment(config: ExperimentConfig) -> SimulationResult:
                 config.camera_pitch,
                 config.camera_target,
             )
-        robot = DifferentialDriveRobot(
+        robot = create_robot(
             client_id=client_id,
-            urdf_path=_robot_urdf_path(config.robot_model),
-            wheel_base=config.wheel_base,
-            wheel_radius=config.wheel_radius,
+            robot_model=config.robot_model,
             start_x=scene.spawn_position[0],
             start_y=scene.spawn_position[1],
             base_height=scene.spawn_position[2] + _robot_base_height(config.robot_model),
+            start_orientation=scene.spawn_orientation,
             drive_motor_force=config.drive_motor_force,
-            track_anisotropic_friction=config.track_anisotropic_friction,
-            track_drive_mode=config.track_drive_mode,
         )
         robot.apply_drive_friction(config.drive_lateral_friction, config.support_lateral_friction)
         logger = CsvSimulationLogger(config.log_dir, prefix=f"slope_{config.slope_deg:g}")
@@ -84,7 +77,7 @@ def run_experiment(config: ExperimentConfig) -> SimulationResult:
         # 当前阶段使用固定 v/w 命令；后续路径跟踪会在这里替换成控制器输出。
         for step in range(steps):
             t = step * config.time_step
-            robot.command_twist(config.target_linear_velocity, config.target_angular_velocity)
+            robot.command_twist(config.target_linear_velocity, config.target_angular_velocity, dt=config.time_step)
             if config.drive_model == "physics":
                 p.stepSimulation(physicsClientId=client_id)
                 lidar_summary = _read_lidar_for_robot(client_id, robot, config)
@@ -103,7 +96,7 @@ def run_experiment(config: ExperimentConfig) -> SimulationResult:
                     lidar_summary=lidar_summary,
                 )
             else:
-                state = robot.step_kinematic(dt=config.time_step, slope_deg=config.slope_deg, t=t)
+                state = robot.step_kinematic(dt=config.time_step, slope_deg=scene.slope_deg, t=t)
                 p.stepSimulation(physicsClientId=client_id)
             if config.mode == "gui" and config.camera_follow_enabled:
                 update_follow_camera(
@@ -147,16 +140,12 @@ def run_experiment(config: ExperimentConfig) -> SimulationResult:
 
 def _robot_urdf_path(robot_model: str) -> Path:
     """根据配置选择机器人 URDF。"""
-    if robot_model == "tracked_proxy":
-        return Path("urdf/tracked_proxy.urdf")
-    return Path("urdf/diff_drive.urdf")
+    return get_robot_model(robot_model).urdf_path
 
 
 def _robot_base_height(robot_model: str) -> float:
     """根据机器人模型选择贴近地面的初始车体高度。"""
-    if robot_model == "tracked_proxy":
-        return 0.16
-    return 0.14
+    return get_robot_model(robot_model).base_height
 
 
 def _read_lidar_for_robot(client_id: int, robot: DifferentialDriveRobot, config: ExperimentConfig) -> LidarSummary:
@@ -181,7 +170,16 @@ def _read_lidar_for_robot(client_id: int, robot: DifferentialDriveRobot, config:
 def _probe_terrain_for_robot(client_id: int, robot: DifferentialDriveRobot, scene: SceneInfo | None = None):
     """用机器人当前位置做一次向下地形探测。"""
     position, _orientation = p.getBasePositionAndOrientation(robot.robot_id, physicsClientId=client_id)
-    return probe_terrain(client_id, float(position[0]), float(position[1]), bounds=None if scene is None else scene.bounds)
+    # PyBullet 单次射线只返回最近命中；向车体侧面偏移可避免先命中机器人自身。
+    probe_y = float(position[1]) + 0.45
+    if scene is not None and scene.bounds is not None and probe_y > scene.bounds.max_y:
+        probe_y = float(position[1]) - 0.45
+    return probe_terrain(
+        client_id,
+        float(position[0]),
+        probe_y,
+        bounds=None if scene is None else scene.bounds,
+    )
 
 
 def plot_trajectory(frame: pd.DataFrame, figure_dir: str | Path, prefix: str = "run") -> Path:

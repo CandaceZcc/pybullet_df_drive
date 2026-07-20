@@ -14,8 +14,22 @@ from typing import Mapping, Sequence
 import pandas as pd
 
 
-DASHBOARD_WINDOW_TITLE = "Step 2 Telemetry Dashboard"
-DEFAULT_MANUAL_PREFIX = "manual_dam_slope_tracked_proxy_10_"
+DASHBOARD_WINDOW_TITLE = "Stage 1 Robot Evaluation Dashboard"
+DASHBOARD_LOGICAL_WIDTH = 420
+DEFAULT_MANUAL_PREFIX = "manual_golf_heightfield_active_steering_4wd_0_"
+DASHBOARD_TAB_X_OFFSETS = {
+    "data": 34,
+    "trajectory": 82,
+    "speed": 145,
+    "slip": 207,
+    "contact": 255,
+}
+DASHBOARD_TAB_Y_OFFSET = 62
+DASHBOARD_CONTROL_SCROLL_BOTTOM_OFFSET = 80
+DASHBOARD_UP_BUTTON_BOTTOM_OFFSET = 156
+DASHBOARD_CONTROL_SCROLL_DOWN_STEPS = 20
+DASHBOARD_CONTROL_SCROLL_DELAY_MS = 20
+DASHBOARD_CONTROL_SCROLL_SETTLE_SEC = 0.2
 
 
 @dataclass(frozen=True)
@@ -46,9 +60,35 @@ def display_is_available(env: Mapping[str, str] | None = None) -> bool:
     return bool(values.get("DISPLAY") or values.get("WAYLAND_DISPLAY"))
 
 
+def dashboard_geometry_scale(geometry: WindowGeometry) -> float:
+    """由物理窗口宽度推导 Qt 逻辑像素到 xdotool 坐标的缩放率。"""
+    return geometry.width / DASHBOARD_LOGICAL_WIDTH
+
+
 def dashboard_up_button_point(geometry: WindowGeometry) -> tuple[int, int]:
-    """按当前 Dashboard 布局估算上箭头按钮中心点。"""
-    return geometry.x + geometry.width - 136, geometry.y + geometry.height - 175
+    """返回控制区滚到底后，侧栏中轴上的上箭头中心点。"""
+    scale = dashboard_geometry_scale(geometry)
+    bottom_offset = round(DASHBOARD_UP_BUTTON_BOTTOM_OFFSET * scale)
+    return geometry.x + geometry.width // 2, geometry.y + geometry.height - bottom_offset
+
+
+def dashboard_control_scroll_point(geometry: WindowGeometry) -> tuple[int, int]:
+    """返回下方控制滚动视口内用于发送滚轮事件的稳定位置。"""
+    scale = dashboard_geometry_scale(geometry)
+    bottom_offset = round(DASHBOARD_CONTROL_SCROLL_BOTTOM_OFFSET * scale)
+    return (
+        geometry.x + geometry.width // 2,
+        geometry.y + geometry.height - bottom_offset,
+    )
+
+
+def dashboard_plot_tab_point(geometry: WindowGeometry, plot_tab: str) -> tuple[int, int]:
+    """按当前标签布局估算数据页或指定曲线页的标签中心点。"""
+    scale = dashboard_geometry_scale(geometry)
+    return (
+        geometry.x + round(DASHBOARD_TAB_X_OFFSETS[plot_tab] * scale),
+        geometry.y + round(DASHBOARD_TAB_Y_OFFSET * scale),
+    )
 
 
 def dashboard_window_ids(search_output: str) -> list[str]:
@@ -117,9 +157,44 @@ def parse_geometry(output: str) -> WindowGeometry:
     )
 
 
+def parse_xwininfo_geometry(output: str) -> WindowGeometry:
+    """解析 xwininfo 客户区的绝对原点和物理尺寸。"""
+    fields = {
+        "Absolute upper-left X": "x",
+        "Absolute upper-left Y": "y",
+        "Width": "width",
+        "Height": "height",
+    }
+    values: dict[str, int] = {}
+    for line in output.splitlines():
+        if ":" not in line:
+            continue
+        key, raw_value = line.strip().split(":", 1)
+        field = fields.get(key)
+        if field is not None:
+            values[field] = int(raw_value.strip())
+    return WindowGeometry(
+        x=values["x"],
+        y=values["y"],
+        width=values["width"],
+        height=values["height"],
+    )
+
+
 def _run_xdotool(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
     """调用 xdotool，并把失败信息保留给调用方打印。"""
     return subprocess.run(["xdotool", *args], check=True, text=True, capture_output=True)
+
+
+def _get_window_geometry(window_id: str) -> WindowGeometry:
+    """用 xwininfo 获取 Qt 客户区几何，避开 XWayland 重父化坐标。"""
+    result = subprocess.run(
+        ["xwininfo", "-id", window_id],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    return parse_xwininfo_geometry(result.stdout)
 
 
 def _find_dashboard_window(timeout_sec: float) -> str:
@@ -141,15 +216,37 @@ def _find_dashboard_window(timeout_sec: float) -> str:
 
 
 def _click_dashboard_up(window_id: str, hold_sec: float) -> None:
-    """把鼠标移到 Dashboard 上箭头按钮位置，并按住一小段时间。"""
-    geometry_output = _run_xdotool(["getwindowgeometry", "--shell", window_id]).stdout
-    geometry = parse_geometry(geometry_output)
-    x, y = dashboard_up_button_point(geometry)
+    """先滚到底部控制组，再按住 Dashboard 上箭头一小段时间。"""
+    geometry = _get_window_geometry(window_id)
+    scroll_x, scroll_y = dashboard_control_scroll_point(geometry)
+    up_x, up_y = dashboard_up_button_point(geometry)
     _run_xdotool(["windowactivate", window_id])
-    _run_xdotool(["mousemove", str(x), str(y)])
+    _run_xdotool(["mousemove", str(scroll_x), str(scroll_y)])
+    _run_xdotool(
+        [
+            "click",
+            "--repeat",
+            str(DASHBOARD_CONTROL_SCROLL_DOWN_STEPS),
+            "--delay",
+            str(DASHBOARD_CONTROL_SCROLL_DELAY_MS),
+            "5",
+        ]
+    )
+    time.sleep(DASHBOARD_CONTROL_SCROLL_SETTLE_SEC)
+    _run_xdotool(["mousemove", str(up_x), str(up_y)])
     _run_xdotool(["mousedown", "1"])
     time.sleep(hold_sec)
     _run_xdotool(["mouseup", "1"])
+
+
+def _select_dashboard_plot_tab(window_id: str, plot_tab: str) -> None:
+    """激活 Dashboard 并点击指定曲线标签，复现曲线可见时的控制链路。"""
+    geometry = _get_window_geometry(window_id)
+    x, y = dashboard_plot_tab_point(geometry, plot_tab)
+    _run_xdotool(["windowactivate", window_id])
+    _run_xdotool(["mousemove", str(x), str(y)])
+    _run_xdotool(["click", "1"])
+    time.sleep(0.5)
 
 
 def _send_dashboard_up_key(window_id: str, hold_sec: float) -> None:
@@ -162,11 +259,17 @@ def _send_dashboard_up_key(window_id: str, hold_sec: float) -> None:
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """解析 Dashboard 屏幕验收参数。"""
-    parser = argparse.ArgumentParser(description="Verify dashboard manual control moves the tracked school-bus proxy.")
-    parser.add_argument("--config", default="configs/step4_dam_gui.yaml", help="GUI manual config to run.")
+    parser = argparse.ArgumentParser(description="Verify stage-1 dashboard manual control moves the selected wheeled robot.")
+    parser.add_argument("--config", default="configs/stage1_golf_gui.yaml", help="GUI manual config to run.")
     parser.add_argument("--duration-sec", type=float, default=4.0, help="Manual run duration.")
     parser.add_argument("--hold-sec", type=float, default=2.0, help="How long to hold the dashboard up button.")
     parser.add_argument("--input-method", choices=["key", "button"], default="key", help="Dashboard screen control method.")
+    parser.add_argument(
+        "--plot-tab",
+        choices=list(DASHBOARD_TAB_X_OFFSETS),
+        default="data",
+        help="Dashboard data/plot tab to activate before sending control input.",
+    )
     parser.add_argument("--window-timeout-sec", type=float, default=12.0, help="Seconds to wait for dashboard window.")
     parser.add_argument("--log-dir", type=Path, default=Path("results/logs"), help="Manual log directory.")
     return parser.parse_args(argv)
@@ -180,6 +283,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     if shutil.which("xdotool") is None:
         print("xdotool is required for screen control.", file=sys.stderr)
+        return 2
+    if shutil.which("xwininfo") is None:
+        print("xwininfo is required for Dashboard client-area geometry.", file=sys.stderr)
         return 2
 
     started_at = time.time()
@@ -196,6 +302,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     process = subprocess.Popen(command)
     try:
         window_id = _find_dashboard_window(args.window_timeout_sec)
+        _select_dashboard_plot_tab(window_id, args.plot_tab)
         if args.input_method == "button":
             _click_dashboard_up(window_id, args.hold_sec)
         else:

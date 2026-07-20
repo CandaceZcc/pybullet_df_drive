@@ -1,4 +1,4 @@
-# 遥测模块：统一整理小车位姿、速度、轮/履带反馈、接触和传感器数据。
+# 遥测模块：统一整理小车位姿、轮式驱动反馈、接触和传感器数据。
 from __future__ import annotations
 
 import math
@@ -89,6 +89,12 @@ class RobotTelemetry:
     right_target_drive_speed: float = 0.0
     left_actual_drive_speed: float = 0.0
     right_actual_drive_speed: float = 0.0
+    front_left_actual_drive_speed: float = math.nan
+    front_right_actual_drive_speed: float = math.nan
+    rear_left_actual_drive_speed: float = math.nan
+    rear_right_actual_drive_speed: float = math.nan
+    front_left_actual_steering_angle: float = math.nan
+    front_right_actual_steering_angle: float = math.nan
     left_track_surface_speed: float = 0.0
     right_track_surface_speed: float = 0.0
     left_body_track_speed: float = 0.0
@@ -120,8 +126,8 @@ class RobotTelemetry:
     left_slip_valid: bool = True
     right_slip_valid: bool = True
     body_lateral_slip_speed: float = 0.0
-    robot_model: str = "diff_drive"
-    terrain_type: str = "box_slope"
+    robot_model: str = "df_back"
+    terrain_type: str = "flat"
     terrain_probe_valid: bool = False
     out_of_bounds: bool = False
     local_ground_height: float = math.nan

@@ -1,4 +1,4 @@
-# 机器人模块：加载差速底盘 URDF，并提供车体速度控制和状态记录。
+# 机器人模块：加载阶段一轮式底盘，并提供差速/主动转向控制和真实状态反馈。
 from __future__ import annotations
 
 import math
@@ -8,13 +8,30 @@ from pathlib import Path
 import pybullet as p
 
 from slope_sim.controller import wheel_speeds_from_twist
+from slope_sim.model_registry import RobotModelSpec, get_robot_model
 from slope_sim.sensors import LidarSummary
 from slope_sim.telemetry import RobotTelemetry, TerrainProbe, body_frame_velocity, slip_is_valid, slip_ratio, track_body_speeds
 
 
-TRACK_ROLLER_RADIUS = 0.07
-DEFAULT_TRACK_ANISOTROPIC_FRICTION = (2.0, 0.05, 0.05)
 CONTACT_FORCE_EPSILON = 1e-6
+
+
+def _require_finite_values(name: str, values: tuple[float, ...]) -> None:
+    """在调用 PyBullet 前拒绝非有限命令，避免污染物理状态。"""
+    for index, value in enumerate(values):
+        try:
+            finite = math.isfinite(float(value))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name}[{index}] must be finite") from exc
+        if not finite:
+            raise ValueError(f"{name}[{index}] must be finite")
+
+
+def _require_positive_finite(name: str, value: float) -> None:
+    """校验物理步长等必须为正的有限标量。"""
+    _require_finite_values(name, (value,))
+    if value <= 0:
+        raise ValueError(f"{name} must be positive")
 
 
 @dataclass(frozen=True)
@@ -46,11 +63,6 @@ class RobotState(RobotTelemetry):
     """兼容旧代码的机器人状态类型，字段来自统一遥测结构。"""
 
 
-def drive_targets_from_track_surface_speed(surface_speed: float, joint_radii: list[float]) -> list[float]:
-    """把同一条履带的线速度换算成不同半径滚轮的目标角速度。"""
-    return [surface_speed / radius for radius in joint_radii]
-
-
 class DifferentialDriveRobot:
     """差速底盘封装，隐藏 URDF 加载、轮关节查找和位姿更新细节。"""
 
@@ -63,9 +75,9 @@ class DifferentialDriveRobot:
         start_x: float = 0.0,
         start_y: float = 0.0,
         base_height: float = 0.18,
+        start_orientation: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 1.0),
         drive_motor_force: float = 5.0,
-        track_anisotropic_friction: tuple[float, float, float] = DEFAULT_TRACK_ANISOTROPIC_FRICTION,
-        track_drive_mode: str = "all_rollers",
+        model_spec: RobotModelSpec | None = None,
     ) -> None:
         """加载机器人模型，并初始化运动学状态。"""
         self.client_id = client_id
@@ -73,8 +85,7 @@ class DifferentialDriveRobot:
         self.wheel_radius = wheel_radius
         self.base_height = base_height
         self.drive_motor_force = drive_motor_force
-        self.track_anisotropic_friction = tuple(float(value) for value in track_anisotropic_friction)
-        self.track_drive_mode = track_drive_mode
+        self.model_spec = model_spec
         self.x = start_x
         self.y = start_y
         self.yaw = 0.0
@@ -91,19 +102,27 @@ class DifferentialDriveRobot:
         self.robot_id = p.loadURDF(
             str(urdf_path),
             basePosition=[start_x, start_y, base_height],
+            baseOrientation=start_orientation,
             physicsClientId=client_id,
         )
         self.joint_name_to_index = self._collect_joint_indices()
         self.left_joint, self.right_joint = self._find_wheel_joints()
         self.drive_center_x = self._drive_center_x()
         self.left_drive_joints, self.right_drive_joints = self._build_drive_joints()
-        self.uses_tracked_proxy = self._has_tracked_proxy_rollers()
+        if self.model_spec is not None:
+            self.drive_wheel_joint_indices = tuple(
+                self.joint_name_to_index[name] for name in self.model_spec.drive_joint_names
+            )
+        else:
+            self.drive_wheel_joint_indices = tuple(
+                drive.joint_index for drive in self.left_drive_joints + self.right_drive_joints
+            )
         self.left_contact_links, self.right_contact_links = self._find_drive_side_links()
         self.support_links = self._find_support_links()
         self._disable_passive_drive_joints()
 
     def _collect_joint_indices(self) -> dict[str, int]:
-        """建立关节名到索引的映射，便于 tracked_proxy 查找前后滚轮。"""
+        """建立关节名到索引的映射，控制器只依赖语义名称而不硬编码索引。"""
         joints: dict[str, int] = {}
         for joint_index in range(p.getNumJoints(self.robot_id, physicsClientId=self.client_id)):
             info = p.getJointInfo(self.robot_id, joint_index, physicsClientId=self.client_id)
@@ -112,34 +131,36 @@ class DifferentialDriveRobot:
 
     def _find_wheel_joints(self) -> tuple[int, int]:
         """从 URDF 里找到左右轮关节，后续才能分别设置轮速。"""
-        return self.joint_name_to_index["left_wheel_joint"], self.joint_name_to_index["right_wheel_joint"]
+        if self.model_spec is not None:
+            left_name = next(name for name in self.model_spec.drive_joint_names if "left" in name)
+            right_name = next(name for name in self.model_spec.drive_joint_names if "right" in name)
+            return self.joint_name_to_index[left_name], self.joint_name_to_index[right_name]
+        left_name = "left_drive_wheel_joint" if "left_drive_wheel_joint" in self.joint_name_to_index else "left_wheel_joint"
+        right_name = "right_drive_wheel_joint" if "right_drive_wheel_joint" in self.joint_name_to_index else "right_wheel_joint"
+        return self.joint_name_to_index[left_name], self.joint_name_to_index[right_name]
 
     def _build_drive_joints(self) -> tuple[list[DriveJoint], list[DriveJoint]]:
-        """为左右两侧创建驱动组；tracked_proxy 会把前后滚轮也纳入履带联动。"""
+        """按注册表语义名称建立左右驱动组。"""
+        if self.model_spec is not None:
+            left = [
+                DriveJoint(self.joint_name_to_index[name], self.wheel_radius)
+                for name in self.model_spec.drive_joint_names
+                if "left" in name
+            ]
+            right = [
+                DriveJoint(self.joint_name_to_index[name], self.wheel_radius)
+                for name in self.model_spec.drive_joint_names
+                if "right" in name
+            ]
+            return left, right
         left = [DriveJoint(self.left_joint, self.wheel_radius)]
         right = [DriveJoint(self.right_joint, self.wheel_radius)]
-        if self.track_drive_mode == "center_only":
-            return left, right
-        for joint_name in ("left_front_roller_joint", "left_back_roller_joint"):
-            if joint_name in self.joint_name_to_index:
-                left.append(DriveJoint(self.joint_name_to_index[joint_name], TRACK_ROLLER_RADIUS))
-        for joint_name in ("right_front_roller_joint", "right_back_roller_joint"):
-            if joint_name in self.joint_name_to_index:
-                right.append(DriveJoint(self.joint_name_to_index[joint_name], TRACK_ROLLER_RADIUS))
         return left, right
-
-    def _has_tracked_proxy_rollers(self) -> bool:
-        """判断 URDF 是否是带前后滚轮的履带代理，即使滚轮不参与驱动也算履带。"""
-        roller_names = {
-            "left_front_roller_joint",
-            "left_back_roller_joint",
-            "right_front_roller_joint",
-            "right_back_roller_joint",
-        }
-        return bool(roller_names & set(self.joint_name_to_index))
 
     def _drive_center_x(self) -> float:
         """读取左右主驱动轮在车体坐标下的 x 位置，侧滑估计用它修正参考点。"""
+        if self.model_spec is not None:
+            return self.model_spec.drive_center_x
         left_info = p.getJointInfo(self.robot_id, self.left_joint, physicsClientId=self.client_id)
         right_info = p.getJointInfo(self.robot_id, self.right_joint, physicsClientId=self.client_id)
         return (float(left_info[14][0]) + float(right_info[14][0])) / 2.0
@@ -170,7 +191,7 @@ class DifferentialDriveRobot:
         return support_links
 
     def _disable_passive_drive_joints(self) -> None:
-        """关闭非驱动连续关节的默认电机，让 tracked_proxy 的滚轮能自由转动。"""
+        """关闭非驱动转动关节的默认电机，交由具体控制器接管。"""
         drive_joint_indices = {drive.joint_index for drive in self.left_drive_joints + self.right_drive_joints}
         for joint_index in range(p.getNumJoints(self.robot_id, physicsClientId=self.client_id)):
             if joint_index in drive_joint_indices:
@@ -196,10 +217,6 @@ class DifferentialDriveRobot:
                 "spinningFriction": 0.02,
                 "physicsClientId": self.client_id,
             }
-            if self.uses_tracked_proxy:
-                # 履带车转向依赖横向滑移；各向异性摩擦让前后方向牵引强、横向更容易滑。
-                kwargs["anisotropicFriction"] = self.track_anisotropic_friction
-                kwargs["frictionAnchor"] = 1
             p.changeDynamics(self.robot_id, link_index, **kwargs)
         for link_index in self.support_links:
             # 支撑轮只负责托住车体，不提供牵引；低摩擦能减少原地转向时的拖拽。
@@ -212,8 +229,41 @@ class DifferentialDriveRobot:
                 physicsClientId=self.client_id,
             )
 
-    def command_twist(self, linear_velocity: float, angular_velocity: float) -> tuple[float, float]:
+    def command_wheel_speeds(
+        self,
+        drive_wheel_speeds: tuple[float, ...],
+        steering_wheel_speeds: tuple[float, ...] = (),
+        dt: float = 1.0 / 240.0,
+    ) -> tuple[float, ...]:
+        """直接下发两个差速驱动轮角速度；差速车型不接受转向轮命令。"""
+        if len(drive_wheel_speeds) != 2:
+            raise ValueError("differential robot requires two drive wheel speeds")
+        if steering_wheel_speeds:
+            raise ValueError("differential robot does not accept steering wheel speeds")
+        _require_finite_values("drive_wheel_speeds", drive_wheel_speeds)
+        _require_positive_finite("dt", dt)
+        self.left_wheel_speed = float(drive_wheel_speeds[0])
+        self.right_wheel_speed = float(drive_wheel_speeds[1])
+        for drive, speed in zip(self.left_drive_joints + self.right_drive_joints, drive_wheel_speeds):
+            p.setJointMotorControl2(
+                self.robot_id,
+                drive.joint_index,
+                controlMode=p.VELOCITY_CONTROL,
+                targetVelocity=self.physics_drive_sign * float(speed),
+                force=self.drive_motor_force,
+                physicsClientId=self.client_id,
+            )
+        return tuple(float(speed) for speed in drive_wheel_speeds)
+
+    def command_twist(
+        self,
+        linear_velocity: float,
+        angular_velocity: float,
+        dt: float = 1.0 / 240.0,
+    ) -> tuple[float, float]:
         """接收车体速度 v/w，并转换成左右轮的目标角速度。"""
+        _require_finite_values("twist", (linear_velocity, angular_velocity))
+        _require_positive_finite("dt", dt)
         self.linear_velocity = linear_velocity
         self.angular_velocity = angular_velocity
         self.left_wheel_speed, self.right_wheel_speed = wheel_speeds_from_twist(
@@ -222,34 +272,28 @@ class DifferentialDriveRobot:
             self.wheel_base,
             self.wheel_radius,
         )
-        left_surface_speed = self.left_wheel_speed * self.wheel_radius
-        right_surface_speed = self.right_wheel_speed * self.wheel_radius
-        commands = [
-            *zip(
-                self.left_drive_joints,
-                drive_targets_from_track_surface_speed(
-                    left_surface_speed,
-                    [drive.radius for drive in self.left_drive_joints],
-                ),
-            ),
-            *zip(
-                self.right_drive_joints,
-                drive_targets_from_track_surface_speed(
-                    right_surface_speed,
-                    [drive.radius for drive in self.right_drive_joints],
-                ),
-            ),
-        ]
-        for drive, speed in commands:
-            p.setJointMotorControl2(
-                self.robot_id,
-                drive.joint_index,
-                controlMode=p.VELOCITY_CONTROL,
-                targetVelocity=self.physics_drive_sign * speed,
-                force=self.drive_motor_force,
-                physicsClientId=self.client_id,
-            )
+        self.command_wheel_speeds((self.left_wheel_speed, self.right_wheel_speed), dt=dt)
         return self.left_wheel_speed, self.right_wheel_speed
+
+    def read_drive_wheel_speeds(self) -> tuple[float, ...]:
+        """按注册表顺序读取 PyBullet 实际驱动轮角速度。"""
+        if self.model_spec is not None:
+            joint_names = self.model_spec.drive_joint_names
+        else:
+            joint_names = tuple(
+                name
+                for name in ("left_drive_wheel_joint", "right_drive_wheel_joint", "left_wheel_joint", "right_wheel_joint")
+                if name in self.joint_name_to_index
+            )[:2]
+        return tuple(
+            self.physics_drive_sign
+            * float(p.getJointState(self.robot_id, self.joint_name_to_index[name], physicsClientId=self.client_id)[1])
+            for name in joint_names
+        )
+
+    def read_steering_wheel_angles(self) -> tuple[float, ...]:
+        """差速车型没有独立转向轮。"""
+        return ()
 
     def step_kinematic(self, dt: float, slope_deg: float, t: float) -> RobotState:
         """用差速车运动学更新位姿，保证 DIRECT 批量实验稳定可重复。"""
@@ -338,8 +382,8 @@ class DifferentialDriveRobot:
         ground_rolling_friction: float = 0.02,
         ground_spinning_friction: float = 0.0,
         support_lateral_friction: float = 0.03,
-        robot_model: str = "diff_drive",
-        terrain_type: str = "box_slope",
+        robot_model: str = "df_back",
+        terrain_type: str = "flat",
         terrain_probe: TerrainProbe | None = None,
         lidar_summary: LidarSummary | None = None,
     ) -> RobotState:
@@ -357,6 +401,16 @@ class DifferentialDriveRobot:
 
         left_joint_state = p.getJointState(self.robot_id, self.left_joint, physicsClientId=self.client_id)
         right_joint_state = p.getJointState(self.robot_id, self.right_joint, physicsClientId=self.client_id)
+        actual_drive_speeds = self.read_drive_wheel_speeds()
+        actual_steering_angles = self.read_steering_wheel_angles()
+        if len(actual_drive_speeds) == 4:
+            front_left_speed, front_right_speed, rear_left_speed, rear_right_speed = actual_drive_speeds
+        else:
+            front_left_speed = front_right_speed = rear_left_speed = rear_right_speed = math.nan
+        if len(actual_steering_angles) == 2:
+            front_left_steering, front_right_steering = actual_steering_angles
+        else:
+            front_left_steering = front_right_steering = math.nan
         # 日志里仍按项目约定记录：正轮速表示车体向前。
         left_position = self.physics_drive_sign * float(left_joint_state[0])
         left_actual_speed = self.physics_drive_sign * float(left_joint_state[1])
@@ -375,7 +429,7 @@ class DifferentialDriveRobot:
         right_slip_valid = slip_is_valid(right_track_surface_speed, right_body_track_speed)
         lidar = lidar_summary or LidarSummary()
         terrain = terrain_probe or TerrainProbe()
-        anisotropic = self.track_anisotropic_friction if self.uses_tracked_proxy else (0.0, 0.0, 0.0)
+        anisotropic = (0.0, 0.0, 0.0)
 
         return RobotState(
             t=t,
@@ -416,6 +470,12 @@ class DifferentialDriveRobot:
             right_target_drive_speed=self.right_wheel_speed,
             left_actual_drive_speed=left_actual_speed,
             right_actual_drive_speed=right_actual_speed,
+            front_left_actual_drive_speed=front_left_speed,
+            front_right_actual_drive_speed=front_right_speed,
+            rear_left_actual_drive_speed=rear_left_speed,
+            rear_right_actual_drive_speed=rear_right_speed,
+            front_left_actual_steering_angle=front_left_steering,
+            front_right_actual_steering_angle=front_right_steering,
             left_track_surface_speed=left_track_surface_speed,
             right_track_surface_speed=right_track_surface_speed,
             left_body_track_speed=left_body_track_speed,
@@ -542,3 +602,139 @@ def _contact_friction_magnitude(contact: tuple[object, ...]) -> float:
 
 def _wrap_angle(angle: float) -> float:
     return (angle + math.pi) % (2.0 * math.pi) - math.pi
+
+
+class ActiveSteeringRobot(DifferentialDriveRobot):
+    """四轮独立驱动、前轮主动转向模型，借鉴 Bullet racecar 的关节层级。"""
+
+    MAX_STEERING_RATE = 2.0
+
+    def __init__(self, *args, model_spec: RobotModelSpec, **kwargs) -> None:
+        super().__init__(*args, model_spec=model_spec, **kwargs)
+        self.steering_joint_indices = tuple(self.joint_name_to_index[name] for name in model_spec.steering_joint_names)
+        self.max_steering_angle = model_spec.max_steering_angle
+        self._steering_targets = [0.0, 0.0]
+        for joint_index in self.steering_joint_indices:
+            p.setJointMotorControl2(
+                self.robot_id,
+                joint_index,
+                controlMode=p.POSITION_CONTROL,
+                targetPosition=0.0,
+                force=self.drive_motor_force,
+                physicsClientId=self.client_id,
+            )
+
+    def command_wheel_speeds(
+        self,
+        drive_wheel_speeds: tuple[float, ...],
+        steering_wheel_speeds: tuple[float, ...] = (),
+        dt: float = 1.0 / 240.0,
+    ) -> tuple[float, ...]:
+        """积分两个前轮转向速度，并给四个驱动轮设置独立速度目标。"""
+        if len(drive_wheel_speeds) != 4:
+            raise ValueError("active steering robot requires four drive wheel speeds")
+        if len(steering_wheel_speeds) != 2:
+            raise ValueError("active steering robot requires two steering wheel speeds")
+        _require_finite_values("drive_wheel_speeds", drive_wheel_speeds)
+        _require_finite_values("steering_wheel_speeds", steering_wheel_speeds)
+        _require_positive_finite("dt", dt)
+        self.left_wheel_speed = float(drive_wheel_speeds[0])
+        self.right_wheel_speed = float(drive_wheel_speeds[1])
+        self._steering_targets = [
+            max(-self.max_steering_angle, min(self.max_steering_angle, target + float(rate) * dt))
+            for target, rate in zip(self._steering_targets, steering_wheel_speeds)
+        ]
+        for joint_index, target in zip(self.steering_joint_indices, self._steering_targets):
+            p.setJointMotorControl2(
+                self.robot_id,
+                joint_index,
+                controlMode=p.POSITION_CONTROL,
+                targetPosition=target,
+                force=self.drive_motor_force,
+                physicsClientId=self.client_id,
+            )
+        for joint_index, speed in zip(self.drive_wheel_joint_indices, drive_wheel_speeds):
+            p.setJointMotorControl2(
+                self.robot_id,
+                joint_index,
+                controlMode=p.VELOCITY_CONTROL,
+                targetVelocity=self.physics_drive_sign * float(speed),
+                force=self.drive_motor_force,
+                physicsClientId=self.client_id,
+            )
+        return tuple(float(speed) for speed in drive_wheel_speeds)
+
+    def command_twist(
+        self,
+        linear_velocity: float,
+        angular_velocity: float,
+        dt: float = 1.0 / 240.0,
+    ) -> tuple[float, float]:
+        """把车体 v/w 转换为四轮驱动速度和前轮转向速度。"""
+        _require_finite_values("twist", (linear_velocity, angular_velocity))
+        _require_positive_finite("dt", dt)
+        self.linear_velocity = float(linear_velocity)
+        self.angular_velocity = float(angular_velocity)
+        drive_speed = self.linear_velocity / self.wheel_radius
+        if abs(self.linear_velocity) < 1e-6:
+            desired_angle = 0.0
+        else:
+            desired_angle = math.atan(self.model_spec.axle_distance * self.angular_velocity / self.linear_velocity)
+        desired_angle = max(-self.max_steering_angle, min(self.max_steering_angle, desired_angle))
+        steering_rates = tuple(
+            max(-self.MAX_STEERING_RATE, min(self.MAX_STEERING_RATE, (desired_angle - target) / dt))
+            for target in self._steering_targets
+        )
+        self.command_wheel_speeds((drive_speed, drive_speed, drive_speed, drive_speed), steering_rates, dt=dt)
+        self.left_wheel_speed = drive_speed
+        self.right_wheel_speed = drive_speed
+        return drive_speed, drive_speed
+
+    def read_steering_wheel_angles(self) -> tuple[float, ...]:
+        """从两个前轮转向关节读取实际角度，而不是回显积分目标。"""
+        return tuple(
+            float(p.getJointState(self.robot_id, joint_index, physicsClientId=self.client_id)[0])
+            for joint_index in self.steering_joint_indices
+        )
+
+
+def create_robot(
+    client_id: int,
+    robot_model: str,
+    *,
+    start_x: float = 0.0,
+    start_y: float = 0.0,
+    base_height: float | None = None,
+    start_orientation: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 1.0),
+    drive_motor_force: float = 5.0,
+) -> DifferentialDriveRobot:
+    """按注册表创建四种阶段一车型，统一处理启动位置和内部参数默认值。"""
+    spec = get_robot_model(robot_model)
+    existing_body_ids = {
+        p.getBodyUniqueId(index, physicsClientId=client_id)
+        for index in range(p.getNumBodies(physicsClientId=client_id))
+    }
+    common = {
+        "client_id": client_id,
+        "urdf_path": spec.urdf_path,
+        "wheel_base": spec.wheel_track,
+        "wheel_radius": spec.wheel_radius,
+        "start_x": start_x,
+        "start_y": start_y,
+        "base_height": spec.base_height if base_height is None else base_height,
+        "start_orientation": start_orientation,
+        "drive_motor_force": drive_motor_force,
+    }
+    try:
+        if spec.controller_kind == "active_steering":
+            return ActiveSteeringRobot(model_spec=spec, **common)
+        return DifferentialDriveRobot(model_spec=spec, **common)
+    except Exception:
+        # 构造函数可能在 loadURDF 之后解析关节失败，此时清理本次新增的半成品刚体。
+        current_body_ids = {
+            p.getBodyUniqueId(index, physicsClientId=client_id)
+            for index in range(p.getNumBodies(physicsClientId=client_id))
+        }
+        for body_id in current_body_ids - existing_body_ids:
+            p.removeBody(body_id, physicsClientId=client_id)
+        raise

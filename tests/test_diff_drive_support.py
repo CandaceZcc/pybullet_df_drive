@@ -1,55 +1,47 @@
-# 二轮支撑测试：保护单前支撑轮的低摩擦设置，避免它参与牵引或卡住转向。
+# 差速支撑测试：保护前/中/后驱模型的球形支撑轮数量、位置和低摩擦设置。
 import pybullet as p
 import pytest
 
-from slope_sim.robot import DifferentialDriveRobot
+from slope_sim.model_registry import get_robot_model
+from slope_sim.robot import create_robot
 
 
-def test_diff_drive_support_wheel_uses_separate_low_friction():
+@pytest.mark.parametrize(
+    ("model_name", "support_names", "drive_x"),
+    [
+        ("df_front", ("rear_support",), 0.22),
+        ("df_mid", ("front_support", "rear_support"), 0.0),
+        ("df_back", ("front_support",), -0.22),
+    ],
+)
+def test_differential_support_wheels_use_separate_low_friction(model_name, support_names, drive_x):
     client_id = p.connect(p.DIRECT)
     try:
-        robot = DifferentialDriveRobot(
-            client_id=client_id,
-            urdf_path="urdf/diff_drive.urdf",
-            wheel_base=0.5,
-            wheel_radius=0.1,
-            base_height=0.14,
-        )
-
+        robot = create_robot(client_id, model_name)
         robot.apply_drive_friction(lateral_friction=1.2, support_lateral_friction=0.03)
 
+        assert get_robot_model(model_name).drive_center_x == pytest.approx(drive_x)
+        assert len(robot.support_links) == len(support_names)
         left_friction = p.getDynamicsInfo(robot.robot_id, robot.left_joint, physicsClientId=client_id)[1]
-        caster_friction = p.getDynamicsInfo(
-            robot.robot_id,
-            robot.joint_name_to_index["caster_joint"],
-            physicsClientId=client_id,
-        )[1]
         assert left_friction == pytest.approx(1.2)
-        assert caster_friction == pytest.approx(0.03)
+        for support_name in support_names:
+            support_joint = robot.joint_name_to_index[f"{support_name}_joint"]
+            support_friction = p.getDynamicsInfo(robot.robot_id, support_joint, physicsClientId=client_id)[1]
+            assert support_friction == pytest.approx(0.03)
     finally:
         p.disconnect(client_id)
 
 
-def test_diff_drive_uses_rear_drive_front_support_geometry():
+def test_front_mid_back_drive_axles_are_physically_ordered():
+    positions = {}
     client_id = p.connect(p.DIRECT)
     try:
-        robot = DifferentialDriveRobot(
-            client_id=client_id,
-            urdf_path="urdf/diff_drive.urdf",
-            wheel_base=0.5,
-            wheel_radius=0.1,
-            base_height=0.14,
-        )
-
-        left_info = p.getJointInfo(robot.robot_id, robot.left_joint, physicsClientId=client_id)
-        caster_info = p.getJointInfo(
-            robot.robot_id,
-            robot.joint_name_to_index["caster_joint"],
-            physicsClientId=client_id,
-        )
-
-        assert left_info[14][0] == pytest.approx(-0.12)
-        assert caster_info[14][0] == pytest.approx(0.30)
-        assert caster_info[14][0] - left_info[14][0] >= 0.40
+        for model_name in ("df_front", "df_mid", "df_back"):
+            robot = create_robot(client_id, model_name)
+            info = p.getJointInfo(robot.robot_id, robot.left_joint, physicsClientId=client_id)
+            positions[model_name] = float(info[14][0])
+            p.removeBody(robot.robot_id, physicsClientId=client_id)
     finally:
         p.disconnect(client_id)
+
+    assert positions["df_front"] > positions["df_mid"] > positions["df_back"]

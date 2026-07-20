@@ -1,27 +1,29 @@
-# Step 2 GUI 演示配置：使用稳定二轮差速、物理驱动、LiDAR 和实时 Dashboard。
+# 阶段一 GUI 演示配置：使用后置差速车、物理驱动和实时 Dashboard。
 mode: gui
 slope_deg: 0.0
 duration_sec: 5.0
 time_step: 0.004166666666666667
-wheel_base: 0.5
-wheel_radius: 0.1
 target_linear_velocity: 0.35
 target_angular_velocity: 0.0
-robot_model: diff_drive
+robot_model: df_back
 drive_model: physics
 dashboard_enabled: true
 dashboard_update_hz: 5.0
 dashboard_smoothing_alpha: 0.25
-camera_distance: 6.5
-camera_yaw: 42.0
-camera_pitch: -38.0
-camera_target: [1.2, 0.0, 0.2]
+camera_distance: 6.0
+camera_yaw: 45.0
+camera_pitch: -35.0
+camera_target: [0.8, 0.0, 0.0]
+camera_follow_enabled: true
+camera_follow_view: front
 lidar_enabled: true
 lidar_ray_count: 31
 lidar_max_distance: 5.0
 lidar_fov_deg: 180.0
 lidar_debug_draw: false
-terrain_model: box_slope
+terrain_model: flat
+golf_seed: 0
+golf_relief: medium
 ground_lateral_friction: 1.0
 ground_rolling_friction: 0.02
 ground_spinning_friction: 0.0

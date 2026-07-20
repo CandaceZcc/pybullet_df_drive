@@ -1,13 +1,21 @@
-# 阶段 1 平地演示配置：坡度为 0，适合 DIRECT 快速验证和 GUI 手动控制。
+# 阶段一平地演示配置：适合 DIRECT 快速验证和 GUI 手动控制。
 mode: direct
 slope_deg: 0.0
 duration_sec: 5.0
 time_step: 0.004166666666666667
-wheel_base: 0.5
-wheel_radius: 0.1
 target_linear_velocity: 0.4
 target_angular_velocity: 0.0
-terrain_model: box_slope
+robot_model: df_back
+drive_model: physics
+camera_distance: 6.0
+camera_yaw: 45.0
+camera_pitch: -35.0
+camera_target: [0.8, 0.0, 0.0]
+camera_follow_enabled: true
+camera_follow_view: front
+terrain_model: flat
+golf_seed: 0
+golf_relief: medium
 ground_lateral_friction: 1.0
 ground_rolling_friction: 0.02
 ground_spinning_friction: 0.0

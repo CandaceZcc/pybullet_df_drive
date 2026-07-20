@@ -1,6 +1,6 @@
 # 阶段一地形与相机跟随改进 Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> 状态说明：本计划已由上一会话完成自动验证并进入阶段一交付门禁；后续会话只需读取交付报告，不要继续按本计划派生实现线程。
 
 **Goal:** 把 `slope` 改为可观察平地进入和离开的三段式下坡，增强可复现高尔夫地形，并在 Dashboard 实现真正随车头旋转的相机跟随。
 
@@ -34,7 +34,7 @@
 - Modify: `tests/test_simulation_smoke.py:150-195`
 - Modify: `slope_sim/scene.py:13-19,180-277`
 
-- [ ] **Step 1: 用三段法向、高度、出生点和 body 数量失败测试替换旧整体斜面断言**
+- [x] **Step 1: 用三段法向、高度、出生点和 body 数量失败测试替换旧整体斜面断言**
 
 ```python
 def test_slope_scene_has_upper_flat_downhill_and_lower_flat():
@@ -74,7 +74,7 @@ def test_slope_scene_has_upper_flat_downhill_and_lower_flat():
         p.disconnect(client_id)
 ```
 
-- [ ] **Step 2: 写出接缝连续性和构造中途失败清理测试**
+- [x] **Step 2: 写出接缝连续性和构造中途失败清理测试**
 
 ```python
 def test_slope_segment_seams_have_no_raycast_gap_or_step():
@@ -211,7 +211,7 @@ def test_stage1_robots_cross_downhill_without_tipping(robot_model: str):
 
 循环在车辆进入低位平地后提前结束，7200 帧只是防卡死上限。如车辆在上限前未进入低位平地，先读取实际最终 `x`、四/两轮速和接触力诊断接触/驱动，不直接放宽 pitch 或距离断言。
 
-- [ ] **Step 3: 运行测试并确认 RED**
+- [x] **Step 3: 运行测试并确认 RED**
 
 Run:
 
@@ -227,7 +227,7 @@ conda run -n slope-sim python -m pytest -q \
 
 Expected: FAIL，因为 `SLOPE_RAMP_LENGTH` / `_create_static_terrain_box` 未定义，现有斜面也只有一个 body。
 
-- [ ] **Step 4: 增加分段常量和可复用静态地形 box 工厂**
+- [x] **Step 4: 增加分段常量和可复用静态地形 box 工厂**
 
 ```python
 SLOPE_UPPER_LENGTH = 4.0
@@ -285,7 +285,7 @@ def _create_static_terrain_box(
     return body_id
 ```
 
-- [ ] **Step 5: 实现三段几何，并让 `create_slope_scene()` 按场地类型选择工厂**
+- [x] **Step 5: 实现三段几何，并让 `create_slope_scene()` 按场地类型选择工厂**
 
 ```python
 def _create_segmented_slope_scene(
@@ -367,7 +367,7 @@ def _create_segmented_slope_scene(
 
 `flat` 继续调用单个 `_create_planar_scene(client_id, 0.0, ground_lateral_friction, ground_rolling_friction, ground_spinning_friction)`；`slope` 改调 `_create_segmented_slope_scene()`；`golf_heightfield` 保持独立分支。
 
-- [ ] **Step 6: 运行斜面聚焦回归并检查差异**
+- [x] **Step 6: 运行斜面聚焦回归并检查差异**
 
 ```bash
 conda run -n slope-sim python -m pytest -q tests/test_scene.py
@@ -382,7 +382,7 @@ Expected: `tests/test_scene.py` 全部 PASS，差异检查无输出。
 - Modify: `tests/test_scene.py:42-49`
 - Modify: `slope_sim/scene.py:59-99,102-153`
 
-- [ ] **Step 1: 写出不同种子、曲线廊道、局部复杂度和网格连续性测试**
+- [x] **Step 1: 写出不同种子、曲线廊道、局部复杂度和网格连续性测试**
 
 ```python
 def _grid(values: tuple[float, ...], rows: int, columns: int) -> list[list[float]]:
@@ -422,7 +422,7 @@ def test_complex_golf_is_seeded_continuous_and_has_smoother_drive_corridor():
     assert max_neighbor_delta < 0.12
 ```
 
-- [ ] **Step 2: 运行测试并确认 RED**
+- [x] **Step 2: 运行测试并确认 RED**
 
 ```bash
 conda run -n slope-sim python -m pytest -q \
@@ -431,7 +431,7 @@ conda run -n slope-sim python -m pytest -q \
 
 Expected: FAIL with `AttributeError: golf_corridor_center`。
 
-- [ ] **Step 3: 增加独立可复现的廊道中线函数**
+- [x] **Step 3: 增加独立可复现的廊道中线函数**
 
 ```python
 def golf_corridor_center(seed: int, normalized_x: float) -> float:
@@ -441,7 +441,7 @@ def golf_corridor_center(seed: int, normalized_x: float) -> float:
     return 0.24 * math.sin(0.85 * math.pi * normalized_x + phase)
 ```
 
-- [ ] **Step 4: 用大尺度波、椭圆丘、浅洼、小尺度波和廊道权重替换高度内核**
+- [x] **Step 4: 用大尺度波、椭圆丘、浅洼、小尺度波和廊道权重替换高度内核**
 
 ```python
 rng = random.Random(int(seed))
@@ -495,7 +495,7 @@ return tuple(height - minimum for height in heights)
 
 如果高差门槛失败，只调整 `detail` 振幅或廊道权重，不放宽连续性断言；一次只改一个参数并重跑该测试。
 
-- [ ] **Step 5: 运行高尔夫和场景回归**
+- [x] **Step 5: 运行高尔夫和场景回归**
 
 ```bash
 conda run -n slope-sim python -m pytest -q tests/test_scene.py tests/test_stage1_terrains.py
@@ -516,7 +516,7 @@ Expected: 两个测试文件全部 PASS，相同种子继续完全可复现。
 - Modify: `configs/gui_step2_demo.yaml`
 - Modify: `configs/step3_feedback.yaml`
 
-- [ ] **Step 1: 把相机测试改为验证车辆 yaw 和旧枚举兼容**
+- [x] **Step 1: 把相机测试改为验证车辆 yaw 和旧枚举兼容**
 
 ```python
 @pytest.mark.parametrize(
@@ -564,7 +564,7 @@ def test_existing_camera_follow_views_remain_valid(legacy_view: str):
     assert ExperimentConfig(camera_follow_view=legacy_view).camera_follow_view == legacy_view
 ```
 
-- [ ] **Step 2: 运行测试并确认 RED**
+- [x] **Step 2: 运行测试并确认 RED**
 
 ```bash
 conda run -n slope-sim python -m pytest -q \
@@ -575,7 +575,7 @@ conda run -n slope-sim python -m pytest -q \
 
 Expected: FAIL，原因分别是 `camera_follow_yaw()` 缺少车辆 yaw 参数，且默认开关仍为 `False`。
 
-- [ ] **Step 3: 让车后和侧面视角随车头旋转**
+- [x] **Step 3: 让车后和侧面视角随车头旋转**
 
 ```python
 def camera_follow_yaw(camera_follow_view: str, camera_yaw: float, robot_yaw: float) -> float:
@@ -609,7 +609,7 @@ def update_follow_camera(
     )
 ```
 
-- [ ] **Step 4: 打开 GUI 默认跟随并在可运行 YAML 中显式写出相机参数**
+- [x] **Step 4: 打开 GUI 默认跟随并在可运行 YAML 中显式写出相机参数**
 
 `ExperimentConfig` 改为：
 
@@ -631,7 +631,7 @@ camera_follow_view: front
 
 不删除 `front` / `side` / `custom` 验证分支，保证已有配置可直接加载。
 
-- [ ] **Step 5: 运行相机与配置聚焦回归**
+- [x] **Step 5: 运行相机与配置聚焦回归**
 
 ```bash
 conda run -n slope-sim python -m pytest -q tests/test_scene.py tests/test_config.py tests/test_flat_demo_config.py
@@ -648,7 +648,7 @@ Expected: 聚焦回归全部 PASS。
 - Modify: `slope_sim/dashboard.py:431-462,566-697,937-973`
 - Modify: `slope_sim/manual_demo.py:267-343,351-509`
 
-- [ ] **Step 1: 写出 Dashboard 开关、三视角和持续命令的失败测试**
+- [x] **Step 1: 写出 Dashboard 开关、三视角和持续命令的失败测试**
 
 ```python
 def test_dashboard_exposes_camera_follow_state(monkeypatch):
@@ -675,7 +675,7 @@ def test_dashboard_exposes_camera_follow_state(monkeypatch):
         dashboard.close()
 ```
 
-- [ ] **Step 2: 写出键盘合并和场景命令不丢失相机状态的失败测试**
+- [x] **Step 2: 写出键盘合并和场景命令不丢失相机状态的失败测试**
 
 ```python
 def test_merge_manual_commands_preserves_camera_state():
@@ -709,7 +709,7 @@ def test_scene_switch_limit_preserves_camera_state():
     assert limited.camera_follow_view == "front"
 ```
 
-- [ ] **Step 3: 运行测试并确认 RED**
+- [x] **Step 3: 运行测试并确认 RED**
 
 ```bash
 conda run -n slope-sim python -m pytest -q \
@@ -720,7 +720,7 @@ conda run -n slope-sim python -m pytest -q \
 
 Expected: FAIL，因为初始化参数、控件属性和 `DashboardCommand` 字段尚不存在。
 
-- [ ] **Step 4: 扩展 `DashboardCommand` 并增加相机控件**
+- [x] **Step 4: 扩展 `DashboardCommand` 并增加相机控件**
 
 ```python
 @dataclass(frozen=True)
@@ -771,7 +771,7 @@ camera_follow_enabled=self.camera_follow_check.isChecked(),
 camera_follow_view=str(self.camera_follow_combo.currentData()),
 ```
 
-- [ ] **Step 5: 在所有命令重建分支传播相机状态**
+- [x] **Step 5: 在所有命令重建分支传播相机状态**
 
 `merge_manual_commands()` 中的退出、场景动作和键盘接管分支都从 `dashboard_command` 复制：
 
@@ -805,7 +805,7 @@ return DashboardCommand(
 
 `limited_linear_velocity` / `limited_angular_velocity` 在场景分支取 `0.0`；正常分支分别取 `_step_toward(previous_command.linear_velocity, target_command.linear_velocity, linear_acceleration_limit * dt)` 和 `_step_toward(previous_command.angular_velocity, target_command.angular_velocity, angular_acceleration_limit * dt)`。不修改场景请求的一次性消费逻辑。
 
-- [ ] **Step 6: 让手动循环使用 Dashboard 当前相机状态**
+- [x] **Step 6: 让手动循环使用 Dashboard 当前相机状态**
 
 Dashboard 初始化补入：
 
@@ -857,7 +857,7 @@ if camera_follow_enabled:
 
 Dashboard 不可用时不重建带默认 `False` 的命令覆盖上述兜底状态。
 
-- [ ] **Step 7: 运行 Dashboard 与手动模式回归**
+- [x] **Step 7: 运行 Dashboard 与手动模式回归**
 
 ```bash
 conda run -n slope-sim python -m pytest -q tests/test_dashboard.py tests/test_manual_demo.py tests/test_scene.py
@@ -876,7 +876,7 @@ Expected: 三个测试文件全部 PASS，Dashboard 无界面测试使用 `QT_QP
 - Modify: `docs/阶段一交付报告.md`
 - Modify: `docs/superpowers/specs/2026-07-17-stage1-terrain-camera-improvements-design.md`
 
-- [ ] **Step 1: 重跑四车型完整下坡 DIRECT 回归**
+- [x] **Step 1: 重跑四车型完整下坡 DIRECT 回归**
 
 ```bash
 conda run -n slope-sim python -m pytest -q tests/test_simulation_smoke.py::test_stage1_robots_cross_downhill_without_tipping
@@ -884,7 +884,7 @@ conda run -n slope-sim python -m pytest -q tests/test_simulation_smoke.py::test_
 
 Expected: 4 个车型参数组全部 PASS。
 
-- [ ] **Step 2: 重跑并记录主动转向四轮实际速度证据**
+- [x] **Step 2: 重跑并记录主动转向四轮实际速度证据**
 
 ```bash
 conda run -n slope-sim python -m pytest -q \
@@ -895,7 +895,7 @@ conda run -n slope-sim python -m pytest -q \
 
 Expected: `3 passed`。交付报告记录四个关节名、实际轮速接近目标以及扭矩差异属于接触载荷的解释。
 
-- [ ] **Step 3: 更新用户、架构、需求和交付文档**
+- [x] **Step 3: 更新用户、架构、需求和交付文档**
 
 `README.md` 和 `docs/阶段一交付报告.md` 必须写明：
 
@@ -905,9 +905,9 @@ Expected: `3 passed`。交付报告记录四个关节名、实际轮速接近目
 - 高尔夫地形包含多尺度丘陵、浅洼、横坡和驾驶廊道，同一种子/起伏等级仍可复现。
 ```
 
-`ARCHITECTURE.md` 增加三个 `body_id` 的所有权、坡面姿态方向和相机数据流。`3d仿真平台需求规格.md` 只收紧阶段一验收描述，不将障碍物或传感器提前。设计文档状态改为“已实现并通过自动验证，待 GUI 人工验收”。
+`ARCHITECTURE.md` 增加三个 `body_id` 的所有权、坡面姿态方向和相机数据流。`3d仿真平台需求规格.md` 只收紧阶段一验收描述，不将障碍物或传感器提前。设计文档状态为“Task6自动验证已完成；GUI人工验收待用户完成”。
 
-- [ ] **Step 4: 运行聚焦回归和文档差异检查**
+- [x] **Step 4: 运行聚焦回归和文档差异检查**
 
 ```bash
 conda run -n slope-sim python -m pytest -q \
@@ -921,10 +921,12 @@ Expected: 所有聚焦回归 PASS，差异检查无输出。
 
 ### Task 6: 全量验证、视觉检查与独立审查
 
+> 状态：Task6自动验证已完成；GUI人工验收待用户完成
+
 **Files:**
 - Verify only: all changed source, tests, configs and documents
 
-- [ ] **Step 1: 运行全量 pytest、DIRECT 矩阵、编译和差异检查**
+- [x] **Step 1: 运行全量 pytest、DIRECT 矩阵、编译和差异检查**
 
 ```bash
 set -e
@@ -936,7 +938,7 @@ git diff --check
 
 Expected: pytest 0 failures，4 车型 × 3 场地共 12 个 `PASS`，编译和差异检查退出码为 0。
 
-- [ ] **Step 2: 执行 Qt offscreen 布局检查**
+- [x] **Step 2: 执行 Qt offscreen 布局检查**
 
 ```bash
 QT_QPA_PLATFORM=offscreen conda run -n slope-sim python -m pytest -q tests/test_dashboard.py
@@ -961,11 +963,11 @@ PY
 
 Expected: Dashboard 测试全部 PASS，用图像查看工具检查 `/tmp/stage1_dashboard_camera.png`，确认新“相机”分组不遮挡车型、场地或方向控制。如当前会话无 `DISPLAY`，不声称已完真实 PyBullet GUI 交互验收。
 
-- [ ] **Step 3: 按项目要求启动独立六维审查线程**
+- [x] **Step 3: 按项目要求启动独立六维审查线程**
 
 审查线程只读代码和测试，不修改文件；从需求完整性、逻辑正确性、边界情况、代码质量、测试覆盖和实际运行结果六方面按 Critical / Important / Minor 报告。主线程对确认问题先补失败测试，再修复并重跑 Step 1。
 
-- [ ] **Step 4: 更新最终交付数据并报告 GUI 边界**
+- [x] **Step 4: 更新最终交付数据并报告 GUI 边界**
 
 用最后一次验证的实际 pytest 数量/时间更新 `docs/阶段一交付报告.md`，附上四轮速度证据、三段坡面操作步骤、相机三视角和高尔夫种子复现步骤。若 `DISPLAY` 未设置，明确将下列内容留给用户桌面验收：
 

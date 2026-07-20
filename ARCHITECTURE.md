@@ -1,277 +1,129 @@
-# 项目结构与参数说明
+# 阶段一架构说明
 
-这份文档说明当前项目里每个主要文件的作用，以及常用参数在哪里修改。
+本文件描述当前可运行代码。完整三阶段目标和企业参数边界以 `3d仿真平台需求规格.md` 为准。
 
-## 当前进度
-
-当前已经完成：
-
-- 阶段 0：环境检查，PyBullet DIRECT 模式可用。
-- 阶段 1：差速车可以在平地中运行，并能生成 CSV 日志和轨迹图。
-- 阶段 1 扩展：本机 X11 桌面下可用 PyBullet GUI 手动控制差速车。
-- 阶段 3：物理模式可记录速度传感、加速度、地形法向、摩擦、接触力和带符号打滑估计，并生成反馈曲线。
-
-还未完成：
-
-- Pure Pursuit 路径跟踪。
-- 噪声模型。
-- Heightfield 起伏地形。
-- Heightfield 起伏地形和更真实的连续履带。
-
-## 入口文件
-
-### `main.py`
-
-主入口文件。
-
-常用命令：
-
-```bash
-python main.py --config configs/flat_demo.yaml --mode direct
-python main.py --config configs/flat_demo.yaml --gui --manual
-python main.py --slope-deg 5 --duration-sec 5 --mode direct
-python main.py --config configs/step3_feedback.yaml --mode direct
-```
-
-主要作用：
-
-- 读取命令行参数。
-- 加载 YAML 配置。
-- 根据 `--manual` 决定运行自动仿真还是手动控制。
-- 手动控制默认一直运行到按 `q` 或 `Esc`，只有显式传 `--duration-sec` 才会按时长结束。
-
-### `analysis.py`
-
-读取一次仿真生成的 CSV 日志，重新计算误差指标并生成轨迹图、打滑曲线图和接触/摩擦力曲线图。
-
-示例：
-
-```bash
-LOG=$(ls -t results/logs/slope_5_*.csv | head -n 1)
-python analysis.py --log "$LOG"
-```
-
-### `experiments/run_slope_sweep.py`
-
-批量运行多个坡度实验，并生成汇总表。
-
-示例：
-
-```bash
-python experiments/run_slope_sweep.py --slopes 0 5 10 15 20 --trials 1
-```
-
-## 核心代码
-
-### `slope_sim/config.py`
-
-配置定义和加载逻辑。
-
-主要参数包括：
-
-- `mode`：`direct` 或 `gui`。
-- `slope_deg`：坡度角，单位是度。
-- `duration_sec`：仿真时长。
-- `time_step`：仿真步长。
-- `wheel_base`：左右轮间距。
-- `wheel_radius`：轮子或履带代理驱动轮有效半径；`tracked_proxy` 建议使用 `0.08`。
-- `terrain_model`：`box_slope` 或 `twr_slope_5deg`；后者只用于 5 度参考坡面。
-- `ground_lateral_friction` / `ground_rolling_friction` / `ground_spinning_friction`：地面摩擦参数。
-- `drive_lateral_friction` / `support_lateral_friction`：驱动接触件和支撑轮摩擦参数。
-- `target_linear_velocity`：目标线速度。
-- `target_angular_velocity`：目标角速度。
-- `log_dir`：日志输出目录。
-- `figure_dir`：图像输出目录。
-
-### `slope_sim/scene.py`
-
-创建 PyBullet 场景。
-
-当前做法：
-
-- `box_slope`：用一个静态长方体表示平地或任意角度斜坡。
-- `twr_slope_5deg`：使用 Two-Wheel-Robot-DeepRL 风格 5 度 URDF 坡面，机器人出生点下方直接是斜面。
-- `probe_terrain()` 用 raycast 记录机器人当前位置下方的地面高度和法向。
-
-### `slope_sim/robot.py`
-
-加载差速车 URDF，并封装机器人控制和状态读取。
-
-当前重要逻辑：
-
-- 从 URDF 中找到左右轮关节。
-- 把车体线速度和角速度转换成左右轮目标速度。
-- 用差速车运动学更新机器人位姿。
-- 物理模式下读取轮/履带表面速度、驱动轴参考点速度、速度传感、加速度、接触法向力、接触摩擦力和带符号打滑估计。
-- `diff_drive` 适合平地教学和手动演示；`tracked_proxy` 更适合坡面姿态、履带打滑和大坝斜坡实验。
-
-注意：`diff_drive` 当前是后驱布局，驱动轮在后方、单支撑轮在前方。`tracked_proxy` 是多滚轮和各向异性摩擦的履带近似，不是连续柔性履带真实物理模型。
-
-### `slope_sim/controller.py`
-
-差速车运动学转换。
-
-核心关系：
+## 主流程
 
 ```text
-v_left  = v - w * wheel_base / 2
-v_right = v + w * wheel_base / 2
-wheel_speed = wheel_linear_speed / wheel_radius
+main.py
+  ├─ load_config()
+  ├─ run_experiment()        DIRECT / GUI 自动实验
+  └─ run_manual_demo()       GUI 人工驾驶
+         |
+         +-- ActiveManualWorld     当前场景、车辆和场地参数
+         +-- apply_manual_switch_request()
+         +-- TelemetryDashboard    驾驶、显式应用、复位和内部诊断
 ```
 
-### `slope_sim/simulation.py`
+阶段一原本只要求启动时选择；用户在 GUI 预验收中要求补充运行期车型和场地切换。当前实现仍未进入障碍物管理，不提前引入完整阶段二 `SimulationCoordinator`。
 
-自动仿真主流程。
+## 车型注册表
 
-主要做：
+`slope_sim/model_registry.py` 是车型的唯一注册入口。每个 `RobotModelSpec` 保存：
 
-- 连接 PyBullet。
-- 创建场景。
-- 加载机器人。
-- 执行固定速度命令。
-- 写 CSV 日志。
-- 生成轨迹图、阶段三反馈图和误差指标。
+- URDF 路径。
+- 控制器类型：`differential` 或 `active_steering`。
+- 内部轮径、轮距、轴距和安全出生高度。
+- 驱动轮、转向轮和支撑轮的语义名称。
+- 主动转向机械角度限位。
 
-### `slope_sim/manual_control.py`
+代码通过 `p.getJointInfo()` 建立“关节名 → PyBullet 索引”映射，不能把某个 URDF 当前的数字索引写死在控制器中。这样修改 URDF 固定挂点时，不会意外把电机命令发给错误关节。
 
-把键盘输入转换成速度命令。
+## 四种 URDF
 
-按键含义：
+| 车型 | 驱动布局 | 支撑/转向结构 |
+|---|---|---|
+| `df_front` | 左右轮位于 `x=+0.22 m` | 后部一个球形支撑轮 |
+| `df_mid` | 左右轮位于 `x=0 m` | 前后各一个球形支撑轮 |
+| `df_back` | 左右轮位于 `x=-0.22 m` | 前部一个球形支撑轮 |
+| `active_steering_4wd` | 四轮独立驱动 | 左右前轮为“转向父关节 + 车轮旋转子关节” |
 
-- 上/下方向键：线速度正负。
-- 左/右方向键：角速度正负。
-- 空格：停车。
-- `q` 或 `Esc`：退出。
+四个模型都预留了顶部安装板、前雷达挂点和后雷达挂点，阶段一只做几何预留，不生成企业传感器数据。
 
-### `slope_sim/manual_demo.py`
+四种车型的车体碰撞尺寸统一为 `0.72 × 0.44 × 0.14 m`，总质量保持在约 `5.95–5.99 kg`，轮径和轮距使用同一基线，避免比较驱动布局时混入明显的尺寸或质量差异。
 
-PyBullet GUI 手动控制演示。
+## 控制器
 
-主要做：
+### 差速控制
 
-- 打开 PyBullet GUI。
-- 创建平地或斜坡场景。
-- 加载差速车。
-- 用方向键控制车体速度。
-- 用 PyBullet debug sliders 调整最大线速度和最大角速度。
-- 同样输出 CSV 和轨迹图。
+`DifferentialDriveRobot.command_twist(v, w)` 使用轮距和轮径把车体线速度、角速度换成左右轮角速度。左右轮同速时直行，速度不同时转弯，方向相反时可原地转向。
 
-### `slope_sim/logger.py`
+### 主动转向控制
 
-写 CSV 日志。
+`ActiveSteeringRobot` 的四个车轮都有速度电机，两个前轮还有位置电机：
 
-记录字段包括：
+1. `command_wheel_speeds()` 接收四个驱动轮速度和两个前轮转向速度。
+2. 转向速度乘以物理步长，积分为新的目标角。
+3. 目标角限制在 `±0.55 rad`，避免超过 URDF 机械范围。
+4. `read_drive_wheel_speeds()` 和 `read_steering_wheel_angles()` 从 PyBullet 关节状态读取实际值，不直接回显命令。
 
-```text
-t, x, y, z, roll, pitch, yaw,
-linear_velocity, angular_velocity,
-reference_x, reference_y,
-estimated_x, estimated_y
-```
+主动转向车的四个实际轮速和两个实际前轮转角进入统一遥测，因此 CSV 与 Dashboard 都能直接检查四驱和转向反馈。
 
-物理模式还会追加：
+这一层级借鉴 Bullet 官方 racecar 示例，但本项目用关节名解析，未复制官方示例的硬编码索引。
 
-```text
-left_track_surface_speed, right_track_surface_speed,
-left_body_track_speed, right_body_track_speed,
-left_slip_ratio, right_slip_ratio,
-left_slip_speed, right_slip_speed,
-left_slip_valid, right_slip_valid,
-left_contact_normal_force, right_contact_normal_force,
-left_contact_friction_force, right_contact_friction_force,
-left_contact_count, right_contact_count,
-velocity_sensor_body_forward_speed, velocity_sensor_yaw_rate,
-linear_acceleration_x, linear_acceleration_y, linear_acceleration_z,
-terrain_type, local_ground_height, local_terrain_normal_x, local_terrain_normal_z,
-ground_lateral_friction, ground_rolling_friction, ground_spinning_friction
-```
+## 三类场地
 
-打滑率是带符号估计值：负数表示驱动表面速度低于该侧车体局部速度。低速急停时会标记为无效，避免接近 0 的分母制造异常尖峰。有效接触点是 PyBullet 接触求解点，不等于真实接触面积。
+### `flat`
 
-### `slope_sim/metrics.py`
+使用质量为 0 的静态长方体作为连续水平碰撞面。
 
-计算误差指标。
+### `slope`
 
-当前包括：
+`slope` 由高位平地、下坡、低位平地三个静态 box 组成。`SceneInfo.body_ids` 按 `(upper_id, ramp_id, lower_id)` 保存三者所有权，`body_id` 指向中间坡段，便于保持旧的单主地形调用。创建中任一后续段失败时，场景工厂按创建逆序删除已创建的 body，不能留下半套地形。
 
-- 终点误差。
-- 平均轨迹误差。
-- 最大轨迹误差。
-- 航向误差。
+正 `slope_deg` 时，车辆从高位平地沿世界 `+X` 行驶，依次经过下坡和低位平地。出生点位于高位平地中部，出生姿态水平；高位平地表面比低位平地高 `8 * sin(slope_deg)`。接缝有很小的水平重叠，避免 raycast 或车轮落入数值缝隙。
 
-## 配置文件
+### `golf_heightfield`
 
-### `configs/experiment.yaml`
+`generate_golf_heightfield()` 使用固定随机种子叠加低频丘陵和横坡、椭圆高斯丘、负高斯浅洼与小尺度连续波，再交给 PyBullet `GEOM_HEIGHTFIELD` 创建单个碰撞地形。平滑驾驶廊道会适度减弱局部丘洼和细节，但保留大部分低频丘洼。
 
-通用实验配置，默认是 5 度斜坡。
+关键点：
 
-适合用于自动斜坡实验。
+- 相同 `golf_seed` 和 `golf_relief` 生成完全相同的高度数组。
+- 只用低频连续函数，不逐格生成独立随机高度，因此不会形成尖锐噪声或台阶。
+- 出生位置和初始姿态来自真实 heightfield 射线高度与局部法向。
+- 公共高度数组语义是 `rows=y`、`columns=x`，以 y-major 顺序写入。PyBullet 的 heightfield 参数把快轴视为 `numHeightfieldRows`，所以创建时传入 `numHeightfieldRows=columns`、`numHeightfieldColumns=rows`；这样非方形网格的世界 X/Y 方向不会交换。
 
-### `configs/flat_demo.yaml`
+## GUI 相机状态流
 
-阶段 1 平地演示配置，坡度固定为 0 度。
+Dashboard 的“启用跟随”和视角是持续状态。每帧 `TelemetryDashboard.current_command()` 读取控件并写入 `DashboardCommand`；`merge_manual_commands()` 合并 PyBullet 键盘驾驶输入时保留这两个字段；`limit_manual_command_step()` 处理加速度限制和场景动作时继续透传它们。随后手动主循环在物理步进和状态读取后，若跟随开启，调用 `update_follow_camera()`，并从当前 `ActiveManualWorld.active_robot.robot.robot_id` 读取活动车辆。车型或场地切换完成后，`ActiveManualWorld` 已替换，因此不会继续引用已删除的车体。
 
-适合用于：
+- `front`：Dashboard 显示为“车后”，target 跟随车体位置，yaw 为车辆实际 yaw 减 90 度。
+- `side`：target 跟随车体位置，yaw 等于车辆实际 yaw。
+- `custom`：Dashboard 显示为“固定”，target 仍跟随车体位置，yaw 使用配置的 `camera_yaw`，不随车头旋转。
 
-```bash
-python main.py --config configs/flat_demo.yaml --mode direct
-python main.py --config configs/flat_demo.yaml --gui --manual
-```
+## 地形探测
 
-### `configs/step3_feedback.yaml`
+PyBullet 的单次 `rayTest()` 只返回最近命中。从机器人正上方发射会先打到机器人自身，因此 `_probe_terrain_for_robot()` 在车体侧面偏移一个安全距离后向下探测。平面和斜面高度不受横向偏移影响；高尔夫场地的结果是车体附近局部地形近似，企业级传感器语义会在阶段三重新收敛。
 
-阶段 3 完整反馈配置，使用 `tracked_proxy + physics + twr_slope_5deg`。
+## Dashboard 运行期切换事务
 
-适合用于：
+Dashboard 不在 Qt 按钮回调中调用 PyBullet。下拉框只保存待应用值，点击按钮后生成一次性请求，由 `run_manual_demo()` 所在物理主线程处理：
 
-```bash
-python main.py --config configs/step3_feedback.yaml --mode direct
-python main.py --config configs/step3_feedback.yaml --gui --manual
-```
+1. 车型切换先在当前出生点成功加载新车，再删除旧车，因此加载失败时旧车仍可继续使用。
+2. 场地切换先清零命令，再通过 `create_slope_scene()` 的 `resetSimulation()` 重建场地和当前车型。
+3. 目标场地失败时，用保存的上一个 `TerrainSelection` 重建旧世界；回滚也失败才终止仿真，避免无地面继续步进。
+4. 成功或回滚后更新活动 `body_id`、相机引用和 Dashboard 控件，清空旧平滑值与曲线。
+5. CSV 时间保持连续，并用每行的 `robot_model`、`terrain_type` 标识切换前后的活动对象。
 
-## 机器人模型
+## 配置边界
 
-### `urdf/diff_drive.urdf`
+启动配置和 Dashboard 运行期可选择的业务参数是：
 
-简化差速底盘模型。
+- `robot_model`：四种车型。
+- `terrain_model`：`flat` / `slope` / `golf_heightfield`。
+- `slope_deg`：仅斜面使用。
+- `golf_seed`、`golf_relief`：高尔夫场地复现与起伏预设。
 
-包含：
+轮距、轮径、质量、惯量、电机力、摩擦、heightfield 网格等仍是内部仿真/诊断参数，不属于企业 eCAL 字段。
 
-- `base_link`：车体。
-- `left_wheel`：左轮。
-- `right_wheel`：右轮。
-- `caster`：辅助支撑轮。
-- `left_wheel_joint`：左轮连续旋转关节。
-- `right_wheel_joint`：右轮连续旋转关节。
+## 验证
 
-当前布局是后驱：左右驱动轮在 `x=-0.12`，前支撑轮在 `x=+0.30`。修改车体尺寸、轮子半径、轮子位置时，主要改这个文件。
+`scripts/verify_stage1_matrix.py` 对四车型 × 三场地逐项执行：
 
-## 输出目录
+- 加载和静置落地。
+- 短距离前进。
+- 逐帧检查有限位姿、地形边界、地面接触和最大穿透深度。
+- 逐帧检查 roll/pitch，避免只看最终帧漏掉中途翻转。
 
-### `results/logs/`
-
-保存 CSV 日志。
-
-### `results/figures/`
-
-保存轨迹图。
-
-## 测试
-
-测试目录是 `tests/`。
-
-运行：
-
-```bash
-python -m pytest -q
-```
-
-当前测试覆盖：
-
-- 配置加载。
-- 差速轮速转换。
-- 日志字段。
-- 误差指标。
-- 自动仿真 smoke test。
-- 手动控制按键映射。
-- 平地演示配置。
+此外，pytest 覆盖注册表、URDF 关节、支撑轮、三种差速车的前进/后退/左右转/差速转向、主动转向速度积分和限位、4+2 实际反馈、三段下坡、高尔夫 heightfield 轴映射和廊道、配置/CLI、日志、Dashboard 一次性请求、持续相机状态、车型事务替换、场地事务重建和失败回滚。

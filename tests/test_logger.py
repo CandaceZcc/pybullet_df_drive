@@ -37,6 +37,12 @@ def test_csv_logger_writes_robot_state_rows(tmp_path: Path):
         right_target_drive_speed=7.0,
         left_actual_drive_speed=5.5,
         right_actual_drive_speed=6.5,
+        front_left_actual_drive_speed=5.0,
+        front_right_actual_drive_speed=5.5,
+        rear_left_actual_drive_speed=6.0,
+        rear_right_actual_drive_speed=6.5,
+        front_left_actual_steering_angle=0.1,
+        front_right_actual_steering_angle=0.12,
         left_track_surface_speed=0.44,
         right_track_surface_speed=0.52,
         left_body_track_speed=0.40,
@@ -57,7 +63,7 @@ def test_csv_logger_writes_robot_state_rows(tmp_path: Path):
         right_contact_friction_force=1.6,
         left_contact_count=2,
         right_contact_count=3,
-        terrain_type="twr_slope_5deg",
+        terrain_type="slope",
         local_ground_height=0.2,
         local_terrain_normal_x=-0.087,
         local_terrain_normal_y=0.0,
@@ -79,6 +85,14 @@ def test_csv_logger_writes_robot_state_rows(tmp_path: Path):
         "angular_acceleration_z",
     }.issubset(frame.columns)
     assert {"left_actual_drive_speed", "right_actual_drive_speed", "lidar_min_distance"}.issubset(frame.columns)
+    assert {
+        "front_left_actual_drive_speed",
+        "front_right_actual_drive_speed",
+        "rear_left_actual_drive_speed",
+        "rear_right_actual_drive_speed",
+        "front_left_actual_steering_angle",
+        "front_right_actual_steering_angle",
+    }.issubset(frame.columns)
     assert {"left_track_surface_speed", "right_body_track_speed"}.issubset(frame.columns)
     assert {"ground_rolling_friction", "ground_spinning_friction", "support_lateral_friction"}.issubset(frame.columns)
     assert {"track_anisotropic_friction_x", "track_anisotropic_friction_y", "track_anisotropic_friction_z"}.issubset(frame.columns)
@@ -95,4 +109,4 @@ def test_csv_logger_writes_robot_state_rows(tmp_path: Path):
     assert frame.iloc[0]["left_slip_speed"] == 0.03
     assert bool(frame.iloc[0]["right_slip_valid"]) is False
     assert frame.iloc[0]["left_contact_count"] == 2
-    assert frame.iloc[0]["terrain_type"] == "twr_slope_5deg"
+    assert frame.iloc[0]["terrain_type"] == "slope"

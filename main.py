@@ -7,6 +7,8 @@ from typing import Sequence
 
 from slope_sim.config import load_config
 from slope_sim.manual_demo import run_manual_demo
+from slope_sim.model_registry import robot_model_names
+from slope_sim.scene import terrain_model_names
 from slope_sim.simulation import run_experiment
 
 
@@ -25,32 +27,24 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Simulation duration in seconds; manual mode runs until q/Esc unless this is passed.",
     )
     parser.add_argument("--time-step", type=float, default=None, help="Simulation time step in seconds.")
-    parser.add_argument("--wheel-radius", type=float, default=None, help="Wheel or drive roller radius in meters.")
     parser.add_argument("--target-linear-velocity", type=float, default=None, help="Target body velocity in m/s.")
     parser.add_argument("--target-angular-velocity", type=float, default=None, help="Target yaw rate in rad/s.")
-    parser.add_argument("--robot-model", choices=["diff_drive", "tracked_proxy"], default=None, help="Robot URDF model.")
-    parser.add_argument("--drive-model", choices=["kinematic", "physics"], default=None, help="Robot motion model.")
+    parser.add_argument("--robot-model", choices=robot_model_names(), default=None, help="Robot URDF model.")
+    parser.add_argument("--drive-model", choices=["physics"], default=None, help="PyBullet joint physics model.")
     parser.add_argument("--no-dashboard", action="store_true", help="Disable the PySide6 telemetry dashboard.")
     parser.add_argument("--dashboard-update-hz", type=float, default=None, help="Telemetry dashboard display refresh rate.")
     parser.add_argument("--dashboard-smoothing-alpha", type=float, default=None, help="Dashboard feedback smoothing alpha.")
     parser.add_argument("--lidar", action="store_true", help="Enable the simple ray-cast LiDAR.")
     parser.add_argument("--lidar-debug-draw", action="store_true", help="Draw LiDAR rays in the PyBullet GUI.")
-    parser.add_argument("--terrain-model", choices=["box_slope", "twr_slope_5deg", "dam_slope"], default=None, help="Terrain model.")
+    parser.add_argument("--terrain-model", choices=terrain_model_names(), default=None, help="Terrain model.")
+    parser.add_argument("--golf-seed", type=int, default=None, help="Reproducible golf heightfield seed.")
+    parser.add_argument("--golf-relief", choices=["low", "medium", "high"], default=None, help="Golf terrain relief preset.")
     parser.add_argument("--ground-friction", type=float, default=None, help="Ground lateral friction coefficient.")
     parser.add_argument("--ground-rolling-friction", type=float, default=None, help="Ground rolling friction coefficient.")
     parser.add_argument("--ground-spinning-friction", type=float, default=None, help="Ground spinning friction coefficient.")
-    parser.add_argument("--wheel-friction", type=float, default=None, help="Wheel/track lateral friction coefficient.")
+    parser.add_argument("--wheel-friction", type=float, default=None, help="Drive-wheel lateral friction coefficient.")
     parser.add_argument("--support-friction", type=float, default=None, help="Caster/support lateral friction coefficient.")
-    parser.add_argument("--drive-motor-force", type=float, default=None, help="Velocity motor force for each driven wheel/roller.")
-    parser.add_argument(
-        "--track-anisotropic-friction",
-        nargs=3,
-        type=float,
-        default=None,
-        metavar=("FX", "FY", "FZ"),
-        help="Tracked proxy anisotropic friction vector.",
-    )
-    parser.add_argument("--track-drive-mode", choices=["all_rollers", "center_only"], default=None, help="Tracked proxy driven roller mode.")
+    parser.add_argument("--drive-motor-force", type=float, default=None, help="Velocity motor force for each driven wheel.")
     parser.add_argument("--log-dir", type=Path, default=None, help="Directory for CSV logs.")
     parser.add_argument("--figure-dir", type=Path, default=None, help="Directory for generated figures.")
     return parser.parse_args(argv)
@@ -65,7 +59,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         "slope_deg": args.slope_deg,
         "duration_sec": args.duration_sec,
         "time_step": args.time_step,
-        "wheel_radius": args.wheel_radius,
         "target_linear_velocity": args.target_linear_velocity,
         "target_angular_velocity": args.target_angular_velocity,
         "robot_model": args.robot_model,
@@ -76,14 +69,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         "lidar": args.lidar,
         "lidar_debug_draw": args.lidar_debug_draw if args.lidar_debug_draw else None,
         "terrain_model": args.terrain_model,
+        "golf_seed": args.golf_seed,
+        "golf_relief": args.golf_relief,
         "ground_friction": args.ground_friction,
         "ground_rolling_friction": args.ground_rolling_friction,
         "ground_spinning_friction": args.ground_spinning_friction,
         "wheel_friction": args.wheel_friction,
         "support_friction": args.support_friction,
         "drive_motor_force": args.drive_motor_force,
-        "track_anisotropic_friction": args.track_anisotropic_friction,
-        "track_drive_mode": args.track_drive_mode,
         "log_dir": args.log_dir,
         "figure_dir": args.figure_dir,
     }

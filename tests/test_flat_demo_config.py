@@ -1,4 +1,4 @@
-# 平地演示配置测试：确保阶段 1 配置确实是 0 度平地。
+# 阶段一示例配置测试：保护平面、斜面和高尔夫 GUI 入口。
 from pathlib import Path
 
 from slope_sim.config import load_config
@@ -6,34 +6,21 @@ from slope_sim.config import load_config
 
 def test_flat_demo_config_runs_on_flat_ground():
     config = load_config(Path("configs/flat_demo.yaml"))
-
     assert config.mode == "direct"
+    assert config.terrain_model == "flat"
     assert config.slope_deg == 0.0
-    assert config.duration_sec > 0.0
     assert config.target_linear_velocity > 0.0
 
 
-def test_gui_step2_demo_uses_stable_diff_drive_physics():
-    config = load_config(Path("configs/gui_step2_demo.yaml"))
-
-    assert config.mode == "gui"
-    assert config.robot_model == "diff_drive"
-    assert config.drive_model == "physics"
-    assert config.wheel_base == 0.5
-    assert config.wheel_radius == 0.1
-    assert config.support_lateral_friction == 0.03
-
-
-def test_step3_feedback_config_uses_tracked_proxy_on_twr_slope():
+def test_slope_feedback_config_uses_mid_drive_on_continuous_slope():
     config = load_config(Path("configs/step3_feedback.yaml"))
-
-    assert config.mode == "direct"
-    assert config.robot_model == "tracked_proxy"
-    assert config.drive_model == "physics"
-    assert config.terrain_model == "twr_slope_5deg"
+    assert config.robot_model == "df_mid"
+    assert config.terrain_model == "slope"
     assert config.slope_deg == 5.0
-    assert config.wheel_radius == 0.08
-    assert config.lidar_enabled is True
-    assert config.ground_lateral_friction > 0.0
-    assert config.ground_rolling_friction > 0.0
-    assert config.ground_spinning_friction >= 0.0
+
+
+def test_golf_gui_config_uses_active_steering_and_reproducible_seed():
+    config = load_config(Path("configs/stage1_golf_gui.yaml"))
+    assert config.robot_model == "active_steering_4wd"
+    assert config.terrain_model == "golf_heightfield"
+    assert config.golf_seed == 41

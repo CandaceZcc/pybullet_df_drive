@@ -62,7 +62,7 @@ def test_robot_telemetry_exports_csv_row_with_core_fields():
         right_slip_valid=False,
         left_contact_friction_force=1.2,
         right_contact_count=2,
-        terrain_type="twr_slope_5deg",
+        terrain_type="slope",
         local_ground_height=0.2,
         local_terrain_normal_x=-0.087,
         local_terrain_normal_z=0.996,
@@ -90,7 +90,7 @@ def test_robot_telemetry_exports_csv_row_with_core_fields():
     assert row["right_slip_valid"] is False
     assert row["left_contact_friction_force"] == 1.2
     assert row["right_contact_count"] == 2
-    assert row["terrain_type"] == "twr_slope_5deg"
+    assert row["terrain_type"] == "slope"
     assert row["local_ground_height"] == 0.2
     assert row["local_terrain_normal_x"] == -0.087
     assert row["local_terrain_normal_z"] == 0.996

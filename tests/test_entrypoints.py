@@ -2,6 +2,7 @@
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from analysis import analyze_log
 import main as main_module
@@ -9,7 +10,16 @@ from main import parse_args
 from slope_sim.simulation import SimulationResult
 
 
-def test_main_parse_args_supports_gui_and_slope():
+@pytest.mark.parametrize(
+    "arguments",
+    [["--robot-model", "tracked_proxy"], ["--terrain-model", "dam_slope"], ["--drive-model", "kinematic"]],
+)
+def test_main_parse_args_rejects_removed_stage1_options(arguments):
+    with pytest.raises(SystemExit):
+        parse_args(arguments)
+
+
+def test_main_parse_args_supports_stage1_model_and_terrain_selection():
     args = parse_args(
         [
             "--gui",
@@ -18,10 +28,8 @@ def test_main_parse_args_supports_gui_and_slope():
             "10",
             "--duration-sec",
             "2",
-            "--wheel-radius",
-            "0.08",
             "--robot-model",
-            "tracked_proxy",
+            "active_steering_4wd",
             "--drive-model",
             "physics",
             "--no-dashboard",
@@ -32,7 +40,11 @@ def test_main_parse_args_supports_gui_and_slope():
             "--lidar",
             "--lidar-debug-draw",
             "--terrain-model",
-            "twr_slope_5deg",
+            "golf_heightfield",
+            "--golf-seed",
+            "23",
+            "--golf-relief",
+            "high",
             "--ground-friction",
             "0.8",
             "--ground-rolling-friction",
@@ -45,12 +57,6 @@ def test_main_parse_args_supports_gui_and_slope():
             "0.03",
             "--drive-motor-force",
             "2.5",
-            "--track-anisotropic-friction",
-            "2.0",
-            "0.2",
-            "0.05",
-            "--track-drive-mode",
-            "center_only",
         ]
     )
 
@@ -58,23 +64,22 @@ def test_main_parse_args_supports_gui_and_slope():
     assert args.manual is True
     assert args.slope_deg == 10.0
     assert args.duration_sec == 2.0
-    assert args.wheel_radius == 0.08
-    assert args.robot_model == "tracked_proxy"
+    assert args.robot_model == "active_steering_4wd"
     assert args.drive_model == "physics"
     assert args.no_dashboard is True
     assert args.dashboard_update_hz == 4.0
     assert args.dashboard_smoothing_alpha == 0.2
     assert args.lidar is True
     assert args.lidar_debug_draw is True
-    assert args.terrain_model == "twr_slope_5deg"
+    assert args.terrain_model == "golf_heightfield"
+    assert args.golf_seed == 23
+    assert args.golf_relief == "high"
     assert args.ground_friction == 0.8
     assert args.ground_rolling_friction == 0.03
     assert args.ground_spinning_friction == 0.04
     assert args.wheel_friction == 0.6
     assert args.support_friction == 0.03
     assert args.drive_motor_force == 2.5
-    assert args.track_anisotropic_friction == [2.0, 0.2, 0.05]
-    assert args.track_drive_mode == "center_only"
 
 
 def test_manual_mode_runs_until_quit_unless_duration_is_explicit(tmp_path: Path, monkeypatch):
