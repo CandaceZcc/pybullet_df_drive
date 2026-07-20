@@ -1,15 +1,16 @@
-# 障碍物基础模块：创建质量为零的箱体，并在物理步进前同步运动学位姿与速度。
+# 障碍物基础模块：规划障碍物，并管理 PyBullet 中障碍物的创建、事务、更新和恢复。
 from __future__ import annotations
 
 import math
 import random
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+import time
+from collections.abc import Callable, Collection, Sequence
+from dataclasses import dataclass, replace
 from numbers import Integral
 
 import pybullet as p
 
-from slope_sim.scene import TerrainBounds
+from slope_sim.scene import TerrainBounds, probe_terrain
 from slope_sim.telemetry import TerrainProbe
 
 
@@ -284,6 +285,7 @@ class ObstacleSnapshot:
     position: tuple[float, float, float]
     orientation: tuple[float, float, float, float]
     path: ObstaclePath | None = None
+    geometry: ObstacleGeometry | None = None
 
     def __post_init__(self) -> None:
         logical_id = _require_integral("logical_id", self.logical_id)
@@ -298,6 +300,25 @@ class ObstacleSnapshot:
         object.__setattr__(self, "shape", _lower_choice("shape", self.shape, OBSTACLE_SHAPES))
         object.__setattr__(self, "position", _require_finite_vector("position", self.position, length=3))
         object.__setattr__(self, "orientation", _normalize_orientation(self.orientation))
+        if self.geometry is not None and self.geometry.shape != self.shape:
+            raise ValueError("geometry shape must match snapshot shape")
+
+    @property
+    def physics_body_id(self) -> int | None:
+        """测试和内部恢复使用的物理 body id；Dashboard 可请求隐藏该值。"""
+        return self.body_id
+
+
+@dataclass(frozen=True)
+class ObstacleOperationResult:
+    """跨帧事务推进结果；done 表示本次操作已结束，succeeded 表示是否提交。"""
+
+    done: bool
+    succeeded: bool
+    operation: str
+    message: str = ""
+    published_count: int = 0
+    deleted_count: int = 0
 
 
 def _require_finite_vector(name: str, values: tuple[float, ...], *, length: int) -> tuple[float, ...]:
@@ -746,6 +767,456 @@ def _body_ids(client_id: int) -> set[int]:
         p.getBodyUniqueId(index, physicsClientId=client_id)
         for index in range(p.getNumBodies(physicsClientId=client_id))
     }
+
+
+@dataclass(frozen=True)
+class _ObstacleRecord:
+    """内部记录保留逻辑规格和当前 PyBullet body id，不直接暴露给 Dashboard。"""
+
+    spec: ObstacleSpec
+    body_id: int
+
+
+@dataclass
+class _PendingOperation:
+    """跨帧事务状态；只在完整成功后发布到正式逻辑集合。"""
+
+    operation: str
+    request: ObstacleGenerationRequest | None = None
+    planned_specs: tuple[ObstacleSpec, ...] = ()
+    temporary_body_ids: list[int] | None = None
+    next_temporary_index: int = 0
+    clear_body_ids: tuple[int, ...] = ()
+    next_clear_index: int = 0
+    deleted_count: int = 0
+
+
+def _remove_body_safely(client_id: int, body_id: int) -> None:
+    """删除可能已被外部清理的 body；恢复快照时避免二次删除中断流程。"""
+    try:
+        p.removeBody(body_id, physicsClientId=client_id)
+    except p.error:
+        return
+
+
+def _shape_type_for_geometry(geometry: ObstacleGeometry) -> int:
+    if geometry.shape == "box":
+        return p.GEOM_BOX
+    if geometry.shape == "cylinder":
+        return p.GEOM_CYLINDER
+    if geometry.shape == "sphere":
+        return p.GEOM_SPHERE
+    raise ValueError(f"unsupported obstacle shape: {geometry.shape}")
+
+
+def _shape_kwargs_for_geometry(geometry: ObstacleGeometry) -> dict[str, object]:
+    if geometry.shape == "box":
+        return {"halfExtents": geometry.half_extents}
+    if geometry.shape == "cylinder":
+        return {"radius": geometry.half_extents[0], "height": geometry.half_extents[2] * 2.0}
+    if geometry.shape == "sphere":
+        return {"radius": geometry.half_extents[0]}
+    raise ValueError(f"unsupported obstacle shape: {geometry.shape}")
+
+
+def _visual_shape_kwargs_for_geometry(geometry: ObstacleGeometry) -> dict[str, object]:
+    """PyBullet cylinder 的 visual API 使用 length，而 collision API 使用 height。"""
+    if geometry.shape == "cylinder":
+        return {"radius": geometry.half_extents[0], "length": geometry.half_extents[2] * 2.0}
+    return _shape_kwargs_for_geometry(geometry)
+
+
+def _create_obstacle_body(
+    client_id: int,
+    spec: ObstacleSpec,
+    *,
+    temporary: bool,
+    color: tuple[float, float, float, float] = (0.85, 0.32, 0.12, 1.0),
+) -> int:
+    """按逻辑规格创建真实或临时 body；异常时仅清理本次新增 body 和碰撞形状。"""
+    shape_type = _shape_type_for_geometry(spec.geometry)
+    collision_shape_kwargs = _shape_kwargs_for_geometry(spec.geometry)
+    visual_shape_kwargs = _visual_shape_kwargs_for_geometry(spec.geometry)
+    base_position = _require_finite_vector("position", spec.position, length=3)
+    base_orientation = _normalize_orientation(spec.orientation)
+    existing_body_ids = _body_ids(client_id)
+    collision_shape_id: int | None = None
+    visual_color = (0.0, 0.0, 0.0, 0.0) if temporary else _require_finite_vector("color", color, length=4)
+
+    try:
+        if not temporary:
+            collision_shape_id = p.createCollisionShape(
+                shapeType=shape_type,
+                physicsClientId=client_id,
+                **collision_shape_kwargs,
+            )
+        visual_shape_id = p.createVisualShape(
+            shapeType=shape_type,
+            rgbaColor=visual_color,
+            physicsClientId=client_id,
+            **visual_shape_kwargs,
+        )
+        body_id = p.createMultiBody(
+            baseMass=0.0,
+            baseCollisionShapeIndex=-1 if temporary else collision_shape_id,
+            baseVisualShapeIndex=visual_shape_id,
+            basePosition=base_position,
+            baseOrientation=base_orientation,
+            physicsClientId=client_id,
+        )
+        if temporary:
+            p.setCollisionFilterGroupMask(body_id, -1, 0, 0, physicsClientId=client_id)
+        return body_id
+    except Exception:
+        # PyBullet 有些失败会在抛错前注册 body，按差集回收保证事务外对象不受影响。
+        for body_id in _body_ids(client_id) - existing_body_ids:
+            _remove_body_safely(client_id, body_id)
+        if collision_shape_id is not None:
+            p.removeCollisionShape(collision_shape_id, physicsClientId=client_id)
+        raise
+
+
+class ObstacleManager:
+    """管理障碍物生命周期：跨帧添加、删除、清空、移动更新和快照恢复。"""
+
+    def __init__(
+        self,
+        client_id: int,
+        settings: ObstacleGenerationSettings,
+        *,
+        terrain_body_ids: Collection[int],
+        vehicle_aabb_getter: Callable[[], Aabb3D | None] | None = None,
+        monotonic_clock: Callable[[], float] | None = None,
+        soft_budget_seconds: float = 0.002,
+    ) -> None:
+        self._client_id = _require_integral("client_id", client_id)
+        if self._client_id < 0:
+            raise ValueError("client_id must be non-negative")
+        self._settings = settings
+        self._terrain_body_ids = tuple(terrain_body_ids)
+        if not self._terrain_body_ids:
+            raise ValueError("terrain_body_ids must be non-empty")
+        self._vehicle_aabb_getter = vehicle_aabb_getter
+        self._clock = monotonic_clock if monotonic_clock is not None else time.monotonic
+        self._soft_budget_seconds = _require_finite_float("soft_budget_seconds", soft_budget_seconds)
+        if self._soft_budget_seconds < 0.0:
+            raise ValueError("soft_budget_seconds must not be negative")
+        self._records: tuple[_ObstacleRecord, ...] = ()
+        self._pending: _PendingOperation | None = None
+
+    def begin_add(self, request: ObstacleGenerationRequest) -> ObstacleOperationResult:
+        """启动整批添加事务；规划和 PyBullet 创建由 advance_pending_operation 分帧推进。"""
+        self._require_no_pending()
+        self._pending = _PendingOperation(operation="add", request=request, temporary_body_ids=[])
+        return ObstacleOperationResult(done=False, succeeded=False, operation="add", message="pending")
+
+    def advance_pending_operation(self) -> ObstacleOperationResult:
+        """推进一个软预算时间片；只有完整成功时才发布新逻辑集合。"""
+        if self._pending is None:
+            return ObstacleOperationResult(done=True, succeeded=True, operation="none")
+        start_time = self._clock()
+        if self._pending.operation == "add":
+            return self._advance_add(start_time)
+        if self._pending.operation == "clear":
+            return self._advance_clear(start_time)
+        raise RuntimeError(f"unsupported pending operation: {self._pending.operation}")
+
+    def delete(self, logical_id: int) -> ObstacleOperationResult:
+        """按逻辑 ID 删除一个已提交障碍物；缺失 ID 返回失败状态但不抛错。"""
+        self._require_no_pending()
+        target_id = _require_integral("logical_id", logical_id)
+        remaining: list[_ObstacleRecord] = []
+        deleted = 0
+        for record in self._records:
+            if record.spec.logical_id == target_id:
+                _remove_body_safely(self._client_id, record.body_id)
+                deleted += 1
+            else:
+                remaining.append(record)
+        if deleted == 0:
+            return ObstacleOperationResult(
+                done=True,
+                succeeded=False,
+                operation="delete",
+                message=f"logical id {target_id} not found",
+            )
+        self._records = tuple(remaining)
+        return ObstacleOperationResult(done=True, succeeded=True, operation="delete", deleted_count=deleted)
+
+    def begin_clear(self) -> ObstacleOperationResult:
+        """启动清空事务；跨帧删除时同步移除已删记录，避免暴露悬空 body id。"""
+        self._require_no_pending()
+        self._pending = _PendingOperation(
+            operation="clear",
+            clear_body_ids=tuple(record.body_id for record in self._records),
+        )
+        return ObstacleOperationResult(done=False, succeeded=False, operation="clear", message="pending")
+
+    def update_moving(self, dt: float) -> None:
+        """在 stepSimulation 前更新移动障碍物的贴地位姿和切向速度。"""
+        delta_time = _require_finite_float("dt", dt)
+        if delta_time < 0.0:
+            raise ValueError("dt must not be negative")
+        sampled_updates: list[tuple[_ObstacleRecord, ObstacleSpec, tuple[float, float, float]]] = []
+        for record in self._records:
+            spec = record.spec
+            if spec.path is None:
+                continue
+            path = spec.path
+            progress, direction = advance_ping_pong_progress(
+                progress=path.progress,
+                direction=path.direction,
+                segment_length=path.length,
+                speed=path.speed,
+                dt=delta_time,
+            )
+            path_dx = path.end_xy[0] - path.start_xy[0]
+            path_dy = path.end_xy[1] - path.start_xy[1]
+            xy = (path.start_xy[0] + path_dx * progress, path.start_xy[1] + path_dy * progress)
+            heading_xy = (path_dx * direction, path_dy * direction)
+            new_spec = self._resample_spec_pose(replace(spec, path=replace(path, progress=progress, direction=direction)), xy, heading_xy)
+            velocity = self._frame_displacement_velocity(spec.position, new_spec.position, delta_time)
+            sampled_updates.append((record, new_spec, velocity))
+
+        updated_records = list(self._records)
+        for record, new_spec, velocity in sampled_updates:
+            update_kinematic_obstacle(
+                self._client_id,
+                record.body_id,
+                position=new_spec.position,
+                orientation=new_spec.orientation,
+                linear_velocity=velocity,
+            )
+            index = updated_records.index(record)
+            updated_records[index] = _ObstacleRecord(spec=new_spec, body_id=record.body_id)
+        self._records = tuple(updated_records)
+
+    def snapshot(self, *, include_body_id: bool = True) -> tuple[ObstacleSnapshot, ...]:
+        """返回不可变快照；Dashboard 可关闭 body id 暴露，避免依赖临时物理标识。"""
+        return tuple(
+            ObstacleSnapshot(
+                logical_id=record.spec.logical_id,
+                body_id=record.body_id if include_body_id else None,
+                mode=record.spec.mode,
+                shape=record.spec.geometry.shape,
+                position=record.spec.position,
+                orientation=record.spec.orientation,
+                path=record.spec.path,
+                geometry=record.spec.geometry,
+            )
+            for record in self._records
+        )
+
+    def restore(self, snapshots: Sequence[ObstacleSnapshot]) -> ObstacleOperationResult:
+        """从逻辑快照重建 body；保留逻辑 ID、XY、路径进度和方向，重采样 Z 和姿态。"""
+        self._require_no_pending()
+        snapshot_items = tuple(snapshots)
+        logical_ids = [snapshot.logical_id for snapshot in snapshot_items]
+        if len(set(logical_ids)) != len(logical_ids):
+            raise ValueError("restore snapshots must not contain duplicate logical IDs")
+        if len(snapshot_items) > self._settings.max_scene_obstacles:
+            raise ValueError(f"scene obstacle count must not exceed {self._settings.max_scene_obstacles}")
+        resampled_specs: list[ObstacleSpec] = []
+        for snapshot in snapshot_items:
+            if snapshot.geometry is None:
+                raise ValueError("snapshot geometry is required for restore")
+            spec = ObstacleSpec(
+                logical_id=snapshot.logical_id,
+                mode=snapshot.mode,
+                geometry=snapshot.geometry,
+                position=snapshot.position,
+                orientation=snapshot.orientation,
+                path=snapshot.path,
+            )
+            xy = (snapshot.position[0], snapshot.position[1])
+            heading_xy = self._heading_for_spec(spec)
+            resampled_specs.append(self._resample_spec_pose(spec, xy, heading_xy))
+
+        created_records: list[_ObstacleRecord] = []
+        try:
+            for spec in resampled_specs:
+                body_id = _create_obstacle_body(self._client_id, spec, temporary=False)
+                created_records.append(_ObstacleRecord(spec=spec, body_id=body_id))
+        except Exception:
+            for record in created_records:
+                _remove_body_safely(self._client_id, record.body_id)
+            raise
+        replacement_body_ids = {record.body_id for record in created_records}
+        for record in self._records:
+            if record.body_id not in replacement_body_ids:
+                _remove_body_safely(self._client_id, record.body_id)
+        self._records = tuple(created_records)
+        return ObstacleOperationResult(
+            done=True,
+            succeeded=True,
+            operation="restore",
+            published_count=len(created_records),
+        )
+
+    def pending_body_ids(self) -> tuple[int, ...]:
+        """测试和调试用：查看未提交事务中的临时 body。"""
+        if self._pending is None or self._pending.temporary_body_ids is None:
+            return ()
+        return tuple(self._pending.temporary_body_ids)
+
+    def pending_specs(self) -> tuple[ObstacleSpec, ...]:
+        """测试和调试用：查看已规划但尚未发布的逻辑规格。"""
+        if self._pending is None:
+            return ()
+        return self._pending.planned_specs
+
+    def _require_no_pending(self) -> None:
+        if self._pending is not None:
+            raise RuntimeError("another obstacle operation is pending")
+
+    def _terrain_sampler(self, x: float, y: float) -> TerrainProbe:
+        return probe_terrain(
+            self._client_id,
+            x,
+            y,
+            bounds=self._settings.bounds,
+            terrain_body_ids=self._terrain_body_ids,
+        )
+
+    def _budget_exhausted(self, start_time: float) -> bool:
+        return self._clock() - start_time >= self._soft_budget_seconds
+
+    def _advance_add(self, start_time: float) -> ObstacleOperationResult:
+        assert self._pending is not None
+        pending = self._pending
+        assert pending.request is not None
+        if not pending.planned_specs:
+            try:
+                pending.planned_specs = plan_obstacle_batch(
+                    self._settings,
+                    pending.request,
+                    self._terrain_sampler,
+                    existing_specs=tuple(record.spec for record in self._records),
+                )
+            except Exception as exc:
+                self._pending = None
+                return ObstacleOperationResult(True, False, "add", message=str(exc))
+            if self._budget_exhausted(start_time):
+                return ObstacleOperationResult(False, False, "add", message="pending")
+
+        assert pending.temporary_body_ids is not None
+        while pending.next_temporary_index < len(pending.planned_specs):
+            spec = pending.planned_specs[pending.next_temporary_index]
+            try:
+                pending.temporary_body_ids.append(_create_obstacle_body(self._client_id, spec, temporary=True))
+            except Exception as exc:
+                self._cleanup_pending_temporary_bodies()
+                self._pending = None
+                return ObstacleOperationResult(True, False, "add", message=str(exc))
+            pending.next_temporary_index += 1
+            if self._budget_exhausted(start_time):
+                return ObstacleOperationResult(False, False, "add", message="pending")
+
+        vehicle_aabb = self._vehicle_aabb_getter() if self._vehicle_aabb_getter is not None else self._settings.vehicle_aabb
+        if self._batch_overlaps_vehicle_aabb(pending.planned_specs, vehicle_aabb):
+            self._cleanup_pending_temporary_bodies()
+            self._pending = None
+            return ObstacleOperationResult(
+                True,
+                False,
+                "add",
+                message="vehicle AABB overlaps planned obstacle batch",
+            )
+
+        created_records: list[_ObstacleRecord] = []
+        try:
+            for spec in pending.planned_specs:
+                body_id = _create_obstacle_body(self._client_id, spec, temporary=False)
+                created_records.append(_ObstacleRecord(spec=spec, body_id=body_id))
+        except Exception as exc:
+            for record in created_records:
+                _remove_body_safely(self._client_id, record.body_id)
+            self._cleanup_pending_temporary_bodies()
+            self._pending = None
+            return ObstacleOperationResult(True, False, "add", message=str(exc))
+
+        self._cleanup_pending_temporary_bodies()
+        self._records = (*self._records, *created_records)
+        self._pending = None
+        return ObstacleOperationResult(
+            True,
+            True,
+            "add",
+            published_count=len(created_records),
+        )
+
+    def _advance_clear(self, start_time: float) -> ObstacleOperationResult:
+        assert self._pending is not None
+        pending = self._pending
+        while pending.next_clear_index < len(pending.clear_body_ids):
+            body_id = pending.clear_body_ids[pending.next_clear_index]
+            _remove_body_safely(self._client_id, body_id)
+            self._records = tuple(record for record in self._records if record.body_id != body_id)
+            pending.deleted_count += 1
+            pending.next_clear_index += 1
+            if self._budget_exhausted(start_time):
+                return ObstacleOperationResult(False, False, "clear", message="pending", deleted_count=pending.deleted_count)
+        self._records = ()
+        self._pending = None
+        return ObstacleOperationResult(
+            True,
+            True,
+            "clear",
+            deleted_count=pending.deleted_count,
+        )
+
+    def _cleanup_pending_temporary_bodies(self) -> None:
+        if self._pending is None or self._pending.temporary_body_ids is None:
+            return
+        for body_id in self._pending.temporary_body_ids:
+            _remove_body_safely(self._client_id, body_id)
+        self._pending.temporary_body_ids.clear()
+
+    def _batch_overlaps_vehicle_aabb(self, specs: Sequence[ObstacleSpec], vehicle_aabb: Aabb3D | None) -> bool:
+        if vehicle_aabb is None:
+            return False
+        normalized_aabb = _normalize_aabb(vehicle_aabb)
+        assert normalized_aabb is not None
+        for spec in specs:
+            radius = spec.geometry.bounding_radius + self._settings.minimum_clearance
+            if spec.path is None:
+                if circle_aabb_distance_2d((spec.position[0], spec.position[1]), normalized_aabb) < radius:
+                    return True
+            elif _segment_aabb_distance_2d(spec.path.start_xy, spec.path.end_xy, normalized_aabb) < radius:
+                return True
+        return False
+
+    def _resample_spec_pose(
+        self,
+        spec: ObstacleSpec,
+        xy: tuple[float, float],
+        heading_xy: tuple[float, float],
+    ) -> ObstacleSpec:
+        probe = self._terrain_sampler(xy[0], xy[1])
+        if not probe.terrain_probe_valid or probe.out_of_bounds:
+            raise ObstaclePlanningError("unable to sample terrain for obstacle pose")
+        position = (xy[0], xy[1], probe.local_ground_height + spec.geometry.half_extents[2])
+        orientation = _orientation_from_heading_and_normal(heading_xy, _normal_from_probe(probe))
+        return replace(spec, position=position, orientation=orientation)
+
+    @staticmethod
+    def _frame_displacement_velocity(
+        previous_position: tuple[float, float, float],
+        next_position: tuple[float, float, float],
+        dt: float,
+    ) -> tuple[float, float, float]:
+        """用本帧真实贴地位移计算速度，坡面和 heightfield 上会包含 Z 分量。"""
+        if dt == 0.0:
+            return (0.0, 0.0, 0.0)
+        return tuple((next_position[index] - previous_position[index]) / dt for index in range(3))
+
+    @staticmethod
+    def _heading_for_spec(spec: ObstacleSpec) -> tuple[float, float]:
+        if spec.path is None:
+            return (1.0, 0.0)
+        dx = spec.path.end_xy[0] - spec.path.start_xy[0]
+        dy = spec.path.end_xy[1] - spec.path.start_xy[1]
+        return (dx * spec.path.direction, dy * spec.path.direction)
 
 
 def create_box_obstacle(
