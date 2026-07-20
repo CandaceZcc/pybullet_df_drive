@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import math
+import random
+from dataclasses import FrozenInstanceError
 
 import pybullet as p
 import pytest
@@ -10,7 +12,8 @@ import slope_sim.obstacles as obstacle_module
 from slope_sim.model_registry import get_robot_model
 from slope_sim.obstacles import create_box_obstacle, update_kinematic_obstacle
 from slope_sim.robot import create_robot
-from slope_sim.scene import create_slope_scene, probe_terrain
+from slope_sim.scene import TerrainBounds, create_slope_scene, probe_terrain
+from slope_sim.telemetry import TerrainProbe
 
 
 TIME_STEP = 1.0 / 240.0
@@ -113,6 +116,38 @@ def test_update_rejects_invalid_explicit_or_current_orientation(monkeypatch, cur
                 position=(0.1, 0.0, 0.30),
                 linear_velocity=(0.1, 0.0, 0.0),
             )
+    finally:
+        p.disconnect(client_id)
+
+
+@pytest.mark.parametrize("body_id", [True, 1.0, -1])
+def test_update_rejects_invalid_body_id_before_touching_pybullet(body_id):
+    client_id = p.connect(p.DIRECT)
+    try:
+        first_id = create_box_obstacle(
+            client_id,
+            half_extents=(0.20, 0.25, 0.30),
+            position=(0.0, 0.0, 0.30),
+        )
+        second_id = create_box_obstacle(
+            client_id,
+            half_extents=(0.20, 0.25, 0.30),
+            position=(1.0, 0.0, 0.30),
+        )
+        before_position, _ = p.getBasePositionAndOrientation(second_id, physicsClientId=client_id)
+
+        with pytest.raises(ValueError, match="body_id"):
+            update_kinematic_obstacle(
+                client_id,
+                body_id,
+                position=(2.0, 0.0, 0.30),
+                linear_velocity=(0.0, 0.0, 0.0),
+            )
+
+        after_position, _ = p.getBasePositionAndOrientation(second_id, physicsClientId=client_id)
+        assert first_id == 0
+        assert second_id == 1
+        assert after_position == pytest.approx(before_position)
     finally:
         p.disconnect(client_id)
 
@@ -444,3 +479,355 @@ def test_static_box_limits_forward_displacement_without_unstable_collision():
     assert linear_speed <= 3.0
     assert angular_speed <= 10.0
     assert obstacle_displacement <= baseline_displacement * 0.50
+
+
+def _flat_terrain_sampler(x: float, y: float) -> TerrainProbe:
+    """规划器单元测试只注入轻量地表回调，不依赖 PyBullet GUI 或真实场景。"""
+    return TerrainProbe(
+        terrain_probe_valid=True,
+        local_ground_height=0.05 * x - 0.03 * y,
+        local_terrain_normal_x=0.0,
+        local_terrain_normal_y=0.0,
+        local_terrain_normal_z=1.0,
+    )
+
+
+def _domain_settings(**overrides):
+    """创建可复用的领域规划设置，默认尺寸固定便于断言空间边界。"""
+    values = {
+        "bounds": TerrainBounds(-4.0, 4.0, -3.0, 3.0),
+        "spawn_position": (0.0, 0.0, 0.0),
+        "spawn_protection_radius": 0.65,
+        "vehicle_aabb": ((-0.45, -0.35, -0.10), (0.45, 0.35, 0.65)),
+        "minimum_clearance": 0.08,
+        "half_extent_ranges": ((0.18, 0.18), (0.22, 0.22), (0.30, 0.30)),
+        "moving_path_length_range": (0.85, 1.10),
+        "max_candidate_attempts": 600,
+    }
+    values.update(overrides)
+    return obstacle_module.ObstacleGenerationSettings(**values)
+
+
+def _existing_static(logical_id: int, x: float, y: float, radius: float = 0.28):
+    geometry = obstacle_module.ObstacleGeometry(shape="box", half_extents=(radius, radius, 0.30))
+    return obstacle_module.ObstacleSpec(
+        logical_id=logical_id,
+        mode="static",
+        geometry=geometry,
+        position=(x, y, 0.30),
+        orientation=(0.0, 0.0, 0.0, 1.0),
+    )
+
+
+def _existing_moving(logical_id: int, start_xy: tuple[float, float], end_xy: tuple[float, float]):
+    geometry = obstacle_module.ObstacleGeometry(shape="box", half_extents=(0.20, 0.20, 0.30))
+    path = obstacle_module.ObstaclePath(start_xy=start_xy, end_xy=end_xy, speed=0.35)
+    return obstacle_module.ObstacleSpec(
+        logical_id=logical_id,
+        mode="moving",
+        geometry=geometry,
+        position=(start_xy[0], start_xy[1], 0.30),
+        orientation=(0.0, 0.0, 0.0, 1.0),
+        path=path,
+    )
+
+
+@pytest.mark.parametrize(
+    "factory, message",
+    [
+        (lambda: obstacle_module.ObstacleGenerationRequest(mode="bad", count=1, seed=1), "mode"),
+        (lambda: obstacle_module.ObstacleGenerationRequest(mode="static", count=0, seed=1), "count"),
+        (lambda: obstacle_module.ObstacleGenerationRequest(mode="static", count=51, seed=1), "count"),
+        (lambda: obstacle_module.ObstacleGenerationRequest(mode="static", count=1, seed=1, shape="mesh"), "shape"),
+        (lambda: obstacle_module.ObstacleGenerationRequest(mode="mixed", count=2, seed=1, moving_ratio=-0.1), "ratio"),
+        (lambda: obstacle_module.ObstacleGenerationRequest(mode="mixed", count=2, seed=1, moving_ratio=1.1), "ratio"),
+        (lambda: obstacle_module.ObstacleGenerationRequest(mode="moving", count=1, seed=1, moving_speed=0.0), "speed"),
+        (lambda: _domain_settings(max_scene_obstacles=101), "scene.*100"),
+    ],
+)
+def test_obstacle_generation_request_rejects_invalid_parameters(factory, message):
+    with pytest.raises(ValueError, match=message):
+        factory()
+
+
+@pytest.mark.parametrize(
+    "factory, message",
+    [
+        (lambda: obstacle_module.ObstacleGenerationRequest(mode="static", count=2.9, seed=1), "count.*integer"),
+        (lambda: obstacle_module.ObstacleGenerationRequest(mode="static", count=True, seed=1), "count.*integer"),
+        (lambda: obstacle_module.ObstacleGenerationRequest(mode="static", count=2, seed=1.5), "seed.*integer"),
+        (lambda: _domain_settings(max_candidate_attempts=4.2), "max_candidate_attempts.*integer"),
+        (lambda: _domain_settings(max_batch_obstacles=True), "max_batch_obstacles.*integer"),
+        (
+            lambda: obstacle_module.ObstaclePath(
+                start_xy=(0.0, 0.0),
+                end_xy=(1.0, 0.0),
+                speed=0.2,
+                direction=0.5,
+            ),
+            "direction.*integer",
+        ),
+        (lambda: _existing_static(1.9, 2.0, 2.0), "logical_id.*integer"),
+        (
+            lambda: obstacle_module.ObstacleSnapshot(
+                logical_id=1,
+                body_id=2.2,
+                mode="static",
+                shape="box",
+                position=(1.0, 2.0, 0.3),
+                orientation=(0.0, 0.0, 0.0, 1.0),
+            ),
+            "body_id.*integer",
+        ),
+    ],
+)
+def test_generation_domain_objects_reject_non_integral_identifiers(factory, message):
+    with pytest.raises(ValueError, match=message):
+        factory()
+
+
+def test_non_box_geometry_uses_canonical_radius_dimensions():
+    sphere = obstacle_module.ObstacleGeometry(shape="sphere", half_extents=(0.20, 0.35, 0.30))
+    cylinder = obstacle_module.ObstacleGeometry(shape="cylinder", half_extents=(0.20, 0.35, 0.60))
+
+    assert sphere.half_extents == pytest.approx((0.35, 0.35, 0.35))
+    assert sphere.bounding_radius == pytest.approx(0.35)
+    assert cylinder.half_extents == pytest.approx((0.35, 0.35, 0.60))
+    assert cylinder.bounding_radius == pytest.approx(0.35)
+
+
+@pytest.mark.parametrize(
+    ("count", "ratio", "expected"),
+    [
+        (5, 0.30, (3, 2)),
+        (10, 0.30, (7, 3)),
+        (2, 0.00, (1, 1)),
+        (2, 0.01, (1, 1)),
+        (2, 0.99, (1, 1)),
+        (2, 1.00, (1, 1)),
+        (1, 0.20, (1, 0)),
+        (1, 0.80, (0, 1)),
+    ],
+)
+def test_mixed_mode_uses_half_up_rounding_and_clamps_when_possible(count, ratio, expected):
+    assert obstacle_module.split_mixed_obstacle_counts(count, ratio) == expected
+
+
+def test_generation_objects_are_immutable_and_body_id_is_not_logical_id():
+    request = obstacle_module.ObstacleGenerationRequest(mode="static", count=1, seed=12)
+    snapshot = obstacle_module.ObstacleSnapshot(
+        logical_id=7,
+        body_id=42,
+        mode="static",
+        shape="box",
+        position=(1.0, 2.0, 0.3),
+        orientation=(0.0, 0.0, 0.0, 1.0),
+    )
+
+    with pytest.raises(FrozenInstanceError):
+        request.count = 2
+    assert snapshot.logical_id == 7
+    assert snapshot.body_id == 42
+
+
+def test_generation_rejects_scene_total_above_limit_before_sampling():
+    settings = _domain_settings(max_scene_obstacles=100)
+    existing = tuple(_existing_static(index + 1, -3.5 + index * 0.01, -2.5) for index in range(99))
+    request = obstacle_module.ObstacleGenerationRequest(mode="static", count=2, seed=3)
+    calls: list[tuple[float, float]] = []
+
+    def sampler(x: float, y: float) -> TerrainProbe:
+        calls.append((x, y))
+        return _flat_terrain_sampler(x, y)
+
+    with pytest.raises(ValueError, match="scene.*100"):
+        obstacle_module.plan_obstacle_batch(settings, request, sampler, existing_specs=existing)
+    assert calls == []
+
+
+def test_same_inputs_and_seed_generate_identical_batch_without_global_rng_mutation():
+    settings = _domain_settings()
+    existing = (_existing_static(3, 2.6, -1.8), _existing_moving(8, (-2.8, 1.8), (-2.0, 1.8)))
+    request = obstacle_module.ObstacleGenerationRequest(
+        mode="mixed",
+        count=6,
+        seed=1234,
+        moving_ratio=0.30,
+        moving_speed=0.40,
+    )
+    random.seed(20260720)
+    before_state = random.getstate()
+
+    first = obstacle_module.plan_obstacle_batch(settings, request, _flat_terrain_sampler, existing_specs=existing)
+    after_state = random.getstate()
+    second = obstacle_module.plan_obstacle_batch(settings, request, _flat_terrain_sampler, existing_specs=existing)
+
+    random.setstate(before_state)
+    expected_next = random.random()
+    random.setstate(after_state)
+    actual_next = random.random()
+    assert actual_next == expected_next
+    assert first == second
+    assert [spec.logical_id for spec in first] == list(range(9, 15))
+    assert [spec.mode for spec in first].count("static") == 4
+    assert [spec.mode for spec in first].count("moving") == 2
+
+
+def test_planner_keeps_bounding_radius_inside_bounds_and_away_from_occupied_space():
+    settings = _domain_settings()
+    existing = (_existing_static(1, 2.4, 1.8), _existing_moving(2, (-3.0, -2.3), (-2.0, -2.3)))
+    request = obstacle_module.ObstacleGenerationRequest(mode="mixed", count=8, seed=91, moving_ratio=0.5)
+
+    batch = obstacle_module.plan_obstacle_batch(settings, request, _flat_terrain_sampler, existing_specs=existing)
+    all_specs = (*existing, *batch)
+
+    for index, spec in enumerate(batch):
+        radius = spec.geometry.bounding_radius
+        x, y, z = spec.position
+        assert settings.bounds.min_x + radius <= x <= settings.bounds.max_x - radius
+        assert settings.bounds.min_y + radius <= y <= settings.bounds.max_y - radius
+        assert math.hypot(x - settings.spawn_position[0], y - settings.spawn_position[1]) >= (
+            radius + settings.spawn_protection_radius + settings.minimum_clearance
+        )
+        assert obstacle_module.circle_aabb_distance_2d((x, y), settings.vehicle_aabb) >= (
+            radius + settings.minimum_clearance
+        )
+        assert z == pytest.approx(_flat_terrain_sampler(x, y).local_ground_height + spec.geometry.half_extents[2])
+
+        for other in all_specs[: len(existing) + index]:
+            if spec.path is None and other.path is None:
+                distance = math.hypot(x - other.position[0], y - other.position[1])
+            elif spec.path is not None and other.path is not None:
+                distance = obstacle_module.segment_distance_2d(
+                    spec.path.start_xy,
+                    spec.path.end_xy,
+                    other.path.start_xy,
+                    other.path.end_xy,
+                )
+            else:
+                moving = spec if spec.path is not None else other
+                static = other if spec.path is not None else spec
+                distance = obstacle_module.point_segment_distance_2d(
+                    (static.position[0], static.position[1]),
+                    moving.path.start_xy,
+                    moving.path.end_xy,
+                )
+            assert distance >= spec.geometry.bounding_radius + other.geometry.bounding_radius + settings.minimum_clearance
+
+
+def test_moving_paths_stay_inside_bounds_and_swept_corridors_do_not_intersect():
+    settings = _domain_settings(bounds=TerrainBounds(-5.0, 5.0, -4.0, 4.0), moving_path_length_range=(1.4, 1.8))
+    request = obstacle_module.ObstacleGenerationRequest(mode="moving", count=5, seed=2048, moving_speed=0.55)
+
+    batch = obstacle_module.plan_obstacle_batch(settings, request, _flat_terrain_sampler)
+
+    for index, spec in enumerate(batch):
+        assert spec.path is not None
+        for point in (spec.path.start_xy, spec.path.end_xy):
+            assert settings.bounds.min_x + spec.geometry.bounding_radius <= point[0] <= (
+                settings.bounds.max_x - spec.geometry.bounding_radius
+            )
+            assert settings.bounds.min_y + spec.geometry.bounding_radius <= point[1] <= (
+                settings.bounds.max_y - spec.geometry.bounding_radius
+            )
+        for other in batch[:index]:
+            assert other.path is not None
+            distance = obstacle_module.segment_distance_2d(
+                spec.path.start_xy,
+                spec.path.end_xy,
+                other.path.start_xy,
+                other.path.end_xy,
+            )
+            assert distance >= spec.geometry.bounding_radius + other.geometry.bounding_radius + settings.minimum_clearance
+
+
+def test_candidate_attempt_exhaustion_is_atomic_and_reports_clear_error():
+    settings = _domain_settings(
+        bounds=TerrainBounds(-0.30, 0.30, -0.30, 0.30),
+        spawn_protection_radius=0.0,
+        vehicle_aabb=None,
+        half_extent_ranges=((0.28, 0.28), (0.28, 0.28), (0.30, 0.30)),
+        max_candidate_attempts=4,
+    )
+    request = obstacle_module.ObstacleGenerationRequest(mode="static", count=2, seed=7)
+
+    with pytest.raises(obstacle_module.ObstaclePlanningError, match="Unable to plan complete obstacle batch.*2"):
+        obstacle_module.plan_obstacle_batch(settings, request, _flat_terrain_sampler)
+
+
+def test_ping_pong_progress_consumes_remaining_displacement_without_leaving_segment():
+    progress, direction = obstacle_module.advance_ping_pong_progress(
+        progress=0.80,
+        direction=1,
+        segment_length=1.0,
+        speed=1.0,
+        dt=0.70,
+    )
+    assert progress == pytest.approx(0.50)
+    assert direction == -1
+
+    progress, direction = obstacle_module.advance_ping_pong_progress(
+        progress=0.10,
+        direction=-1,
+        segment_length=1.0,
+        speed=1.0,
+        dt=4.75,
+    )
+    assert 0.0 <= progress <= 1.0
+    assert direction in {-1, 1}
+    assert progress == pytest.approx(0.65)
+    assert direction == 1
+
+    progress, direction = obstacle_module.advance_ping_pong_progress(
+        progress=0.50,
+        direction=1,
+        segment_length=1.0,
+        speed=1.0,
+        dt=0.50,
+    )
+    assert progress == pytest.approx(1.0)
+    assert direction == -1
+
+    progress, direction = obstacle_module.advance_ping_pong_progress(
+        progress=0.50,
+        direction=-1,
+        segment_length=1.0,
+        speed=1.0,
+        dt=0.50,
+    )
+    assert progress == pytest.approx(0.0)
+    assert direction == 1
+
+
+def test_segment_distance_helpers_cover_crossing_parallel_and_point_cases():
+    assert obstacle_module.segment_distance_2d((0.0, 0.0), (2.0, 0.0), (1.0, -1.0), (1.0, 1.0)) == pytest.approx(0.0)
+    assert obstacle_module.segment_distance_2d((0.0, 0.0), (2.0, 0.0), (0.0, 1.5), (2.0, 1.5)) == pytest.approx(1.5)
+    assert obstacle_module.point_segment_distance_2d((1.0, 2.0), (0.0, 0.0), (2.0, 0.0)) == pytest.approx(2.0)
+
+
+def test_planned_orientation_preserves_path_heading_and_sampled_terrain_normal():
+    normal = (0.20, -0.10, math.sqrt(0.95))
+
+    def tilted_sampler(x: float, y: float) -> TerrainProbe:
+        return TerrainProbe(
+            terrain_probe_valid=True,
+            local_ground_height=0.0,
+            local_terrain_normal_x=normal[0],
+            local_terrain_normal_y=normal[1],
+            local_terrain_normal_z=normal[2],
+        )
+
+    settings = _domain_settings(bounds=TerrainBounds(-3.0, 3.0, -3.0, 3.0))
+    request = obstacle_module.ObstacleGenerationRequest(mode="moving", count=1, seed=5, moving_speed=0.4)
+
+    (spec,) = obstacle_module.plan_obstacle_batch(settings, request, tilted_sampler)
+    assert spec.path is not None
+    matrix = p.getMatrixFromQuaternion(spec.orientation)
+    local_x = (matrix[0], matrix[3], matrix[6])
+    local_z = (matrix[2], matrix[5], matrix[8])
+    path_dx = spec.path.end_xy[0] - spec.path.start_xy[0]
+    path_dy = spec.path.end_xy[1] - spec.path.start_xy[1]
+    path_heading = (path_dx / math.hypot(path_dx, path_dy), path_dy / math.hypot(path_dx, path_dy), 0.0)
+
+    assert local_z == pytest.approx(normal, abs=1e-6)
+    assert local_x[0] * path_heading[0] + local_x[1] * path_heading[1] > 0.97
