@@ -16,6 +16,7 @@ from slope_sim.dashboard import (
     should_refresh_dashboard,
     smooth_telemetry,
 )
+from slope_sim.runtime_actions import ResetRobotAction, SwitchRobotAction, SwitchTerrainAction, TerrainSelection
 from slope_sim.telemetry import RobotTelemetry
 
 
@@ -145,16 +146,11 @@ def test_dashboard_rows_show_active_steering_four_wheel_feedback():
     assert labels["前轮实际转角 FL/FR"] == "0.10 / 0.20 rad"
 
 
-def test_dashboard_command_can_request_model_switch_or_reset():
-    command = DashboardCommand(
-        linear_velocity=0.0,
-        angular_velocity=0.0,
-        requested_robot_model="df_mid",
-        reset_requested=True,
-    )
+def test_dashboard_command_carries_at_most_one_structural_action():
+    command = DashboardCommand(linear_velocity=0.0, angular_velocity=0.0, structural_action=SwitchRobotAction("df_mid"))
 
-    assert command.requested_robot_model == "df_mid"
-    assert command.reset_requested is True
+    assert command.structural_action == SwitchRobotAction("df_mid")
+    assert DashboardCommand(0.0, 0.0, structural_action=ResetRobotAction()).structural_action == ResetRobotAction()
 
 
 def test_dashboard_camera_controls_use_initial_state_and_emit_current_state(monkeypatch):
@@ -215,7 +211,7 @@ def test_dashboard_stop_exit_and_scene_requests_keep_camera_state(monkeypatch):
         assert (stopped.camera_follow_enabled, stopped.camera_follow_view) == (True, "side")
         assert (exiting.camera_follow_enabled, exiting.camera_follow_view) == (True, "side")
         assert (requested.camera_follow_enabled, requested.camera_follow_view) == (True, "side")
-        assert requested.requested_terrain == dashboard_module.TerrainSelection("slope")
+        assert requested.structural_action == SwitchTerrainAction(TerrainSelection("slope"))
     finally:
         dashboard.close()
 
@@ -231,11 +227,11 @@ def test_dashboard_model_switch_requires_apply_and_is_one_shot(monkeypatch):
     )
     try:
         dashboard.robot_combo.setCurrentIndex(dashboard.robot_combo.findData("df_mid"))
-        assert dashboard.current_command().requested_robot_model is None
+        assert dashboard.current_command().structural_action is None
 
         dashboard.request_robot_switch()
-        assert dashboard.current_command().requested_robot_model == "df_mid"
-        assert dashboard.current_command().requested_robot_model is None
+        assert dashboard.current_command().structural_action == SwitchRobotAction("df_mid")
+        assert dashboard.current_command().structural_action is None
     finally:
         dashboard.close()
 
@@ -252,12 +248,12 @@ def test_dashboard_terrain_switch_requires_apply_and_captures_parameters(monkeyp
     try:
         dashboard.terrain_combo.setCurrentIndex(dashboard.terrain_combo.findData("slope"))
         dashboard.slope_spin.setValue(9.5)
-        assert dashboard.current_command().requested_terrain is None
+        assert dashboard.current_command().structural_action is None
 
         dashboard.request_terrain_switch()
-        request = dashboard.current_command().requested_terrain
-        assert request == dashboard_module.TerrainSelection("slope", slope_deg=9.5)
-        assert dashboard.current_command().requested_terrain is None
+        request = dashboard.current_command().structural_action
+        assert request == SwitchTerrainAction(TerrainSelection("slope", slope_deg=9.5))
+        assert dashboard.current_command().structural_action is None
     finally:
         dashboard.close()
 
@@ -294,7 +290,7 @@ def test_dashboard_syncs_controls_to_the_active_world(monkeypatch):
         terrain_switch_enabled=True,
     )
     try:
-        terrain = dashboard_module.TerrainSelection(
+        terrain = TerrainSelection(
             "golf_heightfield",
             slope_deg=7.0,
             golf_seed=41,
@@ -344,15 +340,38 @@ def test_dashboard_disables_scene_buttons_until_switch_finishes(monkeypatch):
         assert dashboard.apply_robot_button.isEnabled() is False
         assert dashboard.apply_terrain_button.isEnabled() is False
         assert dashboard.reset_button.isEnabled() is False
-        assert dashboard.current_command().requested_robot_model == "df_mid"
+        assert dashboard.current_command().structural_action == SwitchRobotAction("df_mid")
 
         dashboard.request_terrain_switch()
-        assert dashboard.current_command().requested_terrain is None
+        assert dashboard.current_command().structural_action is None
 
         dashboard.show_switch_status("车型已切换为 df_mid")
         assert dashboard.apply_robot_button.isEnabled() is True
         assert dashboard.apply_terrain_button.isEnabled() is True
         assert dashboard.reset_button.isEnabled() is True
+    finally:
+        dashboard.close()
+
+
+def test_dashboard_reset_request_marks_structure_busy_immediately(monkeypatch):
+    """复位也是安全停车结构操作，请求发出后不能被同帧其他按钮覆盖。"""
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    dashboard = TelemetryDashboard(
+        max_linear_speed=0.4,
+        max_angular_speed=0.8,
+        model_switch_enabled=True,
+        terrain_switch_enabled=True,
+    )
+    try:
+        dashboard.request_reset()
+
+        assert dashboard.apply_robot_button.isEnabled() is False
+        assert dashboard.apply_terrain_button.isEnabled() is False
+        assert dashboard.reset_button.isEnabled() is False
+
+        dashboard.robot_combo.setCurrentIndex(dashboard.robot_combo.findData("df_mid"))
+        dashboard.request_robot_switch()
+        assert dashboard.current_command().structural_action == ResetRobotAction()
     finally:
         dashboard.close()
 
@@ -369,7 +388,7 @@ def test_default_stage1_dashboard_exposes_current_robot_reset(monkeypatch):
         )
         reset_button.click()
 
-        assert dashboard.current_command().reset_requested is True
+        assert dashboard.current_command().structural_action == ResetRobotAction()
     finally:
         dashboard.close()
 

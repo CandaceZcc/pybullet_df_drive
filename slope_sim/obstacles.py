@@ -1065,6 +1065,10 @@ class ObstacleManager:
             return ()
         return self._pending.planned_specs
 
+    def set_vehicle_aabb_getter(self, vehicle_aabb_getter: Callable[[], Aabb3D | None] | None) -> None:
+        """更新提交前车辆 AABB 读取器，车型或场地重建后继续避开当前车辆。"""
+        self._vehicle_aabb_getter = vehicle_aabb_getter
+
     def _require_no_pending(self) -> None:
         if self._pending is not None:
             raise RuntimeError("another obstacle operation is pending")

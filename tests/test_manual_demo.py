@@ -7,9 +7,19 @@ import pytest
 
 import slope_sim.manual_demo as manual_demo_module
 from slope_sim.config import ExperimentConfig
-from slope_sim.dashboard import DashboardCommand, TerrainSelection
+from slope_sim.coordinator import load_manual_robot, reload_manual_robot
+from slope_sim.dashboard import DashboardCommand
 from slope_sim.manual_control import ManualCommand
-from slope_sim.manual_demo import limit_manual_command_step, load_manual_robot, manual_step_limit, merge_manual_commands, reload_manual_robot
+from slope_sim.manual_demo import limit_manual_command_step, manual_step_limit, merge_manual_commands
+from slope_sim.runtime_actions import (
+    AddObstaclesAction,
+    ClearObstaclesAction,
+    DeleteObstacleAction,
+    ResetRobotAction,
+    SwitchTerrainAction,
+    TerrainSelection,
+)
+from slope_sim.obstacles import ObstacleGenerationRequest
 from slope_sim.scene import create_slope_scene
 from slope_sim.simulation import _probe_terrain_for_robot, _read_lidar_for_robot
 
@@ -44,12 +54,12 @@ def test_limit_manual_command_step_slews_drive_commands():
 
     assert limited.linear_velocity == pytest.approx(0.8)
     assert limited.angular_velocity == pytest.approx(-0.4)
-    assert limited.requested_robot_model is None
+    assert limited.structural_action is None
 
 
 def test_limit_manual_command_step_bypasses_slew_for_reset_or_exit():
     previous = DashboardCommand(1.0, 0.8)
-    reset_target = DashboardCommand(0.0, 0.0, reset_requested=True)
+    reset_target = DashboardCommand(0.0, 0.0, structural_action=ResetRobotAction())
     exit_target = DashboardCommand(0.0, 0.0, should_exit=True)
 
     reset = limit_manual_command_step(previous, reset_target, dt=0.1, linear_acceleration_limit=2.0, angular_acceleration_limit=4.0)
@@ -57,7 +67,7 @@ def test_limit_manual_command_step_bypasses_slew_for_reset_or_exit():
 
     assert reset.linear_velocity == 0.0
     assert reset.angular_velocity == 0.0
-    assert reset.reset_requested is True
+    assert reset.structural_action == ResetRobotAction()
     assert exiting.linear_velocity == 0.0
     assert exiting.angular_velocity == 0.0
     assert exiting.should_exit is True
@@ -89,119 +99,6 @@ def test_manual_robot_reload_switches_model_and_default_radius():
         p.disconnect(client_id)
 
 
-def test_apply_manual_switch_replaces_robot_without_rebuilding_terrain():
-    """车型切换只替换车辆，当前地形刚体必须保持不变。"""
-    client_id = p.connect(p.DIRECT)
-    try:
-        config = ExperimentConfig(mode="gui", robot_model="df_back", terrain_model="flat")
-        world = manual_demo_module.load_manual_world(client_id, config, TerrainSelection("flat"), "df_back")
-        old_terrain_id = world.scene.body_id
-        old_robot_id = world.active_robot.robot.robot_id
-
-        result = manual_demo_module.apply_manual_switch_request(
-            client_id,
-            config,
-            world,
-            DashboardCommand(0.0, 0.0, requested_robot_model="active_steering_4wd"),
-        )
-
-        assert result.world.scene.body_id == old_terrain_id
-        assert result.world.active_robot.robot_model == "active_steering_4wd"
-        assert result.world.active_robot.robot.robot_id != old_robot_id
-        assert old_robot_id not in [p.getBodyUniqueId(index, physicsClientId=client_id) for index in range(p.getNumBodies(client_id))]
-        assert result.state_changed is True
-        assert result.world_reset is False
-    finally:
-        p.disconnect(client_id)
-
-
-def test_apply_manual_switch_rebuilds_terrain_and_keeps_robot_model():
-    """场地切换会重建世界，但不能悄悄改变当前车型。"""
-    client_id = p.connect(p.DIRECT)
-    try:
-        config = ExperimentConfig(mode="gui", robot_model="df_mid", terrain_model="flat")
-        world = manual_demo_module.load_manual_world(client_id, config, TerrainSelection("flat"), "df_mid")
-        result = manual_demo_module.apply_manual_switch_request(
-            client_id,
-            config,
-            world,
-            DashboardCommand(0.0, 0.0, requested_terrain=TerrainSelection("slope", slope_deg=8.0)),
-        )
-
-        assert result.world.scene.terrain_type == "slope"
-        assert result.world.scene.slope_deg == pytest.approx(8.0)
-        assert result.world.active_robot.robot_model == "df_mid"
-        assert result.state_changed is True
-        assert result.world_reset is True
-    finally:
-        p.disconnect(client_id)
-
-
-def test_failed_terrain_switch_rolls_back_to_previous_world(monkeypatch):
-    """目标场地创建失败后必须恢复有效旧世界，而不是留下无地面状态。"""
-    client_id = p.connect(p.DIRECT)
-    original = manual_demo_module.create_slope_scene
-    try:
-        config = ExperimentConfig(mode="gui", robot_model="df_back", terrain_model="flat")
-        world = manual_demo_module.load_manual_world(client_id, config, TerrainSelection("flat"), "df_back")
-
-        def fail_target(*args, **kwargs):
-            if kwargs.get("terrain_model") == "golf_heightfield":
-                raise RuntimeError("target terrain failed")
-            return original(*args, **kwargs)
-
-        monkeypatch.setattr(manual_demo_module, "create_slope_scene", fail_target)
-        result = manual_demo_module.apply_manual_switch_request(
-            client_id,
-            config,
-            world,
-            DashboardCommand(
-                0.0,
-                0.0,
-                requested_terrain=TerrainSelection("golf_heightfield", golf_seed=7),
-            ),
-        )
-
-        assert result.world.terrain == TerrainSelection("flat")
-        assert result.world.scene.terrain_type == "flat"
-        assert result.world.active_robot.robot_model == "df_back"
-        assert "target terrain failed" in result.error_message
-        assert result.state_changed is True
-        assert result.world_reset is True
-    finally:
-        p.disconnect(client_id)
-
-
-def test_failed_robot_switch_keeps_current_robot(monkeypatch):
-    """新车型加载失败时旧车仍然有效，不能先删旧车再尝试加载。"""
-    client_id = p.connect(p.DIRECT)
-    original = manual_demo_module.load_manual_robot
-    try:
-        config = ExperimentConfig(mode="gui", robot_model="df_back", terrain_model="flat")
-        world = manual_demo_module.load_manual_world(client_id, config, TerrainSelection("flat"), "df_back")
-        old_robot_id = world.active_robot.robot.robot_id
-
-        def fail_target(client_id, config, scene, robot_model=None):
-            if robot_model == "df_mid":
-                raise RuntimeError("target robot failed")
-            return original(client_id, config, scene, robot_model)
-
-        monkeypatch.setattr(manual_demo_module, "load_manual_robot", fail_target)
-        result = manual_demo_module.apply_manual_switch_request(
-            client_id,
-            config,
-            world,
-            DashboardCommand(0.0, 0.0, requested_robot_model="df_mid"),
-        )
-
-        assert result.world.active_robot.robot.robot_id == old_robot_id
-        assert result.world.active_robot.robot_model == "df_back"
-        assert "target robot failed" in result.error_message
-        assert result.state_changed is False
-    finally:
-        p.disconnect(client_id)
-
-
 def test_merge_manual_commands_uses_pybullet_keyboard_when_dashboard_is_idle():
     dashboard = DashboardCommand(0.0, 0.0)
     keyboard = ManualCommand(0.4, 0.0)
@@ -210,7 +107,7 @@ def test_merge_manual_commands_uses_pybullet_keyboard_when_dashboard_is_idle():
 
     assert merged.linear_velocity == 0.4
     assert merged.angular_velocity == 0.0
-    assert merged.requested_robot_model is None
+    assert merged.structural_action is None
 
 
 def test_merge_manual_commands_keeps_camera_state_when_keyboard_takes_control():
@@ -227,13 +124,33 @@ def test_merge_manual_commands_preserves_terrain_switch_and_blocks_keyboard_moti
     """场地切换帧不能被 PyBullet 窗口键盘重新注入驾驶速度。"""
     request = TerrainSelection("slope", slope_deg=6.0)
     merged = merge_manual_commands(
-        DashboardCommand(0.0, 0.0, requested_terrain=request),
+        DashboardCommand(0.0, 0.0, structural_action=SwitchTerrainAction(request)),
         ManualCommand(0.4, 0.0),
     )
 
-    assert merged.requested_terrain == request
+    assert merged.structural_action == SwitchTerrainAction(request)
     assert merged.linear_velocity == 0.0
     assert merged.angular_velocity == 0.0
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        AddObstaclesAction(ObstacleGenerationRequest("static", 1, seed=4)),
+        DeleteObstacleAction(1),
+        ClearObstaclesAction(),
+    ],
+)
+def test_merge_manual_commands_allows_obstacle_actions_during_drive(action):
+    """障碍物增删不属于安全停车操作，不能吞掉当前驾驶命令。"""
+    merged = merge_manual_commands(
+        DashboardCommand(0.2, 0.1, structural_action=action),
+        ManualCommand(0.4, 0.0),
+    )
+
+    assert merged.structural_action == action
+    assert merged.linear_velocity == pytest.approx(0.2)
+    assert merged.angular_velocity == pytest.approx(0.1)
 
 
 def test_limit_manual_command_step_bypasses_slew_for_scene_switch():
@@ -244,7 +161,7 @@ def test_limit_manual_command_step_bypasses_slew_for_scene_switch():
         DashboardCommand(
             0.0,
             0.0,
-            requested_terrain=request,
+            structural_action=SwitchTerrainAction(request),
             camera_follow_enabled=True,
             camera_follow_view="front",
         ),
@@ -255,9 +172,32 @@ def test_limit_manual_command_step_bypasses_slew_for_scene_switch():
 
     assert limited.linear_velocity == 0.0
     assert limited.angular_velocity == 0.0
-    assert limited.requested_terrain == request
+    assert limited.structural_action == SwitchTerrainAction(request)
     assert limited.camera_follow_enabled is True
     assert limited.camera_follow_view == "front"
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        AddObstaclesAction(ObstacleGenerationRequest("static", 1, seed=5)),
+        DeleteObstacleAction(1),
+        ClearObstaclesAction(),
+    ],
+)
+def test_limit_manual_command_step_keeps_slew_for_obstacle_actions(action):
+    """障碍物操作可以和驾驶命令同帧排队，速度仍按常规限幅。"""
+    limited = limit_manual_command_step(
+        DashboardCommand(0.0, 0.0),
+        DashboardCommand(0.6, 0.4, structural_action=action),
+        dt=0.1,
+        linear_acceleration_limit=2.0,
+        angular_acceleration_limit=4.0,
+    )
+
+    assert limited.linear_velocity == pytest.approx(0.2)
+    assert limited.angular_velocity == pytest.approx(0.4)
+    assert limited.structural_action == action
 
 
 def test_manual_demo_dashboard_fallback_keeps_configured_camera_state(monkeypatch):
@@ -299,6 +239,11 @@ def test_manual_demo_dashboard_fallback_keeps_configured_camera_state(monkeypatc
     monkeypatch.setattr(manual_demo_module.p, "disconnect", lambda _client_id: None)
     monkeypatch.setattr(manual_demo_module, "TelemetryDashboard", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("offscreen")))
     monkeypatch.setattr(manual_demo_module, "load_manual_world", lambda *_args: world)
+    monkeypatch.setattr(
+        manual_demo_module,
+        "create_obstacle_manager",
+        lambda *_args, **_kwargs: SimpleNamespace(update_moving=lambda _dt: None),
+    )
     monkeypatch.setattr(manual_demo_module, "configure_gui_visualizer", lambda *_args: None)
     monkeypatch.setattr(manual_demo_module, "CsvSimulationLogger", FakeLogger)
     monkeypatch.setattr(manual_demo_module, "command_from_keyboard", lambda *_args: ManualCommand(0.0, 0.0))
@@ -325,103 +270,6 @@ def test_manual_demo_dashboard_fallback_keeps_configured_camera_state(monkeypatc
     )
 
     assert camera_calls == [(client_id, robot_id, 6.0, -35.0, 45.0, "side")]
-
-
-def test_terrain_switch_takes_priority_over_model_switch_and_reset():
-    """同一帧最多重建一次，优先应用会重置整个世界的场地请求。"""
-    client_id = p.connect(p.DIRECT)
-    try:
-        config = ExperimentConfig(mode="gui", robot_model="df_back", terrain_model="flat")
-        world = manual_demo_module.load_manual_world(client_id, config, TerrainSelection("flat"), "df_back")
-        result = manual_demo_module.apply_manual_switch_request(
-            client_id,
-            config,
-            world,
-            DashboardCommand(
-                0.4,
-                0.8,
-                requested_robot_model="df_mid",
-                reset_requested=True,
-                requested_terrain=TerrainSelection("slope", slope_deg=5.0),
-            ),
-        )
-
-        assert result.world.scene.terrain_type == "slope"
-        assert result.world.active_robot.robot_model == "df_back"
-    finally:
-        p.disconnect(client_id)
-
-
-def test_process_manual_scene_action_stops_old_robot_before_switch_and_updates_dashboard(monkeypatch):
-    """单帧协调必须先停旧车，再重建并同步相机与 Dashboard。"""
-    client_id = p.connect(p.DIRECT)
-    events = []
-    try:
-        config = ExperimentConfig(mode="gui", robot_model="df_back", terrain_model="flat")
-        world = manual_demo_module.load_manual_world(client_id, config, TerrainSelection("flat"), "df_back")
-        original_command_twist = world.active_robot.robot.command_twist
-
-        def record_command_twist(linear_velocity, angular_velocity, dt):
-            events.append(("stop", linear_velocity, angular_velocity))
-            return original_command_twist(linear_velocity, angular_velocity, dt=dt)
-
-        monkeypatch.setattr(world.active_robot.robot, "command_twist", record_command_twist)
-
-        expected_result = manual_demo_module.ManualSwitchResult(
-            world=world,
-            state_changed=True,
-            world_reset=True,
-            status_message="场地已切换",
-        )
-
-        def fake_apply(_client_id, _config, _world, _command):
-            events.append(("apply",))
-            return expected_result
-
-        monkeypatch.setattr(manual_demo_module, "apply_manual_switch_request", fake_apply)
-        monkeypatch.setattr(
-            manual_demo_module,
-            "configure_gui_visualizer",
-            lambda *_args: events.append(("camera",)),
-        )
-
-        class DashboardProbe:
-            def set_switch_busy(self, busy, message, **_kwargs):
-                events.append(("busy", busy, message))
-
-            def process_events(self):
-                events.append(("events",))
-
-            def sync_active_selection(self, robot_model, terrain):
-                events.append(("sync", robot_model, terrain.terrain_model))
-
-            def reset_feedback_history(self):
-                events.append(("reset_history",))
-
-            def show_switch_status(self, message, **_kwargs):
-                events.append(("status", message))
-
-        result = manual_demo_module.process_manual_scene_action(
-            client_id,
-            config,
-            world,
-            DashboardCommand(
-                0.4,
-                0.8,
-                requested_terrain=TerrainSelection("slope", slope_deg=5.0),
-            ),
-            DashboardProbe(),
-        )
-
-        assert result is expected_result
-        assert events.index(("stop", 0.0, 0.0)) < events.index(("apply",))
-        assert ("busy", True, "应用中") in events
-        assert ("camera",) in events
-        assert ("sync", "df_back", "flat") in events
-        assert ("reset_history",) in events
-        assert ("status", "场地已切换") in events
-    finally:
-        p.disconnect(client_id)
 
 
 def test_manual_dashboard_command_moves_mid_drive_on_slope():

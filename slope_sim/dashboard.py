@@ -8,6 +8,13 @@ from dataclasses import dataclass, fields, replace
 from pathlib import Path
 
 from slope_sim.model_registry import robot_model_names
+from slope_sim.runtime_actions import (
+    ResetRobotAction,
+    RuntimeAction,
+    SwitchRobotAction,
+    SwitchTerrainAction,
+    TerrainSelection,
+)
 from slope_sim.scene import terrain_model_names
 from slope_sim.telemetry import RobotTelemetry
 
@@ -410,42 +417,13 @@ def dashboard_rows(telemetry: RobotTelemetry) -> list[tuple[str, str]]:
 
 
 @dataclass(frozen=True)
-class TerrainSelection:
-    """Dashboard 提交给手动仿真循环的一组完整场地参数。"""
-
-    terrain_model: str
-    slope_deg: float = 0.0
-    golf_seed: int = 0
-    golf_relief: str = "medium"
-
-    def __post_init__(self) -> None:
-        """规范化选择值，并阻止非法参数进入 PyBullet 场景重建。"""
-        terrain_model = self.terrain_model.lower()
-        golf_relief = self.golf_relief.lower()
-        if terrain_model not in terrain_model_names():
-            raise ValueError(f"terrain_model must be one of: {', '.join(terrain_model_names())}")
-        if golf_relief not in {"low", "medium", "high"}:
-            raise ValueError("golf_relief must be 'low', 'medium', or 'high'")
-        if not math.isfinite(float(self.slope_deg)):
-            raise ValueError("slope_deg must be finite")
-        if not math.isfinite(float(self.golf_seed)) or int(self.golf_seed) != float(self.golf_seed):
-            raise ValueError("golf_seed must be a finite integer")
-        object.__setattr__(self, "terrain_model", terrain_model)
-        object.__setattr__(self, "slope_deg", float(self.slope_deg))
-        object.__setattr__(self, "golf_seed", int(self.golf_seed))
-        object.__setattr__(self, "golf_relief", golf_relief)
-
-
-@dataclass(frozen=True)
 class DashboardCommand:
     """Dashboard 输出给仿真循环的手动速度和一次性场景命令。"""
 
     linear_velocity: float
     angular_velocity: float
     should_exit: bool = False
-    requested_robot_model: str | None = None
-    reset_requested: bool = False
-    requested_terrain: TerrainSelection | None = None
+    structural_action: RuntimeAction | None = None
     camera_follow_enabled: bool = False
     camera_follow_view: str = "front"
 
@@ -482,9 +460,7 @@ class TelemetryDashboard:
         self._button_keys: set[int] = set()
         self._button_pulses: dict[int, float] = {}
         self._should_exit = False
-        self._reset_requested = False
-        self._requested_robot_model: str | None = None
-        self._requested_terrain: TerrainSelection | None = None
+        self._structural_action: RuntimeAction | None = None
         self._switch_busy = False
         self.update_hz = update_hz
         self.smoothing_alpha = smoothing_alpha
@@ -873,24 +849,27 @@ class TelemetryDashboard:
     def request_reset(self) -> None:
         if self._switch_busy:
             return
-        self._reset_requested = True
+        self._structural_action = ResetRobotAction()
+        self.set_switch_busy(True, "等待应用")
 
     def request_robot_switch(self) -> None:
         """把下拉框中的车型保存为一次性应用请求。"""
         if self._switch_busy or self.robot_combo is None:
             return
-        self._requested_robot_model = str(self.robot_combo.currentData())
+        self._structural_action = SwitchRobotAction(str(self.robot_combo.currentData()))
         self.set_switch_busy(True, "等待应用")
 
     def request_terrain_switch(self) -> None:
         """把当前场地控件值保存为一次性应用请求。"""
         if self._switch_busy or self.terrain_combo is None:
             return
-        self._requested_terrain = TerrainSelection(
-            terrain_model=str(self.terrain_combo.currentData()),
-            slope_deg=self.slope_spin.value(),
-            golf_seed=self.golf_seed_spin.value(),
-            golf_relief=str(self.golf_relief_combo.currentData()),
+        self._structural_action = SwitchTerrainAction(
+            TerrainSelection(
+                terrain_model=str(self.terrain_combo.currentData()),
+                slope_deg=self.slope_spin.value(),
+                golf_seed=self.golf_seed_spin.value(),
+                golf_relief=str(self.golf_relief_combo.currentData()),
+            )
         )
         self.set_switch_busy(True, "等待应用")
 
@@ -1004,22 +983,16 @@ class TelemetryDashboard:
         now = time.monotonic()
         self._button_pulses = {key: expires_at for key, expires_at in self._button_pulses.items() if expires_at >= now}
         keys = self._pressed_keys | self._button_keys | set(self._button_pulses)
-        requested_robot_model = self._requested_robot_model
-        requested_terrain = self._requested_terrain
-        reset_requested = self._reset_requested
+        structural_action = self._structural_action
         camera_follow_enabled = self.camera_follow_checkbox.isChecked()
         camera_follow_view = str(self.camera_view_combo.currentData())
-        self._requested_robot_model = None
-        self._requested_terrain = None
-        self._reset_requested = False
+        self._structural_action = None
         if self._normalize_key(self.QtCore.Qt.Key_Space) in keys:
             return DashboardCommand(
                 0.0,
                 0.0,
                 should_exit=self._should_exit,
-                requested_robot_model=requested_robot_model,
-                reset_requested=reset_requested,
-                requested_terrain=requested_terrain,
+                structural_action=structural_action,
                 camera_follow_enabled=camera_follow_enabled,
                 camera_follow_view=camera_follow_view,
             )
@@ -1037,9 +1010,7 @@ class TelemetryDashboard:
             linear,
             angular,
             should_exit=self._should_exit,
-            requested_robot_model=requested_robot_model,
-            reset_requested=reset_requested,
-            requested_terrain=requested_terrain,
+            structural_action=structural_action,
             camera_follow_enabled=camera_follow_enabled,
             camera_follow_view=camera_follow_view,
         )
