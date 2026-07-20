@@ -17,12 +17,14 @@ import pandas as pd
 DASHBOARD_WINDOW_TITLE = "Stage 1 Robot Evaluation Dashboard"
 DASHBOARD_LOGICAL_WIDTH = 420
 DEFAULT_MANUAL_PREFIX = "manual_golf_heightfield_active_steering_4wd_0_"
+DASHBOARD_TAB_ORDER = ("data", "obstacles", "trajectory", "speed", "slip", "contact")
 DASHBOARD_TAB_X_OFFSETS = {
     "data": 34,
-    "trajectory": 82,
-    "speed": 145,
-    "slip": 207,
-    "contact": 255,
+    "obstacles": 92,
+    "trajectory": 155,
+    "speed": 218,
+    "slip": 280,
+    "contact": 328,
 }
 DASHBOARD_TAB_Y_OFFSET = 62
 DASHBOARD_CONTROL_SCROLL_BOTTOM_OFFSET = 80
@@ -83,7 +85,9 @@ def dashboard_control_scroll_point(geometry: WindowGeometry) -> tuple[int, int]:
 
 
 def dashboard_plot_tab_point(geometry: WindowGeometry, plot_tab: str) -> tuple[int, int]:
-    """按当前标签布局估算数据页或指定曲线页的标签中心点。"""
+    """按命名标签布局估算数据、障碍物或曲线页的标签中心点。"""
+    if plot_tab not in DASHBOARD_TAB_ORDER:
+        raise KeyError(f"unknown dashboard tab: {plot_tab}")
     scale = dashboard_geometry_scale(geometry)
     return (
         geometry.x + round(DASHBOARD_TAB_X_OFFSETS[plot_tab] * scale),

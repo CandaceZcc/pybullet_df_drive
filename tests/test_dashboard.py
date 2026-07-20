@@ -16,7 +16,16 @@ from slope_sim.dashboard import (
     should_refresh_dashboard,
     smooth_telemetry,
 )
-from slope_sim.runtime_actions import ResetRobotAction, SwitchRobotAction, SwitchTerrainAction, TerrainSelection
+from slope_sim.obstacles import ObstacleGenerationRequest, ObstacleSnapshot
+from slope_sim.runtime_actions import (
+    AddObstaclesAction,
+    ClearObstaclesAction,
+    DeleteObstacleAction,
+    ResetRobotAction,
+    SwitchRobotAction,
+    SwitchTerrainAction,
+    TerrainSelection,
+)
 from slope_sim.telemetry import RobotTelemetry
 
 
@@ -258,6 +267,261 @@ def test_dashboard_terrain_switch_requires_apply_and_captures_parameters(monkeyp
         dashboard.close()
 
 
+def test_dashboard_top_tabs_include_obstacle_table(monkeypatch):
+    """顶部标签页应新增障碍物表格，并只展示稳定逻辑字段。"""
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from PySide6 import QtWidgets
+
+    dashboard = TelemetryDashboard(max_linear_speed=0.4, max_angular_speed=0.8)
+    try:
+        assert [dashboard.tabs.tabText(index) for index in range(dashboard.tabs.count())] == [
+            "数据",
+            "障碍物",
+            "轨迹",
+            "速度/命令",
+            "打滑",
+            "接触",
+        ]
+        assert dashboard.obstacle_table.selectionBehavior() == QtWidgets.QAbstractItemView.SelectRows
+        assert dashboard.obstacle_table.selectionMode() == QtWidgets.QAbstractItemView.SingleSelection
+        assert [
+            dashboard.obstacle_table.horizontalHeaderItem(column).text()
+            for column in range(dashboard.obstacle_table.columnCount())
+        ] == ["逻辑ID", "模式", "形状", "位置"]
+    finally:
+        dashboard.close()
+
+
+def test_dashboard_obstacle_snapshot_refresh_preserves_selection_by_logical_id(monkeypatch):
+    """障碍物位置刷新后，应按逻辑 ID 恢复当前选中行。"""
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    dashboard = TelemetryDashboard(max_linear_speed=0.4, max_angular_speed=0.8)
+    try:
+        dashboard.update_obstacle_snapshots(
+            (
+                ObstacleSnapshot(1, None, "static", "box", (1.0, 2.0, 0.3), (0.0, 0.0, 0.0, 1.0)),
+                ObstacleSnapshot(2, None, "moving", "sphere", (3.0, 4.0, 0.5), (0.0, 0.0, 0.0, 1.0)),
+            )
+        )
+        dashboard.obstacle_table.selectRow(1)
+
+        dashboard.update_obstacle_snapshots(
+            (
+                ObstacleSnapshot(2, None, "moving", "sphere", (3.5, 4.5, 0.5), (0.0, 0.0, 0.0, 1.0)),
+                ObstacleSnapshot(3, None, "static", "cylinder", (-1.0, 0.0, 0.4), (0.0, 0.0, 0.0, 1.0)),
+            ),
+            force=True,
+        )
+
+        selected_rows = dashboard.obstacle_table.selectionModel().selectedRows()
+        assert len(selected_rows) == 1
+        assert dashboard.obstacle_table.item(selected_rows[0].row(), 0).data(dashboard.QtCore.Qt.UserRole) == 2
+        assert dashboard.obstacle_table.item(selected_rows[0].row(), 3).text() == "3.50, 4.50, 0.50"
+    finally:
+        dashboard.close()
+
+
+def test_dashboard_obstacle_snapshot_refresh_is_throttled(monkeypatch):
+    """障碍物表格刷新频率不能跟 240Hz 物理循环绑定。"""
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    now = {"value": 100.0}
+    monkeypatch.setattr(dashboard_module.time, "monotonic", lambda: now["value"])
+    dashboard = TelemetryDashboard(max_linear_speed=0.4, max_angular_speed=0.8, update_hz=5.0)
+    try:
+        first = (ObstacleSnapshot(1, None, "static", "box", (1.0, 2.0, 0.3), (0.0, 0.0, 0.0, 1.0)),)
+        second = (ObstacleSnapshot(1, None, "static", "box", (9.0, 2.0, 0.3), (0.0, 0.0, 0.0, 1.0)),)
+
+        assert dashboard.update_obstacle_snapshots(first) is True
+        now["value"] = 100.05
+        assert dashboard.update_obstacle_snapshots(second) is False
+        assert dashboard.obstacle_table.item(0, 3).text() == "1.00, 2.00, 0.30"
+
+        now["value"] = 100.20
+        assert dashboard.update_obstacle_snapshots(second) is True
+        assert dashboard.obstacle_table.item(0, 3).text() == "9.00, 2.00, 0.30"
+    finally:
+        dashboard.close()
+
+
+def test_dashboard_control_scroll_includes_obstacle_group(monkeypatch):
+    """障碍物控件组应位于下方滚动控制区，不挤占顶部 tabs。"""
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    dashboard = TelemetryDashboard(
+        max_linear_speed=0.4,
+        max_angular_speed=0.8,
+        model_switch_enabled=True,
+        terrain_switch_enabled=True,
+    )
+    try:
+        assert [group.title() for group in dashboard.control_groups] == ["参数", "车型", "场地", "障碍物", "相机", "控制"]
+        assert dashboard.obstacle_group.parentWidget() is dashboard.control_content
+        assert dashboard.control_scroll.isAncestorOf(dashboard.obstacle_group)
+        assert not dashboard.tabs.isAncestorOf(dashboard.obstacle_group)
+    finally:
+        dashboard.close()
+
+
+@pytest.mark.parametrize(
+    ("mode", "speed_enabled", "ratio_enabled"),
+    [
+        ("static", False, False),
+        ("moving", True, False),
+        ("mixed", True, True),
+    ],
+)
+def test_dashboard_obstacle_mode_enables_relevant_controls(monkeypatch, mode, speed_enabled, ratio_enabled):
+    """不同障碍物模式只开放真正会参与生成请求的参数。"""
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    dashboard = TelemetryDashboard(max_linear_speed=0.4, max_angular_speed=0.8)
+    try:
+        dashboard.obstacle_mode_combo.setCurrentIndex(dashboard.obstacle_mode_combo.findData(mode))
+
+        assert dashboard.obstacle_speed_spin.isEnabled() is speed_enabled
+        assert dashboard.obstacle_ratio_spin.isEnabled() is ratio_enabled
+        assert dashboard.obstacle_ratio_spin.value() == 30
+        assert dashboard.obstacle_count_spin.minimum() == 1
+        assert dashboard.obstacle_count_spin.maximum() == 50
+    finally:
+        dashboard.close()
+
+
+def test_dashboard_add_obstacle_command_captures_all_controls(monkeypatch):
+    """添加请求必须完整携带模式、形状、数量、种子、速度和混合比例。"""
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    dashboard = TelemetryDashboard(max_linear_speed=0.4, max_angular_speed=0.8)
+    try:
+        dashboard.obstacle_mode_combo.setCurrentIndex(dashboard.obstacle_mode_combo.findData("mixed"))
+        dashboard.obstacle_shape_combo.setCurrentIndex(dashboard.obstacle_shape_combo.findData("cylinder"))
+        dashboard.obstacle_count_spin.setValue(7)
+        dashboard.obstacle_seed_spin.setValue(123)
+        dashboard.obstacle_speed_spin.setValue(0.65)
+        dashboard.obstacle_ratio_spin.setValue(45)
+
+        dashboard.request_add_obstacles()
+        action = dashboard.current_command().structural_action
+
+        assert action == AddObstaclesAction(
+            ObstacleGenerationRequest(
+                mode="mixed",
+                shape="cylinder",
+                count=7,
+                seed=123,
+                moving_speed=0.65,
+                moving_ratio=0.45,
+            )
+        )
+    finally:
+        dashboard.close()
+
+
+def test_dashboard_delete_obstacle_uses_selected_logical_id(monkeypatch):
+    """未选择行时删除按钮禁用；选择后按逻辑 ID 生成删除请求。"""
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    dashboard = TelemetryDashboard(max_linear_speed=0.4, max_angular_speed=0.8)
+    try:
+        dashboard.update_obstacle_snapshots(
+            (ObstacleSnapshot(7, None, "static", "box", (0.0, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0)),)
+        )
+        assert dashboard.delete_obstacle_button.isEnabled() is False
+
+        dashboard.obstacle_table.selectRow(0)
+        assert dashboard.delete_obstacle_button.isEnabled() is True
+        dashboard.request_delete_obstacle()
+
+        assert dashboard.current_command().structural_action == DeleteObstacleAction(7)
+    finally:
+        dashboard.close()
+
+
+def test_dashboard_clear_obstacles_queues_directly_without_modal(monkeypatch):
+    """清空障碍物不应弹阻塞确认框，直接排入结构动作队列。"""
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from PySide6 import QtWidgets
+
+    def fail_modal(*_args, **_kwargs):
+        raise AssertionError("clear obstacles must not open a modal dialog")
+
+    monkeypatch.setattr(QtWidgets.QMessageBox, "question", fail_modal, raising=False)
+    dashboard = TelemetryDashboard(max_linear_speed=0.4, max_angular_speed=0.8)
+    try:
+        dashboard.clear_obstacles_button.click()
+
+        assert dashboard.current_command().structural_action == ClearObstaclesAction()
+    finally:
+        dashboard.close()
+
+
+def test_dashboard_structural_actions_emit_fifo_without_loss(monkeypatch):
+    """Dashboard 每帧最多输出一个结构动作，多次排队保持 FIFO 且不重复。"""
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    dashboard = TelemetryDashboard(max_linear_speed=0.4, max_angular_speed=0.8)
+    try:
+        actions = [
+            AddObstaclesAction(ObstacleGenerationRequest("static", 1, seed=1)),
+            DeleteObstacleAction(3),
+            ClearObstaclesAction(),
+        ]
+        for action in actions:
+            dashboard._enqueue_structural_action(action)
+
+        assert [dashboard.current_command().structural_action for _ in range(4)] == [*actions, None]
+    finally:
+        dashboard.close()
+
+
+def test_dashboard_public_obstacle_requests_queue_fifo_before_current_command(monkeypatch):
+    """同一轮 Qt 事件里多个公开请求应全部入队，不能被 busy 状态吞掉。"""
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    dashboard = TelemetryDashboard(max_linear_speed=0.4, max_angular_speed=0.8)
+    try:
+        dashboard.update_obstacle_snapshots(
+            (ObstacleSnapshot(3, None, "static", "box", (0.0, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0)),)
+        )
+        dashboard.obstacle_table.selectRow(0)
+
+        dashboard.request_add_obstacles()
+        dashboard.request_delete_obstacle()
+        dashboard.request_clear_obstacles()
+
+        actions = [dashboard.current_command().structural_action for _ in range(4)]
+        assert isinstance(actions[0], AddObstaclesAction)
+        assert actions[1:] == [DeleteObstacleAction(3), ClearObstaclesAction(), None]
+    finally:
+        dashboard.close()
+
+
+def test_dashboard_structure_busy_disables_buttons_and_restores_status(monkeypatch):
+    """结构操作忙碌期间禁用相关按钮，成功或失败都恢复并显示统一状态。"""
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    dashboard = TelemetryDashboard(
+        max_linear_speed=0.4,
+        max_angular_speed=0.8,
+        model_switch_enabled=True,
+        terrain_switch_enabled=True,
+    )
+    try:
+        dashboard.set_structure_busy(True, "应用中")
+
+        related_buttons = (
+            dashboard.apply_robot_button,
+            dashboard.apply_terrain_button,
+            dashboard.reset_button,
+            dashboard.add_obstacles_button,
+            dashboard.delete_obstacle_button,
+            dashboard.clear_obstacles_button,
+        )
+        assert all(button.isEnabled() is False for button in related_buttons)
+        assert dashboard.structure_status_label.text() == "结构状态：应用中"
+
+        dashboard.show_switch_status("切换失败: boom", is_error=True)
+        assert all(button.isEnabled() is True for button in related_buttons if button is not dashboard.delete_obstacle_button)
+        assert dashboard.delete_obstacle_button.isEnabled() is False
+        assert dashboard.structure_status_label.text() == "结构状态：切换失败: boom"
+        assert "#b00020" in dashboard.structure_status_label.styleSheet()
+    finally:
+        dashboard.close()
+
+
 def test_dashboard_enables_only_parameters_for_pending_terrain(monkeypatch):
     """场地参数的可编辑状态跟随待应用选择，而不是当前活动场地。"""
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
@@ -308,7 +572,7 @@ def test_dashboard_syncs_controls_to_the_active_world(monkeypatch):
 
 
 def test_dashboard_shows_non_blocking_switch_error(monkeypatch):
-    """切换失败只更新状态标签，不弹出阻塞物理循环的对话框。"""
+    """切换失败只更新统一状态标签，不弹出阻塞物理循环的对话框。"""
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     dashboard = TelemetryDashboard(
         max_linear_speed=0.4,
@@ -318,8 +582,9 @@ def test_dashboard_shows_non_blocking_switch_error(monkeypatch):
     try:
         dashboard.show_switch_status("已恢复旧场地", is_error=True)
 
-        assert dashboard.switch_status_label.text() == "切换状态：已恢复旧场地"
-        assert "#b00020" in dashboard.switch_status_label.styleSheet()
+        assert dashboard.switch_status_label is dashboard.structure_status_label
+        assert dashboard.structure_status_label.text() == "结构状态：已恢复旧场地"
+        assert "#b00020" in dashboard.structure_status_label.styleSheet()
     finally:
         dashboard.close()
 
@@ -411,6 +676,15 @@ def test_dashboard_reset_feedback_history_clears_smoothing_and_plots(monkeypatch
         assert dashboard.plot_buffer.series()["x"] == []
     finally:
         dashboard.close()
+
+
+def _dashboard_plot_tab_indices(dashboard):
+    """按标签名定位曲线页，避免新增非曲线页后测试依赖裸索引。"""
+    return [
+        index
+        for index in range(dashboard.tabs.count())
+        if dashboard.tabs.tabText(index) in dashboard.plot_canvases
+    ]
 
 
 def test_telemetry_plot_buffer_keeps_recent_window_and_series():
@@ -510,7 +784,7 @@ def test_dashboard_fixed_sidebar_uses_vertical_control_scroll(monkeypatch):
         assert dashboard.control_scroll.widget() is dashboard.control_content
         assert dashboard.control_scroll.horizontalScrollBarPolicy() == QtCore.Qt.ScrollBarAlwaysOff
         assert dashboard.control_scroll.verticalScrollBar().maximum() > 0
-        assert [group.title() for group in dashboard.control_groups] == ["参数", "车型", "场地", "相机", "控制"]
+        assert [group.title() for group in dashboard.control_groups] == ["参数", "车型", "场地", "障碍物", "相机", "控制"]
         assert all(group.parentWidget() is dashboard.control_content for group in dashboard.control_groups)
         assert not dashboard.control_scroll.isAncestorOf(dashboard.tabs)
         assert all(not dashboard.control_scroll.isAncestorOf(canvas) for canvas in dashboard.plot_canvases.values())
@@ -537,13 +811,23 @@ def test_dashboard_fixed_sidebar_uses_vertical_control_scroll(monkeypatch):
             ("场地", dashboard.golf_seed_spin),
             ("场地", dashboard.golf_relief_combo),
             ("场地", dashboard.apply_terrain_button),
-            ("场地", dashboard.switch_status_label),
+            ("障碍物", dashboard.obstacle_mode_combo),
+            ("障碍物", dashboard.obstacle_shape_combo),
+            ("障碍物", dashboard.obstacle_count_spin),
+            ("障碍物", dashboard.obstacle_seed_spin),
+            ("障碍物", dashboard.obstacle_speed_spin),
+            ("障碍物", dashboard.obstacle_ratio_spin),
+            ("障碍物", dashboard.add_obstacles_button),
+            ("障碍物", dashboard.delete_obstacle_button),
+            ("障碍物", dashboard.clear_obstacles_button),
+            ("障碍物", dashboard.structure_status_label),
             ("相机", dashboard.camera_follow_checkbox),
             ("相机", dashboard.camera_view_combo),
         )
         label_texts = {
             "参数": ("最大线速度", "最大角速度"),
             "场地": ("场地", "坡度", "随机种子", "起伏"),
+            "障碍物": ("模式", "形状", "数量", "随机种子", "速度", "移动占比"),
             "相机": ("视角",),
         }
         for group_name, texts in label_texts.items():
@@ -600,13 +884,13 @@ def test_dashboard_small_fixed_window_keeps_plot_content_and_controls_visible(mo
         assert tabs_rect.bottom() < controls_rect.top()
         assert dashboard.control_scroll.viewport().height() > 0
         assert dashboard.control_scroll.verticalScrollBar().maximum() > 0
-        assert [group.title() for group in dashboard.control_groups] == ["参数", "车型", "场地", "相机", "控制"]
+        assert [group.title() for group in dashboard.control_groups] == ["参数", "车型", "场地", "障碍物", "相机", "控制"]
 
         dashboard.control_scroll.verticalScrollBar().setValue(dashboard.control_scroll.verticalScrollBar().maximum())
         dashboard.process_events()
         assert window_rect(dashboard.control_groups[-1]).intersects(window_rect(dashboard.control_scroll.viewport()))
 
-        for index in range(1, dashboard.tabs.count()):
+        for index in _dashboard_plot_tab_indices(dashboard):
             dashboard.tabs.setCurrentIndex(index)
             dashboard.process_events()
             plot_tab = dashboard.tabs.widget(index)
@@ -657,7 +941,7 @@ def test_dashboard_narrow_plot_layout_keeps_axes_and_buttons_in_top_tabs(monkeyp
     try:
         dashboard.process_events()
 
-        for index, (label, figure) in enumerate(dashboard.plot_figures.items(), start=1):
+        for label, figure in dashboard.plot_figures.items():
             assert tuple(figure.get_size_inches()) == pytest.approx(dashboard_module.DASHBOARD_PLOT_FIGURE_SIZE)
             subplotpars = figure.subplotpars
             assert subplotpars.left >= 0.23
@@ -665,6 +949,7 @@ def test_dashboard_narrow_plot_layout_keeps_axes_and_buttons_in_top_tabs(monkeyp
             assert subplotpars.right <= 0.97
             assert subplotpars.top <= 0.90
 
+            index = next(index for index in _dashboard_plot_tab_indices(dashboard) if dashboard.tabs.tabText(index) == label)
             dashboard.tabs.setCurrentIndex(index)
             dashboard.process_events()
             plot_tab = dashboard.tabs.widget(index)
@@ -688,7 +973,8 @@ def test_dashboard_plot_text_bounds_stay_inside_real_narrow_canvas(monkeypatch):
 
     dashboard = TelemetryDashboard(max_linear_speed=0.4, max_angular_speed=0.8)
     try:
-        for index, (label, axis) in enumerate(dashboard.plot_axes.items(), start=1):
+        for label, axis in dashboard.plot_axes.items():
+            index = next(index for index in _dashboard_plot_tab_indices(dashboard) if dashboard.tabs.tabText(index) == label)
             dashboard.tabs.setCurrentIndex(index)
             dashboard.process_events()
             canvas = dashboard.plot_canvases[label]
@@ -776,7 +1062,7 @@ def test_dashboard_updates_only_the_visible_plot_axis(monkeypatch):
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     dashboard = TelemetryDashboard(max_linear_speed=0.4, max_angular_speed=0.8)
     try:
-        dashboard.tabs.setCurrentIndex(1)
+        dashboard.tabs.setCurrentIndex(next(index for index in _dashboard_plot_tab_indices(dashboard) if dashboard.tabs.tabText(index) == "轨迹"))
         dashboard.process_events()
         relim_counts = {label: 0 for label in dashboard.plot_axes}
         for label, axis in dashboard.plot_axes.items():
@@ -798,7 +1084,7 @@ def test_dashboard_caps_visible_plot_redraw_requests_at_two_hz(monkeypatch):
     monkeypatch.setattr(dashboard_module.time, "monotonic", lambda: now["value"])
     dashboard = TelemetryDashboard(max_linear_speed=0.4, max_angular_speed=0.8, plot_update_hz=5.0)
     try:
-        dashboard.tabs.setCurrentIndex(1)
+        dashboard.tabs.setCurrentIndex(next(index for index in _dashboard_plot_tab_indices(dashboard) if dashboard.tabs.tabText(index) == "轨迹"))
         dashboard.process_events()
         draw_count = {"value": 0}
         dashboard.plot_canvases["轨迹"].draw_idle = lambda: draw_count.__setitem__("value", draw_count["value"] + 1)
@@ -820,7 +1106,7 @@ def test_dashboard_drops_redraw_request_while_qt_canvas_is_pending(monkeypatch):
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     dashboard = TelemetryDashboard(max_linear_speed=0.4, max_angular_speed=0.8)
     try:
-        dashboard.tabs.setCurrentIndex(1)
+        dashboard.tabs.setCurrentIndex(next(index for index in _dashboard_plot_tab_indices(dashboard) if dashboard.tabs.tabText(index) == "轨迹"))
         dashboard.process_events()
         canvas = dashboard.plot_canvases["轨迹"]
         draw_count = {"value": 0}
@@ -841,7 +1127,7 @@ def test_dashboard_slow_draw_completion_extends_redraw_cooldown(monkeypatch):
     monkeypatch.setattr(dashboard_module.time, "monotonic", lambda: now["value"])
     dashboard = TelemetryDashboard(max_linear_speed=0.4, max_angular_speed=0.8, plot_update_hz=5.0)
     try:
-        dashboard.tabs.setCurrentIndex(1)
+        dashboard.tabs.setCurrentIndex(next(index for index in _dashboard_plot_tab_indices(dashboard) if dashboard.tabs.tabText(index) == "轨迹"))
         dashboard.process_events()
         canvas = dashboard.plot_canvases["轨迹"]
         draw_count = {"value": 0}
@@ -880,7 +1166,7 @@ def test_dashboard_clear_plots_redraws_only_the_visible_canvas(monkeypatch):
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     dashboard = TelemetryDashboard(max_linear_speed=0.4, max_angular_speed=0.8)
     try:
-        dashboard.tabs.setCurrentIndex(2)
+        dashboard.tabs.setCurrentIndex(next(index for index in _dashboard_plot_tab_indices(dashboard) if dashboard.tabs.tabText(index) == "速度/命令"))
         dashboard.process_events()
         draw_counts = {label: 0 for label in dashboard.plot_canvases}
         for label, canvas in dashboard.plot_canvases.items():
@@ -900,7 +1186,7 @@ def test_dashboard_controls_still_work_after_each_plot_tab_is_selected(monkeypat
     dashboard = TelemetryDashboard(max_linear_speed=0.4, max_angular_speed=0.8)
     try:
         up_button = next(button for button in dashboard.window.findChildren(QtWidgets.QPushButton) if button.text() == "↑")
-        for index in range(1, dashboard.tabs.count()):
+        for index in _dashboard_plot_tab_indices(dashboard):
             dashboard.tabs.setCurrentIndex(index)
             canvas = dashboard.plot_canvases[dashboard.tabs.tabText(index)]
             press = QtGui.QKeyEvent(QtCore.QEvent.KeyPress, QtCore.Qt.Key_Up, QtCore.Qt.NoModifier)

@@ -89,10 +89,10 @@ def test_dashboard_hidpi_points_scale_all_logical_offsets():
 
     assert dashboard_up_button_point(geometry) == (660, 1230)
     assert verifier_module.dashboard_control_scroll_point(geometry) == (660, 1382)
-    assert verifier_module.dashboard_plot_tab_point(geometry, "trajectory") == (404, 360)
-    assert verifier_module.dashboard_plot_tab_point(geometry, "speed") == (530, 360)
-    assert verifier_module.dashboard_plot_tab_point(geometry, "slip") == (654, 360)
-    assert verifier_module.dashboard_plot_tab_point(geometry, "contact") == (750, 360)
+    assert verifier_module.dashboard_plot_tab_point(geometry, "trajectory") == (550, 360)
+    assert verifier_module.dashboard_plot_tab_point(geometry, "speed") == (676, 360)
+    assert verifier_module.dashboard_plot_tab_point(geometry, "slip") == (800, 360)
+    assert verifier_module.dashboard_plot_tab_point(geometry, "contact") == (896, 360)
 
 
 def test_click_dashboard_up_scrolls_controls_before_holding_button(monkeypatch):
@@ -155,7 +155,7 @@ def test_select_dashboard_plot_tab_uses_client_geometry(monkeypatch):
     assert events == [
         ("geometry", "dashboard-id"),
         ("xdotool", ("windowactivate", "dashboard-id")),
-        ("xdotool", ("mousemove", "376", "262")),
+        ("xdotool", ("mousemove", "522", "262")),
         ("xdotool", ("click", "1")),
         ("sleep", 0.5),
     ]
@@ -164,10 +164,12 @@ def test_select_dashboard_plot_tab_uses_client_geometry(monkeypatch):
 def test_dashboard_plot_tab_point_targets_named_curve_tabs():
     geometry = WindowGeometry(x=10, y=20, width=420, height=760)
 
-    assert verifier_module.dashboard_plot_tab_point(geometry, "trajectory") == (92, 82)
-    assert verifier_module.dashboard_plot_tab_point(geometry, "speed") == (155, 82)
-    assert verifier_module.dashboard_plot_tab_point(geometry, "slip") == (217, 82)
-    assert verifier_module.dashboard_plot_tab_point(geometry, "contact") == (265, 82)
+    assert verifier_module.DASHBOARD_TAB_ORDER == ("data", "obstacles", "trajectory", "speed", "slip", "contact")
+    assert verifier_module.dashboard_plot_tab_point(geometry, "obstacles") == (102, 82)
+    assert verifier_module.dashboard_plot_tab_point(geometry, "trajectory") == (165, 82)
+    assert verifier_module.dashboard_plot_tab_point(geometry, "speed") == (228, 82)
+    assert verifier_module.dashboard_plot_tab_point(geometry, "slip") == (290, 82)
+    assert verifier_module.dashboard_plot_tab_point(geometry, "contact") == (338, 82)
 
 
 def test_dashboard_manual_verifier_accepts_plot_tab_argument():

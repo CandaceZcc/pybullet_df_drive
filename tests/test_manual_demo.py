@@ -11,6 +11,7 @@ from slope_sim.coordinator import load_manual_robot, reload_manual_robot
 from slope_sim.dashboard import DashboardCommand
 from slope_sim.manual_control import ManualCommand
 from slope_sim.manual_demo import limit_manual_command_step, manual_step_limit, merge_manual_commands
+from slope_sim.obstacles import ObstacleOperationResult, ObstacleSnapshot
 from slope_sim.runtime_actions import (
     AddObstaclesAction,
     ClearObstaclesAction,
@@ -270,6 +271,349 @@ def test_manual_demo_dashboard_fallback_keeps_configured_camera_state(monkeypatc
     )
 
     assert camera_calls == [(client_id, robot_id, 6.0, -35.0, 45.0, "side")]
+
+
+def test_manual_demo_keeps_dashboard_busy_while_obstacle_operation_is_pending(monkeypatch):
+    """跨帧障碍物事务未完成时，Dashboard 应保持忙碌且不显示错误。"""
+    client_id = 18
+    robot_id = 24
+    events = []
+    state = SimpleNamespace(x=0.0, y=0.0, out_of_bounds=False)
+    robot = SimpleNamespace(
+        robot_id=robot_id,
+        command_twist=lambda *_args, **_kwargs: None,
+        read_physics_state=lambda **_kwargs: state,
+    )
+    world = SimpleNamespace(
+        scene=SimpleNamespace(terrain_type="flat", slope_deg=0.0),
+        active_robot=SimpleNamespace(robot=robot, robot_model="df_back"),
+        terrain=TerrainSelection("flat"),
+    )
+    pending_result = SimpleNamespace(
+        world=world,
+        state_changed=False,
+        world_reset=False,
+        status_message="pending",
+        error_message=None,
+        obstacle_result=ObstacleOperationResult(done=False, succeeded=False, operation="add", message="pending"),
+    )
+
+    class FakeDashboard:
+        def __init__(self, *_args, **_kwargs):
+            self.linear_spin = SimpleNamespace(value=lambda: 0.4)
+            self.angular_spin = SimpleNamespace(value=lambda: 0.8)
+            self._calls = 0
+
+        def process_events(self):
+            pass
+
+        def current_command(self):
+            self._calls += 1
+            return DashboardCommand(0.0, 0.0, should_exit=self._calls > 1)
+
+        def set_switch_busy(self, busy, message, **_kwargs):
+            events.append(("busy", busy, message))
+
+        def set_structure_busy(self, busy, message, **_kwargs):
+            events.append(("structure", busy, message))
+
+        def sync_active_selection(self, *_args):
+            events.append(("sync",))
+
+        def reset_feedback_history(self):
+            events.append(("reset_history",))
+
+        def show_switch_status(self, message, **kwargs):
+            events.append(("status", message, kwargs.get("is_error")))
+
+        def update(self, _state):
+            pass
+
+        def update_obstacle_snapshots(self, _snapshots):
+            pass
+
+        def close(self):
+            pass
+
+    class FakeManager:
+        def snapshot(self, *, include_body_id=False):
+            assert include_body_id is False
+            return ()
+
+    class FakeCoordinator:
+        def __init__(self, *_args, **_kwargs):
+            self.world = world
+            self.obstacle_manager = FakeManager()
+
+        def enqueue(self, _action):
+            pass
+
+        def step(self, _dt):
+            return pending_result
+
+    class FakeLogger:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def record(self, *_args, **_kwargs):
+            pass
+
+        def close(self):
+            return Path("manual_pending.csv")
+
+    class FakeDiagnosticSummary:
+        def to_dict(self):
+            return {}
+
+    monkeypatch.setattr(manual_demo_module.p, "connect", lambda _mode: client_id)
+    monkeypatch.setattr(manual_demo_module.p, "disconnect", lambda _client_id: None)
+    monkeypatch.setattr(manual_demo_module.p, "getKeyboardEvents", lambda: {})
+    monkeypatch.setattr(manual_demo_module, "TelemetryDashboard", FakeDashboard)
+    monkeypatch.setattr(manual_demo_module, "SimulationCoordinator", FakeCoordinator)
+    monkeypatch.setattr(manual_demo_module, "load_manual_world", lambda *_args: world)
+    monkeypatch.setattr(manual_demo_module, "create_obstacle_manager", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(manual_demo_module, "configure_gui_visualizer", lambda *_args: None)
+    monkeypatch.setattr(manual_demo_module, "CsvSimulationLogger", FakeLogger)
+    monkeypatch.setattr(manual_demo_module, "command_from_keyboard", lambda *_args: ManualCommand(0.0, 0.0))
+    monkeypatch.setattr(manual_demo_module, "update_follow_camera", lambda *_args: None)
+    monkeypatch.setattr(manual_demo_module.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(manual_demo_module.pd, "read_csv", lambda _path: object())
+    monkeypatch.setattr(manual_demo_module, "compute_diagnostic_summary", lambda _frame: FakeDiagnosticSummary())
+    monkeypatch.setattr(manual_demo_module, "write_diagnostic_summary", lambda *_args: Path("diagnostics.json"))
+    monkeypatch.setattr(manual_demo_module, "compute_tracking_metrics", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(manual_demo_module, "plot_trajectory", lambda *_args, **_kwargs: Path("trajectory.png"))
+    monkeypatch.setattr(manual_demo_module, "plot_feedback_figures", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(manual_demo_module, "_read_lidar_for_robot", lambda *_args: None)
+    monkeypatch.setattr(manual_demo_module, "_probe_terrain_for_robot", lambda *_args: None)
+
+    manual_demo_module.run_manual_demo(
+        ExperimentConfig(mode="gui", time_step=0.01, dashboard_enabled=True),
+        duration_limit_sec=0.02,
+    )
+
+    assert ("structure", True, "pending") in events
+    assert not any(event[0] == "status" and event[2] for event in events)
+
+
+def test_manual_demo_keeps_dashboard_busy_after_immediate_action_when_queue_remains(monkeypatch):
+    """即时结构动作完成后，如果 FIFO 里还有动作，Dashboard 不能提前解锁。"""
+    client_id = 22
+    robot_id = 28
+    events = []
+    state = SimpleNamespace(x=0.0, y=0.0, out_of_bounds=False)
+    robot = SimpleNamespace(
+        robot_id=robot_id,
+        command_twist=lambda *_args, **_kwargs: None,
+        read_physics_state=lambda **_kwargs: state,
+    )
+    world = SimpleNamespace(
+        scene=SimpleNamespace(terrain_type="flat", slope_deg=0.0),
+        active_robot=SimpleNamespace(robot=robot, robot_model="df_back"),
+        terrain=TerrainSelection("flat"),
+    )
+    result = SimpleNamespace(
+        world=world,
+        state_changed=True,
+        world_reset=False,
+        status_message="车型已切换为 df_mid",
+        error_message=None,
+        obstacle_result=None,
+    )
+
+    class FakeDashboard:
+        def __init__(self, *_args, **_kwargs):
+            self.linear_spin = SimpleNamespace(value=lambda: 0.4)
+            self.angular_spin = SimpleNamespace(value=lambda: 0.8)
+            self._calls = 0
+
+        def process_events(self):
+            pass
+
+        def current_command(self):
+            self._calls += 1
+            return DashboardCommand(0.0, 0.0, should_exit=self._calls > 1)
+
+        def set_structure_busy(self, busy, message, **_kwargs):
+            events.append(("structure", busy, message))
+
+        def sync_active_selection(self, *_args):
+            pass
+
+        def reset_feedback_history(self):
+            pass
+
+        def show_switch_status(self, message, **kwargs):
+            events.append(("status", message, kwargs.get("is_error")))
+
+        def update(self, _state):
+            pass
+
+        def update_obstacle_snapshots(self, _snapshots):
+            pass
+
+        def close(self):
+            pass
+
+    class FakeManager:
+        def snapshot(self, *, include_body_id=False):
+            assert include_body_id is False
+            return ()
+
+    class FakeCoordinator:
+        def __init__(self, *_args, **_kwargs):
+            self.world = world
+            self.obstacle_manager = FakeManager()
+            self.has_pending_action = True
+
+        def enqueue(self, _action):
+            pass
+
+        def step(self, _dt):
+            return result
+
+    class FakeLogger:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def record(self, *_args, **_kwargs):
+            pass
+
+        def close(self):
+            return Path("manual_queue_busy.csv")
+
+    class FakeDiagnosticSummary:
+        def to_dict(self):
+            return {}
+
+    monkeypatch.setattr(manual_demo_module.p, "connect", lambda _mode: client_id)
+    monkeypatch.setattr(manual_demo_module.p, "disconnect", lambda _client_id: None)
+    monkeypatch.setattr(manual_demo_module.p, "getKeyboardEvents", lambda: {})
+    monkeypatch.setattr(manual_demo_module, "TelemetryDashboard", FakeDashboard)
+    monkeypatch.setattr(manual_demo_module, "SimulationCoordinator", FakeCoordinator)
+    monkeypatch.setattr(manual_demo_module, "load_manual_world", lambda *_args: world)
+    monkeypatch.setattr(manual_demo_module, "create_obstacle_manager", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(manual_demo_module, "configure_gui_visualizer", lambda *_args: None)
+    monkeypatch.setattr(manual_demo_module, "CsvSimulationLogger", FakeLogger)
+    monkeypatch.setattr(manual_demo_module, "command_from_keyboard", lambda *_args: ManualCommand(0.0, 0.0))
+    monkeypatch.setattr(manual_demo_module, "update_follow_camera", lambda *_args: None)
+    monkeypatch.setattr(manual_demo_module.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(manual_demo_module.pd, "read_csv", lambda _path: object())
+    monkeypatch.setattr(manual_demo_module, "compute_diagnostic_summary", lambda _frame: FakeDiagnosticSummary())
+    monkeypatch.setattr(manual_demo_module, "write_diagnostic_summary", lambda *_args: Path("diagnostics.json"))
+    monkeypatch.setattr(manual_demo_module, "compute_tracking_metrics", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(manual_demo_module, "plot_trajectory", lambda *_args, **_kwargs: Path("trajectory.png"))
+    monkeypatch.setattr(manual_demo_module, "plot_feedback_figures", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(manual_demo_module, "_read_lidar_for_robot", lambda *_args: None)
+    monkeypatch.setattr(manual_demo_module, "_probe_terrain_for_robot", lambda *_args: None)
+
+    manual_demo_module.run_manual_demo(
+        ExperimentConfig(mode="gui", time_step=0.01, dashboard_enabled=True),
+        duration_limit_sec=0.02,
+    )
+
+    assert ("structure", True, "车型已切换为 df_mid") in events
+    assert not any(event[0] == "status" for event in events)
+
+
+def test_manual_demo_refreshes_dashboard_obstacle_snapshots(monkeypatch):
+    """手动循环应把管理器快照同步到 Dashboard 障碍物表格。"""
+    client_id = 19
+    robot_id = 25
+    snapshots = (
+        ObstacleSnapshot(5, None, "static", "box", (1.0, 2.0, 0.3), (0.0, 0.0, 0.0, 1.0)),
+    )
+    refreshed = []
+    state = SimpleNamespace(x=0.0, y=0.0, out_of_bounds=False)
+    robot = SimpleNamespace(
+        robot_id=robot_id,
+        command_twist=lambda *_args, **_kwargs: None,
+        read_physics_state=lambda **_kwargs: state,
+    )
+    world = SimpleNamespace(
+        scene=SimpleNamespace(terrain_type="flat", slope_deg=0.0),
+        active_robot=SimpleNamespace(robot=robot, robot_model="df_back"),
+        terrain=TerrainSelection("flat"),
+    )
+
+    class FakeDashboard:
+        def __init__(self, *_args, **_kwargs):
+            self.linear_spin = SimpleNamespace(value=lambda: 0.4)
+            self.angular_spin = SimpleNamespace(value=lambda: 0.8)
+            self._calls = 0
+
+        def process_events(self):
+            pass
+
+        def current_command(self):
+            self._calls += 1
+            return DashboardCommand(0.0, 0.0, should_exit=self._calls > 1)
+
+        def update_obstacle_snapshots(self, value):
+            refreshed.append(value)
+
+        def update(self, _state):
+            pass
+
+        def close(self):
+            pass
+
+    class FakeManager:
+        def snapshot(self, *, include_body_id=False):
+            assert include_body_id is False
+            return snapshots
+
+    class FakeCoordinator:
+        def __init__(self, *_args, **_kwargs):
+            self.world = world
+            self.obstacle_manager = FakeManager()
+
+        def enqueue(self, _action):
+            pass
+
+        def step(self, _dt):
+            return None
+
+    class FakeLogger:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def record(self, *_args, **_kwargs):
+            pass
+
+        def close(self):
+            return Path("manual_obstacles.csv")
+
+    class FakeDiagnosticSummary:
+        def to_dict(self):
+            return {}
+
+    monkeypatch.setattr(manual_demo_module.p, "connect", lambda _mode: client_id)
+    monkeypatch.setattr(manual_demo_module.p, "disconnect", lambda _client_id: None)
+    monkeypatch.setattr(manual_demo_module.p, "getKeyboardEvents", lambda: {})
+    monkeypatch.setattr(manual_demo_module, "TelemetryDashboard", FakeDashboard)
+    monkeypatch.setattr(manual_demo_module, "SimulationCoordinator", FakeCoordinator)
+    monkeypatch.setattr(manual_demo_module, "load_manual_world", lambda *_args: world)
+    monkeypatch.setattr(manual_demo_module, "create_obstacle_manager", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(manual_demo_module, "configure_gui_visualizer", lambda *_args: None)
+    monkeypatch.setattr(manual_demo_module, "CsvSimulationLogger", FakeLogger)
+    monkeypatch.setattr(manual_demo_module, "command_from_keyboard", lambda *_args: ManualCommand(0.0, 0.0))
+    monkeypatch.setattr(manual_demo_module, "update_follow_camera", lambda *_args: None)
+    monkeypatch.setattr(manual_demo_module.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(manual_demo_module.pd, "read_csv", lambda _path: object())
+    monkeypatch.setattr(manual_demo_module, "compute_diagnostic_summary", lambda _frame: FakeDiagnosticSummary())
+    monkeypatch.setattr(manual_demo_module, "write_diagnostic_summary", lambda *_args: Path("diagnostics.json"))
+    monkeypatch.setattr(manual_demo_module, "compute_tracking_metrics", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(manual_demo_module, "plot_trajectory", lambda *_args, **_kwargs: Path("trajectory.png"))
+    monkeypatch.setattr(manual_demo_module, "plot_feedback_figures", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(manual_demo_module, "_read_lidar_for_robot", lambda *_args: None)
+    monkeypatch.setattr(manual_demo_module, "_probe_terrain_for_robot", lambda *_args: None)
+
+    manual_demo_module.run_manual_demo(
+        ExperimentConfig(mode="gui", time_step=0.01, dashboard_enabled=True),
+        duration_limit_sec=0.02,
+    )
+
+    assert refreshed == [snapshots]
 
 
 def test_manual_dashboard_command_moves_mid_drive_on_slope():

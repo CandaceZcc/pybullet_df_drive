@@ -123,6 +123,35 @@ def test_coordinator_fifo_starts_one_structural_operation_at_a_time(monkeypatch)
     assert started.count("robot") == 1
 
 
+def test_coordinator_reports_pending_after_immediate_action_when_queue_remains(monkeypatch):
+    """真实协调器完成一个即时结构动作后，后续 FIFO 未执行前仍应报告 pending。"""
+    events: list[str] = []
+    robot = SimpleNamespace(command_twist=lambda *_args, **_kwargs: None)
+    world = SimpleNamespace(active_robot=SimpleNamespace(robot=robot))
+    manager = SimpleNamespace(update_moving=lambda _dt: events.append("moving"))
+    coordinator = SimulationCoordinator(
+        client_id=0,
+        config=SimpleNamespace(time_step=0.01),
+        world=world,
+        obstacle_manager=manager,
+        step_physics=lambda _client_id: events.append("step"),
+    )
+
+    def finish_immediately(action):
+        events.append(type(action).__name__)
+        return SimpleNamespace(world=world, state_changed=True, world_reset=False, status_message="done")
+
+    monkeypatch.setattr(coordinator, "_apply_immediate_action", finish_immediately)
+    coordinator.enqueue(SwitchRobotAction("df_mid"))
+    coordinator.enqueue(DeleteObstacleAction(99))
+
+    result = coordinator.step(0.01)
+
+    assert getattr(result, "obstacle_result", None) is None
+    assert coordinator.has_pending_action is True
+    assert events == ["SwitchRobotAction", "moving", "step"]
+
+
 def test_robot_switch_and_reset_preserve_obstacle_manager_and_bodies():
     client_id = p.connect(p.DIRECT)
     try:

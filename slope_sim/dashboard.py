@@ -8,7 +8,16 @@ from dataclasses import dataclass, fields, replace
 from pathlib import Path
 
 from slope_sim.model_registry import robot_model_names
+from slope_sim.obstacles import (
+    OBSTACLE_MODES,
+    OBSTACLE_SHAPES,
+    ObstacleGenerationRequest,
+    ObstacleSnapshot,
+)
 from slope_sim.runtime_actions import (
+    AddObstaclesAction,
+    ClearObstaclesAction,
+    DeleteObstacleAction,
     ResetRobotAction,
     RuntimeAction,
     SwitchRobotAction,
@@ -460,8 +469,10 @@ class TelemetryDashboard:
         self._button_keys: set[int] = set()
         self._button_pulses: dict[int, float] = {}
         self._should_exit = False
-        self._structural_action: RuntimeAction | None = None
+        self._pending_actions: deque[RuntimeAction] = deque()
+        self._structure_busy = False
         self._switch_busy = False
+        self._last_obstacle_refresh_time: float | None = None
         self.update_hz = update_hz
         self.smoothing_alpha = smoothing_alpha
         self.plot_update_hz = plot_update_hz
@@ -551,6 +562,7 @@ class TelemetryDashboard:
         data_layout.addWidget(scroll, stretch=1)
         tabs.addTab(data_tab, "数据")
         self.tabs = tabs
+        self._add_obstacle_tab(tabs)
         self._add_plot_tab(tabs)
         tabs.currentChanged.connect(self._handle_tab_changed)
 
@@ -664,13 +676,73 @@ class TelemetryDashboard:
             self.apply_terrain_button = QtWidgets.QPushButton("应用场地")
             self.apply_terrain_button.clicked.connect(self.request_terrain_switch)
             terrain_layout.addWidget(self.apply_terrain_button, 4, 0, 1, 2)
-            self.switch_status_label = QtWidgets.QLabel("切换状态：就绪")
-            terrain_layout.addWidget(self.switch_status_label, 5, 0, 1, 2)
             self.terrain_combo.currentIndexChanged.connect(self._update_terrain_parameter_state)
             self._update_terrain_parameter_state()
-        elif model_switch_enabled:
-            self.switch_status_label = QtWidgets.QLabel("切换状态：就绪")
-            vehicle_layout.addWidget(self.switch_status_label, reset_row + 1, 0, 1, 2)
+
+        obstacle_group = QtWidgets.QGroupBox("障碍物")
+        obstacle_layout = QtWidgets.QGridLayout(obstacle_group)
+        obstacle_layout.setContentsMargins(8, 6, 8, 6)
+        obstacle_layout.setHorizontalSpacing(6)
+        obstacle_layout.setVerticalSpacing(4)
+        self.obstacle_group = obstacle_group
+        self.obstacle_mode_combo = QtWidgets.QComboBox()
+        mode_labels = {"static": "静态", "moving": "移动", "mixed": "混合"}
+        for mode_name in OBSTACLE_MODES:
+            mode_label = mode_labels[mode_name]
+            self.obstacle_mode_combo.addItem(mode_label, mode_name)
+        self.obstacle_mode_combo.setFixedWidth(DASHBOARD_CONTROL_SPINBOX_WIDTH)
+        self.obstacle_shape_combo = QtWidgets.QComboBox()
+        shape_labels = {"box": "方块", "cylinder": "圆柱", "sphere": "球体"}
+        for shape_name in OBSTACLE_SHAPES:
+            shape_label = shape_labels[shape_name]
+            self.obstacle_shape_combo.addItem(shape_label, shape_name)
+        self.obstacle_shape_combo.setFixedWidth(DASHBOARD_CONTROL_SPINBOX_WIDTH)
+        self.obstacle_count_spin = QtWidgets.QSpinBox()
+        self.obstacle_count_spin.setRange(1, 50)
+        self.obstacle_count_spin.setValue(1)
+        self.obstacle_count_spin.setFixedWidth(DASHBOARD_CONTROL_SPINBOX_WIDTH)
+        self.obstacle_seed_spin = QtWidgets.QSpinBox()
+        self.obstacle_seed_spin.setRange(-2_147_483_648, 2_147_483_647)
+        self.obstacle_seed_spin.setValue(0)
+        self.obstacle_seed_spin.setFixedWidth(DASHBOARD_CONTROL_SPINBOX_WIDTH)
+        self.obstacle_speed_spin = QtWidgets.QDoubleSpinBox()
+        self.obstacle_speed_spin.setRange(0.01, 3.0)
+        self.obstacle_speed_spin.setSingleStep(0.05)
+        self.obstacle_speed_spin.setValue(0.35)
+        self.obstacle_speed_spin.setFixedWidth(DASHBOARD_CONTROL_SPINBOX_WIDTH)
+        self.obstacle_ratio_spin = QtWidgets.QSpinBox()
+        self.obstacle_ratio_spin.setRange(0, 100)
+        self.obstacle_ratio_spin.setSingleStep(5)
+        self.obstacle_ratio_spin.setSuffix("%")
+        self.obstacle_ratio_spin.setValue(30)
+        self.obstacle_ratio_spin.setFixedWidth(DASHBOARD_CONTROL_SPINBOX_WIDTH)
+        obstacle_layout.addWidget(QtWidgets.QLabel("模式"), 0, 0)
+        obstacle_layout.addWidget(self.obstacle_mode_combo, 0, 1)
+        obstacle_layout.addWidget(QtWidgets.QLabel("形状"), 1, 0)
+        obstacle_layout.addWidget(self.obstacle_shape_combo, 1, 1)
+        obstacle_layout.addWidget(QtWidgets.QLabel("数量"), 2, 0)
+        obstacle_layout.addWidget(self.obstacle_count_spin, 2, 1)
+        obstacle_layout.addWidget(QtWidgets.QLabel("随机种子"), 3, 0)
+        obstacle_layout.addWidget(self.obstacle_seed_spin, 3, 1)
+        obstacle_layout.addWidget(QtWidgets.QLabel("速度"), 4, 0)
+        obstacle_layout.addWidget(self.obstacle_speed_spin, 4, 1)
+        obstacle_layout.addWidget(QtWidgets.QLabel("移动占比"), 5, 0)
+        obstacle_layout.addWidget(self.obstacle_ratio_spin, 5, 1)
+        self.add_obstacles_button = QtWidgets.QPushButton("添加障碍")
+        self.add_obstacles_button.clicked.connect(self.request_add_obstacles)
+        self.delete_obstacle_button = QtWidgets.QPushButton("删除选中")
+        self.delete_obstacle_button.clicked.connect(self.request_delete_obstacle)
+        self.clear_obstacles_button = QtWidgets.QPushButton("清空障碍")
+        self.clear_obstacles_button.clicked.connect(self.request_clear_obstacles)
+        obstacle_layout.addWidget(self.add_obstacles_button, 6, 0, 1, 2)
+        obstacle_layout.addWidget(self.delete_obstacle_button, 7, 0, 1, 2)
+        obstacle_layout.addWidget(self.clear_obstacles_button, 8, 0, 1, 2)
+        self.structure_status_label = QtWidgets.QLabel("结构状态：就绪")
+        obstacle_layout.addWidget(self.structure_status_label, 9, 0, 1, 2)
+        self.switch_status_label = self.structure_status_label
+        self.obstacle_mode_combo.currentIndexChanged.connect(self._update_obstacle_parameter_state)
+        self._update_obstacle_parameter_state()
+        self._update_delete_obstacle_button_state()
 
         camera_group = QtWidgets.QGroupBox("相机")
         camera_layout = QtWidgets.QGridLayout(camera_group)
@@ -711,7 +783,7 @@ class TelemetryDashboard:
         self.control_groups = [parameter_group, vehicle_group]
         if terrain_group is not None:
             self.control_groups.append(terrain_group)
-        self.control_groups.extend((camera_group, control_group))
+        self.control_groups.extend((obstacle_group, camera_group, control_group))
         for group in self.control_groups:
             self.control_layout.addWidget(group)
         self.control_layout.addStretch(1)
@@ -747,6 +819,24 @@ class TelemetryDashboard:
         button.released.connect(lambda key=key: self._button_keys.discard(self._normalize_key(key)))
         button.clicked.connect(lambda _checked=False, key=key: self._pulse_button_key(key))
         grid.addWidget(button, row, col)
+
+    def _add_obstacle_tab(self, tabs: object) -> None:
+        """创建障碍物快照表；表格只保存逻辑字段，不接触 PyBullet body。"""
+        obstacle_tab = self.QtWidgets.QWidget()
+        obstacle_layout = self.QtWidgets.QVBoxLayout(obstacle_tab)
+        self.obstacle_table = self.QtWidgets.QTableWidget(0, 4)
+        self.obstacle_table.setHorizontalHeaderLabels(["逻辑ID", "模式", "形状", "位置"])
+        self.obstacle_table.setEditTriggers(self.QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.obstacle_table.setSelectionBehavior(self.QtWidgets.QAbstractItemView.SelectRows)
+        self.obstacle_table.setSelectionMode(self.QtWidgets.QAbstractItemView.SingleSelection)
+        self.obstacle_table.verticalHeader().setVisible(False)
+        self.obstacle_table.horizontalHeader().setStretchLastSection(True)
+        self.obstacle_table.horizontalHeader().setSectionResizeMode(
+            self.QtWidgets.QHeaderView.ResizeToContents
+        )
+        self.obstacle_table.itemSelectionChanged.connect(self._update_delete_obstacle_button_state)
+        obstacle_layout.addWidget(self.obstacle_table, stretch=1)
+        tabs.addTab(obstacle_tab, "障碍物")
 
     def _add_plot_tab(self, tabs: object) -> None:
         """按曲线规格创建多个 Matplotlib 实时曲线页。"""
@@ -846,32 +936,65 @@ class TelemetryDashboard:
     def request_exit(self) -> None:
         self._should_exit = True
 
+    def _enqueue_structural_action(self, action: RuntimeAction) -> None:
+        """把结构动作放入 FIFO，确保同一帧多次请求不会互相覆盖。"""
+        self._pending_actions.append(action)
+        self.set_structure_busy(True, "等待应用")
+
     def request_reset(self) -> None:
-        if self._switch_busy:
+        if self._structure_busy and not self._pending_actions:
             return
-        self._structural_action = ResetRobotAction()
-        self.set_switch_busy(True, "等待应用")
+        self._enqueue_structural_action(ResetRobotAction())
 
     def request_robot_switch(self) -> None:
         """把下拉框中的车型保存为一次性应用请求。"""
-        if self._switch_busy or self.robot_combo is None:
+        if (self._structure_busy and not self._pending_actions) or self.robot_combo is None:
             return
-        self._structural_action = SwitchRobotAction(str(self.robot_combo.currentData()))
-        self.set_switch_busy(True, "等待应用")
+        self._enqueue_structural_action(SwitchRobotAction(str(self.robot_combo.currentData())))
 
     def request_terrain_switch(self) -> None:
         """把当前场地控件值保存为一次性应用请求。"""
-        if self._switch_busy or self.terrain_combo is None:
+        if (self._structure_busy and not self._pending_actions) or self.terrain_combo is None:
             return
-        self._structural_action = SwitchTerrainAction(
-            TerrainSelection(
-                terrain_model=str(self.terrain_combo.currentData()),
-                slope_deg=self.slope_spin.value(),
-                golf_seed=self.golf_seed_spin.value(),
-                golf_relief=str(self.golf_relief_combo.currentData()),
+        self._enqueue_structural_action(
+            SwitchTerrainAction(
+                TerrainSelection(
+                    terrain_model=str(self.terrain_combo.currentData()),
+                    slope_deg=self.slope_spin.value(),
+                    golf_seed=self.golf_seed_spin.value(),
+                    golf_relief=str(self.golf_relief_combo.currentData()),
+                )
             )
         )
-        self.set_switch_busy(True, "等待应用")
+
+    def request_add_obstacles(self) -> None:
+        """读取障碍物控件并生成纯数据添加请求，实际 PyBullet 操作交给主循环。"""
+        if self._structure_busy and not self._pending_actions:
+            return
+        request = ObstacleGenerationRequest(
+            mode=str(self.obstacle_mode_combo.currentData()),
+            shape=str(self.obstacle_shape_combo.currentData()),
+            count=self.obstacle_count_spin.value(),
+            seed=self.obstacle_seed_spin.value(),
+            moving_speed=self.obstacle_speed_spin.value(),
+            moving_ratio=self.obstacle_ratio_spin.value() / 100.0,
+        )
+        self._enqueue_structural_action(AddObstaclesAction(request))
+
+    def request_delete_obstacle(self) -> None:
+        """按表格选中行的逻辑 ID 删除障碍物，不依赖临时 body id。"""
+        if self._structure_busy and not self._pending_actions:
+            return
+        logical_id = self._selected_obstacle_logical_id()
+        if logical_id is None:
+            return
+        self._enqueue_structural_action(DeleteObstacleAction(logical_id))
+
+    def request_clear_obstacles(self) -> None:
+        """清空障碍物直接入队，不弹出会阻塞仿真循环的确认框。"""
+        if self._structure_busy and not self._pending_actions:
+            return
+        self._enqueue_structural_action(ClearObstaclesAction())
 
     def _update_terrain_parameter_state(self, _index: int | None = None) -> None:
         """只启用待应用场地真正使用的参数，减少误操作。"""
@@ -886,6 +1009,62 @@ class TelemetryDashboard:
     def _update_camera_follow_state(self, _checked: bool | None = None) -> None:
         """跟随关闭时禁用视角选择，避免编辑不生效的控件。"""
         self.camera_view_combo.setEnabled(self.camera_follow_checkbox.isChecked())
+
+    def _update_obstacle_parameter_state(self, _index: int | None = None) -> None:
+        """按生成模式启用移动参数，避免静态/全移动模式显示无效输入。"""
+        mode = str(self.obstacle_mode_combo.currentData())
+        self.obstacle_speed_spin.setEnabled(mode in {"moving", "mixed"})
+        self.obstacle_ratio_spin.setEnabled(mode == "mixed")
+
+    def _selected_obstacle_logical_id(self) -> int | None:
+        """返回当前选中障碍物的稳定逻辑 ID；无选择时返回 None。"""
+        rows = self.obstacle_table.selectionModel().selectedRows()
+        if not rows:
+            return None
+        item = self.obstacle_table.item(rows[0].row(), 0)
+        if item is None:
+            return None
+        value = item.data(self.QtCore.Qt.UserRole)
+        return None if value is None else int(value)
+
+    def _update_delete_obstacle_button_state(self) -> None:
+        """删除按钮只在非忙碌且存在选中逻辑 ID 时可用。"""
+        button = getattr(self, "delete_obstacle_button", None)
+        if button is None:
+            return
+        button.setEnabled(not self._structure_busy and self._selected_obstacle_logical_id() is not None)
+
+    def update_obstacle_snapshots(self, snapshots: tuple[ObstacleSnapshot, ...], *, force: bool = False) -> bool:
+        """低成本刷新障碍物表格，并按逻辑 ID 恢复选中行。"""
+        now = time.monotonic()
+        if not force and not should_refresh_dashboard(self._last_obstacle_refresh_time, now, self.update_hz):
+            return False
+        selected_logical_id = self._selected_obstacle_logical_id()
+        self.obstacle_table.setRowCount(len(snapshots))
+        selected_row: int | None = None
+        for row, snapshot in enumerate(snapshots):
+            values = (
+                str(snapshot.logical_id),
+                snapshot.mode,
+                snapshot.shape,
+                f"{snapshot.position[0]:.2f}, {snapshot.position[1]:.2f}, {snapshot.position[2]:.2f}",
+            )
+            for column, value in enumerate(values):
+                item = self.obstacle_table.item(row, column)
+                if item is None:
+                    item = self.QtWidgets.QTableWidgetItem()
+                    self.obstacle_table.setItem(row, column, item)
+                item.setText(value)
+                if column == 0:
+                    item.setData(self.QtCore.Qt.UserRole, snapshot.logical_id)
+            if snapshot.logical_id == selected_logical_id:
+                selected_row = row
+        self.obstacle_table.clearSelection()
+        if selected_row is not None:
+            self.obstacle_table.selectRow(selected_row)
+        self._update_delete_obstacle_button_state()
+        self._last_obstacle_refresh_time = now
+        return True
 
     def sync_active_selection(self, robot_model: str, terrain: TerrainSelection) -> None:
         """在切换成功或回滚后，让控件重新反映真实活动世界。"""
@@ -906,19 +1085,32 @@ class TelemetryDashboard:
         self._update_terrain_parameter_state()
 
     def show_switch_status(self, message: str, *, is_error: bool = False) -> None:
-        """显示最近一次切换结果；错误使用醒目颜色但不弹阻塞窗口。"""
-        self.set_switch_busy(False, message, is_error=is_error)
+        """显示最近一次结构操作结果；错误使用醒目颜色但不弹阻塞窗口。"""
+        self.set_structure_busy(False, message, is_error=is_error)
 
     def set_switch_busy(self, busy: bool, message: str, *, is_error: bool = False) -> None:
-        """切换事务期间禁用会产生重建请求的按钮，完成后统一恢复。"""
+        """兼容旧场景切换 API，实际委托给统一结构状态。"""
+        self.set_structure_busy(busy, message, is_error=is_error)
+
+    def set_structure_busy(self, busy: bool, message: str, *, is_error: bool = False) -> None:
+        """结构事务期间禁用相关按钮，完成后按选择状态恢复删除按钮。"""
+        self._structure_busy = busy
         self._switch_busy = busy
-        for button in (self.apply_robot_button, self.apply_terrain_button, self.reset_button):
+        for button in (
+            self.apply_robot_button,
+            self.apply_terrain_button,
+            self.reset_button,
+            self.add_obstacles_button,
+            self.clear_obstacles_button,
+        ):
             if button is not None:
                 button.setEnabled(not busy)
-        if self.switch_status_label is None:
+        self._update_delete_obstacle_button_state()
+        status_label = getattr(self, "structure_status_label", None)
+        if status_label is None:
             return
-        self.switch_status_label.setText(f"切换状态：{message}")
-        self.switch_status_label.setStyleSheet("color: #b00020;" if is_error else "")
+        status_label.setText(f"结构状态：{message}")
+        status_label.setStyleSheet("color: #b00020;" if is_error else "")
 
     def _active_plot_label(self) -> str | None:
         """返回当前可见的曲线标签；数据页不参与绘图。"""
@@ -983,10 +1175,9 @@ class TelemetryDashboard:
         now = time.monotonic()
         self._button_pulses = {key: expires_at for key, expires_at in self._button_pulses.items() if expires_at >= now}
         keys = self._pressed_keys | self._button_keys | set(self._button_pulses)
-        structural_action = self._structural_action
+        structural_action = self._pending_actions.popleft() if self._pending_actions else None
         camera_follow_enabled = self.camera_follow_checkbox.isChecked()
         camera_follow_view = str(self.camera_view_combo.currentData())
-        self._structural_action = None
         if self._normalize_key(self.QtCore.Qt.Key_Space) in keys:
             return DashboardCommand(
                 0.0,

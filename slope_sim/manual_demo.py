@@ -317,10 +317,16 @@ def run_manual_demo(config: ExperimentConfig, *, duration_limit_sec: float | Non
                     dashboard.sync_active_selection(result.world.active_robot.robot_model, result.world.terrain)
                     if result.state_changed:
                         dashboard.reset_feedback_history()
-                    dashboard.show_switch_status(
-                        result.status_message,
-                        is_error=result.error_message is not None,
-                    )
+                    queue_still_busy = getattr(coordinator, "has_pending_action", False)
+                    obstacle_still_busy = result.obstacle_result is not None and not result.obstacle_result.done
+                    if queue_still_busy or obstacle_still_busy:
+                        # 结构 FIFO 未清空时保持按钮锁定，不把 pending 当成失败。
+                        dashboard.set_structure_busy(True, result.status_message)
+                    else:
+                        dashboard.show_switch_status(
+                            result.status_message,
+                            is_error=result.error_message is not None,
+                        )
             out_of_bounds_latched = state.out_of_bounds
             if camera_follow_enabled:
                 update_follow_camera(
@@ -332,6 +338,7 @@ def run_manual_demo(config: ExperimentConfig, *, duration_limit_sec: float | Non
                     camera_follow_view,
                 )
             if dashboard is not None:
+                dashboard.update_obstacle_snapshots(coordinator.obstacle_manager.snapshot(include_body_id=False))
                 dashboard.update(state)
             logger.record(
                 state,
