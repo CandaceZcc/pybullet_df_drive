@@ -10,7 +10,7 @@ import slope_sim.obstacles as obstacle_module
 from slope_sim.model_registry import get_robot_model
 from slope_sim.obstacles import create_box_obstacle, update_kinematic_obstacle
 from slope_sim.robot import create_robot
-from slope_sim.scene import create_slope_scene
+from slope_sim.scene import create_slope_scene, probe_terrain
 
 
 TIME_STEP = 1.0 / 240.0
@@ -271,6 +271,117 @@ def test_moving_zero_mass_box_keeps_path_and_collision_state_bounded():
         assert maximum_penetration <= 0.03
         assert maximum_robot_linear_speed <= 3.0
         assert maximum_robot_angular_speed <= 10.0
+    finally:
+        p.disconnect(client_id)
+
+
+def test_probe_terrain_ignores_vehicle_above_flat_ground():
+    """车辆覆盖采样点时，只接受 SceneInfo 声明的地形 body。"""
+    client_id = p.connect(p.DIRECT)
+    try:
+        scene = create_slope_scene(client_id, slope_deg=0.0, time_step=TIME_STEP, terrain_model="flat")
+        spec = get_robot_model(ROBOT_MODEL)
+        robot = create_robot(
+            client_id,
+            ROBOT_MODEL,
+            start_x=0.0,
+            start_y=0.0,
+            base_height=scene.spawn_position[2] + spec.base_height,
+            start_orientation=scene.spawn_orientation,
+        )
+        first_hit = p.rayTest((0.0, 0.0, 2.0), (0.0, 0.0, -2.0), physicsClientId=client_id)[0]
+
+        probe = probe_terrain(client_id, 0.0, 0.0, ray_height=2.0, terrain_body_ids=scene.body_ids)
+
+        assert first_hit[0] == robot.robot_id
+        assert probe.terrain_probe_valid is True
+        assert probe.local_ground_height == pytest.approx(0.0, abs=1e-6)
+        assert (
+            probe.local_terrain_normal_x,
+            probe.local_terrain_normal_y,
+            probe.local_terrain_normal_z,
+        ) == pytest.approx((0.0, 0.0, 1.0), abs=1e-6)
+    finally:
+        p.disconnect(client_id)
+
+
+def test_probe_terrain_starting_above_moving_obstacle_skips_itself():
+    """从运动障碍物上方起射时，不把障碍物顶面误当作逐帧抬升的地表。"""
+    client_id = p.connect(p.DIRECT)
+    try:
+        scene = create_slope_scene(client_id, slope_deg=0.0, time_step=TIME_STEP, terrain_model="flat")
+        obstacle_id = create_box_obstacle(
+            client_id,
+            half_extents=(0.25, 0.25, 0.30),
+            position=(0.0, 0.0, 0.30),
+        )
+        update_kinematic_obstacle(
+            client_id,
+            obstacle_id,
+            position=(0.0, 0.0, 0.30),
+            linear_velocity=(0.20, 0.0, 0.0),
+        )
+        ray_start_z = 0.61
+        first_hit = p.rayTest((0.0, 0.0, ray_start_z), (0.0, 0.0, -2.0), physicsClientId=client_id)[0]
+
+        probe = probe_terrain(
+            client_id,
+            0.0,
+            0.0,
+            ray_height=2.0,
+            ray_start_z=ray_start_z,
+            terrain_body_ids=scene.body_ids,
+        )
+
+        assert first_hit[0] == obstacle_id
+        assert probe.terrain_probe_valid is True
+        assert probe.local_ground_height == pytest.approx(0.0, abs=1e-6)
+        assert probe.local_terrain_normal_z == pytest.approx(1.0, abs=1e-6)
+    finally:
+        p.disconnect(client_id)
+
+
+def test_terrain_collision_group_preserves_default_dynamic_contacts():
+    """地形专用组仍须与默认组车辆和动态箱体产生物理接触。"""
+    client_id = p.connect(p.DIRECT)
+    try:
+        scene = create_slope_scene(client_id, slope_deg=0.0, time_step=TIME_STEP, terrain_model="flat")
+        spec = get_robot_model(ROBOT_MODEL)
+        robot = create_robot(
+            client_id,
+            ROBOT_MODEL,
+            start_x=-1.0,
+            start_y=0.0,
+            base_height=scene.spawn_position[2] + spec.base_height,
+            start_orientation=scene.spawn_orientation,
+        )
+        collision_shape_id = p.createCollisionShape(
+            p.GEOM_BOX,
+            halfExtents=(0.18, 0.18, 0.18),
+            physicsClientId=client_id,
+        )
+        dynamic_obstacle_id = p.createMultiBody(
+            baseMass=1.0,
+            baseCollisionShapeIndex=collision_shape_id,
+            basePosition=(1.0, 0.0, 0.65),
+            physicsClientId=client_id,
+        )
+        robot_contact_max = 0
+        obstacle_contact_max = 0
+        for _ in range(480):
+            robot.command_twist(0.0, 0.0, dt=TIME_STEP)
+            p.stepSimulation(physicsClientId=client_id)
+            robot_contact_max = max(
+                robot_contact_max,
+                len(p.getContactPoints(bodyA=robot.robot_id, bodyB=scene.body_id, physicsClientId=client_id)),
+            )
+            obstacle_contact_max = max(
+                obstacle_contact_max,
+                len(p.getContactPoints(bodyA=dynamic_obstacle_id, bodyB=scene.body_id, physicsClientId=client_id)),
+            )
+
+        assert robot_contact_max > 0
+        assert obstacle_contact_max > 0
     finally:
         p.disconnect(client_id)
 

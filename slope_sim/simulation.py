@@ -170,7 +170,7 @@ def _read_lidar_for_robot(client_id: int, robot: DifferentialDriveRobot, config:
 def _probe_terrain_for_robot(client_id: int, robot: DifferentialDriveRobot, scene: SceneInfo | None = None):
     """用机器人当前位置做一次向下地形探测。"""
     position, _orientation = p.getBasePositionAndOrientation(robot.robot_id, physicsClientId=client_id)
-    # PyBullet 单次射线只返回最近命中；向车体侧面偏移可避免先命中机器人自身。
+    # 有 scene 时按地形 body 过滤，侧向偏移只作为旧调用和边界保护。
     probe_y = float(position[1]) + 0.45
     if scene is not None and scene.bounds is not None and probe_y > scene.bounds.max_y:
         probe_y = float(position[1]) - 0.45
@@ -179,6 +179,7 @@ def _probe_terrain_for_robot(client_id: int, robot: DifferentialDriveRobot, scen
         float(position[0]),
         probe_y,
         bounds=None if scene is None else scene.bounds,
+        terrain_body_ids=None if scene is None else scene.body_ids,
     )
 
 

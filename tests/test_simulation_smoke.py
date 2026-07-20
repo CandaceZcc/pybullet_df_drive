@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
 import pybullet as p
@@ -15,7 +16,7 @@ from slope_sim.model_registry import get_robot_model, robot_model_names
 from slope_sim.robot import create_robot
 import slope_sim.scene as scene_module
 from slope_sim.scene import terrain_model_names
-from slope_sim.simulation import run_experiment
+from slope_sim.simulation import _probe_terrain_for_robot, run_experiment
 
 
 def test_run_experiment_direct_generates_log_and_figure(tmp_path: Path):
@@ -282,3 +283,36 @@ def test_physics_log_keeps_existing_internal_diagnostics(tmp_path: Path):
     assert expected.issubset(frame.columns)
     assert frame["terrain_probe_valid"].all()
     assert set(frame["terrain_type"]) == {"golf_heightfield"}
+
+
+def test_robot_terrain_probe_filters_obstacle_on_offset_ray():
+    """运行时遥测的侧向探测线被障碍物覆盖时，仍应采到真实地形。"""
+    client_id = p.connect(p.DIRECT)
+    try:
+        scene = scene_module.create_slope_scene(client_id, slope_deg=0.0, time_step=1.0 / 240.0, terrain_model="flat")
+        robot_id = p.createMultiBody(
+            baseMass=0.0,
+            basePosition=(0.0, 0.0, 0.20),
+            physicsClientId=client_id,
+        )
+        collision_shape_id = p.createCollisionShape(
+            p.GEOM_BOX,
+            halfExtents=(0.25, 0.25, 0.30),
+            physicsClientId=client_id,
+        )
+        obstacle_id = p.createMultiBody(
+            baseMass=0.0,
+            baseCollisionShapeIndex=collision_shape_id,
+            basePosition=(0.0, 0.45, 0.30),
+            physicsClientId=client_id,
+        )
+        first_hit = p.rayTest((0.0, 0.45, 2.0), (0.0, 0.45, -2.0), physicsClientId=client_id)[0]
+
+        probe = _probe_terrain_for_robot(client_id, SimpleNamespace(robot_id=robot_id), scene)
+
+        assert first_hit[0] == obstacle_id
+        assert probe.terrain_probe_valid is True
+        assert probe.local_ground_height == pytest.approx(0.0, abs=1e-6)
+        assert probe.local_terrain_normal_z == pytest.approx(1.0, abs=1e-6)
+    finally:
+        p.disconnect(client_id)

@@ -361,7 +361,13 @@ def test_probe_terrain_marks_bounds_or_misses_as_out_of_bounds():
     client_id = p.connect(p.DIRECT)
     try:
         scene = scene_module.create_slope_scene(client_id, slope_deg=0.0, time_step=1.0 / 240.0, terrain_model="flat")
-        outside = scene_module.probe_terrain(client_id, scene.bounds.max_x + 1.0, 0.0, bounds=scene.bounds)
+        outside = scene_module.probe_terrain(
+            client_id,
+            scene.bounds.max_x + 1.0,
+            0.0,
+            bounds=scene.bounds,
+            terrain_body_ids=scene.body_ids,
+        )
         assert outside.terrain_probe_valid is False
         assert outside.out_of_bounds is True
     finally:
@@ -374,6 +380,449 @@ def test_probe_terrain_marks_bounds_or_misses_as_out_of_bounds():
         assert miss.out_of_bounds is True
     finally:
         p.disconnect(empty_client)
+
+
+def test_probe_terrain_skips_seven_non_terrain_bodies_above_ground():
+    """同一射线上的七个非地形体应逐个跳过，最终返回真实地面。"""
+    client_id = p.connect(p.DIRECT)
+    try:
+        scene = scene_module.create_slope_scene(client_id, slope_deg=0.0, time_step=1.0 / 240.0, terrain_model="flat")
+        collision_shape_id = p.createCollisionShape(
+            p.GEOM_BOX,
+            halfExtents=(0.30, 0.30, 0.12),
+            physicsClientId=client_id,
+        )
+        non_terrain_ids = tuple(
+            p.createMultiBody(
+                baseMass=0.0,
+                baseCollisionShapeIndex=collision_shape_id,
+                basePosition=(0.0, 0.0, center_z),
+                physicsClientId=client_id,
+            )
+            for center_z in (0.22, 0.56, 0.90, 1.24, 1.58, 1.92, 2.26)
+        )
+        first_hit = p.rayTest((0.0, 0.0, 3.0), (0.0, 0.0, -3.0), physicsClientId=client_id)[0]
+
+        probe = scene_module.probe_terrain(
+            client_id,
+            0.0,
+            0.0,
+            ray_height=3.0,
+            terrain_body_ids=scene.body_ids,
+        )
+
+        assert first_hit[0] == non_terrain_ids[-1]
+        assert probe.terrain_probe_valid is True
+        assert probe.local_ground_height == pytest.approx(0.0, abs=1e-6)
+        assert (
+            probe.local_terrain_normal_x,
+            probe.local_terrain_normal_y,
+            probe.local_terrain_normal_z,
+        ) == pytest.approx((0.0, 0.0, 1.0), abs=1e-6)
+    finally:
+        p.disconnect(client_id)
+
+
+def test_probe_terrain_skips_single_sphere_touching_ground():
+    """球体内部的 fraction=0 重复命中不能耗尽过滤次数。"""
+    client_id = p.connect(p.DIRECT)
+    try:
+        scene = scene_module.create_slope_scene(client_id, slope_deg=0.0, time_step=1.0 / 240.0, terrain_model="flat")
+        collision_shape_id = p.createCollisionShape(
+            p.GEOM_SPHERE,
+            radius=0.30,
+            physicsClientId=client_id,
+        )
+        sphere_id = p.createMultiBody(
+            baseMass=0.0,
+            baseCollisionShapeIndex=collision_shape_id,
+            basePosition=(0.0, 0.0, 0.30),
+            physicsClientId=client_id,
+        )
+        first_hit = p.rayTest((0.0, 0.0, 2.0), (0.0, 0.0, -2.0), physicsClientId=client_id)[0]
+
+        probe = scene_module.probe_terrain(
+            client_id,
+            0.0,
+            0.0,
+            ray_height=2.0,
+            terrain_body_ids=scene.body_ids,
+        )
+
+        assert first_hit[0] == sphere_id
+        assert probe.terrain_probe_valid is True
+        assert probe.out_of_bounds is False
+        assert probe.local_ground_height == pytest.approx(0.0, abs=2e-4)
+        assert probe.local_terrain_normal_z == pytest.approx(1.0, abs=1e-6)
+    finally:
+        p.disconnect(client_id)
+
+
+def test_probe_terrain_filtered_ray_uses_terrain_mask_once(monkeypatch):
+    """过滤模式应由专用 mask 一次命中地形，不再从物体内部重试。"""
+    client_id = p.connect(p.DIRECT)
+    try:
+        scene = scene_module.create_slope_scene(client_id, slope_deg=0.0, time_step=1.0 / 240.0, terrain_model="flat")
+        collision_shape_id = p.createCollisionShape(
+            p.GEOM_SPHERE,
+            radius=0.30,
+            physicsClientId=client_id,
+        )
+        p.createMultiBody(
+            baseMass=0.0,
+            baseCollisionShapeIndex=collision_shape_id,
+            basePosition=(0.0, 0.0, 0.30),
+            physicsClientId=client_id,
+        )
+        ray_calls: list[dict[str, object]] = []
+        original_ray_test = scene_module.p.rayTest
+
+        def capture_ray_test(*args, **kwargs):
+            ray_calls.append(dict(kwargs))
+            return original_ray_test(*args, **kwargs)
+
+        monkeypatch.setattr(scene_module.p, "rayTest", capture_ray_test)
+
+        probe = scene_module.probe_terrain(
+            client_id,
+            0.0,
+            0.0,
+            ray_height=2.0,
+            terrain_body_ids=scene.body_ids,
+        )
+
+        assert probe.terrain_probe_valid is True
+        assert len(ray_calls) == 1
+        assert ray_calls[0]["collisionFilterMask"] == scene_module.TERRAIN_FILTER_GROUP
+    finally:
+        p.disconnect(client_id)
+
+
+@pytest.mark.parametrize("terrain_model", ["flat", "slope", "golf_heightfield"])
+def test_scene_assigns_dedicated_collision_filter_to_every_terrain_link(monkeypatch, terrain_model: str):
+    """三类场地创建完成时，所有地形 base/link 都必须进入专用碰撞组。"""
+    client_id = p.connect(p.DIRECT)
+    calls: list[tuple[int, int, int, int, int]] = []
+    original_set_filter = scene_module.p.setCollisionFilterGroupMask
+
+    def capture_filter(body_id, link_id, group, mask, *, physicsClientId):
+        calls.append((int(body_id), int(link_id), int(group), int(mask), int(physicsClientId)))
+        return original_set_filter(body_id, link_id, group, mask, physicsClientId=physicsClientId)
+
+    monkeypatch.setattr(scene_module.p, "setCollisionFilterGroupMask", capture_filter)
+    try:
+        scene = scene_module.create_slope_scene(
+            client_id,
+            slope_deg=8.0,
+            time_step=1.0 / 240.0,
+            terrain_model=terrain_model,
+        )
+        expected_body_links = {
+            (body_id, link_id)
+            for body_id in scene.body_ids
+            for link_id in range(-1, p.getNumJoints(body_id, physicsClientId=client_id))
+        }
+
+        assert {(body_id, link_id) for body_id, link_id, _group, _mask, _client in calls} == expected_body_links
+        assert all(
+            group == scene_module.TERRAIN_COLLISION_GROUP
+            and mask == scene_module.TERRAIN_COLLISION_MASK
+            and call_client == client_id
+            for _, _, group, mask, call_client in calls
+        )
+    finally:
+        p.disconnect(client_id)
+
+
+def test_scene_reapplies_terrain_collision_filter_after_reset(monkeypatch):
+    """reset 会清除碰撞组，重建场地必须再次对新 body 设置。"""
+    client_id = p.connect(p.DIRECT)
+    calls: list[tuple[int, int]] = []
+    original_set_filter = scene_module.p.setCollisionFilterGroupMask
+
+    def capture_filter(body_id, link_id, group, mask, *, physicsClientId):
+        assert (group, mask) == (scene_module.TERRAIN_COLLISION_GROUP, scene_module.TERRAIN_COLLISION_MASK)
+        calls.append((int(body_id), int(link_id)))
+        return original_set_filter(body_id, link_id, group, mask, physicsClientId=physicsClientId)
+
+    monkeypatch.setattr(scene_module.p, "setCollisionFilterGroupMask", capture_filter)
+    try:
+        scene_module.create_slope_scene(client_id, slope_deg=0.0, time_step=1.0 / 240.0, terrain_model="flat")
+        assert calls
+        p.resetSimulation(physicsClientId=client_id)
+        calls.clear()
+
+        rebuilt = scene_module.create_slope_scene(
+            client_id,
+            slope_deg=0.0,
+            time_step=1.0 / 240.0,
+            terrain_model="flat",
+        )
+
+        assert calls == [(rebuilt.body_id, -1)]
+    finally:
+        p.disconnect(client_id)
+
+
+def test_terrain_collision_group_preserves_static_filter_ray_mask():
+    """自定义静态 mask 仍应能命中项目地形，避免破坏外部 PyBullet 调试射线。"""
+    client_id = p.connect(p.DIRECT)
+    try:
+        scene = scene_module.create_slope_scene(client_id, slope_deg=0.0, time_step=1.0 / 240.0, terrain_model="flat")
+
+        hit = p.rayTest(
+            (0.0, 0.0, 2.0),
+            (0.0, 0.0, -2.0),
+            collisionFilterMask=0x2,
+            physicsClientId=client_id,
+        )[0]
+
+        assert hit[0] == scene.body_id
+        assert hit[3][2] == pytest.approx(0.0, abs=1e-6)
+    finally:
+        p.disconnect(client_id)
+
+
+@pytest.mark.parametrize(
+    ("terrain_body_ids", "message"),
+    [
+        ((), "terrain_body_ids.*non-empty"),
+        ((True,), "terrain_body_ids.*integers"),
+        ((1.0,), "terrain_body_ids.*integers"),
+        ((-1,), "terrain_body_ids.*non-negative"),
+    ],
+)
+def test_probe_terrain_rejects_invalid_terrain_body_ids(terrain_body_ids: tuple[object, ...], message: str):
+    client_id = p.connect(p.DIRECT)
+    try:
+        scene_module.create_slope_scene(client_id, slope_deg=0.0, time_step=1.0 / 240.0, terrain_model="flat")
+        with pytest.raises(ValueError, match=message):
+            scene_module.probe_terrain(client_id, 0.0, 0.0, terrain_body_ids=terrain_body_ids)
+    finally:
+        p.disconnect(client_id)
+
+
+def test_probe_terrain_rejects_body_id_removed_from_current_client():
+    client_id = p.connect(p.DIRECT)
+    try:
+        scene_module.create_slope_scene(client_id, slope_deg=0.0, time_step=1.0 / 240.0, terrain_model="flat")
+        stale_body_id = p.createMultiBody(baseMass=0.0, physicsClientId=client_id)
+        p.removeBody(stale_body_id, physicsClientId=client_id)
+
+        with pytest.raises(ValueError, match="terrain_body_ids.*current physics client"):
+            scene_module.probe_terrain(client_id, 0.0, 0.0, terrain_body_ids=(stale_body_id,))
+    finally:
+        p.disconnect(client_id)
+
+
+def test_probe_terrain_rejects_unknown_body_id_in_current_client():
+    client_id = p.connect(p.DIRECT)
+    try:
+        scene_module.create_slope_scene(client_id, slope_deg=0.0, time_step=1.0 / 240.0, terrain_model="flat")
+
+        with pytest.raises(ValueError, match="terrain_body_ids.*current physics client"):
+            scene_module.probe_terrain(client_id, 0.0, 0.0, terrain_body_ids=(999_999,))
+    finally:
+        p.disconnect(client_id)
+
+
+def test_probe_terrain_rejects_current_non_terrain_body_id():
+    client_id = p.connect(p.DIRECT)
+    try:
+        scene_module.create_slope_scene(client_id, slope_deg=0.0, time_step=1.0 / 240.0, terrain_model="flat")
+        collision_shape_id = p.createCollisionShape(
+            p.GEOM_BOX,
+            halfExtents=(0.25, 0.25, 0.30),
+            physicsClientId=client_id,
+        )
+        obstacle_id = p.createMultiBody(
+            baseMass=0.0,
+            baseCollisionShapeIndex=collision_shape_id,
+            basePosition=(0.0, 0.0, 0.30),
+            physicsClientId=client_id,
+        )
+
+        with pytest.raises(ValueError, match="terrain_body_ids.*terrain body"):
+            scene_module.probe_terrain(client_id, 0.0, 0.0, terrain_body_ids=(obstacle_id,))
+    finally:
+        p.disconnect(client_id)
+
+
+def test_probe_terrain_rejects_non_terrain_body_mixed_with_scene_body_ids():
+    client_id = p.connect(p.DIRECT)
+    try:
+        scene = scene_module.create_slope_scene(client_id, slope_deg=0.0, time_step=1.0 / 240.0, terrain_model="flat")
+        collision_shape_id = p.createCollisionShape(
+            p.GEOM_BOX,
+            halfExtents=(0.25, 0.25, 0.30),
+            physicsClientId=client_id,
+        )
+        obstacle_id = p.createMultiBody(
+            baseMass=0.0,
+            baseCollisionShapeIndex=collision_shape_id,
+            basePosition=(0.0, 0.0, 0.30),
+            physicsClientId=client_id,
+        )
+
+        with pytest.raises(ValueError, match="terrain_body_ids.*terrain body"):
+            scene_module.probe_terrain(
+                client_id,
+                0.0,
+                0.0,
+                terrain_body_ids=(*scene.body_ids, obstacle_id),
+            )
+    finally:
+        p.disconnect(client_id)
+
+
+@pytest.mark.parametrize(("terrain_model", "extra_body_count"), [("flat", 0), ("flat", 100), ("slope", 0), ("slope", 100)])
+def test_probe_terrain_validates_only_requested_body_ids(monkeypatch, terrain_model: str, extra_body_count: int):
+    """body ID 校验查询数只随地形集合 K 增长，不得枚举场景中的移动体。"""
+    client_id = p.connect(p.DIRECT)
+    try:
+        scene = scene_module.create_slope_scene(
+            client_id,
+            slope_deg=8.0,
+            time_step=1.0 / 240.0,
+            terrain_model=terrain_model,
+        )
+        for _ in range(extra_body_count):
+            p.createMultiBody(baseMass=0.0, physicsClientId=client_id)
+
+        queried_body_ids: list[int] = []
+        enumeration_calls = 0
+        original_get_body_info = scene_module.p.getBodyInfo
+        original_get_num_bodies = scene_module.p.getNumBodies
+        original_get_body_unique_id = scene_module.p.getBodyUniqueId
+
+        def capture_body_info(body_id, **kwargs):
+            queried_body_ids.append(int(body_id))
+            return original_get_body_info(body_id, **kwargs)
+
+        def capture_num_bodies(**kwargs):
+            nonlocal enumeration_calls
+            enumeration_calls += 1
+            return original_get_num_bodies(**kwargs)
+
+        def capture_body_unique_id(index, **kwargs):
+            nonlocal enumeration_calls
+            enumeration_calls += 1
+            return original_get_body_unique_id(index, **kwargs)
+
+        monkeypatch.setattr(scene_module.p, "getBodyInfo", capture_body_info)
+        monkeypatch.setattr(scene_module.p, "getNumBodies", capture_num_bodies)
+        monkeypatch.setattr(scene_module.p, "getBodyUniqueId", capture_body_unique_id)
+
+        probe = scene_module.probe_terrain(
+            client_id,
+            0.0,
+            0.0,
+            bounds=scene.bounds,
+            terrain_body_ids=scene.body_ids,
+        )
+
+        assert probe.terrain_probe_valid is True
+        assert enumeration_calls == 0
+        assert len(queried_body_ids) == len(scene.body_ids)
+        assert set(queried_body_ids) == set(scene.body_ids)
+    finally:
+        p.disconnect(client_id)
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        ({"ray_height": 0.0}, "ray_height.*greater than zero"),
+        ({"ray_height": -1.0}, "ray_height.*greater than zero"),
+        ({"ray_height": math.nan}, "ray_height.*finite"),
+        ({"ray_height": math.inf}, "ray_height.*finite"),
+        ({"x": math.nan}, "x.*finite"),
+        ({"y": -math.inf}, "y.*finite"),
+        ({"ray_start_z": math.nan}, "ray_start_z.*finite"),
+        ({"ray_start_z": math.inf}, "ray_start_z.*finite"),
+        ({"ray_start_z": -8.0}, "ray_start_z.*above.*ray"),
+        ({"ray_start_z": -9.0}, "ray_start_z.*above.*ray"),
+    ],
+)
+def test_probe_terrain_rejects_invalid_ray_geometry(arguments: dict[str, float], message: str):
+    client_id = p.connect(p.DIRECT)
+    try:
+        scene = scene_module.create_slope_scene(client_id, slope_deg=0.0, time_step=1.0 / 240.0, terrain_model="flat")
+        call_arguments = {
+            "client_id": client_id,
+            "x": 0.0,
+            "y": 0.0,
+            "terrain_body_ids": scene.body_ids,
+        }
+        call_arguments.update(arguments)
+
+        with pytest.raises(ValueError, match=message):
+            scene_module.probe_terrain(**call_arguments)
+    finally:
+        p.disconnect(client_id)
+
+
+@pytest.mark.parametrize("terrain_model", ["flat", "slope", "golf_heightfield"])
+@pytest.mark.parametrize("shape_type", [p.GEOM_BOX, p.GEOM_SPHERE, p.GEOM_CYLINDER])
+def test_probe_terrain_filters_common_shapes_across_terrain_models(terrain_model: str, shape_type: int):
+    """箱、球和圆柱不应改变三类正式地形的采样高度与法向。"""
+    client_id = p.connect(p.DIRECT)
+    try:
+        scene = scene_module.create_slope_scene(
+            client_id,
+            slope_deg=8.0,
+            time_step=1.0 / 240.0,
+            terrain_model=terrain_model,
+        )
+        baseline = scene_module.probe_terrain(
+            client_id,
+            0.0,
+            0.0,
+            bounds=scene.bounds,
+            terrain_body_ids=scene.body_ids,
+        )
+        shape_arguments = {"shapeType": shape_type, "physicsClientId": client_id}
+        if shape_type == p.GEOM_BOX:
+            shape_arguments["halfExtents"] = (0.25, 0.25, 0.30)
+        elif shape_type == p.GEOM_SPHERE:
+            shape_arguments["radius"] = 0.30
+        else:
+            shape_arguments.update({"radius": 0.25, "height": 0.60})
+        collision_shape_id = p.createCollisionShape(**shape_arguments)
+        obstacle_id = p.createMultiBody(
+            baseMass=0.0,
+            baseCollisionShapeIndex=collision_shape_id,
+            basePosition=(0.0, 0.0, baseline.local_ground_height + 0.30),
+            physicsClientId=client_id,
+        )
+        first_hit = p.rayTest((0.0, 0.0, 2.0), (0.0, 0.0, -2.0), physicsClientId=client_id)[0]
+
+        probe = scene_module.probe_terrain(
+            client_id,
+            0.0,
+            0.0,
+            ray_height=2.0,
+            bounds=scene.bounds,
+            terrain_body_ids=scene.body_ids,
+        )
+
+        assert first_hit[0] == obstacle_id
+        assert probe.terrain_probe_valid is True
+        assert probe.local_ground_height == pytest.approx(baseline.local_ground_height, abs=2e-4)
+        assert (
+            probe.local_terrain_normal_x,
+            probe.local_terrain_normal_y,
+            probe.local_terrain_normal_z,
+        ) == pytest.approx(
+            (
+                baseline.local_terrain_normal_x,
+                baseline.local_terrain_normal_y,
+                baseline.local_terrain_normal_z,
+            ),
+            abs=1e-5,
+        )
+    finally:
+        p.disconnect(client_id)
 
 
 def test_golf_relief_presets_change_height_range():

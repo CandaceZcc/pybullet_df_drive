@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import math
 import random
+from collections.abc import Collection
 from dataclasses import dataclass
+from numbers import Integral
 
 import pybullet as p
 
@@ -25,6 +27,13 @@ GOLF_RELIEF_AMPLITUDES = {"low": 0.10, "medium": 0.20, "high": 0.32}
 # 廊道中心仍保留大部分丘洼，避免把高尔夫地形变成无语义的平面。
 GOLF_CORRIDOR_FEATURE_FLOOR = 0.813
 GOLF_CORRIDOR_DETAIL_FLOOR = 0.18
+# Bullet 默认动态/静态组分别为 0x1/0x2；地形保留静态位并额外使用独立位供 ray mask 精确筛选。
+STATIC_COLLISION_GROUP = 0x2
+TERRAIN_FILTER_GROUP = 0x8
+TERRAIN_COLLISION_GROUP = STATIC_COLLISION_GROUP | TERRAIN_FILTER_GROUP
+TERRAIN_COLLISION_MASK = 0x3
+TERRAIN_USER_DATA_KEY = "slope_sim.terrain_body"
+TERRAIN_USER_DATA_VALUE = "1"
 
 
 @dataclass(frozen=True)
@@ -243,7 +252,7 @@ def create_slope_scene(
         choices = ", ".join(STAGE1_TERRAIN_MODELS)
         raise ValueError(f"terrain_model must be one of: {choices}")
     if terrain_model == "golf_heightfield":
-        return _create_golf_heightfield_scene(
+        scene = _create_golf_heightfield_scene(
             client_id,
             ground_lateral_friction,
             ground_rolling_friction,
@@ -251,39 +260,43 @@ def create_slope_scene(
             golf_seed,
             golf_relief,
         )
-    if terrain_model == "slope":
-        return _create_segmented_slope_scene(
+    elif terrain_model == "slope":
+        scene = _create_segmented_slope_scene(
             client_id,
             slope_deg,
             ground_lateral_friction,
             ground_rolling_friction,
             ground_spinning_friction,
         )
-    actual_slope_deg = 0.0
-    body_id = _create_planar_scene(
-        client_id,
-        actual_slope_deg,
-        ground_lateral_friction,
-        ground_rolling_friction,
-        ground_spinning_friction,
-    )
-    bounds = TerrainBounds(
-        min_x=-STAGE1_TERRAIN_LENGTH / 2.0,
-        max_x=STAGE1_TERRAIN_LENGTH / 2.0,
-        min_y=-STAGE1_TERRAIN_WIDTH / 2.0,
-        max_y=STAGE1_TERRAIN_WIDTH / 2.0,
-    )
-    spawn_x = -3.5
-    spawn_z = _raycast_ground_height(client_id, spawn_x, 0.0)
-    spawn_orientation = p.getQuaternionFromEuler([0.0, -math.radians(actual_slope_deg), 0.0])
-    return SceneInfo(
-        body_id=body_id,
-        terrain_type=terrain_model,
-        slope_deg=actual_slope_deg,
-        spawn_position=(spawn_x, 0.0, spawn_z),
-        spawn_orientation=tuple(float(value) for value in spawn_orientation),
-        bounds=bounds,
-    )
+    else:
+        actual_slope_deg = 0.0
+        body_id = _create_planar_scene(
+            client_id,
+            actual_slope_deg,
+            ground_lateral_friction,
+            ground_rolling_friction,
+            ground_spinning_friction,
+        )
+        bounds = TerrainBounds(
+            min_x=-STAGE1_TERRAIN_LENGTH / 2.0,
+            max_x=STAGE1_TERRAIN_LENGTH / 2.0,
+            min_y=-STAGE1_TERRAIN_WIDTH / 2.0,
+            max_y=STAGE1_TERRAIN_WIDTH / 2.0,
+        )
+        spawn_x = -3.5
+        spawn_z = _raycast_ground_height(client_id, spawn_x, 0.0)
+        spawn_orientation = p.getQuaternionFromEuler([0.0, -math.radians(actual_slope_deg), 0.0])
+        scene = SceneInfo(
+            body_id=body_id,
+            terrain_type=terrain_model,
+            slope_deg=actual_slope_deg,
+            spawn_position=(spawn_x, 0.0, spawn_z),
+            spawn_orientation=tuple(float(value) for value in spawn_orientation),
+            bounds=bounds,
+        )
+
+    _apply_terrain_collision_filter(client_id, scene.body_ids)
+    return scene
 
 
 def _create_static_terrain_box(
@@ -460,6 +473,69 @@ def _apply_terrain_friction(
         )
 
 
+def _apply_terrain_collision_filter(client_id: int, body_ids: Collection[int]) -> None:
+    """把所有地形 base/link 放入专用组，同时保留与默认动态、静态体的碰撞。"""
+    for body_id in body_ids:
+        for link_index in range(-1, p.getNumJoints(body_id, physicsClientId=client_id)):
+            p.setCollisionFilterGroupMask(
+                body_id,
+                link_index,
+                TERRAIN_COLLISION_GROUP,
+                TERRAIN_COLLISION_MASK,
+                physicsClientId=client_id,
+            )
+        # body ID 会在 reset 后复用，用 user data 标记当前 client 中真正的地形体。
+        p.addUserData(
+            body_id,
+            TERRAIN_USER_DATA_KEY,
+            TERRAIN_USER_DATA_VALUE,
+            physicsClientId=client_id,
+        )
+
+
+def _require_finite_probe_value(name: str, value: float) -> float:
+    """在进入 PyBullet 前把地形射线标量规范为有限浮点数。"""
+    try:
+        normalized = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be finite") from exc
+    if not math.isfinite(normalized):
+        raise ValueError(f"{name} must be finite")
+    return normalized
+
+
+def _validate_terrain_body_ids(client_id: int, terrain_body_ids: Collection[int] | None) -> frozenset[int] | None:
+    """校验允许集合确实引用当前 PyBullet 客户端中的非负刚体。"""
+    if terrain_body_ids is None:
+        return None
+    try:
+        requested_ids = tuple(terrain_body_ids)
+    except TypeError as exc:
+        raise ValueError("terrain_body_ids must be a non-empty collection of integers") from exc
+    if not requested_ids:
+        raise ValueError("terrain_body_ids must be non-empty")
+    if any(isinstance(body_id, bool) or not isinstance(body_id, Integral) for body_id in requested_ids):
+        raise ValueError("terrain_body_ids must contain only integers")
+    normalized_ids = frozenset(int(body_id) for body_id in requested_ids)
+    if any(body_id < 0 for body_id in normalized_ids):
+        raise ValueError("terrain_body_ids must contain only non-negative integers")
+    # 允许集合通常只有 1-3 个地形体，逐 ID 查询避免每帧扫描全部移动体。
+    for body_id in normalized_ids:
+        try:
+            p.getBodyInfo(body_id, physicsClientId=client_id)
+        except p.error as exc:
+            raise ValueError("terrain_body_ids must belong to the current physics client") from exc
+        marker_id = p.getUserDataId(
+            body_id,
+            TERRAIN_USER_DATA_KEY,
+            physicsClientId=client_id,
+        )
+        marker_value = p.getUserData(marker_id, physicsClientId=client_id) if marker_id >= 0 else None
+        if marker_value != TERRAIN_USER_DATA_VALUE.encode("utf-8"):
+            raise ValueError("terrain_body_ids must contain only terrain body IDs")
+    return normalized_ids
+
+
 def probe_terrain(
     client_id: int,
     x: float,
@@ -467,17 +543,44 @@ def probe_terrain(
     ray_height: float = 8.0,
     bounds: TerrainBounds | None = None,
     ray_start_z: float | None = None,
+    terrain_body_ids: Collection[int] | None = None,
 ) -> TerrainProbe:
-    """从机器人当前位置向下发射射线，估计局部地面高度和法向。"""
-    if bounds is not None and not bounds.contains(x, y):
+    """向下探测地表；指定地形 body 时由专用碰撞组屏蔽其他刚体。"""
+    probe_x = _require_finite_probe_value("x", x)
+    probe_y = _require_finite_probe_value("y", y)
+    probe_ray_height = _require_finite_probe_value("ray_height", ray_height)
+    if probe_ray_height <= 0.0:
+        raise ValueError("ray_height must be greater than zero")
+    current_start_z = (
+        probe_ray_height
+        if ray_start_z is None
+        else _require_finite_probe_value("ray_start_z", ray_start_z)
+    )
+    ray_end_z = -probe_ray_height
+    if current_start_z <= ray_end_z:
+        raise ValueError("ray_start_z must be above the ray end at -ray_height")
+    allowed_body_ids = _validate_terrain_body_ids(client_id, terrain_body_ids)
+    if bounds is not None and not bounds.contains(probe_x, probe_y):
         return TerrainProbe(terrain_probe_valid=False, out_of_bounds=True)
-    hit = p.rayTest(
-        (x, y, ray_height if ray_start_z is None else ray_start_z),
-        (x, y, -ray_height),
-        physicsClientId=client_id,
-    )[0]
-    if hit[0] < 0:
+    if allowed_body_ids is None:
+        hit = p.rayTest(
+            (probe_x, probe_y, current_start_z),
+            (probe_x, probe_y, ray_end_z),
+            physicsClientId=client_id,
+        )[0]
+    else:
+        # 专用 mask 让 Bullet 在一次 broadphase 查询中忽略车辆和障碍物。
+        hit = p.rayTest(
+            (probe_x, probe_y, current_start_z),
+            (probe_x, probe_y, ray_end_z),
+            collisionFilterMask=TERRAIN_FILTER_GROUP,
+            physicsClientId=client_id,
+        )[0]
+    hit_body_id = int(hit[0])
+    if hit_body_id < 0:
         return TerrainProbe(terrain_probe_valid=False, out_of_bounds=True)
+    if allowed_body_ids is not None and hit_body_id not in allowed_body_ids:
+        raise ValueError("terrain_body_ids must contain the terrain body hit by the filtered ray")
     hit_position = hit[3]
     normal = hit[4]
     return TerrainProbe(
