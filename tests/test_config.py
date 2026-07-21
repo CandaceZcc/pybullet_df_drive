@@ -1,4 +1,4 @@
-# 配置测试：阶段一只允许四种车型、三类场地和高尔夫复现参数。
+# 配置测试：保护四种车型、三类场地及阶段二示例配置的稳定参数。
 from __future__ import annotations
 
 import math

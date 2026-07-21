@@ -1,10 +1,13 @@
 # 阶段二障碍物验收脚本测试：固定报告聚合、哈希、运动和性能判据。
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 from slope_sim.obstacles import ObstacleGeometry, ObstaclePath, ObstacleSnapshot
+from slope_sim.runtime_actions import TerrainSelection
+from slope_sim.scene import create_slope_scene
 from scripts import verify_stage2_obstacles as verifier
 
 
@@ -149,6 +152,69 @@ def test_batch_performance_gate_fails_on_direct_blocking_or_event_delay():
     assert verifier.batch_performance_passed(event_blocked) is False
     assert "soft_budget_ms=2.00" in direct_blocked.details
     assert "hard_event_ms=100.00" in event_blocked.details
+
+
+def test_performance_summary_marks_empty_qt_samples_as_unmeasured():
+    stats = verifier.performance_summary(
+        operation="add_50_clear_100",
+        step_durations=(0.035,),
+        qt_event_durations=(),
+        soft_budget_seconds=0.002,
+        hard_event_seconds=0.100,
+    )
+
+    assert stats.max_qt_event_seconds is None
+    assert stats.exceeded_hard_event_limit is None
+    assert "max_qt_event_ms=not_measured" in stats.details
+    assert verifier.batch_performance_passed(stats) is True
+
+
+def test_motion_gate_uses_one_micrometre_path_error_limit():
+    at_limit = verifier.MotionMetrics(reversal_count=2, max_path_error=0.000001)
+    over_limit = verifier.MotionMetrics(reversal_count=2, max_path_error=0.000002)
+
+    assert verifier.motion_gate_passed(at_limit) is True
+    assert verifier.motion_gate_passed(over_limit) is False
+
+
+def test_collision_gate_requires_complete_static_and_moving_physics_limits():
+    baseline = verifier.CollisionMetrics(displacement=1.0)
+    static = verifier.CollisionMetrics(
+        displacement=0.5,
+        contact_frames=3,
+        max_penetration=0.03,
+        max_robot_linear_speed=3.0,
+        max_robot_angular_speed=10.0,
+    )
+    moving = verifier.CollisionMetrics(
+        contact_frames=2,
+        max_penetration=0.03,
+        max_robot_linear_speed=3.0,
+        max_robot_angular_speed=10.0,
+        max_obstacle_path_error=0.000001,
+    )
+
+    assert verifier.collision_gate_passed(baseline, static, moving) is True
+    assert verifier.collision_gate_passed(baseline, replace(static, displacement=0.51), moving) is False
+    assert verifier.collision_gate_passed(baseline, replace(static, contact_frames=0), moving) is False
+    assert verifier.collision_gate_passed(baseline, replace(static, max_penetration=0.031), moving) is False
+    assert verifier.collision_gate_passed(baseline, replace(static, max_robot_linear_speed=3.01), moving) is False
+    assert verifier.collision_gate_passed(baseline, static, replace(moving, max_robot_angular_speed=10.01)) is False
+    assert verifier.collision_gate_passed(baseline, static, replace(moving, states_finite=False)) is False
+    assert verifier.collision_gate_passed(baseline, static, replace(moving, max_obstacle_path_error=0.000002)) is False
+
+
+def test_slope_scene_gate_checks_metadata_and_physical_surface():
+    client_id = verifier.p.connect(verifier.p.DIRECT)
+    try:
+        target = TerrainSelection("slope", slope_deg=6.0)
+        scene = create_slope_scene(client_id, slope_deg=6.0, time_step=1.0 / 240.0, terrain_model="slope")
+
+        assert verifier.slope_scene_matches(client_id, scene, target) is True
+        assert verifier.slope_scene_matches(client_id, replace(scene, slope_deg=5.0), target) is False
+        assert verifier.slope_scene_matches(client_id, replace(scene, terrain_type="flat"), target) is False
+    finally:
+        verifier.p.disconnect(client_id)
 
 
 def test_snapshot_layout_state_ignores_height_orientation_and_body_ids():

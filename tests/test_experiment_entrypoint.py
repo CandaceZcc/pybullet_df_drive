@@ -1,4 +1,4 @@
-# 批量实验入口测试：确保脚本按路径直接执行时也能导入项目包。
+# 验收脚本入口测试：确保阶段一批量与阶段二障碍物脚本可按路径执行。
 import subprocess
 import sys
 from pathlib import Path

@@ -1,4 +1,4 @@
-# 阶段一示例配置测试：保护平面、斜面和高尔夫 GUI 入口。
+# GUI 示例配置测试：保护阶段一场地与阶段二障碍物入口。
 from pathlib import Path
 
 from slope_sim.config import load_config
