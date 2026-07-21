@@ -1,6 +1,7 @@
 # GUI 手动演示模块：打开 PyBullet 窗口，用方向键控制车辆在当前地形中运动。
 from __future__ import annotations
 
+from collections import deque
 from pathlib import Path
 import time
 
@@ -11,10 +12,20 @@ from slope_sim.config import ExperimentConfig
 from slope_sim.coordinator import SimulationCoordinator, create_obstacle_manager, load_manual_robot, load_manual_world, reload_manual_robot
 from slope_sim.dashboard import DashboardCommand, TelemetryDashboard
 from slope_sim.diagnostics import compute_diagnostic_summary, write_diagnostic_summary
-from slope_sim.logger import CsvSimulationLogger
+from slope_sim.logger import CsvSimulationLogger, ObstacleEventLogger
 from slope_sim.manual_control import ManualCommand, ManualControlSettings, command_from_keyboard
 from slope_sim.metrics import compute_tracking_metrics
-from slope_sim.runtime_actions import TerrainSelection, is_safe_stop_action
+from slope_sim.runtime_actions import (
+    AddObstaclesAction,
+    ClearObstaclesAction,
+    DeleteObstacleAction,
+    ResetRobotAction,
+    RuntimeAction,
+    SwitchRobotAction,
+    SwitchTerrainAction,
+    TerrainSelection,
+    is_safe_stop_action,
+)
 from slope_sim.scene import configure_gui_visualizer, update_follow_camera
 from slope_sim.simulation import (
     SimulationResult,
@@ -119,6 +130,120 @@ def _step_toward(current: float, target: float, max_delta: float) -> float:
     return current + max_delta * (1.0 if delta > 0.0 else -1.0)
 
 
+def _request_params_for_event(action: RuntimeAction | None) -> dict[str, object]:
+    """把结构动作转换成 JSON 友好的请求参数，供障碍物事件日志复现操作来源。"""
+    if isinstance(action, AddObstaclesAction):
+        request = action.request
+        return {
+            "mode": request.mode,
+            "count": request.count,
+            "shape": request.shape,
+            "moving_ratio": request.moving_ratio,
+            "seed": request.seed,
+            "speed": request.moving_speed,
+        }
+    if isinstance(action, DeleteObstacleAction):
+        return {"logical_id": action.logical_id}
+    if isinstance(action, ClearObstaclesAction):
+        return {}
+    if isinstance(action, SwitchTerrainAction):
+        return _terrain_params(action.terrain)
+    if isinstance(action, SwitchRobotAction):
+        return {"robot_model": action.robot_model}
+    if isinstance(action, ResetRobotAction):
+        return {}
+    return {}
+
+
+def _terrain_params(terrain: TerrainSelection) -> dict[str, object]:
+    """把场地选择转换成稳定 JSON 字段，供重建和回滚事件复用。"""
+    return {
+        "terrain_model": terrain.terrain_model,
+        "slope_deg": terrain.slope_deg,
+        "golf_seed": terrain.golf_seed,
+        "golf_relief": terrain.golf_relief,
+    }
+
+
+def _event_type_for_action(action: RuntimeAction | None, result_operation: str | None = None) -> str:
+    """统一事件类型名称，避免 Dashboard 文案变化影响日志解析。"""
+    if result_operation in {"add", "delete", "clear"}:
+        return result_operation
+    if isinstance(action, AddObstaclesAction):
+        return "add"
+    if isinstance(action, DeleteObstacleAction):
+        return "delete"
+    if isinstance(action, ClearObstaclesAction):
+        return "clear"
+    if isinstance(action, SwitchTerrainAction):
+        return "terrain_rebuild"
+    if isinstance(action, SwitchRobotAction):
+        return "robot_switch"
+    if isinstance(action, ResetRobotAction):
+        return "robot_reset"
+    return result_operation or "structural_action"
+
+
+def _seed_for_event(action: RuntimeAction | None) -> int | None:
+    """提取可复现随机种子；非随机操作用 None。"""
+    if isinstance(action, AddObstaclesAction):
+        return action.request.seed
+    return None
+
+
+def _logical_id_for_event(action: RuntimeAction | None) -> int | None:
+    """删除单个障碍物时记录逻辑 ID，批量事件保留为 null。"""
+    if isinstance(action, DeleteObstacleAction):
+        return action.logical_id
+    return None
+
+
+def _record_manual_structural_event(
+    logger: ObstacleEventLogger,
+    *,
+    sim_time: float,
+    action: RuntimeAction | None,
+    result,
+) -> None:
+    """把协调器结果写入障碍物事件日志；pending 事务不写，避免重复刷屏。"""
+    obstacle_result = getattr(result, "obstacle_result", None)
+    if obstacle_result is not None and not obstacle_result.done:
+        return
+    if obstacle_result is None and not isinstance(action, SwitchTerrainAction):
+        return
+    operation = None if obstacle_result is None else obstacle_result.operation
+    success = bool(getattr(result, "error_message", None) is None)
+    if obstacle_result is not None:
+        success = bool(obstacle_result.succeeded)
+    error_reason = getattr(result, "error_message", None)
+    if obstacle_result is not None and not obstacle_result.succeeded:
+        error_reason = obstacle_result.message or error_reason
+    event_type = _event_type_for_action(action, operation)
+    logger.record_event(
+        sim_time=sim_time,
+        event_type=event_type,
+        logical_id=_logical_id_for_event(action),
+        request_params=_request_params_for_event(action),
+        seed=_seed_for_event(action),
+        robot_model=result.world.active_robot.robot_model,
+        terrain=result.world.terrain,
+        success=success,
+        error_reason=error_reason,
+    )
+    if isinstance(action, SwitchTerrainAction) and getattr(result, "error_message", None) is not None:
+        logger.record_event(
+            sim_time=sim_time,
+            event_type="rollback",
+            logical_id=None,
+            request_params=_terrain_params(result.world.terrain),
+            seed=None,
+            robot_model=result.world.active_robot.robot_model,
+            terrain=result.world.terrain,
+            success=True,
+            error_reason=None,
+        )
+
+
 def run_manual_demo(config: ExperimentConfig, *, duration_limit_sec: float | None = None) -> SimulationResult:
     """启动 PyBullet GUI，使用方向键手动控制当前地形中的车辆。"""
     if config.mode != "gui":
@@ -129,7 +254,9 @@ def run_manual_demo(config: ExperimentConfig, *, duration_limit_sec: float | Non
         raise RuntimeError("Failed to connect to PyBullet GUI")
 
     logger: CsvSimulationLogger | None = None
+    obstacle_event_logger: ObstacleEventLogger | None = None
     dashboard: TelemetryDashboard | None = None
+    event_log_path: Path | None = None
     try:
         # 场景和机器人仍复用自动仿真的构建逻辑，避免两套世界配置不一致。
         terrain = TerrainSelection(
@@ -152,6 +279,7 @@ def run_manual_demo(config: ExperimentConfig, *, duration_limit_sec: float | Non
         )
         manual_prefix = f"manual_{config.terrain_model}_{active_robot.robot_model}_{config.slope_deg:g}"
         logger = CsvSimulationLogger(config.log_dir, prefix=manual_prefix)
+        obstacle_event_logger = ObstacleEventLogger(config.log_dir, prefix=f"{manual_prefix}_obstacles")
 
         linear_slider = None
         angular_slider = None
@@ -196,6 +324,7 @@ def run_manual_demo(config: ExperimentConfig, *, duration_limit_sec: float | Non
             camera_follow_view=camera_follow_view,
         )
         handled_result = None
+        pending_event_actions: deque[RuntimeAction] = deque()
         while max_steps is None or step < max_steps:
             if dashboard is not None:
                 dashboard.process_events()
@@ -230,6 +359,7 @@ def run_manual_demo(config: ExperimentConfig, *, duration_limit_sec: float | Non
             safe_stop_requested = is_safe_stop_action(structural_action)
             if structural_action is not None:
                 coordinator.enqueue(structural_action)
+                pending_event_actions.append(structural_action)
                 if dashboard is not None:
                     dashboard.set_switch_busy(True, "应用中")
 
@@ -298,6 +428,17 @@ def run_manual_demo(config: ExperimentConfig, *, duration_limit_sec: float | Non
                 robot = active_robot.robot
             if result is not None and result is not handled_result:
                 handled_result = result
+                event_action = pending_event_actions[0] if pending_event_actions else None
+                _record_manual_structural_event(
+                    obstacle_event_logger,
+                    sim_time=t,
+                    action=event_action,
+                    result=result,
+                )
+                obstacle_result = getattr(result, "obstacle_result", None)
+                if obstacle_result is None or obstacle_result.done:
+                    if pending_event_actions:
+                        pending_event_actions.popleft()
                 if result.world_reset:
                     configure_gui_visualizer(
                         client_id,
@@ -352,9 +493,13 @@ def run_manual_demo(config: ExperimentConfig, *, duration_limit_sec: float | Non
 
         log_path = logger.close()
         logger = None
+        event_log_path = obstacle_event_logger.close()
+        obstacle_event_logger = None
     finally:
         if logger is not None:
             log_path = logger.close()
+        if obstacle_event_logger is not None:
+            event_log_path = obstacle_event_logger.close()
         if dashboard is not None:
             dashboard.close()
         # 不管中途是否退出，都要断开 PyBullet，避免 GUI/物理客户端残留。
@@ -374,4 +519,5 @@ def run_manual_demo(config: ExperimentConfig, *, duration_limit_sec: float | Non
         feedback_figure_paths=feedback_figure_paths,
         diagnostic_summary=diagnostic_summary.to_dict(),
         diagnostic_summary_path=diagnostic_summary_path,
+        obstacle_event_log_path=event_log_path,
     )

@@ -1,10 +1,14 @@
-# 日志测试：确保 CSV 输出字段稳定，便于后续分析脚本读取。
+# 日志测试：确保 CSV 输出字段稳定，并单独记录阶段二障碍物事件。
+import json
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
+import slope_sim.logger as logger_module
 from slope_sim.logger import CsvSimulationLogger
 from slope_sim.robot import RobotState
+from slope_sim.runtime_actions import TerrainSelection
 
 
 def test_csv_logger_writes_robot_state_rows(tmp_path: Path):
@@ -110,3 +114,77 @@ def test_csv_logger_writes_robot_state_rows(tmp_path: Path):
     assert bool(frame.iloc[0]["right_slip_valid"]) is False
     assert frame.iloc[0]["left_contact_count"] == 2
     assert frame.iloc[0]["terrain_type"] == "slope"
+
+
+def test_obstacle_event_logger_writes_stable_jsonl_fields_and_flushes(tmp_path: Path):
+    """障碍物事件必须写独立 JSONL，避免把结构事件混入遥测 CSV。"""
+    logger = logger_module.ObstacleEventLogger(tmp_path, prefix="obstacles")
+
+    logger.record_event(
+        sim_time=1.25,
+        event_type="add",
+        logical_id=7,
+        request_params={"mode": "mixed", "count": 3, "shape": "box"},
+        seed=42,
+        robot_model="df_back",
+        terrain=TerrainSelection("golf_heightfield", golf_seed=9, golf_relief="high"),
+        success=False,
+        error_reason="no valid placement",
+    )
+    path = logger.close()
+
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert len(rows) == 1
+    assert set(rows[0]) == {
+        "sim_time",
+        "event_type",
+        "logical_id",
+        "request_params",
+        "seed",
+        "robot_model",
+        "terrain",
+        "success",
+        "error_reason",
+    }
+    assert rows[0]["sim_time"] == 1.25
+    assert rows[0]["event_type"] == "add"
+    assert rows[0]["logical_id"] == 7
+    assert rows[0]["request_params"] == {"mode": "mixed", "count": 3, "shape": "box"}
+    assert rows[0]["seed"] == 42
+    assert rows[0]["robot_model"] == "df_back"
+    assert rows[0]["terrain"] == {
+        "terrain_model": "golf_heightfield",
+        "slope_deg": 0.0,
+        "golf_seed": 9,
+        "golf_relief": "high",
+    }
+    assert rows[0]["success"] is False
+    assert rows[0]["error_reason"] == "no valid placement"
+
+
+def test_obstacle_event_logger_close_is_idempotent(tmp_path: Path):
+    logger = logger_module.ObstacleEventLogger(tmp_path, prefix="obstacles")
+
+    first_path = logger.close()
+    second_path = logger.close()
+
+    assert first_path == second_path
+    assert first_path.exists()
+
+
+def test_obstacle_event_logger_rejects_record_after_close(tmp_path: Path):
+    logger = logger_module.ObstacleEventLogger(tmp_path, prefix="obstacles")
+    logger.close()
+
+    with pytest.raises(ValueError, match="closed"):
+        logger.record_event(
+            sim_time=0.0,
+            event_type="add",
+            logical_id=None,
+            request_params={},
+            seed=None,
+            robot_model="df_back",
+            terrain=TerrainSelection("flat"),
+            success=True,
+            error_reason=None,
+        )

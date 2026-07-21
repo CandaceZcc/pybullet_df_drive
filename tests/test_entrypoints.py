@@ -118,6 +118,24 @@ def test_manual_mode_runs_until_quit_unless_duration_is_explicit(tmp_path: Path,
     assert calls[-1][1] == 2.0
 
 
+def test_main_reports_obstacle_event_log_when_present(tmp_path: Path, monkeypatch, capsys):
+    """CLI 输出要包含独立障碍物事件日志路径，方便 GUI 验收后定位结构操作。"""
+    monkeypatch.setattr(
+        main_module,
+        "run_experiment",
+        lambda _config: SimulationResult(
+            log_path=tmp_path / "run.csv",
+            figure_path=tmp_path / "run.png",
+            metrics={"endpoint_error": 0.0},
+            obstacle_event_log_path=tmp_path / "obstacles.jsonl",
+        ),
+    )
+
+    assert main_module.main(["--mode", "direct"]) == 0
+
+    assert f"obstacle_event_log: {tmp_path / 'obstacles.jsonl'}" in capsys.readouterr().out
+
+
 def test_analyze_log_generates_metrics_and_figure(tmp_path: Path):
     log_path = tmp_path / "run.csv"
     pd.DataFrame(

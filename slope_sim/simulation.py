@@ -31,6 +31,7 @@ class SimulationResult:
     feedback_figure_paths: tuple[Path, ...] = ()
     diagnostic_summary: dict[str, float] | None = None
     diagnostic_summary_path: Path | None = None
+    obstacle_event_log_path: Path | None = None
 
 
 def run_experiment(config: ExperimentConfig) -> SimulationResult:

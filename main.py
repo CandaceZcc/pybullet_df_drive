@@ -92,6 +92,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"feedback_figure: {figure_path}")
     if result.diagnostic_summary_path is not None:
         print(f"diagnostic_summary: {result.diagnostic_summary_path}")
+    if result.obstacle_event_log_path is not None:
+        print(f"obstacle_event_log: {result.obstacle_event_log_path}")
     for name, value in result.metrics.items():
         print(f"{name}: {value:.6f}")
     if result.diagnostic_summary is not None:
