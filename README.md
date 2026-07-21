@@ -1,8 +1,8 @@
 # PyBullet 3D 移动机器人仿真平台
 
-当前仓库正在按 `3d仿真平台需求规格.md` 分四阶段交付。阶段一已完成四种机器人模型、三类基础场地、GUI 人工观察及 Dashboard 运行期车型/场地切换；阶段二将实现动态障碍物，阶段三接入 eCAL 与企业传感器，阶段四实现自动导航与避障。
+当前仓库正在按 `3d仿真平台需求规格.md` 分四阶段交付。阶段一已完成四种机器人模型、三类基础场地、GUI 人工观察及 Dashboard 运行期车型/场地切换；阶段二已实现动态障碍物和自动验收入口，阶段三计划接入 eCAL 与企业传感器，阶段四计划实现自动导航与避障。
 
-阶段一已经用户验收，阶段二设计已确认、等待按实施计划开发。阶段一完整结果和逐项清单见 [`docs/阶段一交付报告.md`](docs/阶段一交付报告.md)。
+阶段一已经用户验收，阶段二设计已确认并正在按实施计划收尾。阶段一完整结果和逐项清单见 [`docs/阶段一交付报告.md`](docs/阶段一交付报告.md)。
 
 ## 阶段一已实现范围
 
@@ -48,6 +48,12 @@ python main.py --mode direct --robot-model df_back --terrain-model flat --drive-
 python scripts/verify_stage1_matrix.py
 ```
 
+运行阶段二障碍物 DIRECT 验收：
+
+```bash
+python scripts/verify_stage2_obstacles.py
+```
+
 运行自动测试：
 
 ```bash
@@ -75,6 +81,14 @@ python main.py --gui --manual --drive-model physics --robot-model df_mid --terra
 ```bash
 python main.py --gui --manual --drive-model physics --robot-model active_steering_4wd --terrain-model golf_heightfield --golf-seed 41 --golf-relief medium
 ```
+
+阶段二障碍物 GUI 验收示例：
+
+```bash
+python main.py --config configs/stage2_obstacles_gui.yaml --gui --manual
+```
+
+Dashboard 的“障碍物”页可以随机追加静态、移动或混合障碍物。混合模式默认按 30% 生成移动障碍物，例如添加 10 个时得到 7 个静态和 3 个移动；相同场地、种子和参数会复现同一组逻辑布局。表格单选逻辑 ID 后可删除选中项，也可以清空全部。切换平面、斜面和高尔夫场地时，障碍物保留逻辑 ID、XY、路径进度和方向，并重新贴合目标地表。移动障碍物是运动学刚体，会沿直线往返并与车辆发生碰撞，但不会被车辆撞偏；自动导航、自动刹停和动态避障不在阶段二，属于阶段四。
 
 任意一个 GUI 命令都可以作为初始组合；启动后可直接在 Dashboard 完成其余车型和场地的运行期评估。主动转向车需要同时给前进/后退和左/右命令才会形成转弯；原地只按左/右不会像差速车一样自转。
 
@@ -128,6 +142,8 @@ urdf/df_mid.urdf                  中置差速模型
 urdf/df_back.urdf                 后置差速模型
 urdf/active_steering_4wd.urdf     主动转向四驱模型
 scripts/verify_stage1_matrix.py   4×3 DIRECT 验证
+scripts/verify_stage2_obstacles.py 阶段二障碍物 DIRECT 验收
+configs/stage2_obstacles_gui.yaml 阶段二障碍物 GUI 验收配置
 tests/                            自动测试
 ```
 

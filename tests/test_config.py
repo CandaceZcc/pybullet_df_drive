@@ -139,6 +139,7 @@ def test_old_tracked_and_dam_keys_are_not_runnable_config_keys(tmp_path: Path):
         "configs/experiment.yaml",
         "configs/flat_demo.yaml",
         "configs/gui_step2_demo.yaml",
+        "configs/stage2_obstacles_gui.yaml",
         "configs/step3_feedback.yaml",
         "configs/stage1_golf_gui.yaml",
     ],

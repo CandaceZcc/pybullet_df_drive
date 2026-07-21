@@ -24,3 +24,14 @@ def test_golf_gui_config_uses_active_steering_and_reproducible_seed():
     assert config.robot_model == "active_steering_4wd"
     assert config.terrain_model == "golf_heightfield"
     assert config.golf_seed == 41
+
+
+def test_stage2_obstacle_gui_config_opens_dashboard_on_reproducible_golf_scene():
+    config = load_config(Path("configs/stage2_obstacles_gui.yaml"))
+
+    assert config.mode == "gui"
+    assert config.dashboard_enabled is True
+    assert config.robot_model == "df_back"
+    assert config.terrain_model == "golf_heightfield"
+    assert config.golf_seed == 2026
+    assert config.golf_relief == "medium"

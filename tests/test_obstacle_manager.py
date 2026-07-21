@@ -336,6 +336,50 @@ def test_add_planning_and_hidden_temporary_creation_yield_across_frames(monkeypa
         p.disconnect(client_id)
 
 
+def test_stage2_batch_add_50_and_clear_100_yield_across_frames():
+    """阶段二验收上限：50 个添加和 100 个清空都要跨帧让出控制。"""
+    client_id = p.connect(p.DIRECT)
+    try:
+        scene = create_slope_scene(client_id, slope_deg=0.0, time_step=TIME_STEP, terrain_model="flat")
+        manager = ObstacleManager(
+            client_id,
+            _settings(
+                bounds=scene.bounds,
+                max_scene_obstacles=100,
+                half_extent_ranges=((0.08, 0.08), (0.08, 0.08), (0.12, 0.12)),
+                minimum_clearance=0.01,
+                spawn_protection_radius=0.20,
+                max_candidate_attempts=3000,
+            ),
+            terrain_body_ids=scene.body_ids,
+            soft_budget_seconds=0.0,
+        )
+        manager.begin_add(ObstacleGenerationRequest(mode="mixed", count=50, seed=101))
+        first_add = manager.advance_pending_operation()
+        assert not first_add.done
+        assert manager.snapshot() == ()
+        add_result = _finish(manager)
+        assert add_result.done and add_result.succeeded
+        assert add_result.published_count == 50
+
+        manager.begin_add(ObstacleGenerationRequest(mode="mixed", count=50, seed=202))
+        second_add = _finish(manager)
+        assert second_add.done and second_add.succeeded
+        assert second_add.published_count == 50
+        assert len(manager.snapshot()) == 100
+
+        manager.begin_clear()
+        first_clear = manager.advance_pending_operation()
+        assert not first_clear.done
+        assert first_clear.deleted_count == 1
+        clear_result = _finish(manager)
+        assert clear_result.done and clear_result.succeeded
+        assert clear_result.deleted_count == 100
+        assert manager.snapshot() == ()
+    finally:
+        p.disconnect(client_id)
+
+
 def test_temporary_bodies_are_non_colliding_and_logical_list_publishes_once_after_batch_success():
     client_id = p.connect(p.DIRECT)
     try:

@@ -1,0 +1,36 @@
+# 阶段二 GUI 验收配置：打开 Dashboard 障碍物页，在可复现高尔夫场地中手动添加/删除/清空障碍物。
+mode: gui
+slope_deg: 0.0
+duration_sec: 5.0
+time_step: 0.004166666666666667
+target_linear_velocity: 0.35
+target_angular_velocity: 0.0
+robot_model: df_back
+drive_model: physics
+dashboard_enabled: true
+dashboard_update_hz: 5.0
+dashboard_smoothing_alpha: 0.25
+dashboard_plot_update_hz: 5.0
+dashboard_plot_window_sec: 20.0
+camera_distance: 6.0
+camera_yaw: 45.0
+camera_pitch: -35.0
+camera_target: [0.8, 0.0, 0.0]
+camera_follow_enabled: true
+camera_follow_view: front
+lidar_enabled: true
+lidar_ray_count: 31
+lidar_max_distance: 5.0
+lidar_fov_deg: 180.0
+lidar_debug_draw: false
+terrain_model: golf_heightfield
+golf_seed: 2026
+golf_relief: medium
+ground_lateral_friction: 1.0
+ground_rolling_friction: 0.02
+ground_spinning_friction: 0.0
+drive_lateral_friction: 2.0
+support_lateral_friction: 0.03
+drive_motor_force: 5.0
+log_dir: results/logs
+figure_dir: results/figures
