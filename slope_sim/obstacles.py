@@ -6,17 +6,26 @@ import random
 import time
 from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass, replace
-from numbers import Integral
+from numbers import Integral, Real
 
 import pybullet as p
 
-from slope_sim.scene import TerrainBounds, probe_terrain
+from slope_sim.scene import (
+    LIDAR_VISIBLE_GROUP,
+    STATIC_COLLISION_GROUP,
+    TERRAIN_FILTER_GROUP,
+    TerrainBounds,
+    probe_terrain,
+)
 from slope_sim.telemetry import TerrainProbe
 
 
 QUATERNION_NORM_EPSILON = 1e-12
+_QUATERNION_UNIT_ROUNDOFF = 4.0 * math.ulp(1.0)
 OBSTACLE_MODES = ("static", "moving", "mixed")
 OBSTACLE_SHAPES = ("box", "cylinder", "sphere")
+OBSTACLE_COLLISION_GROUP = STATIC_COLLISION_GROUP | LIDAR_VISIBLE_GROUP
+OBSTACLE_COLLISION_MASK = 0x3
 Aabb3D = tuple[tuple[float, float, float], tuple[float, float, float]]
 TerrainSampler = Callable[[float, float], TerrainProbe]
 
@@ -25,7 +34,41 @@ class ObstaclePlanningError(RuntimeError):
     """障碍物整批规划失败；调用方不得发布半批结果。"""
 
 
+def _exception_reason(error: BaseException) -> str:
+    """异常无文本时保留类型名，保证事务诊断始终可读。"""
+    return str(error) or type(error).__name__
+
+
+class _ObstacleBodyCreationError(RuntimeError):
+    """创建后置步骤失败且清理不完整；结构化携带仍受管的 body ID。"""
+
+    def __init__(
+        self,
+        primary_error: BaseException,
+        *,
+        residual_body_ids: Sequence[int],
+        cleanup_errors: Sequence[BaseException],
+    ) -> None:
+        self.primary_error = primary_error
+        self.residual_body_ids = tuple(dict.fromkeys(int(body_id) for body_id in residual_body_ids))
+        self.cleanup_errors = tuple(cleanup_errors)
+        cleanup_reason = "; ".join(_exception_reason(error) for error in self.cleanup_errors)
+        residual_reason = ", ".join(str(body_id) for body_id in self.residual_body_ids)
+        details: list[str] = []
+        if cleanup_reason:
+            details.append(f"cleanup errors: {cleanup_reason}")
+        if residual_reason:
+            details.append(f"residual body IDs: {residual_reason}")
+        super().__init__(
+            f"obstacle body creation failed ({_exception_reason(primary_error)}); "
+            f"cleanup also failed ({'; '.join(details)})"
+        )
+
+
 def _require_finite_float(name: str, value: object) -> float:
+    """只接受有限实数，避免 bool 和可转换字符串静默变成场景数值。"""
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"{name} must be finite")
     normalized = float(value)
     if not math.isfinite(normalized):
         raise ValueError(f"{name} must be finite")
@@ -248,6 +291,32 @@ class ObstaclePath:
         return math.dist(self.start_xy, self.end_xy)
 
 
+def _revalidate_geometry(value: object) -> ObstacleGeometry:
+    """重构造几何对象，防止 frozen 实例被绕过构造器后携带非法字段。"""
+    if not isinstance(value, ObstacleGeometry):
+        raise ValueError("geometry must be an ObstacleGeometry")
+    try:
+        return ObstacleGeometry(value.shape, value.half_extents)
+    except (AttributeError, TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"geometry: {exc}") from exc
+
+
+def _revalidate_path(value: object) -> ObstaclePath:
+    """重构造路径对象，统一复验端点、速度、进度和往返方向。"""
+    if not isinstance(value, ObstaclePath):
+        raise ValueError("path must be an ObstaclePath")
+    try:
+        return ObstaclePath(
+            value.start_xy,
+            value.end_xy,
+            value.speed,
+            value.progress,
+            value.direction,
+        )
+    except (AttributeError, TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"path: {exc}") from exc
+
+
 @dataclass(frozen=True)
 class ObstacleSpec:
     """不含 PyBullet body id 的稳定逻辑障碍物规格。"""
@@ -264,14 +333,18 @@ class ObstacleSpec:
         if logical_id < 1:
             raise ValueError("logical_id must be positive")
         mode = _lower_choice("mode", self.mode, ("static", "moving"))
-        if mode == "static" and self.path is not None:
+        geometry = _revalidate_geometry(self.geometry)
+        path = None if self.path is None else _revalidate_path(self.path)
+        if mode == "static" and path is not None:
             raise ValueError("static obstacle must not have a path")
-        if mode == "moving" and self.path is None:
+        if mode == "moving" and path is None:
             raise ValueError("moving obstacle must have a path")
         object.__setattr__(self, "logical_id", logical_id)
         object.__setattr__(self, "mode", mode)
+        object.__setattr__(self, "geometry", geometry)
         object.__setattr__(self, "position", _require_finite_vector("position", self.position, length=3))
         object.__setattr__(self, "orientation", _normalize_orientation(self.orientation))
+        object.__setattr__(self, "path", path)
 
 
 @dataclass(frozen=True)
@@ -325,10 +398,10 @@ def _require_finite_vector(name: str, values: tuple[float, ...], *, length: int)
     """把 PyBullet 向量参数规范为浮点数，并在进入物理引擎前拒绝非法值。"""
     if len(values) != length:
         raise ValueError(f"{name} must contain {length} values")
-    normalized = tuple(float(value) for value in values)
-    if not all(math.isfinite(value) for value in normalized):
-        raise ValueError(f"{name} must contain only finite values")
-    return normalized
+    return tuple(
+        _require_finite_float(f"{name}[{index}]", value)
+        for index, value in enumerate(values)
+    )
 
 
 def _normalize_orientation(orientation: tuple[float, ...]) -> tuple[float, float, float, float]:
@@ -339,6 +412,9 @@ def _normalize_orientation(orientation: tuple[float, ...]) -> tuple[float, float
         raise ValueError("orientation norm must be finite")
     if norm <= QUATERNION_NORM_EPSILON:
         raise ValueError("orientation norm must be greater than zero")
+    # 已归一化值的 hypot 可能偏离 1 数个 ULP；避免重复构造继续改写末位。
+    if abs(norm - 1.0) <= _QUATERNION_UNIT_ROUNDOFF:
+        return quaternion  # type: ignore[return-value]
     return tuple(value / norm for value in quaternion)
 
 
@@ -791,12 +867,62 @@ class _PendingOperation:
     deleted_count: int = 0
 
 
-def _remove_body_safely(client_id: int, body_id: int) -> None:
-    """删除可能已被外部清理的 body；恢复快照时避免二次删除中断流程。"""
+def _remove_committed_body_strict(client_id: int, body_id: int) -> None:
+    """删除已提交 body 并复核物理结果；未确认删除时保留逻辑记录。"""
+    removal_error: Exception | None = None
     try:
         p.removeBody(body_id, physicsClientId=client_id)
-    except p.error:
+    except Exception as exc:
+        removal_error = exc
+
+    try:
+        body_remains = body_id in _body_ids(client_id)
+    except Exception as verification_exc:
+        verification_reason = str(verification_exc) or type(verification_exc).__name__
+        if removal_error is None:
+            raise RuntimeError(
+                f"failed to verify committed body {body_id} removal: {verification_reason}"
+            ) from verification_exc
+        removal_reason = str(removal_error) or type(removal_error).__name__
+        raise RuntimeError(
+            f"failed to remove committed body {body_id} ({removal_reason}); "
+            f"verification also failed ({verification_reason})"
+        ) from verification_exc
+
+    if not body_remains:
         return
+    if removal_error is not None:
+        removal_reason = str(removal_error) or type(removal_error).__name__
+        raise RuntimeError(
+            f"failed to remove committed body {body_id} ({removal_reason}); body remained"
+        ) from removal_error
+    raise RuntimeError(f"committed body {body_id} remained after removeBody")
+
+
+def _cleanup_records_strict(
+    client_id: int,
+    records: Sequence[_ObstacleRecord],
+) -> list[tuple[int, Exception]]:
+    """严格清理未提交候选，并保留全部失败供事务错误链汇总。"""
+    failures: list[tuple[int, Exception]] = []
+    for record in records:
+        try:
+            _remove_committed_body_strict(client_id, record.body_id)
+        except Exception as exc:
+            failures.append((record.body_id, exc))
+    return failures
+
+
+def _format_body_failures(failures: Sequence[tuple[int, BaseException]]) -> str:
+    """把 body 清理/恢复失败按稳定顺序拼成事务诊断。"""
+    return "; ".join(
+        (
+            f"body {body_id}: {_exception_reason(error)}"
+            if body_id >= 0
+            else f"body diagnosis: {_exception_reason(error)}"
+        )
+        for body_id, error in failures
+    )
 
 
 def _shape_type_for_geometry(geometry: ObstacleGeometry) -> int:
@@ -841,6 +967,7 @@ def _create_obstacle_body(
     base_orientation = _normalize_orientation(spec.orientation)
     existing_body_ids = _body_ids(client_id)
     collision_shape_id: int | None = None
+    body_id: int | None = None
     visual_color = (0.0, 0.0, 0.0, 0.0) if temporary else _require_finite_vector("color", color, length=4)
 
     try:
@@ -866,13 +993,58 @@ def _create_obstacle_body(
         )
         if temporary:
             p.setCollisionFilterGroupMask(body_id, -1, 0, 0, physicsClientId=client_id)
+        else:
+            p.setCollisionFilterGroupMask(
+                body_id,
+                -1,
+                OBSTACLE_COLLISION_GROUP,
+                OBSTACLE_COLLISION_MASK,
+                physicsClientId=client_id,
+            )
         return body_id
-    except Exception:
-        # PyBullet 有些失败会在抛错前注册 body，按差集回收保证事务外对象不受影响。
-        for body_id in _body_ids(client_id) - existing_body_ids:
-            _remove_body_safely(client_id, body_id)
+    except Exception as creation_exc:
+        # createMultiBody 可能在抛错前注册 body；已返回的 ID 与差集都属于本次创建。
+        cleanup_errors: list[BaseException] = []
+        created_body_ids: list[int] = []
+        if body_id is not None:
+            created_body_ids.append(body_id)
+        try:
+            current_body_ids = _body_ids(client_id)
+        except Exception as diagnosis_exc:
+            cleanup_errors.append(diagnosis_exc)
+        else:
+            created_body_ids.extend(sorted(current_body_ids - existing_body_ids))
+        created_body_ids = list(dict.fromkeys(created_body_ids))
+
+        for created_body_id in created_body_ids:
+            try:
+                _remove_committed_body_strict(client_id, created_body_id)
+            except Exception as cleanup_exc:
+                cleanup_errors.append(cleanup_exc)
+
+        try:
+            remaining_body_ids = _body_ids(client_id)
+        except Exception as diagnosis_exc:
+            cleanup_errors.append(diagnosis_exc)
+            residual_body_ids = tuple(created_body_ids)
+        else:
+            residual_body_ids = tuple(
+                created_body_id
+                for created_body_id in created_body_ids
+                if created_body_id in remaining_body_ids
+            )
+
         if collision_shape_id is not None:
-            p.removeCollisionShape(collision_shape_id, physicsClientId=client_id)
+            try:
+                p.removeCollisionShape(collision_shape_id, physicsClientId=client_id)
+            except Exception as cleanup_exc:
+                cleanup_errors.append(cleanup_exc)
+        if residual_body_ids or cleanup_errors:
+            raise _ObstacleBodyCreationError(
+                creation_exc,
+                residual_body_ids=residual_body_ids,
+                cleanup_errors=cleanup_errors,
+            ) from creation_exc
         raise
 
 
@@ -896,12 +1068,19 @@ class ObstacleManager:
         self._terrain_body_ids = tuple(terrain_body_ids)
         if not self._terrain_body_ids:
             raise ValueError("terrain_body_ids must be non-empty")
+        self._terrain_body_id_set = frozenset(self._terrain_body_ids)
         self._vehicle_aabb_getter = vehicle_aabb_getter
         self._clock = monotonic_clock if monotonic_clock is not None else time.monotonic
         self._soft_budget_seconds = _require_finite_float("soft_budget_seconds", soft_budget_seconds)
         if self._soft_budget_seconds < 0.0:
             raise ValueError("soft_budget_seconds must not be negative")
         self._records: tuple[_ObstacleRecord, ...] = ()
+        self._revision = 0
+        self._moving_count = 0
+        self._logical_specs_cache: tuple[ObstacleSpec, ...] = ()
+        self._logical_specs_cache_revision = 0
+        self._cleanup_debt_body_ids: tuple[int, ...] = ()
+        self._fault_reason: str | None = None
         self._pending: _PendingOperation | None = None
 
     def begin_add(self, request: ObstacleGenerationRequest) -> ObstacleOperationResult:
@@ -925,23 +1104,43 @@ class ObstacleManager:
         """按逻辑 ID 删除一个已提交障碍物；缺失 ID 返回失败状态但不抛错。"""
         self._require_no_pending()
         target_id = _require_integral("logical_id", logical_id)
-        remaining: list[_ObstacleRecord] = []
-        deleted = 0
-        for record in self._records:
-            if record.spec.logical_id == target_id:
-                _remove_body_safely(self._client_id, record.body_id)
-                deleted += 1
-            else:
-                remaining.append(record)
-        if deleted == 0:
+        target_index = next(
+            (
+                index
+                for index, record in enumerate(self._records)
+                if record.spec.logical_id == target_id
+            ),
+            None,
+        )
+        if target_index is None:
             return ObstacleOperationResult(
                 done=True,
                 succeeded=False,
                 operation="delete",
                 message=f"logical id {target_id} not found",
             )
-        self._records = tuple(remaining)
-        return ObstacleOperationResult(done=True, succeeded=True, operation="delete", deleted_count=deleted)
+        record = self._records[target_index]
+        try:
+            _remove_committed_body_strict(self._client_id, record.body_id)
+        except Exception as exc:
+            return ObstacleOperationResult(
+                done=True,
+                succeeded=False,
+                operation="delete",
+                message=str(exc) or type(exc).__name__,
+            )
+        self._publish_records(
+            (
+                *self._records[:target_index],
+                *self._records[target_index + 1 :],
+            )
+        )
+        return ObstacleOperationResult(
+            done=True,
+            succeeded=True,
+            operation="delete",
+            deleted_count=1,
+        )
 
     def begin_clear(self) -> ObstacleOperationResult:
         """启动清空事务；跨帧删除时同步移除已删记录，避免暴露悬空 body id。"""
@@ -957,8 +1156,16 @@ class ObstacleManager:
         delta_time = _require_finite_float("dt", dt)
         if delta_time < 0.0:
             raise ValueError("dt must not be negative")
-        sampled_updates: list[tuple[_ObstacleRecord, ObstacleSpec, tuple[float, float, float]]] = []
-        for record in self._records:
+        planned_updates: list[
+            tuple[
+                int,
+                _ObstacleRecord,
+                ObstaclePath,
+                tuple[float, float],
+                tuple[float, float],
+            ]
+        ] = []
+        for index, record in enumerate(self._records):
             spec = record.spec
             if spec.path is None:
                 continue
@@ -974,12 +1181,39 @@ class ObstacleManager:
             path_dy = path.end_xy[1] - path.start_xy[1]
             xy = (path.start_xy[0] + path_dx * progress, path.start_xy[1] + path_dy * progress)
             heading_xy = (path_dx * direction, path_dy * direction)
-            new_spec = self._resample_spec_pose(replace(spec, path=replace(path, progress=progress, direction=direction)), xy, heading_xy)
-            velocity = self._frame_displacement_velocity(spec.position, new_spec.position, delta_time)
-            sampled_updates.append((record, new_spec, velocity))
+            planned_updates.append(
+                (
+                    index,
+                    record,
+                    replace(path, progress=progress, direction=direction),
+                    xy,
+                    heading_xy,
+                )
+            )
 
+        if not planned_updates:
+            return
+        probes = self._sample_moving_terrain_batch(
+            tuple(update[3] for update in planned_updates)
+        )
         updated_records = list(self._records)
-        for record, new_spec, velocity in sampled_updates:
+        for (index, record, new_path, xy, heading_xy), probe in zip(
+            planned_updates,
+            probes,
+            strict=True,
+        ):
+            new_spec = self._spec_with_sampled_pose(
+                record.spec,
+                xy,
+                heading_xy,
+                probe,
+                path=new_path,
+            )
+            velocity = self._frame_displacement_velocity(
+                record.spec.position,
+                new_spec.position,
+                delta_time,
+            )
             update_kinematic_obstacle(
                 self._client_id,
                 record.body_id,
@@ -987,9 +1221,30 @@ class ObstacleManager:
                 orientation=new_spec.orientation,
                 linear_velocity=velocity,
             )
-            index = updated_records.index(record)
             updated_records[index] = _ObstacleRecord(spec=new_spec, body_id=record.body_id)
-        self._records = tuple(updated_records)
+        self._publish_records(updated_records, moving_count=self._moving_count)
+
+    @property
+    def has_moving(self) -> bool:
+        """O(1) 返回是否存在移动障碍物，不为热路径创建快照。"""
+        return self._moving_count > 0
+
+    @property
+    def revision(self) -> int:
+        """返回逻辑状态修订号，记录集合或移动位姿发布后单调递增。"""
+        return self._revision
+
+    @property
+    def faulted(self) -> bool:
+        """回滚无法恢复完整逻辑集合后保持故障态，禁止再次发布普通操作。"""
+        return self._fault_reason is not None
+
+    def logical_specs(self) -> tuple[ObstacleSpec, ...]:
+        """返回不含 body id 的冻结规格缓存，不暴露内部可变记录。"""
+        if self._logical_specs_cache_revision != self._revision:
+            self._logical_specs_cache = tuple(record.spec for record in self._records)
+            self._logical_specs_cache_revision = self._revision
+        return self._logical_specs_cache
 
     def snapshot(self, *, include_body_id: bool = True) -> tuple[ObstacleSnapshot, ...]:
         """返回不可变快照；Dashboard 可关闭 body id 暴露，避免依赖临时物理标识。"""
@@ -1032,20 +1287,212 @@ class ObstacleManager:
             heading_xy = self._heading_for_spec(spec)
             resampled_specs.append(self._resample_spec_pose(spec, xy, heading_xy))
 
+        original_records = self._records
+        original_body_ids = tuple(record.body_id for record in original_records)
+        try:
+            transaction_start_body_ids = _body_ids(self._client_id)
+        except Exception as diagnosis_exc:
+            reason = (
+                "failed to validate original obstacle bodies before restore: "
+                f"{_exception_reason(diagnosis_exc)}"
+            )
+            self._enter_fault(reason, original_body_ids)
+            raise RuntimeError(reason) from diagnosis_exc
+        missing_original_body_ids = tuple(
+            body_id
+            for body_id in original_body_ids
+            if body_id not in transaction_start_body_ids
+        )
+        if missing_original_body_ids:
+            missing = ", ".join(str(body_id) for body_id in missing_original_body_ids)
+            reason = f"original obstacle bodies missing before restore: {missing}"
+            self._enter_fault(
+                reason,
+                tuple(
+                    body_id
+                    for body_id in original_body_ids
+                    if body_id in transaction_start_body_ids
+                ),
+            )
+            raise RuntimeError(reason)
+
         created_records: list[_ObstacleRecord] = []
         try:
             for spec in resampled_specs:
                 body_id = _create_obstacle_body(self._client_id, spec, temporary=False)
                 created_records.append(_ObstacleRecord(spec=spec, body_id=body_id))
-        except Exception:
-            for record in created_records:
-                _remove_body_safely(self._client_id, record.body_id)
+        except Exception as creation_exc:
+            self._register_creation_error_debt(creation_exc)
+            cleanup_failures = _cleanup_records_strict(self._client_id, created_records)
+            if cleanup_failures:
+                self._register_cleanup_debt(cleanup_failures)
+                raise RuntimeError(
+                    f"restore candidate creation failed "
+                    f"({_exception_reason(creation_exc)}); "
+                    f"candidate cleanup also failed ({_format_body_failures(cleanup_failures)})"
+                ) from cleanup_failures[0][1]
             raise
-        replacement_body_ids = {record.body_id for record in created_records}
-        for record in self._records:
-            if record.body_id not in replacement_body_ids:
-                _remove_body_safely(self._client_id, record.body_id)
-        self._records = tuple(created_records)
+
+        candidate_body_id_order = tuple(record.body_id for record in created_records)
+        candidate_body_ids = frozenset(candidate_body_id_order)
+        try:
+            for record in original_records:
+                _remove_committed_body_strict(self._client_id, record.body_id)
+        except Exception as removal_exc:
+            removal_reason = _exception_reason(removal_exc)
+            candidate_cleanup_failures = _cleanup_records_strict(
+                self._client_id,
+                created_records,
+            )
+            if candidate_cleanup_failures:
+                self._register_cleanup_debt(candidate_cleanup_failures)
+            rollback_failures: list[tuple[int, BaseException]] = list(
+                candidate_cleanup_failures
+            )
+            rollback_residual_body_ids: list[int] = []
+            restored_records: list[_ObstacleRecord] = []
+            collection_complete = True
+
+            # 只认可事务开始时存在且不属于候选/debt 的旧 ID；缺失项按原 spec 重建。
+            try:
+                current_body_ids = _body_ids(self._client_id)
+            except Exception as diagnosis_exc:
+                rollback_failures.append((-1, diagnosis_exc))
+                collection_complete = False
+            else:
+                cleanup_debt_body_ids = frozenset(self._cleanup_debt_body_ids)
+                original_source_body_ids = frozenset(original_body_ids)
+                for original in original_records:
+                    if original.body_id in current_body_ids:
+                        is_original_survivor = (
+                            original.body_id in transaction_start_body_ids
+                            and original.body_id in original_source_body_ids
+                            and original.body_id not in candidate_body_ids
+                            and original.body_id not in cleanup_debt_body_ids
+                        )
+                        if is_original_survivor:
+                            restored_records.append(original)
+                        else:
+                            collection_complete = False
+                            rollback_failures.append(
+                                (
+                                    original.body_id,
+                                    RuntimeError(
+                                        "body ID no longer has verified original ownership"
+                                    ),
+                                )
+                            )
+                        continue
+                    try:
+                        restored_body_id = _create_obstacle_body(
+                            self._client_id,
+                            original.spec,
+                            temporary=False,
+                        )
+                    except Exception as restore_exc:
+                        rollback_residual_body_ids.extend(
+                            getattr(restore_exc, "residual_body_ids", ())
+                        )
+                        rollback_failures.append((original.body_id, restore_exc))
+                        collection_complete = False
+                    else:
+                        restored_records.append(
+                            _ObstacleRecord(
+                                spec=original.spec,
+                                body_id=restored_body_id,
+                            )
+                        )
+
+            if len(restored_records) != len(original_records):
+                collection_complete = False
+            if collection_complete:
+                try:
+                    final_body_ids = _body_ids(self._client_id)
+                except Exception as diagnosis_exc:
+                    rollback_failures.append((-1, diagnosis_exc))
+                    collection_complete = False
+                else:
+                    restored_body_ids = tuple(
+                        record.body_id for record in restored_records
+                    )
+                    if len(set(restored_body_ids)) != len(restored_body_ids):
+                        rollback_failures.append(
+                            (-1, RuntimeError("restored obstacle body IDs are not unique"))
+                        )
+                        collection_complete = False
+                    missing_restored_ids = tuple(
+                        body_id
+                        for body_id in restored_body_ids
+                        if body_id not in final_body_ids
+                    )
+                    if missing_restored_ids:
+                        rollback_failures.append(
+                            (
+                                -1,
+                                RuntimeError(
+                                    "restored obstacle bodies missing: "
+                                    + ", ".join(
+                                        str(body_id)
+                                        for body_id in missing_restored_ids
+                                    )
+                                ),
+                            )
+                        )
+                        collection_complete = False
+                    debt_overlap = set(restored_body_ids) & set(
+                        self._cleanup_debt_body_ids
+                    )
+                    if debt_overlap:
+                        rollback_failures.append(
+                            (
+                                -1,
+                                RuntimeError(
+                                    "restored obstacle bodies overlap cleanup debt: "
+                                    + ", ".join(
+                                        str(body_id)
+                                        for body_id in sorted(debt_overlap)
+                                    )
+                                ),
+                            )
+                        )
+                        collection_complete = False
+
+            if collection_complete:
+                self._publish_records(restored_records)
+                if rollback_failures:
+                    rollback_reason = _format_body_failures(rollback_failures)
+                    raise RuntimeError(
+                        f"restore old body removal failed ({removal_reason}); "
+                        f"rollback also failed ({rollback_reason})"
+                    ) from rollback_failures[0][1]
+                return ObstacleOperationResult(
+                    done=True,
+                    succeeded=False,
+                    operation="restore",
+                    message=removal_reason,
+                )
+
+            rollback_reason = (
+                _format_body_failures(rollback_failures)
+                or "old obstacle collection could not be restored completely"
+            )
+            fault_reason = (
+                f"restore old body removal failed ({removal_reason}); "
+                f"rollback also failed ({rollback_reason})"
+            )
+            self._enter_fault(
+                fault_reason,
+                (
+                    *original_body_ids,
+                    *candidate_body_id_order,
+                    *(record.body_id for record in restored_records),
+                    *rollback_residual_body_ids,
+                ),
+            )
+            cause = rollback_failures[0][1] if rollback_failures else removal_exc
+            raise RuntimeError(fault_reason) from cause
+
+        self._publish_records(created_records)
         return ObstacleOperationResult(
             done=True,
             succeeded=True,
@@ -1054,10 +1501,15 @@ class ObstacleManager:
         )
 
     def pending_body_ids(self) -> tuple[int, ...]:
-        """测试和调试用：查看未提交事务中的临时 body。"""
-        if self._pending is None or self._pending.temporary_body_ids is None:
-            return ()
-        return tuple(self._pending.temporary_body_ids)
+        """枚举所有未正式发布但仍由 manager 负责回收的 body。"""
+        temporary_body_ids = (
+            ()
+            if self._pending is None or self._pending.temporary_body_ids is None
+            else tuple(self._pending.temporary_body_ids)
+        )
+        return tuple(
+            dict.fromkeys((*temporary_body_ids, *self._cleanup_debt_body_ids))
+        )
 
     def pending_specs(self) -> tuple[ObstacleSpec, ...]:
         """测试和调试用：查看已规划但尚未发布的逻辑规格。"""
@@ -1072,6 +1524,128 @@ class ObstacleManager:
     def _require_no_pending(self) -> None:
         if self._pending is not None:
             raise RuntimeError("another obstacle operation is pending")
+        record_body_ids = {record.body_id for record in self._records}
+        debt_overlap = record_body_ids & set(self._cleanup_debt_body_ids)
+        if debt_overlap:
+            reason = (
+                "formal obstacle records overlap cleanup debt: "
+                + ", ".join(str(body_id) for body_id in sorted(debt_overlap))
+            )
+            self._enter_fault(reason, tuple(record_body_ids))
+        if self._cleanup_debt_body_ids:
+            failures: list[tuple[int, BaseException]] = []
+            for body_id in self._cleanup_debt_body_ids:
+                try:
+                    _remove_committed_body_strict(self._client_id, body_id)
+                except Exception as cleanup_exc:
+                    failures.append((body_id, cleanup_exc))
+            self._cleanup_debt_body_ids = tuple(
+                body_id for body_id, _error in failures
+            )
+            if failures:
+                raise RuntimeError(
+                    "unresolved obstacle cleanup bodies remain: "
+                    + _format_body_failures(failures)
+                ) from failures[0][1]
+        if self._fault_reason is not None:
+            raise RuntimeError(f"obstacle manager is faulted: {self._fault_reason}")
+
+    def _register_creation_error_debt(self, error: BaseException) -> tuple[int, ...]:
+        """接管创建异常结构化上报的残留 body，供后续门禁或世界重建回收。"""
+        residual_body_ids = tuple(getattr(error, "residual_body_ids", ()))
+        self._register_cleanup_body_ids(residual_body_ids)
+        return residual_body_ids
+
+    def _register_cleanup_debt(
+        self,
+        failures: Sequence[tuple[int, BaseException]],
+    ) -> None:
+        """登记未能清理的候选 body，使后续世界回收仍保有明确所有权。"""
+        self._register_cleanup_body_ids(
+            tuple(body_id for body_id, _error in failures if body_id >= 0)
+        )
+
+    def _register_cleanup_body_ids(self, body_ids: Sequence[int]) -> None:
+        """登记不属于正式记录的清理债务，并阻断双重所有权。"""
+        failed_body_ids = tuple(
+            dict.fromkeys(int(body_id) for body_id in body_ids if body_id >= 0)
+        )
+        overlap = {
+            record.body_id for record in self._records
+        } & set(failed_body_ids)
+        if overlap:
+            raise RuntimeError(
+                "cleanup debt cannot overlap formal obstacle records: "
+                + ", ".join(str(body_id) for body_id in sorted(overlap))
+            )
+        self._cleanup_debt_body_ids = tuple(
+            dict.fromkeys((*self._cleanup_debt_body_ids, *failed_body_ids))
+        )
+
+    def _enter_fault(
+        self,
+        reason: str,
+        owned_body_ids: Sequence[int],
+    ) -> None:
+        """无法恢复完整集合时撤下全部正式记录，并保守保留物理所有权。"""
+        temporary_body_ids = (
+            ()
+            if self._pending is None or self._pending.temporary_body_ids is None
+            else tuple(self._pending.temporary_body_ids)
+        )
+        known_owned_body_ids = tuple(
+            dict.fromkeys(
+                (
+                    *(record.body_id for record in self._records),
+                    *temporary_body_ids,
+                    *self._cleanup_debt_body_ids,
+                    *(int(body_id) for body_id in owned_body_ids if body_id >= 0),
+                )
+            )
+        )
+        self._pending = None
+        self._publish_records(())
+        self._fault_reason = reason
+        try:
+            current_body_ids = _body_ids(self._client_id)
+        except Exception:
+            remaining_owned_body_ids = known_owned_body_ids
+        else:
+            remaining_owned_body_ids = tuple(
+                body_id
+                for body_id in known_owned_body_ids
+                if body_id in current_body_ids
+            )
+        self._cleanup_debt_body_ids = ()
+        self._register_cleanup_body_ids(remaining_owned_body_ids)
+
+    def _publish_records(
+        self,
+        records: Sequence[_ObstacleRecord],
+        *,
+        moving_count: int | None = None,
+    ) -> None:
+        """单次发布不可变记录集合，并同步 O(1) 元数据和只读缓存代际。"""
+        normalized = tuple(records)
+        normalized_body_ids = tuple(record.body_id for record in normalized)
+        if len(set(normalized_body_ids)) != len(normalized_body_ids):
+            raise RuntimeError("formal obstacle records must have unique body IDs")
+        debt_overlap = set(normalized_body_ids) & set(self._cleanup_debt_body_ids)
+        if debt_overlap:
+            raise RuntimeError(
+                "formal obstacle records cannot overlap cleanup debt: "
+                + ", ".join(str(body_id) for body_id in sorted(debt_overlap))
+            )
+        if self._fault_reason is not None and normalized:
+            raise RuntimeError("faulted obstacle manager cannot publish formal records")
+        self._records = normalized
+        self._moving_count = (
+            sum(record.spec.path is not None for record in normalized)
+            if moving_count is None
+            else moving_count
+        )
+        self._revision += 1
+        self._logical_specs_cache_revision = -1
 
     def _terrain_sampler(self, x: float, y: float) -> TerrainProbe:
         return probe_terrain(
@@ -1099,7 +1673,12 @@ class ObstacleManager:
                 )
             except Exception as exc:
                 self._pending = None
-                return ObstacleOperationResult(True, False, "add", message=str(exc))
+                return ObstacleOperationResult(
+                    True,
+                    False,
+                    "add",
+                    message=_exception_reason(exc),
+                )
             if self._budget_exhausted(start_time):
                 return ObstacleOperationResult(False, False, "add", message="pending")
 
@@ -1109,22 +1688,37 @@ class ObstacleManager:
             try:
                 pending.temporary_body_ids.append(_create_obstacle_body(self._client_id, spec, temporary=True))
             except Exception as exc:
-                self._cleanup_pending_temporary_bodies()
+                self._register_creation_error_debt(exc)
+                cleanup_failures = self._cleanup_pending_temporary_bodies()
                 self._pending = None
-                return ObstacleOperationResult(True, False, "add", message=str(exc))
+                message = _exception_reason(exc)
+                if cleanup_failures:
+                    message += (
+                        "; temporary cleanup also failed ("
+                        + _format_body_failures(cleanup_failures)
+                        + ")"
+                    )
+                return ObstacleOperationResult(True, False, "add", message=message)
             pending.next_temporary_index += 1
             if self._budget_exhausted(start_time):
                 return ObstacleOperationResult(False, False, "add", message="pending")
 
         vehicle_aabb = self._vehicle_aabb_getter() if self._vehicle_aabb_getter is not None else self._settings.vehicle_aabb
         if self._batch_overlaps_vehicle_aabb(pending.planned_specs, vehicle_aabb):
-            self._cleanup_pending_temporary_bodies()
+            cleanup_failures = self._cleanup_pending_temporary_bodies()
             self._pending = None
+            message = "vehicle AABB overlaps planned obstacle batch"
+            if cleanup_failures:
+                message += (
+                    "; temporary cleanup also failed ("
+                    + _format_body_failures(cleanup_failures)
+                    + ")"
+                )
             return ObstacleOperationResult(
                 True,
                 False,
                 "add",
-                message="vehicle AABB overlaps planned obstacle batch",
+                message=message,
             )
 
         created_records: list[_ObstacleRecord] = []
@@ -1133,14 +1727,48 @@ class ObstacleManager:
                 body_id = _create_obstacle_body(self._client_id, spec, temporary=False)
                 created_records.append(_ObstacleRecord(spec=spec, body_id=body_id))
         except Exception as exc:
-            for record in created_records:
-                _remove_body_safely(self._client_id, record.body_id)
-            self._cleanup_pending_temporary_bodies()
+            self._register_creation_error_debt(exc)
+            cleanup_failures = _cleanup_records_strict(
+                self._client_id,
+                created_records,
+            )
+            if cleanup_failures:
+                self._register_cleanup_debt(cleanup_failures)
+            cleanup_failures.extend(self._cleanup_pending_temporary_bodies())
             self._pending = None
-            return ObstacleOperationResult(True, False, "add", message=str(exc))
+            message = _exception_reason(exc)
+            if cleanup_failures:
+                message += (
+                    "; candidate cleanup also failed ("
+                    + _format_body_failures(cleanup_failures)
+                    + ")"
+                )
+            return ObstacleOperationResult(True, False, "add", message=message)
 
-        self._cleanup_pending_temporary_bodies()
-        self._records = (*self._records, *created_records)
+        temporary_cleanup_failures = self._cleanup_pending_temporary_bodies()
+        if temporary_cleanup_failures:
+            created_cleanup_failures = _cleanup_records_strict(
+                self._client_id,
+                created_records,
+            )
+            if created_cleanup_failures:
+                self._register_cleanup_debt(created_cleanup_failures)
+            self._pending = None
+            cleanup_failures = (
+                *temporary_cleanup_failures,
+                *created_cleanup_failures,
+            )
+            return ObstacleOperationResult(
+                True,
+                False,
+                "add",
+                message=(
+                    "temporary candidate cleanup failed ("
+                    + _format_body_failures(cleanup_failures)
+                    + ")"
+                ),
+            )
+        self._publish_records((*self._records, *created_records))
         self._pending = None
         return ObstacleOperationResult(
             True,
@@ -1154,13 +1782,24 @@ class ObstacleManager:
         pending = self._pending
         while pending.next_clear_index < len(pending.clear_body_ids):
             body_id = pending.clear_body_ids[pending.next_clear_index]
-            _remove_body_safely(self._client_id, body_id)
-            self._records = tuple(record for record in self._records if record.body_id != body_id)
+            try:
+                _remove_committed_body_strict(self._client_id, body_id)
+            except Exception as exc:
+                self._pending = None
+                return ObstacleOperationResult(
+                    True,
+                    False,
+                    "clear",
+                    message=str(exc) or type(exc).__name__,
+                    deleted_count=pending.deleted_count,
+                )
+            self._publish_records(
+                tuple(record for record in self._records if record.body_id != body_id)
+            )
             pending.deleted_count += 1
             pending.next_clear_index += 1
             if self._budget_exhausted(start_time):
                 return ObstacleOperationResult(False, False, "clear", message="pending", deleted_count=pending.deleted_count)
-        self._records = ()
         self._pending = None
         return ObstacleOperationResult(
             True,
@@ -1169,12 +1808,20 @@ class ObstacleManager:
             deleted_count=pending.deleted_count,
         )
 
-    def _cleanup_pending_temporary_bodies(self) -> None:
+    def _cleanup_pending_temporary_bodies(self) -> list[tuple[int, Exception]]:
+        """严格尝试清理全部临时候选；失败项转入 debt 后再返回诊断。"""
         if self._pending is None or self._pending.temporary_body_ids is None:
-            return
-        for body_id in self._pending.temporary_body_ids:
-            _remove_body_safely(self._client_id, body_id)
+            return []
+        failures: list[tuple[int, Exception]] = []
+        for body_id in tuple(self._pending.temporary_body_ids):
+            try:
+                _remove_committed_body_strict(self._client_id, body_id)
+            except Exception as cleanup_exc:
+                failures.append((body_id, cleanup_exc))
         self._pending.temporary_body_ids.clear()
+        if failures:
+            self._register_cleanup_debt(failures)
+        return failures
 
     def _batch_overlaps_vehicle_aabb(self, specs: Sequence[ObstacleSpec], vehicle_aabb: Aabb3D | None) -> bool:
         if vehicle_aabb is None:
@@ -1197,11 +1844,69 @@ class ObstacleManager:
         heading_xy: tuple[float, float],
     ) -> ObstacleSpec:
         probe = self._terrain_sampler(xy[0], xy[1])
+        return self._spec_with_sampled_pose(spec, xy, heading_xy, probe)
+
+    def _sample_moving_terrain_batch(
+        self,
+        positions_xy: Sequence[tuple[float, float]],
+    ) -> tuple[TerrainProbe, ...]:
+        """用一次 Bullet batch 为本帧全部移动体采样地表高度和法向。"""
+        for x, y in positions_xy:
+            if not self._settings.bounds.contains(x, y):
+                raise ObstaclePlanningError("unable to sample terrain for obstacle pose")
+        ray_starts = tuple((x, y, 8.0) for x, y in positions_xy)
+        ray_ends = tuple((x, y, -8.0) for x, y in positions_xy)
+        hits = p.rayTestBatch(
+            ray_starts,
+            ray_ends,
+            collisionFilterMask=TERRAIN_FILTER_GROUP,
+            physicsClientId=self._client_id,
+        )
+        if len(hits) != len(positions_xy):
+            raise RuntimeError("PyBullet terrain ray batch returned an unexpected size")
+        probes: list[TerrainProbe] = []
+        for hit in hits:
+            hit_body_id = int(hit[0])
+            if hit_body_id < 0:
+                raise ObstaclePlanningError("unable to sample terrain for obstacle pose")
+            if hit_body_id not in self._terrain_body_id_set:
+                raise ValueError(
+                    "terrain_body_ids must contain the terrain body hit by the filtered ray"
+                )
+            hit_position = hit[3]
+            normal = hit[4]
+            probes.append(
+                TerrainProbe(
+                    terrain_probe_valid=True,
+                    out_of_bounds=False,
+                    local_ground_height=float(hit_position[2]),
+                    local_terrain_normal_x=float(normal[0]),
+                    local_terrain_normal_y=float(normal[1]),
+                    local_terrain_normal_z=float(normal[2]),
+                )
+            )
+        return tuple(probes)
+
+    @staticmethod
+    def _spec_with_sampled_pose(
+        spec: ObstacleSpec,
+        xy: tuple[float, float],
+        heading_xy: tuple[float, float],
+        probe: TerrainProbe,
+        *,
+        path: ObstaclePath | None = None,
+    ) -> ObstacleSpec:
+        """把已采样地形发布到冻结规格；调用方保证 path 已通过领域校验。"""
         if not probe.terrain_probe_valid or probe.out_of_bounds:
             raise ObstaclePlanningError("unable to sample terrain for obstacle pose")
         position = (xy[0], xy[1], probe.local_ground_height + spec.geometry.half_extents[2])
         orientation = _orientation_from_heading_and_normal(heading_xy, _normal_from_probe(probe))
-        return replace(spec, position=position, orientation=orientation)
+        return replace(
+            spec,
+            position=position,
+            orientation=orientation,
+            path=spec.path if path is None else path,
+        )
 
     @staticmethod
     def _frame_displacement_velocity(
@@ -1253,7 +1958,7 @@ def create_box_obstacle(
             rgbaColor=rgba_color,
             physicsClientId=client_id,
         )
-        return p.createMultiBody(
+        body_id = p.createMultiBody(
             baseMass=0.0,
             baseCollisionShapeIndex=collision_shape_id,
             baseVisualShapeIndex=visual_shape_id,
@@ -1261,6 +1966,14 @@ def create_box_obstacle(
             baseOrientation=base_orientation,
             physicsClientId=client_id,
         )
+        p.setCollisionFilterGroupMask(
+            body_id,
+            -1,
+            OBSTACLE_COLLISION_GROUP,
+            OBSTACLE_COLLISION_MASK,
+            physicsClientId=client_id,
+        )
+        return body_id
     except Exception:
         # 创建调用可能在抛错前已注册 body，按差集清理可避免污染仍在运行的场景。
         for body_id in _body_ids(client_id) - existing_body_ids:

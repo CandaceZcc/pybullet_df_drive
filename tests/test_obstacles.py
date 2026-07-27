@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import math
 import random
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
+from types import SimpleNamespace
 
 import pybullet as p
 import pytest
@@ -52,6 +53,45 @@ def _body_ids(client_id: int) -> set[int]:
     }
 
 
+def _manager_with_static_obstacles(
+    client_id: int,
+    *,
+    count: int,
+    soft_budget_seconds: float = 0.002,
+):
+    """创建带正式静态 body 的管理器，供删除一致性回归复用。"""
+    scene = create_slope_scene(
+        client_id,
+        slope_deg=0.0,
+        time_step=TIME_STEP,
+        terrain_model="flat",
+    )
+    manager = obstacle_module.ObstacleManager(
+        client_id,
+        obstacle_module.ObstacleGenerationSettings(
+            bounds=scene.bounds or TerrainBounds(-4.0, 4.0, -3.0, 3.0),
+            spawn_position=scene.spawn_position,
+            spawn_protection_radius=0.4,
+        ),
+        terrain_body_ids=scene.body_ids,
+        soft_budget_seconds=soft_budget_seconds,
+    )
+    snapshots = tuple(
+        obstacle_module.ObstacleSnapshot(
+            logical_id=index + 1,
+            body_id=None,
+            mode="static",
+            shape="box",
+            position=(-2.0 + index * 0.7, -1.0, 0.3),
+            orientation=(0.0, 0.0, 0.0, 1.0),
+            geometry=obstacle_module.ObstacleGeometry("box", (0.2, 0.2, 0.3)),
+        )
+        for index in range(count)
+    )
+    assert manager.restore(snapshots).succeeded is True
+    return manager
+
+
 def _assert_finite_robot_state(client_id: int, robot_id: int) -> tuple[float, float]:
     """检查碰撞帧位姿与速度均有限，并返回线、角速度模长。"""
     position, orientation = p.getBasePositionAndOrientation(robot_id, physicsClientId=client_id)
@@ -61,6 +101,88 @@ def _assert_finite_robot_state(client_id: int, robot_id: int) -> tuple[float, fl
     return math.sqrt(sum(float(value) ** 2 for value in linear_velocity)), math.sqrt(
         sum(float(value) ** 2 for value in angular_velocity)
     )
+
+
+@pytest.mark.parametrize("failure_mode", ("raises", "remains"))
+def test_delete_keeps_record_until_physical_body_is_confirmed_absent(
+    monkeypatch,
+    failure_mode,
+):
+    """removeBody 抛错或假成功时，逻辑记录必须继续指向仍存在的活动 body。"""
+    client_id = p.connect(p.DIRECT)
+    try:
+        manager = _manager_with_static_obstacles(client_id, count=1)
+        before = manager.snapshot()
+        body_id = before[0].physics_body_id
+        assert body_id is not None
+        original_remove = obstacle_module.p.removeBody
+
+        def fail_or_leave_body(candidate_body_id: int, **kwargs) -> None:
+            if candidate_body_id == body_id:
+                if failure_mode == "raises":
+                    raise p.error("injected committed body removal failure")
+                return
+            original_remove(candidate_body_id, **kwargs)
+
+        monkeypatch.setattr(obstacle_module.p, "removeBody", fail_or_leave_body)
+
+        result = manager.delete(before[0].logical_id)
+
+        assert result.done is True
+        assert result.succeeded is False
+        assert result.deleted_count == 0
+        assert manager.snapshot() == before
+        assert body_id in _body_ids(client_id)
+        expected_reason = "injected committed body removal failure" if failure_mode == "raises" else "remained"
+        assert expected_reason in result.message
+    finally:
+        p.disconnect(client_id)
+
+
+@pytest.mark.parametrize("failure_mode", ("raises", "remains"))
+def test_cross_frame_clear_stops_at_unconfirmed_body_and_preserves_fifo_tail(
+    monkeypatch,
+    failure_mode,
+):
+    """清空部分成功后遇到失败，应保留失败项和尚未处理的 FIFO 记录。"""
+    client_id = p.connect(p.DIRECT)
+    try:
+        manager = _manager_with_static_obstacles(
+            client_id,
+            count=3,
+            soft_budget_seconds=0.0,
+        )
+        before = manager.snapshot()
+        body_ids = tuple(snapshot.physics_body_id for snapshot in before)
+        assert all(body_id is not None for body_id in body_ids)
+        failed_body_id = body_ids[1]
+        original_remove = obstacle_module.p.removeBody
+
+        def fail_or_leave_body(candidate_body_id: int, **kwargs) -> None:
+            if candidate_body_id == failed_body_id:
+                if failure_mode == "raises":
+                    raise p.error("injected clear removal failure")
+                return
+            original_remove(candidate_body_id, **kwargs)
+
+        monkeypatch.setattr(obstacle_module.p, "removeBody", fail_or_leave_body)
+        manager.begin_clear()
+
+        first_slice = manager.advance_pending_operation()
+        failed_slice = manager.advance_pending_operation()
+
+        assert first_slice.done is False
+        assert first_slice.deleted_count == 1
+        assert failed_slice.done is True
+        assert failed_slice.succeeded is False
+        assert failed_slice.deleted_count == 1
+        assert [snapshot.logical_id for snapshot in manager.snapshot()] == [2, 3]
+        remaining_body_ids = _body_ids(client_id)
+        assert body_ids[0] not in remaining_body_ids
+        assert body_ids[1] in remaining_body_ids
+        assert body_ids[2] in remaining_body_ids
+    finally:
+        p.disconnect(client_id)
 
 
 def test_create_box_obstacle_rejects_zero_norm_orientation():
@@ -189,6 +311,20 @@ def test_non_unit_orientations_are_normalized_before_pybullet_calls(monkeypatch)
         assert update_orientations == [(0.0, 0.0, 0.0, 1.0)]
     finally:
         p.disconnect(client_id)
+
+
+def test_obstacle_spec_quaternion_normalization_is_idempotent():
+    first = obstacle_module.ObstacleSpec(
+        logical_id=1,
+        mode="static",
+        geometry=obstacle_module.ObstacleGeometry("box", (0.2, 0.2, 0.3)),
+        position=(0.0, 0.0, 0.3),
+        orientation=(1.0, 2.0, 3.0, 4.0),
+    )
+
+    second = replace(first, orientation=first.orientation)
+
+    assert second.orientation == first.orientation
 
 
 @pytest.mark.parametrize("failure_stage", ["visual", "multibody"])
@@ -584,6 +720,73 @@ def test_obstacle_generation_request_rejects_invalid_parameters(factory, message
 def test_generation_domain_objects_reject_non_integral_identifiers(factory, message):
     with pytest.raises(ValueError, match=message):
         factory()
+
+
+@pytest.mark.parametrize("nested_name", ("geometry", "path"))
+def test_obstacle_spec_rejects_foreign_nested_domain_values(nested_name):
+    values = {
+        "logical_id": 1,
+        "mode": "static",
+        "geometry": obstacle_module.ObstacleGeometry("box", (0.2, 0.2, 0.3)),
+        "position": (0.0, 0.0, 0.3),
+        "orientation": (0.0, 0.0, 0.0, 1.0),
+        "path": None,
+    }
+    if nested_name == "geometry":
+        values["geometry"] = SimpleNamespace(
+            shape="mesh",
+            half_extents=(0.2, 0.2, 0.3),
+        )
+    else:
+        values["mode"] = "moving"
+        values["path"] = SimpleNamespace(
+            start_xy=(0.0, 0.0),
+            end_xy=(1.0, 0.0),
+            speed=0.2,
+            progress=2.0,
+            direction=0,
+        )
+
+    with pytest.raises(ValueError, match=f"{nested_name}.*Obstacle{nested_name.title()}"):
+        obstacle_module.ObstacleSpec(**values)
+
+
+@pytest.mark.parametrize(
+    ("nested_name", "field_name", "invalid_value", "message"),
+    (
+        ("geometry", "shape", "mesh", "geometry.*shape"),
+        ("geometry", "half_extents", (0.0, 0.2, 0.3), "geometry.*half_extents"),
+        ("geometry", "half_extents", (math.inf, 0.2, 0.3), "geometry.*half_extents"),
+        ("geometry", "half_extents", (True, 0.2, 0.3), "geometry.*half_extents"),
+        ("path", "start_xy", (math.nan, 0.0), "path.*start_xy"),
+        ("path", "end_xy", (0.0, 0.0), "path.*endpoints"),
+        ("path", "speed", 0.0, "path.*speed"),
+        ("path", "speed", True, "path.*speed"),
+        ("path", "progress", 2.0, "path.*progress"),
+        ("path", "progress", False, "path.*progress"),
+        ("path", "direction", 0, "path.*direction"),
+    ),
+)
+def test_obstacle_spec_revalidates_forged_nested_domain_values(
+    nested_name,
+    field_name,
+    invalid_value,
+    message,
+):
+    geometry = obstacle_module.ObstacleGeometry("box", (0.2, 0.2, 0.3))
+    path = obstacle_module.ObstaclePath((0.0, 0.0), (1.0, 0.0), 0.2)
+    nested = geometry if nested_name == "geometry" else path
+    object.__setattr__(nested, field_name, invalid_value)
+
+    with pytest.raises(ValueError, match=message):
+        obstacle_module.ObstacleSpec(
+            logical_id=1,
+            mode="static" if nested_name == "geometry" else "moving",
+            geometry=geometry,
+            position=(0.0, 0.0, 0.3),
+            orientation=(0.0, 0.0, 0.0, 1.0),
+            path=None if nested_name == "geometry" else path,
+        )
 
 
 def test_non_box_geometry_uses_canonical_radius_dimensions():

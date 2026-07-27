@@ -1,0 +1,630 @@
+# 传感器后端测试：锁定位姿变换、语义 link、射线命中分类和 PyBullet 边界校验。
+from __future__ import annotations
+
+from dataclasses import FrozenInstanceError
+import math
+import statistics
+import time
+from types import SimpleNamespace
+
+import pybullet as p
+import pytest
+
+import slope_sim.sensor_backend as sensor_backend_module
+from slope_sim.model_registry import get_robot_model
+from slope_sim.obstacles import ObstacleSnapshot
+from slope_sim.robot import create_robot
+from slope_sim.scene import TERRAIN_FILTER_GROUP, create_slope_scene
+from slope_sim.sensor_backend import Pose, PyBulletSensorBackend, RayHit
+
+
+IDENTITY_QUATERNION = (0.0, 0.0, 0.0, 1.0)
+LIDAR_RAY_COUNT = 16 * 180
+DUAL_LIDAR_BACKEND_BUDGET_MS = 80.0
+
+
+def _assert_same_orientation(actual, expected, *, abs_tol: float = 1e-7) -> None:
+    """四元数 q 与 -q 表示同一旋转，比较绝对内积避免符号歧义。"""
+    dot = sum(float(left) * float(right) for left, right in zip(actual, expected))
+    assert abs(dot) == pytest.approx(1.0, abs=abs_tol)
+
+
+def _create_backend(model_name: str = "df_back") -> tuple[int, PyBulletSensorBackend]:
+    client_id = p.connect(p.DIRECT)
+    robot = create_robot(client_id, model_name, start_x=10.0, start_y=10.0)
+    return client_id, PyBulletSensorBackend(client_id, robot.robot_id)
+
+
+def _create_static_box(
+    client_id: int,
+    position: tuple[float, float, float],
+) -> int:
+    collision_id = p.createCollisionShape(
+        p.GEOM_BOX,
+        halfExtents=(0.25, 0.25, 0.25),
+        physicsClientId=client_id,
+    )
+    return p.createMultiBody(
+        baseMass=0.0,
+        baseCollisionShapeIndex=collision_id,
+        basePosition=position,
+        physicsClientId=client_id,
+    )
+
+
+def _build_lidar_batch(
+    origin: tuple[float, float, float],
+    *,
+    rear: bool,
+) -> tuple[tuple[tuple[float, float, float], ...], tuple[tuple[float, float, float], ...]]:
+    """生成固定 16x180 前向或后向真实性能射线。"""
+    directions = []
+    yaw_offset = math.pi if rear else 0.0
+    for line in range(16):
+        elevation = math.radians(-15.0 + line * 30.0 / 15.0)
+        for sample in range(180):
+            azimuth = yaw_offset + math.radians(-90.0 + sample * 180.0 / 179.0)
+            directions.append(
+                (
+                    math.cos(elevation) * math.cos(azimuth),
+                    math.cos(elevation) * math.sin(azimuth),
+                    math.sin(elevation),
+                )
+            )
+    starts = (origin,) * len(directions)
+    ends = tuple(
+        (
+            origin[0] + 30.0 * direction[0],
+            origin[1] + 30.0 * direction[1],
+            origin[2] + 30.0 * direction[2],
+        )
+        for direction in directions
+    )
+    return starts, ends
+
+
+def test_pose_and_ray_hit_are_immutable_and_pose_normalizes_quaternion():
+    pose = Pose((1.0, 2.0, 3.0), (0.0, 0.0, 0.0, 2.0))
+    hit = RayHit(
+        position=(4.0, 5.0, 6.0),
+        body_id=7,
+        link_index=-1,
+        category="terrain",
+    )
+
+    assert pose.orientation == IDENTITY_QUATERNION
+    assert hit.hit is True
+    with pytest.raises(FrozenInstanceError):
+        pose.position = (0.0, 0.0, 0.0)
+    with pytest.raises(FrozenInstanceError):
+        hit.category = "unknown"
+
+
+def test_pose_quaternion_normalization_is_idempotent():
+    first = Pose((1.0, 2.0, 3.0), (1.0, 2.0, 3.0, 4.0))
+
+    second = Pose(first.position, first.orientation)
+
+    assert second.orientation == first.orientation
+
+
+@pytest.mark.parametrize(
+    ("position", "orientation", "message"),
+    [
+        ((math.nan, 0.0, 0.0), IDENTITY_QUATERNION, "position"),
+        ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 0.0), "quaternion"),
+        ((0.0, 0.0, 0.0), (0.0, math.inf, 0.0, 1.0), "quaternion"),
+    ],
+)
+def test_pose_rejects_non_finite_position_and_invalid_quaternion(position, orientation, message):
+    with pytest.raises(ValueError, match=message):
+        Pose(position, orientation)
+
+
+def test_pose_rejects_unordered_and_one_shot_position_values():
+    with pytest.raises(ValueError, match="position"):
+        Pose({0.0, 1.0, 2.0}, IDENTITY_QUATERNION)
+    with pytest.raises(ValueError, match="position"):
+        Pose(iter((0.0, 1.0, 2.0)), IDENTITY_QUATERNION)
+
+
+def test_backend_exposes_semantic_links_and_recovers_base_link_frame():
+    client_id, backend = _create_backend("df_front")
+    try:
+        names = backend.link_names()
+        base_pose = backend.world_pose("base_link")
+        world_inertial_position, world_inertial_orientation = p.getBasePositionAndOrientation(
+            backend.robot_id,
+            physicsClientId=client_id,
+        )
+        dynamics = p.getDynamicsInfo(
+            backend.robot_id,
+            -1,
+            physicsClientId=client_id,
+        )
+        inverse_position, inverse_orientation = p.invertTransform(
+            dynamics[3],
+            dynamics[4],
+        )
+        expected_position, expected_orientation = p.multiplyTransforms(
+            world_inertial_position,
+            world_inertial_orientation,
+            inverse_position,
+            inverse_orientation,
+        )
+
+        assert names[0] == "base_link"
+        assert "lidar_front_mount" in names
+        assert "lidar_rear_mount" in names
+        assert base_pose.position == pytest.approx(expected_position)
+        _assert_same_orientation(base_pose.orientation, expected_orientation)
+        assert math.dist(base_pose.position, world_inertial_position) > 0.03
+        with pytest.raises(ValueError, match="parent link"):
+            backend.world_pose("missing_link")
+    finally:
+        p.disconnect(client_id)
+
+
+def test_base_link_recovery_handles_nonzero_inertial_position_and_rotation():
+    client_id = p.connect(p.DIRECT)
+    expected_position = (1.1, -2.2, 0.8)
+    expected_orientation = tuple(p.getQuaternionFromEuler((-0.4, 0.25, 0.7)))
+    local_inertial_position = (0.13, -0.07, 0.05)
+    local_inertial_orientation = tuple(p.getQuaternionFromEuler((0.2, -0.3, 0.4)))
+    try:
+        body_id = p.createMultiBody(
+            baseMass=1.0,
+            basePosition=expected_position,
+            baseOrientation=expected_orientation,
+            baseInertialFramePosition=local_inertial_position,
+            baseInertialFrameOrientation=local_inertial_orientation,
+            physicsClientId=client_id,
+        )
+
+        pose = PyBulletSensorBackend(client_id, body_id).world_pose("base_link")
+
+        assert pose.position == pytest.approx(expected_position, abs=1e-7)
+        _assert_same_orientation(pose.orientation, expected_orientation)
+    finally:
+        p.disconnect(client_id)
+
+
+@pytest.mark.parametrize(
+    ("local_position", "local_orientation", "message"),
+    [
+        ((math.nan, 0.0, 0.0), IDENTITY_QUATERNION, "finite"),
+        ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 0.0), "quaternion"),
+        ((0.0, 0.0, 0.0), (0.0, math.inf, 0.0, 1.0), "quaternion"),
+    ],
+)
+def test_base_link_recovery_rejects_invalid_local_inertial_pose(
+    monkeypatch,
+    local_position,
+    local_orientation,
+    message,
+):
+    client_id, backend = _create_backend()
+    original_get_dynamics_info = sensor_backend_module.p.getDynamicsInfo
+
+    def invalid_dynamics_info(*args, **kwargs):
+        fields = list(original_get_dynamics_info(*args, **kwargs))
+        fields[3] = local_position
+        fields[4] = local_orientation
+        return tuple(fields)
+
+    try:
+        monkeypatch.setattr(
+            sensor_backend_module.p,
+            "getDynamicsInfo",
+            invalid_dynamics_info,
+        )
+        with pytest.raises(RuntimeError, match=message):
+            backend.world_pose("base_link")
+    finally:
+        p.disconnect(client_id)
+
+
+def test_non_base_world_pose_uses_world_link_frame_state(monkeypatch):
+    client_id, backend = _create_backend()
+    world_link_position = (1.0, 2.0, 3.0)
+    world_link_orientation = tuple(p.getQuaternionFromEuler((0.1, -0.2, 0.3)))
+
+    def fake_get_link_state(*_args, **_kwargs):
+        return (
+            (91.0, 92.0, 93.0),
+            IDENTITY_QUATERNION,
+            (0.0, 0.0, 0.0),
+            IDENTITY_QUATERNION,
+            world_link_position,
+            world_link_orientation,
+        )
+
+    try:
+        monkeypatch.setattr(sensor_backend_module.p, "getLinkState", fake_get_link_state)
+        pose = backend.world_pose("lidar_front_mount")
+
+        assert pose.position == pytest.approx(world_link_position)
+        assert pose.orientation == pytest.approx(world_link_orientation)
+    finally:
+        p.disconnect(client_id)
+
+
+def test_backend_transforms_pose_point_and_quaternion_coordinates():
+    client_id, backend = _create_backend()
+    try:
+        parent = Pose(
+            (1.0, 2.0, 3.0),
+            tuple(p.getQuaternionFromEuler((0.0, 0.0, math.pi / 2.0))),
+        )
+        local = Pose(
+            (1.0, 0.0, 0.5),
+            tuple(p.getQuaternionFromEuler((0.2, 0.0, 0.0))),
+        )
+
+        world = backend.transform_pose(parent, local)
+        local_again = backend.inverse_transform_point(world, world.position)
+        local_batch = backend.inverse_transform_points(
+            world,
+            (
+                world.position,
+                backend.transform_pose(
+                    world,
+                    Pose((0.5, -0.25, 1.0), IDENTITY_QUATERNION),
+                ).position,
+            ),
+        )
+        roll, pitch, yaw = backend.euler_from_quaternion(world.orientation)
+
+        assert world.position == pytest.approx((1.0, 3.0, 3.5), abs=1e-7)
+        assert local_again == pytest.approx((0.0, 0.0, 0.0), abs=1e-7)
+        assert local_batch[0] == pytest.approx((0.0, 0.0, 0.0), abs=1e-6)
+        assert local_batch[1] == pytest.approx((0.5, -0.25, 1.0), abs=1e-6)
+        assert (roll, pitch, yaw) == pytest.approx((0.2, 0.0, math.pi / 2.0), abs=1e-7)
+    finally:
+        p.disconnect(client_id)
+
+
+def test_bind_scene_maps_temporary_body_ids_to_stable_hit_categories():
+    client_id, backend = _create_backend()
+    try:
+        terrain_id = _create_static_box(client_id, (0.0, 0.0, 0.0))
+        static_id = _create_static_box(client_id, (0.0, 2.0, 0.0))
+        moving_id = _create_static_box(client_id, (0.0, 4.0, 0.0))
+        unknown_id = _create_static_box(client_id, (0.0, 6.0, 0.0))
+        backend.bind_scene(
+            (terrain_id,),
+            (
+                ObstacleSnapshot(1, static_id, "static", "box", (0.0, 2.0, 0.0), IDENTITY_QUATERNION),
+                ObstacleSnapshot(2, moving_id, "moving", "box", (0.0, 4.0, 0.0), IDENTITY_QUATERNION),
+            ),
+        )
+        starts = tuple((-1.0, y, 0.0) for y in (0.0, 2.0, 4.0, 6.0, 8.0))
+        ends = tuple((1.0, y, 0.0) for y in (0.0, 2.0, 4.0, 6.0, 8.0))
+
+        hits = backend.ray_test_batch(starts, ends, collision_mask=0xFFFF)
+
+        assert tuple(hit.category for hit in hits) == (
+            "terrain",
+            "static_obstacle",
+            "moving_obstacle",
+            "unknown",
+            "unknown",
+        )
+        assert tuple(hit.body_id for hit in hits[:4]) == (terrain_id, static_id, moving_id, unknown_id)
+        assert all(hit.hit for hit in hits[:4])
+        assert hits[-1].hit is False
+        assert hits[-1].body_id == -1
+    finally:
+        p.disconnect(client_id)
+
+
+def test_bind_scene_rejects_generators_and_mappings_before_tuple_conversion():
+    client_id, backend = _create_backend()
+    try:
+        with pytest.raises(ValueError, match="terrain_body_ids"):
+            backend.bind_scene(iter((1,)), ())
+        with pytest.raises(ValueError, match="terrain_body_ids"):
+            backend.bind_scene({1: "terrain"}, ())
+        with pytest.raises(ValueError, match="obstacles"):
+            backend.bind_scene((1,), iter(()))
+        with pytest.raises(ValueError, match="obstacles"):
+            backend.bind_scene((1,), {"item": object()})
+    finally:
+        p.disconnect(client_id)
+
+
+def test_bind_scene_validates_mode_even_when_obstacle_has_no_body_id():
+    client_id, backend = _create_backend()
+    try:
+        invalid_obstacle = SimpleNamespace(body_id=None, mode="teleporting")
+        with pytest.raises(ValueError, match="mode"):
+            backend.bind_scene((), (invalid_obstacle,))
+    finally:
+        p.disconnect(client_id)
+
+
+def test_bind_scene_rejects_unhashable_mode_with_stable_value_error():
+    client_id, backend = _create_backend()
+    try:
+        invalid_obstacle = SimpleNamespace(body_id=None, mode=["static"])
+        with pytest.raises(ValueError, match="mode.*string"):
+            backend.bind_scene((), (invalid_obstacle,))
+    finally:
+        p.disconnect(client_id)
+
+
+def test_two_real_2880_ray_batches_fit_10hz_backend_budget_with_stable_semantics():
+    client_id = p.connect(p.DIRECT)
+    try:
+        scene = create_slope_scene(
+            client_id,
+            slope_deg=0.0,
+            time_step=1.0 / 240.0,
+            terrain_model="flat",
+        )
+        spec = get_robot_model("df_back")
+        robot = create_robot(
+            client_id,
+            "df_back",
+            start_x=scene.spawn_position[0],
+            start_y=scene.spawn_position[1],
+            base_height=scene.spawn_position[2] + spec.base_height,
+        )
+        backend = PyBulletSensorBackend(client_id, robot.robot_id)
+        backend.bind_scene(scene.body_ids, ())
+        sensor_z = scene.spawn_position[2] + 0.40
+        front_rays = _build_lidar_batch(
+            (scene.spawn_position[0] + 0.34, scene.spawn_position[1], sensor_z),
+            rear=False,
+        )
+        rear_rays = _build_lidar_batch(
+            (scene.spawn_position[0] - 0.34, scene.spawn_position[1], sensor_z),
+            rear=True,
+        )
+
+        def scan_pair():
+            front_hits = backend.ray_test_batch(
+                *front_rays,
+                collision_mask=TERRAIN_FILTER_GROUP,
+            )
+            rear_hits = backend.ray_test_batch(
+                *rear_rays,
+                collision_mask=TERRAIN_FILTER_GROUP,
+            )
+            return front_hits, rear_hits
+
+        for _ in range(2):
+            scan_pair()
+        elapsed_ms = []
+        for _ in range(5):
+            started = time.perf_counter()
+            front_hits, rear_hits = scan_pair()
+            elapsed_ms.append((time.perf_counter() - started) * 1000.0)
+
+        assert len(front_hits) == len(rear_hits) == LIDAR_RAY_COUNT
+        for hits in (front_hits, rear_hits):
+            assert any(hit.hit for hit in hits)
+            assert any(not hit.hit for hit in hits)
+            for hit in hits:
+                if hit.hit:
+                    assert hit.body_id in scene.body_ids
+                    assert hit.link_index == -1
+                    assert hit.category == "terrain"
+                else:
+                    assert (hit.body_id, hit.link_index, hit.category) == (-1, -1, "unknown")
+        assert statistics.median(elapsed_ms) < DUAL_LIDAR_BACKEND_BUDGET_MS
+    finally:
+        p.disconnect(client_id)
+
+
+def test_ray_batch_rejects_bad_lengths_non_finite_points_and_invalid_mask(monkeypatch):
+    client_id, backend = _create_backend()
+    calls = 0
+
+    def record_call(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return ()
+
+    try:
+        monkeypatch.setattr(sensor_backend_module.p, "rayTestBatch", record_call)
+        with pytest.raises(ValueError, match="same length"):
+            backend.ray_test_batch(((0.0, 0.0, 0.0),), (), collision_mask=1)
+        with pytest.raises(ValueError, match="finite"):
+            backend.ray_test_batch(
+                ((0.0, math.nan, 0.0),),
+                ((1.0, 0.0, 0.0),),
+                collision_mask=1,
+            )
+        with pytest.raises(ValueError, match="sequence"):
+            backend.ray_test_batch(
+                {(0.0, 0.0, 0.0)},
+                ((1.0, 0.0, 0.0),),
+                collision_mask=1,
+            )
+        for invalid_mask in (True, -1, 1.5):
+            with pytest.raises(ValueError, match="collision_mask"):
+                backend.ray_test_batch((), (), collision_mask=invalid_mask)
+        assert calls == 0
+        assert backend.ray_test_batch((), (), collision_mask=0) == ()
+        assert backend.ray_test_batch((), (), collision_mask=0x7FFFFFFF) == ()
+        assert calls == 0
+    finally:
+        p.disconnect(client_id)
+
+
+@pytest.mark.parametrize("invalid_mask", (True, 0x80000000, 0xFFFFFFFF, 2**32))
+def test_ray_batch_rejects_masks_outside_signed_c_int_for_empty_and_nonempty_batches(
+    monkeypatch,
+    invalid_mask,
+):
+    client_id, backend = _create_backend()
+    calls = 0
+
+    def record_call(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return ()
+
+    try:
+        monkeypatch.setattr(sensor_backend_module.p, "rayTestBatch", record_call)
+        with pytest.raises(ValueError, match="collision_mask"):
+            backend.ray_test_batch((), (), collision_mask=invalid_mask)
+        with pytest.raises(ValueError, match="collision_mask"):
+            backend.ray_test_batch(
+                ((0.0, 0.0, 0.0),),
+                ((1.0, 0.0, 0.0),),
+                collision_mask=invalid_mask,
+            )
+        assert calls == 0
+    finally:
+        p.disconnect(client_id)
+
+
+def test_ray_batch_rejects_more_than_pybullet_maximum_before_native_call(monkeypatch):
+    client_id, backend = _create_backend()
+    too_many_points = ((0.0, 0.0, 0.0),) * 16384
+    calls = 0
+
+    def record_call(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return ()
+
+    try:
+        monkeypatch.setattr(sensor_backend_module.p, "rayTestBatch", record_call)
+        with pytest.raises(ValueError, match="16383"):
+            backend.ray_test_batch(
+                too_many_points,
+                too_many_points,
+                collision_mask=1,
+            )
+        assert calls == 0
+    finally:
+        p.disconnect(client_id)
+
+
+def test_ray_batch_accepts_real_pybullet_maximum_size():
+    client_id, backend = _create_backend()
+    starts = ((100.0, 100.0, 100.0),) * 16383
+    ends = ((101.0, 100.0, 100.0),) * 16383
+    try:
+        hits = backend.ray_test_batch(starts, ends, collision_mask=0)
+
+        assert len(hits) == 16383
+        assert all(not hit.hit for hit in hits)
+        assert all(hit.category == "unknown" for hit in hits)
+    finally:
+        p.disconnect(client_id)
+
+
+def test_ray_batch_passes_collision_mask_and_rejects_return_length_mismatch(monkeypatch):
+    client_id, backend = _create_backend()
+    observed_mask = None
+
+    def mismatched_result(_starts, _ends, *, collisionFilterMask, physicsClientId):
+        nonlocal observed_mask
+        observed_mask = collisionFilterMask
+        assert physicsClientId == client_id
+        return ()
+
+    try:
+        monkeypatch.setattr(sensor_backend_module.p, "rayTestBatch", mismatched_result)
+        with pytest.raises(RuntimeError, match="returned 0 results for 1 rays"):
+            backend.ray_test_batch(
+                ((0.0, 0.0, 0.0),),
+                ((1.0, 0.0, 0.0),),
+                collision_mask=0x10,
+            )
+        assert observed_mask == 0x10
+    finally:
+        p.disconnect(client_id)
+
+
+def test_ray_batch_rejects_result_with_extra_fields(monkeypatch):
+    client_id, backend = _create_backend()
+    raw_hit = (1, -1, 0.5, (0.0, 0.0, 0.0), (0.0, 0.0, 1.0), "extra")
+    try:
+        monkeypatch.setattr(
+            sensor_backend_module.p,
+            "rayTestBatch",
+            lambda *_args, **_kwargs: (raw_hit,),
+        )
+        with pytest.raises(RuntimeError, match="exactly 5 fields"):
+            backend.ray_test_batch(
+                ((0.0, 0.0, 0.0),),
+                ((1.0, 0.0, 0.0),),
+                collision_mask=1,
+            )
+    finally:
+        p.disconnect(client_id)
+
+
+@pytest.mark.parametrize(
+    "raw_hit",
+    [
+        (1, -1, math.nan, (0.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
+        (1, -1, 0.5, (math.inf, 0.0, 0.0), (0.0, 0.0, 1.0)),
+        (1, -1, 0.5, (0.0, 0.0, 0.0), (0.0, math.nan, 1.0)),
+    ],
+)
+def test_ray_batch_rejects_non_finite_pybullet_results(monkeypatch, raw_hit):
+    client_id, backend = _create_backend()
+    try:
+        monkeypatch.setattr(
+            sensor_backend_module.p,
+            "rayTestBatch",
+            lambda *_args, **_kwargs: (raw_hit,),
+        )
+        with pytest.raises(RuntimeError, match="finite"):
+            backend.ray_test_batch(
+                ((0.0, 0.0, 0.0),),
+                ((1.0, 0.0, 0.0),),
+                collision_mask=1,
+            )
+    finally:
+        p.disconnect(client_id)
+
+
+@pytest.mark.parametrize(
+    ("raw_hit", "message"),
+    [
+        ((True, -1, 0.5, (0.0, 0.0, 0.0), (0.0, 0.0, 1.0)), "body id"),
+        ((1, True, 0.5, (0.0, 0.0, 0.0), (0.0, 0.0, 1.0)), "link index"),
+        ((1, -1, True, (0.0, 0.0, 0.0), (0.0, 0.0, 1.0)), "hit fraction"),
+        ((-2, -1, 0.5, (0.0, 0.0, 0.0), (0.0, 0.0, 1.0)), "body id"),
+        ((1, -2, 0.5, (0.0, 0.0, 0.0), (0.0, 0.0, 1.0)), "link index"),
+        (
+            (1, -1, math.nextafter(0.0, -math.inf), (0.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
+            "range 0..1",
+        ),
+        (
+            (1, -1, math.nextafter(1.0, math.inf), (0.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
+            "range 0..1",
+        ),
+        ((1, -1, 0.5, (0.0, 0.0), (0.0, 0.0, 1.0)), "position"),
+        ((1, -1, 0.5, (0.0, 0.0, 0.0), (0.0, 1.0)), "normal"),
+        ((1, -1, 0.5, (True, 0.0, 0.0), (0.0, 0.0, 1.0)), "position"),
+        ((1, -1, 0.5, (0.0, 0.0, 0.0), (False, 0.0, 1.0)), "normal"),
+    ],
+)
+def test_trusted_ray_conversion_rejects_invalid_pybullet_fields(
+    monkeypatch,
+    raw_hit,
+    message,
+):
+    client_id, backend = _create_backend()
+    try:
+        monkeypatch.setattr(
+            sensor_backend_module.p,
+            "rayTestBatch",
+            lambda *_args, **_kwargs: (raw_hit,),
+        )
+        with pytest.raises(RuntimeError, match=message):
+            backend.ray_test_batch(
+                ((0.0, 0.0, 0.0),),
+                ((1.0, 0.0, 0.0),),
+                collision_mask=1,
+            )
+    finally:
+        p.disconnect(client_id)

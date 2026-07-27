@@ -146,6 +146,147 @@ def test_static_objects_do_not_move_and_moving_objects_reverse_at_endpoints():
         p.disconnect(client_id)
 
 
+def test_update_moving_does_not_search_records_by_dataclass_equality(monkeypatch):
+    """移动更新必须按稳定索引发布，不能对已更新列表逐项执行 index 搜索。"""
+    client_id = p.connect(p.DIRECT)
+    try:
+        scene = create_slope_scene(client_id, slope_deg=0.0, time_step=TIME_STEP, terrain_model="flat")
+        manager = ObstacleManager(client_id, _settings(bounds=scene.bounds), terrain_body_ids=scene.body_ids)
+        for offset in range(5):
+            _add_one(
+                manager,
+                mode="moving",
+                seed=230 + offset,
+                moving_speed=0.3,
+            )
+        original_eq = obstacle_module._ObstacleRecord.__eq__
+        equality_calls = 0
+
+        def count_equality(left, right):
+            nonlocal equality_calls
+            equality_calls += 1
+            return original_eq(left, right)
+
+        monkeypatch.setattr(obstacle_module._ObstacleRecord, "__eq__", count_equality)
+
+        manager.update_moving(0.01)
+
+        assert equality_calls == 0
+    finally:
+        p.disconnect(client_id)
+
+
+def test_update_moving_batches_all_terrain_rays_once(monkeypatch):
+    """同一帧全部移动体必须共享一次 rayTestBatch，不重复标量地形探测。"""
+    client_id = p.connect(p.DIRECT)
+    try:
+        scene = create_slope_scene(client_id, slope_deg=0.0, time_step=TIME_STEP, terrain_model="flat")
+        manager = ObstacleManager(client_id, _settings(bounds=scene.bounds), terrain_body_ids=scene.body_ids)
+        for offset in range(6):
+            _add_one(
+                manager,
+                mode="moving",
+                seed=250 + offset,
+                moving_speed=0.3,
+            )
+        original_probe = obstacle_module.probe_terrain
+        original_batch = obstacle_module.p.rayTestBatch
+        scalar_calls = 0
+        batch_sizes: list[int] = []
+
+        def count_scalar_probe(*args, **kwargs):
+            nonlocal scalar_calls
+            scalar_calls += 1
+            return original_probe(*args, **kwargs)
+
+        def count_batch(ray_from, ray_to, **kwargs):
+            batch_sizes.append(len(ray_from))
+            return original_batch(ray_from, ray_to, **kwargs)
+
+        monkeypatch.setattr(obstacle_module, "probe_terrain", count_scalar_probe)
+        monkeypatch.setattr(obstacle_module.p, "rayTestBatch", count_batch)
+
+        manager.update_moving(0.01)
+
+        assert scalar_calls == 0
+        assert batch_sizes == [6]
+    finally:
+        p.disconnect(client_id)
+
+
+@pytest.mark.parametrize(
+    ("terrain_model", "slope_deg"),
+    (("flat", 0.0), ("slope", 8.0), ("golf_heightfield", 0.0)),
+)
+def test_batch_terrain_sampling_matches_scalar_probe_pose(
+    terrain_model: str,
+    slope_deg: float,
+):
+    """batch 射线须与旧逐点探测生成相同地高、法向和障碍物姿态。"""
+    client_id = p.connect(p.DIRECT)
+    try:
+        scene = create_slope_scene(
+            client_id,
+            slope_deg=slope_deg,
+            time_step=TIME_STEP,
+            terrain_model=terrain_model,
+            golf_seed=37,
+            golf_relief="medium",
+        )
+        manager = ObstacleManager(
+            client_id,
+            _settings(bounds=scene.bounds),
+            terrain_body_ids=scene.body_ids,
+        )
+        positions = ((-2.25, -1.10), (0.15, 0.20), (2.40, 1.25))
+        batch_probes = manager._sample_moving_terrain_batch(positions)
+        scalar_probes = tuple(manager._terrain_sampler(x, y) for x, y in positions)
+        geometry = ObstacleGeometry("box", (0.20, 0.20, 0.30))
+
+        for index, (batch_probe, scalar_probe) in enumerate(
+            zip(batch_probes, scalar_probes, strict=True),
+            start=1,
+        ):
+            assert batch_probe.local_ground_height == pytest.approx(
+                scalar_probe.local_ground_height,
+                abs=2e-4,
+            )
+            batch_normal = (
+                batch_probe.local_terrain_normal_x,
+                batch_probe.local_terrain_normal_y,
+                batch_probe.local_terrain_normal_z,
+            )
+            scalar_normal = (
+                scalar_probe.local_terrain_normal_x,
+                scalar_probe.local_terrain_normal_y,
+                scalar_probe.local_terrain_normal_z,
+            )
+            assert batch_normal == pytest.approx(scalar_normal, abs=1e-5)
+            base_spec = obstacle_module.ObstacleSpec(
+                logical_id=index,
+                mode="static",
+                geometry=geometry,
+                position=(positions[index - 1][0], positions[index - 1][1], 0.30),
+                orientation=(0.0, 0.0, 0.0, 1.0),
+            )
+            batch_spec = manager._spec_with_sampled_pose(
+                base_spec,
+                positions[index - 1],
+                (1.0, 0.0),
+                batch_probe,
+            )
+            scalar_spec = manager._spec_with_sampled_pose(
+                base_spec,
+                positions[index - 1],
+                (1.0, 0.0),
+                scalar_probe,
+            )
+            assert batch_spec.position == pytest.approx(scalar_spec.position, abs=2e-4)
+            assert batch_spec.orientation == pytest.approx(scalar_spec.orientation, abs=1e-5)
+    finally:
+        p.disconnect(client_id)
+
+
 def test_dashboard_snapshot_is_immutable_copy_without_body_id():
     client_id = p.connect(p.DIRECT)
     try:
@@ -158,6 +299,38 @@ def test_dashboard_snapshot_is_immutable_copy_without_body_id():
         with pytest.raises(AttributeError):
             dashboard[0].position = (99.0, 99.0, 99.0)
         assert manager.snapshot()[0].position != (99.0, 99.0, 99.0)
+    finally:
+        p.disconnect(client_id)
+
+
+def test_manager_exposes_read_only_specs_revision_and_constant_time_moving_flag():
+    """热路径元数据不能暴露 body id 或可变内部 records。"""
+    client_id = p.connect(p.DIRECT)
+    try:
+        scene = create_slope_scene(client_id, slope_deg=0.0, time_step=TIME_STEP, terrain_model="flat")
+        manager = ObstacleManager(client_id, _settings(bounds=scene.bounds), terrain_body_ids=scene.body_ids)
+
+        assert hasattr(manager, "has_moving")
+        assert hasattr(manager, "revision")
+        assert hasattr(manager, "logical_specs")
+        initial_revision = manager.revision
+        assert manager.has_moving is False
+
+        _add_one(manager, mode="static", seed=240)
+        static_revision = manager.revision
+        specs = manager.logical_specs()
+        assert static_revision > initial_revision
+        assert manager.has_moving is False
+        assert isinstance(specs, tuple)
+        assert all(isinstance(spec, obstacle_module.ObstacleSpec) for spec in specs)
+        assert all(not hasattr(spec, "body_id") for spec in specs)
+
+        _add_one(manager, mode="moving", seed=241, moving_speed=0.3)
+        moving_revision = manager.revision
+        assert manager.has_moving is True
+        manager.update_moving(0.01)
+        assert manager.revision > moving_revision
+        assert manager.logical_specs()[0] is specs[0]
     finally:
         p.disconnect(client_id)
 
@@ -248,6 +421,188 @@ def test_creation_failure_rolls_back_only_this_batch_and_keeps_existing_logical_
         assert manager.snapshot() == before_snapshot
         assert _body_ids(client_id) == before_ids
         assert manager.snapshot()[0].logical_id == existing.logical_id
+    finally:
+        p.disconnect(client_id)
+
+
+def test_create_body_propagates_residual_id_when_filter_failure_cleanup_is_fake(
+    monkeypatch,
+):
+    """createMultiBody 后置失败且清理假成功时，异常必须携带残留 body ID。"""
+    client_id = p.connect(p.DIRECT)
+    try:
+        scene = create_slope_scene(client_id, slope_deg=0.0, time_step=TIME_STEP, terrain_model="flat")
+        spec = obstacle_module.ObstacleSpec(
+            logical_id=70,
+            mode="static",
+            geometry=ObstacleGeometry("box", (0.20, 0.20, 0.30)),
+            position=(2.0, 1.0, 0.30),
+            orientation=(0.0, 0.0, 0.0, 1.0),
+        )
+        original_filter = obstacle_module.p.setCollisionFilterGroupMask
+        original_remove = obstacle_module.p.removeBody
+        residual_body_id: int | None = None
+
+        def fail_real_filter(body_id, link_id, group, mask, **kwargs):
+            nonlocal residual_body_id
+            if group == obstacle_module.OBSTACLE_COLLISION_GROUP:
+                residual_body_id = int(body_id)
+                raise RuntimeError("injected obstacle filter failure")
+            return original_filter(body_id, link_id, group, mask, **kwargs)
+
+        def leave_residual_body(body_id: int, **kwargs) -> None:
+            if body_id == residual_body_id:
+                return
+            original_remove(body_id, **kwargs)
+
+        monkeypatch.setattr(obstacle_module.p, "setCollisionFilterGroupMask", fail_real_filter)
+        monkeypatch.setattr(obstacle_module.p, "removeBody", leave_residual_body)
+
+        with pytest.raises(RuntimeError) as excinfo:
+            obstacle_module._create_obstacle_body(client_id, spec, temporary=False)
+
+        assert "injected obstacle filter failure" in str(excinfo.value)
+        assert residual_body_id is not None
+        assert getattr(excinfo.value, "residual_body_ids", ()) == (residual_body_id,)
+        assert residual_body_id in _body_ids(client_id)
+    finally:
+        p.disconnect(client_id)
+
+
+@pytest.mark.parametrize("operation", ("add", "restore"))
+def test_manager_registers_post_creation_residual_as_cleanup_debt(
+    monkeypatch,
+    operation: str,
+):
+    """add/restore 都必须接管创建异常留下的候选 body，不能丢失所有权。"""
+    client_id = p.connect(p.DIRECT)
+    try:
+        scene = create_slope_scene(client_id, slope_deg=0.0, time_step=TIME_STEP, terrain_model="flat")
+        manager = ObstacleManager(
+            client_id,
+            _settings(bounds=scene.bounds),
+            terrain_body_ids=scene.body_ids,
+        )
+        original_filter = obstacle_module.p.setCollisionFilterGroupMask
+        original_remove = obstacle_module.p.removeBody
+        residual_body_id: int | None = None
+
+        def fail_real_filter(body_id, link_id, group, mask, **kwargs):
+            nonlocal residual_body_id
+            if group == obstacle_module.OBSTACLE_COLLISION_GROUP:
+                residual_body_id = int(body_id)
+                raise RuntimeError(f"{operation} filter failure")
+            return original_filter(body_id, link_id, group, mask, **kwargs)
+
+        def leave_residual_body(body_id: int, **kwargs) -> None:
+            if body_id == residual_body_id:
+                return
+            original_remove(body_id, **kwargs)
+
+        monkeypatch.setattr(obstacle_module.p, "setCollisionFilterGroupMask", fail_real_filter)
+        monkeypatch.setattr(obstacle_module.p, "removeBody", leave_residual_body)
+
+        if operation == "add":
+            manager.begin_add(ObstacleGenerationRequest("static", 1, seed=71))
+            result = _finish(manager)
+            assert result.succeeded is False
+        else:
+            target = ObstacleSnapshot(
+                71,
+                None,
+                "static",
+                "box",
+                (2.0, 1.0, 0.30),
+                (0.0, 0.0, 0.0, 1.0),
+                geometry=ObstacleGeometry("box", (0.20, 0.20, 0.30)),
+            )
+            with pytest.raises(RuntimeError, match="restore filter failure"):
+                manager.restore((target,))
+
+        assert residual_body_id is not None
+        assert manager.pending_body_ids() == (residual_body_id,)
+        formal_body_ids = {
+            snapshot.physics_body_id for snapshot in manager.snapshot()
+        }
+        assert residual_body_id not in formal_body_ids
+    finally:
+        p.disconnect(client_id)
+
+
+def test_cleanup_debt_retries_strictly_and_transient_failure_recovers(monkeypatch):
+    """新操作门禁每次都重试 debt；瞬时失败消失后应自动清债并继续。"""
+    client_id = p.connect(p.DIRECT)
+    try:
+        scene = create_slope_scene(client_id, slope_deg=0.0, time_step=TIME_STEP, terrain_model="flat")
+        manager = ObstacleManager(client_id, _settings(bounds=scene.bounds), terrain_body_ids=scene.body_ids)
+        spec = obstacle_module.ObstacleSpec(
+            81,
+            "static",
+            ObstacleGeometry("box", (0.20, 0.20, 0.30)),
+            (2.0, 1.0, 0.30),
+            (0.0, 0.0, 0.0, 1.0),
+        )
+        debt_body_id = obstacle_module._create_obstacle_body(client_id, spec, temporary=False)
+        manager._register_cleanup_debt(((debt_body_id, RuntimeError("seed debt")),))
+        original_remove = obstacle_module.p.removeBody
+        attempts = 0
+
+        def fail_debt_once(body_id: int, **kwargs) -> None:
+            nonlocal attempts
+            if body_id == debt_body_id:
+                attempts += 1
+                if attempts == 1:
+                    raise RuntimeError("transient cleanup failure")
+            original_remove(body_id, **kwargs)
+
+        monkeypatch.setattr(obstacle_module.p, "removeBody", fail_debt_once)
+
+        with pytest.raises(RuntimeError) as excinfo:
+            manager.begin_clear()
+        assert str(debt_body_id) in str(excinfo.value)
+        assert manager.pending_body_ids() == (debt_body_id,)
+
+        started = manager.begin_clear()
+        assert started.done is False
+        assert manager.pending_body_ids() == ()
+        assert debt_body_id not in _body_ids(client_id)
+        assert _finish(manager).succeeded is True
+    finally:
+        p.disconnect(client_id)
+
+
+def test_cleanup_debt_fake_success_stays_blocked_with_concrete_body_id(monkeypatch):
+    """debt 删除正常返回但 body 仍在时，门禁必须保留债务并指出具体 ID。"""
+    client_id = p.connect(p.DIRECT)
+    try:
+        scene = create_slope_scene(client_id, slope_deg=0.0, time_step=TIME_STEP, terrain_model="flat")
+        manager = ObstacleManager(client_id, _settings(bounds=scene.bounds), terrain_body_ids=scene.body_ids)
+        spec = obstacle_module.ObstacleSpec(
+            82,
+            "static",
+            ObstacleGeometry("box", (0.20, 0.20, 0.30)),
+            (2.0, 1.0, 0.30),
+            (0.0, 0.0, 0.0, 1.0),
+        )
+        debt_body_id = obstacle_module._create_obstacle_body(client_id, spec, temporary=False)
+        manager._register_cleanup_debt(((debt_body_id, RuntimeError("seed debt")),))
+        original_remove = obstacle_module.p.removeBody
+
+        def leave_debt_body(body_id: int, **kwargs) -> None:
+            if body_id == debt_body_id:
+                return
+            original_remove(body_id, **kwargs)
+
+        monkeypatch.setattr(obstacle_module.p, "removeBody", leave_debt_body)
+
+        with pytest.raises(RuntimeError) as excinfo:
+            manager.begin_clear()
+
+        assert str(debt_body_id) in str(excinfo.value)
+        assert "remained" in str(excinfo.value)
+        assert manager.pending_body_ids() == (debt_body_id,)
+        assert debt_body_id in _body_ids(client_id)
+        assert manager.snapshot() == ()
     finally:
         p.disconnect(client_id)
 
@@ -468,20 +823,341 @@ def test_restore_from_snapshot_preserves_logical_id_xy_path_progress_and_directi
         assert saved_obstacle.path is not None
         old_body_id = manager.snapshot()[0].physics_body_id
 
-        p.removeBody(old_body_id, physicsClientId=client_id)
-        manager.restore(saved)
+        result = manager.restore(saved)
         restored = manager.snapshot()[0]
 
+        assert result.succeeded is True
         assert restored.logical_id == saved_obstacle.logical_id == original.logical_id
         assert restored.position[:2] == pytest.approx(saved_obstacle.position[:2], abs=1e-9)
         assert restored.position[2] == pytest.approx(saved_obstacle.geometry.half_extents[2], abs=0.04)
         assert math.hypot(*restored.orientation) == pytest.approx(1.0, abs=1e-9)
         assert restored.physics_body_id is not None
+        assert restored.physics_body_id != old_body_id
         assert restored.physics_body_id in _body_ids(client_id)
         assert restored.path.start_xy == pytest.approx(saved_obstacle.path.start_xy)
         assert restored.path.end_xy == pytest.approx(saved_obstacle.path.end_xy)
         assert restored.path.progress == pytest.approx(saved_obstacle.path.progress)
         assert restored.path.direction == saved_obstacle.path.direction
+    finally:
+        p.disconnect(client_id)
+
+
+def test_restore_rejects_missing_original_before_creating_any_candidate(monkeypatch):
+    """正式记录缺 body 时立即进入 fault，不能让新候选复用缺失 ID。"""
+    client_id = p.connect(p.DIRECT)
+    try:
+        scene = create_slope_scene(client_id, slope_deg=0.0, time_step=TIME_STEP, terrain_model="flat")
+        manager = ObstacleManager(client_id, _settings(bounds=scene.bounds), terrain_body_ids=scene.body_ids)
+        _add_one(manager, seed=181)
+        _add_one(manager, seed=182)
+        before = manager.snapshot()
+        missing_body_id = before[0].physics_body_id
+        survivor_body_id = before[1].physics_body_id
+        assert missing_body_id is not None and survivor_body_id is not None
+        p.removeBody(missing_body_id, physicsClientId=client_id)
+        original_create = obstacle_module._create_obstacle_body
+        creation_calls: list[int] = []
+
+        def record_creation(client_id_arg, spec, **kwargs):
+            creation_calls.append(spec.logical_id)
+            return original_create(client_id_arg, spec, **kwargs)
+
+        monkeypatch.setattr(obstacle_module, "_create_obstacle_body", record_creation)
+        target = ObstacleSnapshot(
+            90,
+            None,
+            "static",
+            "box",
+            (2.0, 1.0, 0.30),
+            (0.0, 0.0, 0.0, 1.0),
+            geometry=ObstacleGeometry("box", (0.20, 0.20, 0.30)),
+        )
+
+        with pytest.raises(RuntimeError) as excinfo:
+            manager.restore((target,))
+
+        assert str(missing_body_id) in str(excinfo.value)
+        assert "missing" in str(excinfo.value)
+        assert creation_calls == []
+        assert manager.faulted is True
+        assert manager.snapshot() == ()
+        assert manager.pending_body_ids() == (survivor_body_id,)
+    finally:
+        p.disconnect(client_id)
+
+
+def test_restore_missing_id_reuse_combination_never_publishes_candidate_as_old(
+    monkeypatch,
+):
+    """预缺失、ID 复用、另一旧体失败和候选清理失败组合下不得错配所有权。"""
+    client_id = p.connect(p.DIRECT)
+    try:
+        scene = create_slope_scene(client_id, slope_deg=0.0, time_step=TIME_STEP, terrain_model="flat")
+        manager = ObstacleManager(client_id, _settings(bounds=scene.bounds), terrain_body_ids=scene.body_ids)
+        _add_one(manager, seed=183)
+        _add_one(manager, seed=184)
+        original_records = manager.snapshot()
+        missing_body_id = original_records[0].physics_body_id
+        blocked_body_id = original_records[1].physics_body_id
+        assert missing_body_id is not None and blocked_body_id is not None
+        p.removeBody(missing_body_id, physicsClientId=client_id)
+        original_create = obstacle_module._create_obstacle_body
+        original_remove = obstacle_module.p.removeBody
+        candidate_ids: list[int] = []
+
+        def record_candidate(client_id_arg, spec, **kwargs):
+            body_id = original_create(client_id_arg, spec, **kwargs)
+            if spec.logical_id == 91:
+                candidate_ids.append(body_id)
+            return body_id
+
+        def fail_old_and_candidate_cleanup(body_id: int, **kwargs) -> None:
+            if body_id == blocked_body_id:
+                raise RuntimeError("other old body removal failed")
+            if body_id in candidate_ids:
+                raise RuntimeError("candidate cleanup failed")
+            original_remove(body_id, **kwargs)
+
+        monkeypatch.setattr(obstacle_module, "_create_obstacle_body", record_candidate)
+        monkeypatch.setattr(
+            obstacle_module.p,
+            "removeBody",
+            fail_old_and_candidate_cleanup,
+        )
+        target = ObstacleSnapshot(
+            91,
+            None,
+            "static",
+            "sphere",
+            (2.0, -1.0, 0.20),
+            (0.0, 0.0, 0.0, 1.0),
+            geometry=ObstacleGeometry("sphere", (0.20, 0.20, 0.20)),
+        )
+
+        with pytest.raises(RuntimeError):
+            manager.restore((target,))
+
+        assert candidate_ids == []
+        assert manager.faulted is True
+        assert manager.snapshot() == ()
+        assert blocked_body_id in manager.pending_body_ids()
+        assert not any(
+            snapshot.logical_id == original_records[0].logical_id
+            and snapshot.physics_body_id in candidate_ids
+            for snapshot in manager.snapshot()
+        )
+    finally:
+        p.disconnect(client_id)
+
+
+@pytest.mark.parametrize("failure_mode", ("raises", "remains"))
+def test_restore_nonempty_collection_rolls_back_when_first_old_body_is_not_removed(
+    monkeypatch,
+    failure_mode,
+):
+    """旧 body 抛非 p.error 或假成功时，候选必须清空且原集合保持有效。"""
+    client_id = p.connect(p.DIRECT)
+    try:
+        scene = create_slope_scene(client_id, slope_deg=0.0, time_step=TIME_STEP, terrain_model="flat")
+        manager = ObstacleManager(client_id, _settings(bounds=scene.bounds), terrain_body_ids=scene.body_ids)
+        _add_one(manager, mode="moving", seed=191, moving_speed=0.4)
+        _add_one(manager, mode="static", seed=192)
+        before_logical = manager.snapshot(include_body_id=False)
+        before_physical = manager.snapshot()
+        failed_body_id = before_physical[0].physics_body_id
+        original_remove = obstacle_module.p.removeBody
+        target = (
+            ObstacleSnapshot(
+                logical_id=101,
+                body_id=None,
+                mode="static",
+                shape="box",
+                position=(2.0, 1.0, 0.3),
+                orientation=(0.0, 0.0, 0.0, 1.0),
+                geometry=ObstacleGeometry("box", (0.2, 0.2, 0.3)),
+            ),
+        )
+
+        def fail_or_leave_old_body(body_id: int, **kwargs) -> None:
+            if body_id == failed_body_id:
+                if failure_mode == "raises":
+                    raise RuntimeError("old committed body removal exploded")
+                return
+            original_remove(body_id, **kwargs)
+
+        monkeypatch.setattr(obstacle_module.p, "removeBody", fail_or_leave_old_body)
+
+        result = manager.restore(target)
+
+        assert result.done is True
+        assert result.succeeded is False
+        expected_reason = "old committed body removal exploded" if failure_mode == "raises" else "remained"
+        assert expected_reason in result.message
+        assert manager.snapshot(include_body_id=False) == before_logical
+        assert manager.snapshot() == before_physical
+        expected_body_ids = set(scene.body_ids) | {
+            snapshot.physics_body_id for snapshot in manager.snapshot()
+        }
+        assert _body_ids(client_id) == expected_body_ids
+    finally:
+        p.disconnect(client_id)
+
+
+def test_restore_partial_old_removal_recreates_deleted_specs_in_original_order(
+    monkeypatch,
+):
+    """第一旧体已删、第二旧体失败时，要从原 spec 重建并恢复完整顺序。"""
+    client_id = p.connect(p.DIRECT)
+    try:
+        scene = create_slope_scene(client_id, slope_deg=0.0, time_step=TIME_STEP, terrain_model="flat")
+        manager = ObstacleManager(client_id, _settings(bounds=scene.bounds), terrain_body_ids=scene.body_ids)
+        _add_one(manager, mode="moving", seed=201, moving_speed=0.35)
+        _add_one(manager, mode="static", seed=202)
+        _add_one(manager, mode="moving", seed=203, moving_speed=0.45)
+        manager.update_moving(0.2)
+        before_logical = manager.snapshot(include_body_id=False)
+        before_physical = manager.snapshot()
+        failed_body_id = before_physical[1].physics_body_id
+        original_remove = obstacle_module.p.removeBody
+        original_create = obstacle_module._create_obstacle_body
+        created_logical_ids: list[int] = []
+        target = (
+            ObstacleSnapshot(
+                logical_id=301,
+                body_id=None,
+                mode="static",
+                shape="sphere",
+                position=(2.0, -1.0, 0.2),
+                orientation=(0.0, 0.0, 0.0, 1.0),
+                geometry=ObstacleGeometry("sphere", (0.2, 0.2, 0.2)),
+            ),
+        )
+
+        def fail_second_old_body(body_id: int, **kwargs) -> None:
+            if body_id == failed_body_id:
+                raise RuntimeError("second old body removal failed")
+            original_remove(body_id, **kwargs)
+
+        def record_created_spec(client_id_arg, spec, **kwargs):
+            created_logical_ids.append(spec.logical_id)
+            return original_create(client_id_arg, spec, **kwargs)
+
+        monkeypatch.setattr(obstacle_module.p, "removeBody", fail_second_old_body)
+        monkeypatch.setattr(obstacle_module, "_create_obstacle_body", record_created_spec)
+
+        result = manager.restore(target)
+
+        assert result.done is True
+        assert result.succeeded is False
+        assert "second old body removal failed" in result.message
+        assert manager.snapshot(include_body_id=False) == before_logical
+        after_physical = manager.snapshot()
+        assert [snapshot.logical_id for snapshot in after_physical] == [1, 2, 3]
+        assert created_logical_ids == [301, 1]
+        assert after_physical[0].physics_body_id in _body_ids(client_id)
+        expected_body_ids = set(scene.body_ids) | {
+            snapshot.physics_body_id for snapshot in after_physical
+        }
+        assert _body_ids(client_id) == expected_body_ids
+    finally:
+        p.disconnect(client_id)
+
+
+def test_restore_reports_primary_and_candidate_cleanup_failures(monkeypatch):
+    """候选无法清理时必须同时报告旧体删除首错和候选回滚错。"""
+    client_id = p.connect(p.DIRECT)
+    try:
+        scene = create_slope_scene(client_id, slope_deg=0.0, time_step=TIME_STEP, terrain_model="flat")
+        manager = ObstacleManager(client_id, _settings(bounds=scene.bounds), terrain_body_ids=scene.body_ids)
+        _add_one(manager, mode="static", seed=211)
+        before = manager.snapshot(include_body_id=False)
+        old_body_id = manager.snapshot()[0].physics_body_id
+        target = (
+            ObstacleSnapshot(
+                401,
+                None,
+                "static",
+                "box",
+                (2.0, 1.0, 0.3),
+                (0.0, 0.0, 0.0, 1.0),
+                geometry=ObstacleGeometry("box", (0.2, 0.2, 0.3)),
+            ),
+        )
+
+        def fail_old_and_candidate(body_id: int, **_kwargs) -> None:
+            if body_id == old_body_id:
+                raise RuntimeError("primary old removal failure")
+            raise RuntimeError("candidate cleanup failure")
+
+        monkeypatch.setattr(obstacle_module.p, "removeBody", fail_old_and_candidate)
+
+        with pytest.raises(RuntimeError) as excinfo:
+            manager.restore(target)
+
+        assert "primary old removal failure" in str(excinfo.value)
+        assert "candidate cleanup failure" in str(excinfo.value)
+        assert manager.snapshot(include_body_id=False) == before
+        logical_body_ids = {
+            snapshot.physics_body_id for snapshot in manager.snapshot()
+        }
+        cleanup_debt = _body_ids(client_id) - set(scene.body_ids) - logical_body_ids
+        assert cleanup_debt
+        assert set(manager.pending_body_ids()) == cleanup_debt
+    finally:
+        p.disconnect(client_id)
+
+
+def test_restore_reports_primary_and_old_spec_rebuild_failures(monkeypatch):
+    """部分旧体已删且补建失败时，异常必须包含两段原因且不得伪装完整回滚。"""
+    client_id = p.connect(p.DIRECT)
+    try:
+        scene = create_slope_scene(client_id, slope_deg=0.0, time_step=TIME_STEP, terrain_model="flat")
+        manager = ObstacleManager(client_id, _settings(bounds=scene.bounds), terrain_body_ids=scene.body_ids)
+        _add_one(manager, mode="moving", seed=221, moving_speed=0.3)
+        _add_one(manager, mode="static", seed=222)
+        before = manager.snapshot()
+        failed_body_id = before[1].physics_body_id
+        original_remove = obstacle_module.p.removeBody
+        original_create = obstacle_module._create_obstacle_body
+        target = (
+            ObstacleSnapshot(
+                501,
+                None,
+                "static",
+                "sphere",
+                (2.0, -1.0, 0.2),
+                (0.0, 0.0, 0.0, 1.0),
+                geometry=ObstacleGeometry("sphere", (0.2, 0.2, 0.2)),
+            ),
+        )
+
+        def fail_second_old_body(body_id: int, **kwargs) -> None:
+            if body_id == failed_body_id:
+                raise RuntimeError("primary second-old removal failure")
+            original_remove(body_id, **kwargs)
+
+        def fail_rebuilding_first_old(client_id_arg, spec, **kwargs):
+            if spec.logical_id == before[0].logical_id:
+                raise RuntimeError("old spec rebuild failure")
+            return original_create(client_id_arg, spec, **kwargs)
+
+        monkeypatch.setattr(obstacle_module.p, "removeBody", fail_second_old_body)
+        monkeypatch.setattr(
+            obstacle_module,
+            "_create_obstacle_body",
+            fail_rebuilding_first_old,
+        )
+
+        with pytest.raises(RuntimeError) as excinfo:
+            manager.restore(target)
+
+        assert "primary second-old removal failure" in str(excinfo.value)
+        assert "old spec rebuild failure" in str(excinfo.value)
+        assert manager.faulted is True
+        assert manager.snapshot() == ()
+        owned_body_ids = _body_ids(client_id) - set(scene.body_ids)
+        assert owned_body_ids
+        assert set(manager.pending_body_ids()) == owned_body_ids
     finally:
         p.disconnect(client_id)
 
