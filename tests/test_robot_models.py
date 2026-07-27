@@ -10,6 +10,7 @@ import pytest
 
 import slope_sim.robot as robot_module
 from slope_sim.model_registry import ROBOT_MODELS, get_robot_model, robot_model_names
+from slope_sim.interfaces.models import WheelCommand
 from slope_sim.robot import ActiveSteeringRobot, DifferentialDriveRobot, create_robot
 
 
@@ -80,6 +81,14 @@ def test_active_steering_metadata_has_four_drive_and_two_steering_joints():
     assert spec.steering_joint_names == ("front_left_steering_joint", "front_right_steering_joint")
 
 
+@pytest.mark.parametrize("model_name", robot_model_names())
+def test_all_robot_models_keep_stage3_mechanical_speed_limits(model_name: str):
+    """四种车型共享稳定的驱动轮与转向轮速度机械限位。"""
+    spec = get_robot_model(model_name)
+    assert spec.max_drive_wheel_speed_rad_s == pytest.approx(20.0)
+    assert spec.max_steering_speed_rad_s == pytest.approx(2.0)
+
+
 @pytest.mark.parametrize("model_name", ["df_front", "df_mid", "df_back"])
 def test_differential_robot_resolves_named_drive_joints_and_supports_twist(model_name: str):
     client_id, robot = _load_robot(model_name)
@@ -90,6 +99,50 @@ def test_differential_robot_resolves_named_drive_joints_and_supports_twist(model
         _step(client_id)
         assert left_speed < right_speed
         assert robot.read_drive_wheel_speeds() == pytest.approx((left_speed, right_speed), abs=0.05)
+    finally:
+        p.disconnect(client_id)
+
+
+@pytest.mark.parametrize("model_name", ["df_front", "df_mid", "df_back"])
+def test_task12_differential_wheel_command_from_twist_is_pure(model_name: str, monkeypatch):
+    client_id, robot = _load_robot(model_name)
+    try:
+        before = (robot.left_wheel_speed, robot.right_wheel_speed, robot.linear_velocity, robot.angular_velocity)
+        monkeypatch.setattr(
+            robot_module.p,
+            "setJointMotorControl2",
+            lambda *args, **kwargs: pytest.fail("pure conversion called PyBullet"),
+        )
+
+        command = robot.wheel_command_from_twist(0.4, 0.8, timestamp_ns=123, dt=0.1)
+
+        assert isinstance(command, WheelCommand)
+        assert command.timestamp_ns == 123
+        assert command.drive_wheel_speed_rad_s == pytest.approx((2.0, 6.0))
+        assert command.steering_wheel_speed_rad_s == ()
+        assert (robot.left_wheel_speed, robot.right_wheel_speed, robot.linear_velocity, robot.angular_velocity) == before
+    finally:
+        p.disconnect(client_id)
+
+
+def test_task12_active_steering_wheel_command_from_twist_is_pure_and_limited(monkeypatch):
+    client_id, robot = _load_robot("active_steering_4wd")
+    try:
+        before = (tuple(robot._steering_targets), robot.left_wheel_speed, robot.right_wheel_speed)
+        monkeypatch.setattr(
+            robot_module.p,
+            "setJointMotorControl2",
+            lambda *args, **kwargs: pytest.fail("pure conversion called PyBullet"),
+        )
+
+        command = robot.wheel_command_from_twist(0.4, 0.1, timestamp_ns=456, dt=0.1)
+
+        assert command.timestamp_ns == 456
+        assert command.drive_wheel_speed_rad_s == pytest.approx((4.0, 4.0, 4.0, 4.0))
+        expected_angle = math.atan(robot.model_spec.axle_distance * 0.1 / 0.4)
+        expected_rate = min(robot.MAX_STEERING_RATE, expected_angle / 0.1)
+        assert command.steering_wheel_speed_rad_s == pytest.approx((expected_rate, expected_rate))
+        assert (tuple(robot._steering_targets), robot.left_wheel_speed, robot.right_wheel_speed) == before
     finally:
         p.disconnect(client_id)
 

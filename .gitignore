@@ -12,6 +12,8 @@ venv/
 
 results/logs/*.csv
 results/logs/*.summary.json
+results/logs/*.jsonl
+results/logs/*.interfaces.bin
 results/figures/*.png
 results/figures/*.pdf
 

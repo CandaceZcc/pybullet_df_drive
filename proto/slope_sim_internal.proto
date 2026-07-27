@@ -1,0 +1,14 @@
+// 阶段三内部日志协议：封装企业消息原始字节及其时序上下文。
+syntax = "proto3";
+
+package slope_sim.internal.v1;
+
+message InterfaceLogEnvelope {
+  uint64 sequence = 1;
+  string topic = 2;
+  string direction = 3;
+  uint64 sim_time_ns = 4;
+  uint64 wall_time_ns = 5;
+  string type_name = 6;
+  bytes payload = 7;
+}

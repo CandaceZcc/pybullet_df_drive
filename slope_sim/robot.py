@@ -8,6 +8,7 @@ from pathlib import Path
 import pybullet as p
 
 from slope_sim.controller import wheel_speeds_from_twist
+from slope_sim.interfaces.models import WheelCommand, WheelState
 from slope_sim.model_registry import RobotModelSpec, get_robot_model
 from slope_sim.sensors import LidarSummary
 from slope_sim.telemetry import RobotTelemetry, TerrainProbe, body_frame_velocity, slip_is_valid, slip_ratio, track_body_speeds
@@ -262,18 +263,30 @@ class DifferentialDriveRobot:
         dt: float = 1.0 / 240.0,
     ) -> tuple[float, float]:
         """接收车体速度 v/w，并转换成左右轮的目标角速度。"""
+        command = self.wheel_command_from_twist(linear_velocity, angular_velocity, timestamp_ns=0, dt=dt)
+        self.linear_velocity = float(linear_velocity)
+        self.angular_velocity = float(angular_velocity)
+        self.left_wheel_speed, self.right_wheel_speed = command.drive_wheel_speed_rad_s
+        self.command_wheel_speeds(command.drive_wheel_speed_rad_s, dt=dt)
+        return self.left_wheel_speed, self.right_wheel_speed
+
+    def wheel_command_from_twist(
+        self,
+        linear_velocity: float,
+        angular_velocity: float,
+        timestamp_ns: int,
+        dt: float = 1.0 / 240.0,
+    ) -> WheelCommand:
+        """纯转换车体 twist，不访问 PyBullet 或修改机器人状态。"""
         _require_finite_values("twist", (linear_velocity, angular_velocity))
         _require_positive_finite("dt", dt)
-        self.linear_velocity = linear_velocity
-        self.angular_velocity = angular_velocity
-        self.left_wheel_speed, self.right_wheel_speed = wheel_speeds_from_twist(
+        drive_wheel_speeds = wheel_speeds_from_twist(
             linear_velocity,
             angular_velocity,
             self.wheel_base,
             self.wheel_radius,
         )
-        self.command_wheel_speeds((self.left_wheel_speed, self.right_wheel_speed), dt=dt)
-        return self.left_wheel_speed, self.right_wheel_speed
+        return WheelCommand(timestamp_ns, drive_wheel_speeds, ())
 
     def read_drive_wheel_speeds(self) -> tuple[float, ...]:
         """按注册表顺序读取 PyBullet 实际驱动轮角速度。"""
@@ -294,6 +307,41 @@ class DifferentialDriveRobot:
     def read_steering_wheel_angles(self) -> tuple[float, ...]:
         """差速车型没有独立转向轮。"""
         return ()
+
+    def read_interface_wheel_state(self, timestamp_ns: int) -> WheelState:
+        """按注册表顺序封装当前 PyBullet 关节反馈。"""
+        return WheelState(
+            timestamp_ns,
+            self.read_drive_wheel_speeds(),
+            self.read_steering_wheel_angles(),
+        )
+
+    def _stop_registered_drive_joints_best_effort(self) -> BaseException | None:
+        """逐个尝试停止全部注册驱动关节，并保留遇到的首个错误。"""
+        self.left_wheel_speed = 0.0
+        self.right_wheel_speed = 0.0
+        first_error: BaseException | None = None
+        for joint_index in self.drive_wheel_joint_indices:
+            try:
+                p.setJointMotorControl2(
+                    self.robot_id,
+                    joint_index,
+                    controlMode=p.VELOCITY_CONTROL,
+                    targetVelocity=0.0,
+                    force=self.drive_motor_force,
+                    physicsClientId=self.client_id,
+                )
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+        return first_error
+
+    def hold_current_steering_and_stop_drive(self, dt: float) -> None:
+        """差速车型没有转向执行器，仅把全部注册驱动轮置零。"""
+        _require_positive_finite("dt", dt)
+        first_error = self._stop_registered_drive_joints_best_effort()
+        if first_error is not None:
+            raise first_error
 
     def step_kinematic(self, dt: float, slope_deg: float, t: float) -> RobotState:
         """用差速车运动学更新位姿，保证 DIRECT 批量实验稳定可重复。"""
@@ -671,24 +719,41 @@ class ActiveSteeringRobot(DifferentialDriveRobot):
         dt: float = 1.0 / 240.0,
     ) -> tuple[float, float]:
         """把车体 v/w 转换为四轮驱动速度和前轮转向速度。"""
-        _require_finite_values("twist", (linear_velocity, angular_velocity))
-        _require_positive_finite("dt", dt)
+        command = self.wheel_command_from_twist(linear_velocity, angular_velocity, timestamp_ns=0, dt=dt)
         self.linear_velocity = float(linear_velocity)
         self.angular_velocity = float(angular_velocity)
-        drive_speed = self.linear_velocity / self.wheel_radius
-        if abs(self.linear_velocity) < 1e-6:
+        self.command_wheel_speeds(
+            command.drive_wheel_speed_rad_s,
+            command.steering_wheel_speed_rad_s,
+            dt=dt,
+        )
+        return command.drive_wheel_speed_rad_s[0], command.drive_wheel_speed_rad_s[1]
+
+    def wheel_command_from_twist(
+        self,
+        linear_velocity: float,
+        angular_velocity: float,
+        timestamp_ns: int,
+        dt: float = 1.0 / 240.0,
+    ) -> WheelCommand:
+        """纯计算四轮速度和限幅后的前轮转向速度。"""
+        _require_finite_values("twist", (linear_velocity, angular_velocity))
+        _require_positive_finite("dt", dt)
+        drive_speed = float(linear_velocity) / self.wheel_radius
+        if abs(linear_velocity) < 1e-6:
             desired_angle = 0.0
         else:
-            desired_angle = math.atan(self.model_spec.axle_distance * self.angular_velocity / self.linear_velocity)
+            desired_angle = math.atan(self.model_spec.axle_distance * angular_velocity / linear_velocity)
         desired_angle = max(-self.max_steering_angle, min(self.max_steering_angle, desired_angle))
         steering_rates = tuple(
             max(-self.MAX_STEERING_RATE, min(self.MAX_STEERING_RATE, (desired_angle - target) / dt))
             for target in self._steering_targets
         )
-        self.command_wheel_speeds((drive_speed, drive_speed, drive_speed, drive_speed), steering_rates, dt=dt)
-        self.left_wheel_speed = drive_speed
-        self.right_wheel_speed = drive_speed
-        return drive_speed, drive_speed
+        return WheelCommand(
+            timestamp_ns,
+            (drive_speed, drive_speed, drive_speed, drive_speed),
+            steering_rates,
+        )
 
     def read_steering_wheel_angles(self) -> tuple[float, ...]:
         """从两个前轮转向关节读取实际角度，而不是回显积分目标。"""
@@ -696,6 +761,55 @@ class ActiveSteeringRobot(DifferentialDriveRobot):
             float(p.getJointState(self.robot_id, joint_index, physicsClientId=self.client_id)[0])
             for joint_index in self.steering_joint_indices
         )
+
+    def hold_current_steering_and_stop_drive(self, dt: float) -> None:
+        """以超时瞬间的真实转角重设目标，同时停止四个驱动轮。"""
+        _require_positive_finite("dt", dt)
+        first_error = self._stop_registered_drive_joints_best_effort()
+        held_targets = list(self._steering_targets)
+        valid_targets: list[tuple[int, float]] = []
+
+        # 每个转向反馈独立读取；单个关节失败不妨碍其余可安全保持的关节。
+        for target_index, joint_index in enumerate(self.steering_joint_indices):
+            try:
+                angle = float(
+                    p.getJointState(
+                        self.robot_id,
+                        joint_index,
+                        physicsClientId=self.client_id,
+                    )[0]
+                )
+                _require_finite_values(
+                    f"steering_wheel_angles[{target_index}]",
+                    (angle,),
+                )
+                held_angle = max(
+                    -self.max_steering_angle,
+                    min(self.max_steering_angle, angle),
+                )
+                held_targets[target_index] = held_angle
+                valid_targets.append((joint_index, held_angle))
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+
+        self._steering_targets = held_targets
+        for joint_index, target in valid_targets:
+            try:
+                p.setJointMotorControl2(
+                    self.robot_id,
+                    joint_index,
+                    controlMode=p.POSITION_CONTROL,
+                    targetPosition=target,
+                    force=self.drive_motor_force,
+                    physicsClientId=self.client_id,
+                )
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+
+        if first_error is not None:
+            raise first_error
 
 
 def create_robot(

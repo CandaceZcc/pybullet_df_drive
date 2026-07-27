@@ -1,3 +1,4 @@
+# Conda 仿真环境依赖配置。
 name: slope-sim
 channels:
   - conda-forge
@@ -10,6 +11,12 @@ dependencies:
   - scipy
   - pyyaml
   - pyside6
+  - protobuf=6.33.6
+  - grpcio-tools=1.76.0
+  - packaging=26.2
+  - pip
   - pytest
   - jupyterlab
   - ipykernel
+  - pip:
+      - eclipse-ecal==6.1.1

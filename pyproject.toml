@@ -1,10 +1,18 @@
+# Python 项目与测试配置。
 [project]
 name = "pybullet-df-drive"
 version = "0.1.0"
 description = "Lightweight PyBullet slope simulation for a differential-drive mobile base."
 requires-python = ">=3.10,<3.11"
+dependencies = ["protobuf>=6.33.6,<6.34"]
+
+[project.optional-dependencies]
+dev = ["grpcio-tools==1.76.0"]
+interfaces = ["eclipse-ecal==6.1.1"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
-
+markers = [
+    "ecal: requires a real Eclipse eCAL Python runtime and cross-process transport",
+]

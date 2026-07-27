@@ -1,0 +1,48 @@
+// 阶段三企业接口：定义轮子控制、点云、RTK 与 IMU 的稳定线协议。
+syntax = "proto3";
+
+package slope_sim.interfaces.v1;
+
+message WheelCommand {
+  uint64 timestamp_ns = 1;
+  repeated float drive_wheel_speed_rad_s = 2;
+  repeated float steering_wheel_speed_rad_s = 3;
+}
+
+message WheelState {
+  uint64 timestamp_ns = 1;
+  repeated float drive_wheel_speed_rad_s = 2;
+  repeated float steering_wheel_angle_rad = 3;
+}
+
+message LidarPoint {
+  uint32 offset_time_ns = 1;
+  float x = 2;
+  float y = 3;
+  float z = 4;
+  uint32 reflectivity = 5;
+  uint32 tag = 6;
+  uint32 line = 7;
+}
+
+message LidarPointCloud {
+  uint64 timebase_ns = 1;
+  string frame_id = 2;
+  uint32 point_num = 3;
+  uint32 lidar_id = 4;
+  repeated LidarPoint points = 5;
+}
+
+message RtkState {
+  uint64 timestamp_ns = 1;
+  double main_x = 2;
+  double main_y = 3;
+  double main_z = 4;
+  double baseline_yaw_rad = 5;
+}
+
+message ImuAttitude {
+  uint64 timestamp_ns = 1;
+  double roll_rad = 2;
+  double pitch_rad = 3;
+}

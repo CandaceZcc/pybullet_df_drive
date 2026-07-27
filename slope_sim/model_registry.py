@@ -21,6 +21,8 @@ class RobotModelSpec:
     steering_joint_names: tuple[str, ...] = ()
     support_link_names: tuple[str, ...] = ()
     max_steering_angle: float = 0.55
+    max_drive_wheel_speed_rad_s: float = 20.0
+    max_steering_speed_rad_s: float = 2.0
 
 
 _DIFFERENTIAL_DRIVE_JOINTS = ("left_drive_wheel_joint", "right_drive_wheel_joint")
