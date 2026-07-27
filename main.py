@@ -31,6 +31,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--target-angular-velocity", type=float, default=None, help="Target yaw rate in rad/s.")
     parser.add_argument("--robot-model", choices=robot_model_names(), default=None, help="Robot URDF model.")
     parser.add_argument("--drive-model", choices=["physics"], default=None, help="PyBullet joint physics model.")
+    parser.add_argument("--interface-mode", choices=["auto", "ecal", "local"], default=None, help="Interface transport mode.")
+    parser.add_argument("--no-interface", action="store_true", help="Disable the enterprise interface.")
+    parser.add_argument("--no-interface-log", action="store_true", help="Disable enterprise interface logs.")
+    parser.add_argument("--scene-in", type=Path, default=None, help="Input scene document path.")
+    parser.add_argument("--scene-out", type=Path, default=None, help="Exported scene document path.")
+    parser.add_argument("--developer-diagnostics", action="store_true", help="Enable developer diagnostics.")
     parser.add_argument("--no-dashboard", action="store_true", help="Disable the PySide6 telemetry dashboard.")
     parser.add_argument("--dashboard-update-hz", type=float, default=None, help="Telemetry dashboard display refresh rate.")
     parser.add_argument("--dashboard-smoothing-alpha", type=float, default=None, help="Dashboard feedback smoothing alpha.")
@@ -63,6 +69,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         "target_angular_velocity": args.target_angular_velocity,
         "robot_model": args.robot_model,
         "drive_model": args.drive_model,
+        "interface_mode": args.interface_mode,
+        "no_interface": args.no_interface,
+        "no_interface_log": args.no_interface_log,
+        "scene_in": args.scene_in,
+        "scene_out": args.scene_out,
+        "developer_diagnostics": args.developer_diagnostics,
         "no_dashboard": args.no_dashboard,
         "dashboard_update_hz": args.dashboard_update_hz,
         "dashboard_smoothing_alpha": args.dashboard_smoothing_alpha,
@@ -94,6 +106,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"diagnostic_summary: {result.diagnostic_summary_path}")
     if result.obstacle_event_log_path is not None:
         print(f"obstacle_event_log: {result.obstacle_event_log_path}")
+    if result.interface_binary_log is not None:
+        print(f"interface_binary_log: {result.interface_binary_log}")
+    if result.interface_event_log is not None:
+        print(f"interface_event_log: {result.interface_event_log}")
+    if result.scene_export is not None:
+        print(f"scene_export: {result.scene_export}")
     for name, value in result.metrics.items():
         print(f"{name}: {value:.6f}")
     if result.diagnostic_summary is not None:

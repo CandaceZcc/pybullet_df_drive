@@ -149,3 +149,67 @@ def test_repository_configs_are_stage1_loadable(path: str):
     assert config.robot_model in robot_model_names()
     assert config.terrain_model in terrain_model_names()
     assert config.drive_model == "physics"
+
+
+def test_task12_interface_defaults_and_path_normalization():
+    config = ExperimentConfig(scene_in="scenes/input.yaml", scene_out="scenes/output.yaml")
+
+    assert config.interface_mode == "auto"
+    assert config.interface_enabled is True
+    assert config.interface_log_enabled is True
+    assert config.developer_diagnostics_enabled is False
+    assert config.scene_in == Path("scenes/input.yaml")
+    assert config.scene_out == Path("scenes/output.yaml")
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("interface_mode", None),
+        ("interface_mode", 1),
+        ("interface_mode", True),
+        ("interface_enabled", None),
+        ("interface_enabled", 1),
+        ("interface_enabled", "true"),
+        ("interface_log_enabled", None),
+        ("interface_log_enabled", 1),
+        ("interface_log_enabled", "true"),
+        ("developer_diagnostics_enabled", None),
+        ("developer_diagnostics_enabled", 1),
+        ("developer_diagnostics_enabled", "true"),
+        ("scene_in", 1),
+        ("scene_in", True),
+        ("scene_out", 1),
+        ("scene_out", True),
+    ],
+)
+def test_task12_rejects_wrong_types(field_name, value):
+    with pytest.raises(ValueError, match=field_name):
+        ExperimentConfig(**{field_name: value})
+
+
+@pytest.mark.parametrize("interface_mode", ["", "fake", "AUTO", 1])
+def test_task12_rejects_invalid_interface_mode(interface_mode):
+    with pytest.raises(ValueError, match="interface_mode"):
+        ExperimentConfig(interface_mode=interface_mode)
+
+
+def test_task12_cli_overrides_are_loaded(tmp_path: Path):
+    config = load_config(
+        tmp_path / "missing.yaml",
+        overrides={
+            "interface_mode": "local",
+            "interface_enabled": False,
+            "interface_log_enabled": False,
+            "scene_in": tmp_path / "in.yaml",
+            "scene_out": tmp_path / "out.yaml",
+            "developer_diagnostics_enabled": True,
+        },
+    )
+
+    assert config.interface_mode == "local"
+    assert config.interface_enabled is False
+    assert config.interface_log_enabled is False
+    assert config.scene_in == tmp_path / "in.yaml"
+    assert config.scene_out == tmp_path / "out.yaml"
+    assert config.developer_diagnostics_enabled is True

@@ -3,10 +3,13 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import TypeAlias
+from typing import TYPE_CHECKING, TypeAlias
 
 from slope_sim.obstacles import ObstacleGenerationRequest
 from slope_sim.scene import terrain_model_names
+
+if TYPE_CHECKING:
+    from slope_sim.scene_config import SceneDocument
 
 
 @dataclass(frozen=True)
@@ -77,6 +80,20 @@ class ClearObstaclesAction:
     """请求清空当前所有障碍物。"""
 
 
+@dataclass(frozen=True)
+class LoadSceneAction:
+    """请求加载经过校验的完整逻辑场景文档。"""
+
+    document: "SceneDocument"
+
+    def __post_init__(self) -> None:
+        """局部导入 SceneDocument，避免运行时模块循环依赖。"""
+        from slope_sim.scene_config import SceneDocument
+
+        if not isinstance(self.document, SceneDocument):
+            raise ValueError("document must be a SceneDocument")
+
+
 RuntimeAction: TypeAlias = (
     SwitchRobotAction
     | SwitchTerrainAction
@@ -84,9 +101,10 @@ RuntimeAction: TypeAlias = (
     | AddObstaclesAction
     | DeleteObstacleAction
     | ClearObstaclesAction
+    | LoadSceneAction
 )
 
 
 def is_safe_stop_action(action: RuntimeAction | None) -> bool:
     """结构操作中，只有会重建车辆或场地的动作需要立即清零驾驶命令。"""
-    return isinstance(action, (SwitchRobotAction, SwitchTerrainAction, ResetRobotAction))
+    return isinstance(action, (SwitchRobotAction, SwitchTerrainAction, ResetRobotAction, LoadSceneAction))

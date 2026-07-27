@@ -22,6 +22,17 @@ def _require_finite(name: str, value: object) -> None:
         raise ValueError(f"{name} must be a finite number")
 
 
+def _require_optional_path(name: str, value: object) -> Path | None:
+    """校验可选场景路径，并统一转换为 Path。"""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (str, Path)):
+        raise ValueError(f"{name} must be None, a string, or a Path")
+    if isinstance(value, str) and not value:
+        raise ValueError(f"{name} must not be empty")
+    return Path(value)
+
+
 @dataclass(frozen=True)
 class ExperimentConfig:
     """单次仿真实验的完整参数集合。"""
@@ -34,6 +45,12 @@ class ExperimentConfig:
     target_angular_velocity: float = 0.0
     robot_model: str = "df_back"
     drive_model: str = "physics"
+    interface_mode: str = "auto"
+    interface_enabled: bool = True
+    interface_log_enabled: bool = True
+    scene_in: Path | None = None
+    scene_out: Path | None = None
+    developer_diagnostics_enabled: bool = False
     dashboard_enabled: bool = True
     dashboard_update_hz: float = 5.0
     dashboard_smoothing_alpha: float = 0.35
@@ -75,6 +92,13 @@ class ExperimentConfig:
         drive_model = self.drive_model.lower()
         if drive_model != "physics":
             raise ValueError("drive_model must be 'physics' in stage 1")
+        if not isinstance(self.interface_mode, str) or self.interface_mode not in {"auto", "ecal", "local"}:
+            raise ValueError("interface_mode must be 'auto', 'ecal', or 'local'")
+        for field_name in ("interface_enabled", "interface_log_enabled", "developer_diagnostics_enabled"):
+            if not isinstance(getattr(self, field_name), bool):
+                raise ValueError(f"{field_name} must be a bool")
+        scene_in = _require_optional_path("scene_in", self.scene_in)
+        scene_out = _require_optional_path("scene_out", self.scene_out)
         terrain_model = self.terrain_model.lower()
         if terrain_model not in set(terrain_model_names()):
             raise ValueError(f"terrain_model must be one of: {', '.join(terrain_model_names())}")
@@ -155,6 +179,8 @@ class ExperimentConfig:
         object.__setattr__(self, "mode", mode)
         object.__setattr__(self, "robot_model", robot_model)
         object.__setattr__(self, "drive_model", drive_model)
+        object.__setattr__(self, "scene_in", scene_in)
+        object.__setattr__(self, "scene_out", scene_out)
         object.__setattr__(self, "terrain_model", terrain_model)
         object.__setattr__(self, "golf_relief", golf_relief)
         object.__setattr__(self, "camera_follow_view", camera_follow_view)
@@ -184,6 +210,18 @@ def load_config(path: str | Path = "configs/experiment.yaml", overrides: dict[st
         if key == "no_dashboard":
             if value:
                 data["dashboard_enabled"] = False
+            continue
+        if key == "no_interface":
+            if value:
+                data["interface_enabled"] = False
+            continue
+        if key == "no_interface_log":
+            if value:
+                data["interface_log_enabled"] = False
+            continue
+        if key == "developer_diagnostics":
+            if value:
+                data["developer_diagnostics_enabled"] = True
             continue
         if key == "lidar":
             if value:

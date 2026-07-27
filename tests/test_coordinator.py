@@ -251,6 +251,112 @@ def test_robot_switch_rolls_back_replacement_when_old_robot_removal_fails(monkey
         p.disconnect(client_id)
 
 
+def test_robot_switch_commits_replacement_when_old_removal_raises_after_deletion(
+    monkeypatch,
+):
+    """removeBody 删后抛错时，物理事实已提交，不能返回失效旧 world。"""
+    client_id = p.connect(p.DIRECT)
+    try:
+        config = ExperimentConfig(mode="gui", robot_model="df_back", terrain_model="flat")
+        world = load_manual_world(client_id, config, TerrainSelection("flat"), "df_back")
+        manager = _manager(client_id, world)
+        coordinator = SimulationCoordinator(client_id, config, world, manager)
+        old_robot_id = world.active_robot.robot.robot_id
+        original_remove = coordinator_module.p.removeBody
+
+        def remove_old_then_raise(body_id: int, **kwargs) -> None:
+            original_remove(body_id, **kwargs)
+            if body_id == old_robot_id:
+                raise RuntimeError("old robot removed before injected error")
+
+        monkeypatch.setattr(coordinator_module.p, "removeBody", remove_old_then_raise)
+
+        result = coordinator.apply_action(SwitchRobotAction("df_mid"))
+
+        assert result.state_changed is True
+        assert result.error_message is None
+        assert coordinator.world.active_robot.robot_model == "df_mid"
+        replacement_id = coordinator.world.active_robot.robot.robot_id
+        assert old_robot_id not in _body_ids(client_id)
+        assert _body_ids(client_id) == set(world.scene.body_ids) | {replacement_id}
+    finally:
+        p.disconnect(client_id)
+
+
+def test_robot_switch_rejects_remove_success_when_old_body_still_exists(monkeypatch):
+    """removeBody 假成功时必须清理 replacement，并继续返回仍有效的旧 world。"""
+    client_id = p.connect(p.DIRECT)
+    try:
+        config = ExperimentConfig(mode="gui", robot_model="df_back", terrain_model="flat")
+        world = load_manual_world(client_id, config, TerrainSelection("flat"), "df_back")
+        manager = _manager(client_id, world)
+        coordinator = SimulationCoordinator(client_id, config, world, manager)
+        old_robot_id = world.active_robot.robot.robot_id
+        before_ids = _body_ids(client_id)
+        original_remove = coordinator_module.p.removeBody
+
+        def leave_old_body(body_id: int, **kwargs) -> None:
+            if body_id == old_robot_id:
+                return
+            original_remove(body_id, **kwargs)
+
+        monkeypatch.setattr(coordinator_module.p, "removeBody", leave_old_body)
+
+        result = coordinator.apply_action(SwitchRobotAction("df_mid"))
+
+        assert result.state_changed is False
+        assert result.error_message is not None
+        assert "remained" in result.error_message
+        assert coordinator.world is world
+        assert _body_ids(client_id) == before_ids
+    finally:
+        p.disconnect(client_id)
+
+
+def test_robot_switch_body_diagnosis_failure_raises_instead_of_returning_world(
+    monkeypatch,
+):
+    """无法判断旧车是否删除时必须显式抛错，不能选择可能悬空的一侧。"""
+    client_id = p.connect(p.DIRECT)
+    try:
+        config = ExperimentConfig(mode="gui", robot_model="df_back", terrain_model="flat")
+        world = load_manual_world(client_id, config, TerrainSelection("flat"), "df_back")
+        manager = _manager(client_id, world)
+        coordinator = SimulationCoordinator(client_id, config, world, manager)
+        old_robot_id = world.active_robot.robot.robot_id
+        before_ids = _body_ids(client_id)
+        original_remove = coordinator_module.p.removeBody
+        original_current_body_ids = coordinator_module._current_body_ids
+        diagnosis_calls = 0
+
+        def leave_old_body(body_id: int, **kwargs) -> None:
+            if body_id == old_robot_id:
+                return
+            original_remove(body_id, **kwargs)
+
+        def fail_first_diagnosis(current_client_id: int) -> set[int]:
+            nonlocal diagnosis_calls
+            diagnosis_calls += 1
+            if diagnosis_calls == 1:
+                raise RuntimeError("robot body diagnosis unavailable")
+            return original_current_body_ids(current_client_id)
+
+        monkeypatch.setattr(coordinator_module.p, "removeBody", leave_old_body)
+        monkeypatch.setattr(
+            coordinator_module,
+            "_current_body_ids",
+            fail_first_diagnosis,
+        )
+
+        with pytest.raises(RuntimeError, match="robot body diagnosis unavailable"):
+            coordinator.apply_action(SwitchRobotAction("df_mid"))
+
+        assert coordinator.world is world
+        assert _body_ids(client_id) == before_ids
+    finally:
+        p.disconnect(client_id)
+
+
 def test_terrain_switch_snapshots_obstacles_and_restores_identity_xy_and_path_state():
     client_id = p.connect(p.DIRECT)
     try:
@@ -274,6 +380,43 @@ def test_terrain_switch_snapshots_obstacles_and_restores_identity_xy_and_path_st
         assert before[1].path is not None
         assert after[1].path.progress == pytest.approx(before[1].path.progress)
         assert after[1].path.direction == before[1].path.direction
+    finally:
+        p.disconnect(client_id)
+
+
+def test_disabled_terrain_switch_recovers_when_active_body_removal_fails_once(
+    monkeypatch,
+):
+    client_id = p.connect(p.DIRECT)
+    try:
+        config = ExperimentConfig(mode="gui", robot_model="df_back", terrain_model="flat")
+        world = load_manual_world(client_id, config, TerrainSelection("flat"), "df_back")
+        manager = _manager(client_id, world)
+        coordinator = SimulationCoordinator(client_id, config, world, manager)
+        failed_body_id = world.scene.body_ids[0]
+        original_remove = coordinator_module.p.removeBody
+        failures = 0
+
+        def fail_once(body_id: int, **kwargs) -> None:
+            nonlocal failures
+            if body_id == failed_body_id and failures == 0:
+                failures += 1
+                raise RuntimeError("disabled old terrain removal failed")
+            original_remove(body_id, **kwargs)
+
+        monkeypatch.setattr(coordinator_module.p, "removeBody", fail_once)
+
+        result = coordinator.apply_action(
+            SwitchTerrainAction(TerrainSelection("slope", slope_deg=4.0))
+        )
+
+        assert result.error_message is not None
+        assert "disabled old terrain removal failed" in result.error_message
+        assert coordinator.world.terrain == TerrainSelection("flat")
+        expected_ids = set(coordinator.world.scene.body_ids) | {
+            coordinator.world.active_robot.robot.robot_id
+        }
+        assert _body_ids(client_id) == expected_ids
     finally:
         p.disconnect(client_id)
 

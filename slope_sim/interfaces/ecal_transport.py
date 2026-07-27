@@ -1,0 +1,1339 @@
+# 真实 eCAL 传输适配器：隔离版本绑定、六话题资源、最新帧队列与重连生命周期。
+from __future__ import annotations
+
+from collections import OrderedDict
+from collections.abc import Callable
+from contextlib import contextmanager
+from dataclasses import dataclass
+from importlib import import_module
+import math
+from numbers import Real
+from threading import Condition, Lock, RLock, Thread, current_thread, local
+import time
+from typing import Any
+
+from google.protobuf.message import Message
+
+from slope_sim.interfaces.config import InterfaceConfig
+from slope_sim.interfaces.generated import slope_sim_interfaces_pb2 as pb
+from slope_sim.interfaces.transport import (
+    LocalTransport,
+    TRANSPORT_STATES,
+    TransportCallback,
+    TransportSnapshot,
+    TransportTopicQuality,
+)
+
+
+_UINT64_MAX = (1 << 64) - 1
+_ROLES = frozenset({"simulation", "peer"})
+_STOPPING_STATES = frozenset({"quiescing", "quiesced", "closing", "closed"})
+_CALLBACK_CONTEXT = local()
+
+
+class EcalUnavailableError(RuntimeError):
+    """表示已知的 eCAL Python binding 均无法导入。"""
+
+
+@contextmanager
+def _transport_callback_context(transport: object):
+    """标记当前用户回调及其所属 transport，供重入生命周期操作识别。"""
+    previous_depth = getattr(_CALLBACK_CONTEXT, "depth", 0)
+    previous_transports = getattr(_CALLBACK_CONTEXT, "transports", ())
+    _CALLBACK_CONTEXT.depth = previous_depth + 1
+    _CALLBACK_CONTEXT.transports = (*previous_transports, transport)
+    try:
+        yield
+    finally:
+        if previous_depth == 0:
+            del _CALLBACK_CONTEXT.depth
+        else:
+            _CALLBACK_CONTEXT.depth = previous_depth
+        if previous_transports:
+            _CALLBACK_CONTEXT.transports = previous_transports
+        else:
+            del _CALLBACK_CONTEXT.transports
+
+
+def _inside_transport_callback(transport: object) -> bool:
+    """判断当前线程是否正在该 transport 的 delivery gate 内执行用户代码。"""
+    return transport in getattr(_CALLBACK_CONTEXT, "transports", ())
+
+
+@dataclass(frozen=True)
+class EcalTransportSnapshot(TransportSnapshot):
+    """在通用传输计数之外暴露 eCAL 连接详情和连接代际。"""
+
+    detail: str
+    state: str
+    generation: int
+
+
+@dataclass(frozen=True)
+class _ChannelBinding:
+    """保存集中配置话题对应的完整类型名与 Protobuf 类。"""
+
+    topic: str
+    direction: str
+    type_name: str
+    message_type: type[Message]
+
+
+@dataclass(frozen=True)
+class _PendingMessage:
+    """保存异步发布线程尚未发送的单话题最新负载。"""
+
+    payload: bytes
+    sim_time_ns: int
+    wall_time: float
+
+
+class _CoreParticipant:
+    """把 eCAL 的进程级 initialize/finalize 包装成幂等 participant 资源。"""
+
+    def __init__(self, core: object) -> None:
+        self._core: object | None = core
+        self._closed = False
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        core = self._core
+        self._core = None
+        finalize = getattr(core, "finalize", None)
+        if not callable(finalize):
+            raise RuntimeError("eCAL core.finalize is unavailable")
+        result = finalize()
+        if result is False:
+            raise RuntimeError("eCAL core.finalize returned False")
+
+
+class _ProtoResource:
+    """保留官方 v6 Protobuf 资源，并在关闭时清除全部 Python 引用。"""
+
+    def __init__(
+        self,
+        raw: object,
+        *,
+        direction: str,
+        callback: Callable[..., None] | None = None,
+    ) -> None:
+        self.raw: object | None = raw
+        self.direction = direction
+        self.callback = callback
+        self._closed = False
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        raw = self.raw
+        self.raw = None
+        self.callback = None
+        if self.direction != "subscriber":
+            return
+        remove_callback = getattr(raw, "remove_receive_callback", None)
+        if not callable(remove_callback):
+            raise RuntimeError("eCAL Subscriber.remove_receive_callback is unavailable")
+        remove_callback()
+
+
+def _resource_raw(resource: _ProtoResource) -> object:
+    """拒绝访问已清引用的底层官方资源。"""
+    if resource.raw is None:
+        raise RuntimeError(f"eCAL {resource.direction} resource is closed")
+    return resource.raw
+
+
+def _resource_peer_connected(resource: _ProtoResource) -> bool:
+    """严格读取官方 v6 discovery count，拒绝 bool 和伪整数。"""
+    raw = _resource_raw(resource)
+    method_name = (
+        "get_publisher_count"
+        if resource.direction == "subscriber"
+        else "get_subscriber_count"
+    )
+    count_method = getattr(raw, method_name, None)
+    if not callable(count_method):
+        raise RuntimeError(f"eCAL resource.{method_name} is unavailable")
+    count = count_method()
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        raise RuntimeError("eCAL peer count must be a nonnegative integer")
+    return count > 0
+
+
+@dataclass(frozen=True)
+class EcalBindings:
+    """封装项目唯一支持的 Eclipse eCAL 6.1 官方 Protobuf API。"""
+
+    api: str
+    core: object
+    proto_core: object
+    common_core: object
+
+    @classmethod
+    def v61(
+        cls,
+        core: object,
+        proto_core: object,
+        common_core: object,
+    ) -> "EcalBindings":
+        """绑定 `nanobind_core` 和 `ecal.msg.proto.core` 官方路径。"""
+        cls._validate_modules(core, proto_core, common_core)
+        return cls("v6.1", core, proto_core, common_core)
+
+    @staticmethod
+    def _validate_modules(
+        core: object,
+        proto_core: object,
+        common_core: object,
+    ) -> None:
+        """导入成功后立即拒绝不完整 API，且不把兼容错误伪装成缺包。"""
+        required = (
+            (core, "initialize", "eCAL core.initialize"),
+            (core, "finalize", "eCAL core.finalize"),
+            (proto_core, "Publisher", "eCAL proto Publisher"),
+            (proto_core, "Subscriber", "eCAL proto Subscriber"),
+            (common_core, "ReceiveCallbackData", "eCAL ReceiveCallbackData"),
+        )
+        for owner, attribute, label in required:
+            if not callable(getattr(owner, attribute, None)):
+                raise RuntimeError(f"{label} is unavailable")
+
+    def create_participant(self, name: str) -> _CoreParticipant:
+        """初始化当前进程的 eCAL participant，并检查显式失败返回值。"""
+        result = self.core.initialize(name)
+        if result is False:
+            raise RuntimeError("eCAL core.initialize returned False")
+        return _CoreParticipant(self.core)
+
+    def create_publisher(
+        self,
+        topic: str,
+        message_type: type[Message],
+    ) -> _ProtoResource:
+        """创建绑定到固定 Protobuf 类的真实 publisher。"""
+        publisher_type = self.proto_core.Publisher
+        return _ProtoResource(
+            publisher_type(message_type, topic),
+            direction="publisher",
+        )
+
+    def create_subscriber(
+        self,
+        topic: str,
+        message_type: type[Message],
+        callback: Callable[[bytes], None],
+    ) -> _ProtoResource:
+        """创建 v6 subscriber，并只从 ReceiveCallbackData.message 复制负载。"""
+        subscriber_type = self.proto_core.Subscriber
+        subscriber = subscriber_type(message_type, topic)
+        resource = _ProtoResource(subscriber, direction="subscriber")
+
+        def protobuf_callback(_topic_id: object, data: object) -> None:
+            message = getattr(data, "message", None)
+            if not isinstance(message, Message):
+                raise RuntimeError(
+                    "eCAL ReceiveCallbackData.message must be a protobuf message"
+                )
+            callback(message.SerializeToString(deterministic=True))
+
+        resource.callback = protobuf_callback
+        set_callback = getattr(subscriber, "set_receive_callback", None)
+        if not callable(set_callback):
+            resource.close()
+            raise RuntimeError("eCAL Subscriber.set_receive_callback is unavailable")
+        try:
+            set_callback(protobuf_callback)
+        except BaseException:
+            resource.close()
+            raise
+        return resource
+
+    @staticmethod
+    def send(
+        publisher: _ProtoResource,
+        payload: bytes,
+        message_type: type[Message],
+    ) -> None:
+        """解析稳定线负载后交给 eCAL Protobuf publisher。"""
+        message = message_type()
+        message.ParseFromString(payload)
+        send = getattr(_resource_raw(publisher), "send", None)
+        if not callable(send):
+            raise RuntimeError("eCAL ProtoPublisher.send is unavailable")
+        result = send(message)
+        if result is False:
+            raise RuntimeError("eCAL ProtoPublisher.send returned False")
+
+    @staticmethod
+    def is_peer_connected(resource: _ProtoResource) -> bool:
+        """通过官方 count API 判断对应远端端点是否存在。"""
+        return _resource_peer_connected(resource)
+
+    @staticmethod
+    def close(resource: object) -> None:
+        """关闭由 binding 创建的 participant、publisher 或 subscriber。"""
+        close = getattr(resource, "close", None)
+        if not callable(close):
+            raise RuntimeError("eCAL resource.close is unavailable")
+        close()
+
+
+def _copy_ecal_payload(payload: object) -> bytes:
+    """把 eCAL 回调值复制成与上层 TransportCallback 一致的 bytes。"""
+    if isinstance(payload, Message):
+        return payload.SerializeToString(deterministic=True)
+    if isinstance(payload, (bytes, bytearray, memoryview)):
+        return bytes(payload)
+    raise ValueError("eCAL payload must be a protobuf message or bytes-like")
+
+
+def load_ecal_bindings() -> EcalBindings:
+    """只导入项目固定的 Eclipse eCAL 6.1 官方 API。"""
+    try:
+        core = import_module("ecal.nanobind_core")
+        proto_core = import_module("ecal.msg.proto.core")
+        common_core = import_module("ecal.msg.common.core")
+    except ImportError as error:
+        raise EcalUnavailableError(
+            f"official Eclipse eCAL 6.1 bindings unavailable: {error}"
+        ) from error
+    return EcalBindings.v61(core, proto_core, common_core)
+
+
+def _channel_bindings(config: InterfaceConfig) -> tuple[_ChannelBinding, ...]:
+    """按集中配置固定顺序组装六个话题和五种 Protobuf 类型。"""
+    return (
+        _ChannelBinding(
+            config.wheel_command.topic,
+            config.wheel_command.direction,
+            "slope_sim.interfaces.v1.WheelCommand",
+            pb.WheelCommand,
+        ),
+        _ChannelBinding(
+            config.wheel_state.topic,
+            config.wheel_state.direction,
+            "slope_sim.interfaces.v1.WheelState",
+            pb.WheelState,
+        ),
+        _ChannelBinding(
+            config.lidar_front.topic,
+            config.lidar_front.direction,
+            "slope_sim.interfaces.v1.LidarPointCloud",
+            pb.LidarPointCloud,
+        ),
+        _ChannelBinding(
+            config.lidar_rear.topic,
+            config.lidar_rear.direction,
+            "slope_sim.interfaces.v1.LidarPointCloud",
+            pb.LidarPointCloud,
+        ),
+        _ChannelBinding(
+            config.rtk.topic,
+            config.rtk.direction,
+            "slope_sim.interfaces.v1.RtkState",
+            pb.RtkState,
+        ),
+        _ChannelBinding(
+            config.imu.topic,
+            config.imu.direction,
+            "slope_sim.interfaces.v1.ImuAttitude",
+            pb.ImuAttitude,
+        ),
+    )
+
+
+def _require_nonempty_text(name: str, value: object) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{name} must be a nonempty string")
+    return value
+
+
+def _require_uint64(name: str, value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= _UINT64_MAX:
+        raise ValueError(f"{name} must be a uint64 integer")
+    return value
+
+
+def _require_wall_time(name: str, value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"{name} must be a nonnegative finite number")
+    normalized = float(value)
+    if not math.isfinite(normalized) or normalized < 0.0:
+        raise ValueError(f"{name} must be a nonnegative finite number")
+    return normalized
+
+
+def _require_queue_size(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError("queue_size must be a positive integer")
+    return value
+
+
+def _error_detail(error: BaseException) -> str:
+    """生成供逐话题质量快照消费的稳定非空错误说明。"""
+    message = str(error)
+    return f"{type(error).__name__}: {message}" if message else type(error).__name__
+
+
+class _DetailedLocalTransport(LocalTransport):
+    """为显式 local/auto 降级补充不会误报 eCAL 的状态详情。"""
+
+    def __init__(
+        self,
+        *,
+        monotonic: Callable[[], float] | None = None,
+        detail: str = "eCAL 未连接",
+    ) -> None:
+        super().__init__(monotonic=monotonic)
+        self._detail = _require_nonempty_text("detail", detail)
+
+    def snapshot(self) -> EcalTransportSnapshot:
+        base = super().snapshot()
+        return EcalTransportSnapshot(
+            mode=base.mode,
+            ecal_connected=base.ecal_connected,
+            published_count=base.published_count,
+            received_count=base.received_count,
+            error_count=base.error_count,
+            dropped_count=base.dropped_count,
+            topic_quality=base.topic_quality,
+            detail=self._detail,
+            state="disconnected",
+            generation=0,
+        )
+
+
+class EcalSubscription:
+    """逻辑订阅句柄；底层 eCAL subscriber 由 transport 集中持有。"""
+
+    def __init__(
+        self,
+        transport: "EcalTransport",
+        topic: str,
+        callback: TransportCallback,
+    ) -> None:
+        self._transport = transport
+        self._topic = topic
+        self._callback = callback
+        self._active = True
+
+    def close(self) -> None:
+        self._transport._close_subscription(self)
+
+
+class EcalTransport:
+    """集中创建六话题真实资源，并异步发送每话题最新 Protobuf 帧。"""
+
+    def __init__(
+        self,
+        config: InterfaceConfig | None = None,
+        *,
+        bindings: EcalBindings | Any | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+        start_worker: bool = True,
+        queue_size: int | None = None,
+        participant_name: str = "slope-sim",
+        role: str = "simulation",
+        peer_state_callback: Callable[[str], None] | None = None,
+    ) -> None:
+        selected_config = InterfaceConfig.default(transport_mode="ecal") if config is None else config
+        if not isinstance(selected_config, InterfaceConfig):
+            raise ValueError("config must be an InterfaceConfig")
+        if not callable(monotonic):
+            raise ValueError("monotonic must be callable")
+        if not isinstance(start_worker, bool):
+            raise ValueError("start_worker must be a bool")
+        if not isinstance(role, str) or role not in _ROLES:
+            raise ValueError("role must be 'simulation' or 'peer'")
+        if peer_state_callback is not None and not callable(peer_state_callback):
+            raise ValueError("peer_state_callback must be callable")
+        normalized_name = _require_nonempty_text("participant_name", participant_name)
+        selected_queue_size = (
+            selected_config.outgoing_queue_size if queue_size is None else queue_size
+        )
+
+        self._config = selected_config
+        self._bindings = load_ecal_bindings() if bindings is None else bindings
+        self._monotonic = monotonic
+        self._queue_size = _require_queue_size(selected_queue_size)
+        self._role = role
+        self._peer_state_callback = peer_state_callback
+        self._condition = Condition()
+        self._io_lock = Lock()
+        self._delivery_gate = RLock()
+        self._state = "initializing"
+        self._stop_worker = False
+        self._in_flight_deliveries = 0
+        self._cleanup_thread: Thread | None = None
+        self._cleanup_claimed = False
+        self._close_error: BaseException | None = None
+        self._quiesce_started = False
+        self._quiesce_complete = False
+        self._peer_connected = False
+        self._deferred_peer_connected: dict[str, bool] | None = None
+        self._generation = 0
+        self._detail = ""
+        self._published_count = 0
+        self._received_count = 0
+        self._error_count = 0
+        self._dropped_count = 0
+        self._pending: OrderedDict[str, _PendingMessage] = OrderedDict()
+        self._claimed_pending: tuple[str, _PendingMessage] | None = None
+        self._claimed_send_started = False
+        self._subscriptions: dict[str, list[EcalSubscription]] = {}
+        self._subscriber_resources: list[tuple[_ChannelBinding, object]] = []
+        self._publisher_resources: list[tuple[_ChannelBinding, object]] = []
+        self._publisher_by_topic: dict[str, tuple[_ChannelBinding, object]] = {}
+        self._subscriber_by_topic: dict[str, tuple[_ChannelBinding, object]] = {}
+        self._participant: object | None = None
+        self._worker: Thread | None = None
+
+        channels = _channel_bindings(selected_config)
+        if role == "peer":
+            channels = tuple(
+                _ChannelBinding(
+                    channel.topic,
+                    "publish" if channel.direction == "subscribe" else "subscribe",
+                    channel.type_name,
+                    channel.message_type,
+                )
+                for channel in channels
+            )
+        self._channels = channels
+        self._topic_quality = {
+            channel.topic: TransportTopicQuality(channel.topic)
+            for channel in channels
+        }
+
+        # 初始化是一个事务：任何阶段失败都逆序释放此前已经创建的真实资源。
+        try:
+            self._participant = self._bindings.create_participant(normalized_name)
+            for channel in channels:
+                if channel.direction != "subscribe":
+                    continue
+                resource = self._bindings.create_subscriber(
+                    channel.topic,
+                    channel.message_type,
+                    lambda payload, topic=channel.topic: self._on_payload(topic, payload),
+                )
+                self._subscriber_resources.append((channel, resource))
+                self._subscriber_by_topic[channel.topic] = (channel, resource)
+                self._subscriptions[channel.topic] = []
+            for channel in channels:
+                if channel.direction != "publish":
+                    continue
+                resource = self._bindings.create_publisher(
+                    channel.topic,
+                    channel.message_type,
+                )
+                self._publisher_resources.append((channel, resource))
+                self._publisher_by_topic[channel.topic] = (channel, resource)
+            self._state = "waiting_peer"
+            if start_worker:
+                self._worker = Thread(
+                    target=self._worker_main,
+                    name=f"ecal-{role}-publisher",
+                    daemon=True,
+                )
+                self._worker.start()
+        except BaseException:
+            self._cleanup_partial_initialization()
+            raise
+
+    @property
+    def worker_alive(self) -> bool:
+        worker = self._worker
+        return worker is not None and worker.is_alive()
+
+    @property
+    def role(self) -> str:
+        return self._role
+
+    def _cleanup_partial_initialization(self) -> None:
+        """初始化失败时继续清理全部资源，并保留最初的创建异常。"""
+        with self._condition:
+            self._stop_worker = True
+            self._pending.clear()
+            self._condition.notify_all()
+        worker = self._worker
+        if worker is not None:
+            try:
+                is_alive = getattr(worker, "is_alive", None)
+                join = getattr(worker, "join", None)
+                if callable(is_alive) and is_alive() and callable(join):
+                    join()
+            except BaseException:
+                pass
+        self._worker = None
+        for _channel, resource in reversed(self._publisher_resources):
+            try:
+                self._bindings.close(resource)
+            except BaseException:
+                pass
+        for _channel, resource in reversed(self._subscriber_resources):
+            try:
+                self._bindings.close(resource)
+            except BaseException:
+                pass
+        participant = self._participant
+        self._participant = None
+        self._publisher_by_topic.clear()
+        self._subscriber_by_topic.clear()
+        self._publisher_resources.clear()
+        self._subscriber_resources.clear()
+        if participant is not None:
+            try:
+                self._bindings.close(participant)
+            except BaseException:
+                pass
+
+    def _require_open_locked(self) -> None:
+        if self._state in _STOPPING_STATES:
+            raise RuntimeError("transport is closed")
+
+    def subscribe(
+        self,
+        topic: str,
+        type_name: str,
+        callback: TransportCallback,
+    ) -> EcalSubscription:
+        """把上层回调挂到已集中创建的真实 subscriber。"""
+        normalized_topic = _require_nonempty_text("topic", topic)
+        normalized_type = _require_nonempty_text("type_name", type_name)
+        if not callable(callback):
+            raise ValueError("callback must be callable")
+        with self._condition:
+            self._require_open_locked()
+            channel_resource = self._subscriber_by_topic.get(normalized_topic)
+            if channel_resource is None:
+                raise ValueError(f"topic {normalized_topic!r} is not configured for subscribe")
+            channel, _resource = channel_resource
+            if normalized_type != channel.type_name:
+                raise ValueError(
+                    f"topic {normalized_topic!r} requires type {channel.type_name!r}"
+                )
+            subscription = EcalSubscription(self, normalized_topic, callback)
+            self._subscriptions[normalized_topic].append(subscription)
+            return subscription
+
+    def _close_subscription(self, subscription: EcalSubscription) -> None:
+        """仅移除逻辑回调；真实 subscriber 随 transport 生命周期关闭。"""
+        with self._condition:
+            if not subscription._active:
+                return
+            subscription._active = False
+            callbacks = self._subscriptions.get(subscription._topic)
+            if callbacks is not None:
+                try:
+                    callbacks.remove(subscription)
+                except ValueError:
+                    pass
+
+    def publish(
+        self,
+        topic: str,
+        payload: bytes,
+        type_name: str,
+        sim_time_ns: int,
+        *,
+        wall_time: float | None = None,
+    ) -> bool:
+        """非阻塞提交单话题最新帧；覆盖旧帧时准确累计 dropped。"""
+        normalized_topic = _require_nonempty_text("topic", topic)
+        normalized_type = _require_nonempty_text("type_name", type_name)
+        if not isinstance(payload, (bytes, bytearray, memoryview)):
+            raise ValueError("payload must be bytes-like")
+        copied_payload = bytes(payload)
+        normalized_sim_time = _require_uint64("sim_time_ns", sim_time_ns)
+        clock_value = self._monotonic() if wall_time is None else wall_time
+        normalized_wall_time = _require_wall_time("wall_time", clock_value)
+
+        with self._condition:
+            self._require_open_locked()
+            channel_resource = self._publisher_by_topic.get(normalized_topic)
+            if channel_resource is None:
+                raise ValueError(f"topic {normalized_topic!r} is not configured for publish")
+            channel, _resource = channel_resource
+            if normalized_type != channel.type_name:
+                raise ValueError(
+                    f"topic {normalized_topic!r} requires type {channel.type_name!r}"
+                )
+
+            dropped_topic: str | None = None
+            if normalized_topic in self._pending:
+                del self._pending[normalized_topic]
+                dropped_topic = normalized_topic
+            elif len(self._pending) >= self._queue_size:
+                dropped_topic, _dropped_message = self._pending.popitem(last=False)
+            self._pending[normalized_topic] = _PendingMessage(
+                copied_payload,
+                normalized_sim_time,
+                normalized_wall_time,
+            )
+            if dropped_topic is not None:
+                self._dropped_count += 1
+                self._state = "degraded"
+                self._detail = "输出队列覆盖旧消息"
+                self._update_topic_quality_locked(
+                    dropped_topic,
+                    dropped_delta=1,
+                    state="degraded",
+                    detail="output queue replaced a pending message",
+                )
+            self._condition.notify_all()
+            return True
+
+    def pending_payload(self, topic: str) -> bytes | None:
+        """返回尚未发送的单话题负载副本，供队列诊断使用。"""
+        normalized_topic = _require_nonempty_text("topic", topic)
+        with self._condition:
+            pending = self._pending.get(normalized_topic)
+            return None if pending is None else bytes(pending.payload)
+
+    def _on_payload(self, topic: str, payload: object) -> None:
+        """锁外交付负载；至少一次成功且没有明确拒绝时才激活当前代。"""
+        copied_payload = _copy_ecal_payload(payload)
+        received_at = _require_wall_time("received_at", self._monotonic())
+        with self._condition:
+            if self._state in _STOPPING_STATES:
+                return
+            callback_generation = self._generation
+            callbacks = tuple(
+                subscription
+                for subscription in self._subscriptions.get(topic, ())
+                if subscription._active
+            )
+            self._received_count += 1
+            self._in_flight_deliveries += 1
+
+        self._delivery_gate.acquire()
+        transition: str | None = None
+        try:
+            accepted_current_generation = False
+            rejected_current_generation = False
+            for subscription in callbacks:
+                # 调用前先挡住已失效 delivery；用户 callback 始终在生命周期锁外执行。
+                with self._condition:
+                    if (
+                        self._state in _STOPPING_STATES
+                        or callback_generation != self._generation
+                    ):
+                        break
+                    if not subscription._active:
+                        continue
+
+                callback_error: Exception | None = None
+                accepted: bool | None = None
+                with _transport_callback_context(self):
+                    try:
+                        accepted = subscription._callback(copied_payload, received_at)
+                    except Exception as exc:
+                        callback_error = exc
+
+                # 返回后复核是结果的线性化点：旧代结果和异常不得污染新代。
+                with self._condition:
+                    if (
+                        self._state in _STOPPING_STATES
+                        or callback_generation != self._generation
+                    ):
+                        break
+                    if callback_error is not None:
+                        self._record_error_locked(callback_error)
+                    elif accepted is False:
+                        rejected_current_generation = True
+                    elif accepted is True or accepted is None:
+                        accepted_current_generation = True
+                    else:
+                        self._record_error_locked(
+                            TypeError("transport callback must return bool or None")
+                        )
+
+            with self._condition:
+                if (
+                    self._state not in _STOPPING_STATES
+                    and callback_generation == self._generation
+                ):
+                    self._set_topic_peer_connected_locked(topic, True)
+                    if topic == self._config.wheel_command.topic:
+                        self._peer_connected = True
+                        if (
+                            accepted_current_generation
+                            and not rejected_current_generation
+                        ):
+                            transition = self._set_state_locked("active", self._detail)
+                        elif self._state == "disconnected":
+                            transition = self._set_state_locked(
+                                "waiting_peer", self._detail
+                            )
+            self._notify_peer_transition(transition)
+            self._drain_deferred_peer_state()
+        finally:
+            self._delivery_gate.release()
+            with self._condition:
+                self._in_flight_deliveries -= 1
+                self._condition.notify_all()
+            # 仍位于底层 subscriber callback 栈，绝不能在此同步销毁 subscriber。
+
+    def _set_state_locked(self, state: str, detail: str) -> str | None:
+        """调用方持锁时提交状态，并返回需要在锁外通知的变化。"""
+        if state not in TRANSPORT_STATES:
+            raise RuntimeError(f"invalid eCAL state: {state}")
+        changed = self._state != state
+        self._state = state
+        self._detail = detail
+        return state if changed else None
+
+    def _notify_peer_transition(self, transition: str | None) -> None:
+        """在 transport 锁外通知上层，以便断连时清邮箱和归零目标。"""
+        if transition is None or self._peer_state_callback is None:
+            return
+        try:
+            with _transport_callback_context(self):
+                self._peer_state_callback(transition)
+        except Exception as exc:
+            self._record_error(exc)
+        finally:
+            self._run_deferred_cleanup_if_safe()
+
+    def _apply_peer_state_locked(
+        self,
+        connected: bool,
+        *,
+        previously_known: bool,
+    ) -> str | None:
+        """只用命令话题 discovery 驱动安全代际和全局连接状态。"""
+        def publish_lifecycle_state(state: str, detail: str) -> str | None:
+            if any(
+                quality.state != "active"
+                for quality in self._topic_quality.values()
+            ):
+                # 健康错误保留在快照中，但连接边沿仍必须通知 runtime 清命令。
+                return state
+            return self._set_state_locked(state, detail)
+
+        if not previously_known:
+            self._peer_connected = connected
+            if connected:
+                initial_state = "active" if self._role == "peer" else "waiting_peer"
+                return publish_lifecycle_state(initial_state, "")
+            return publish_lifecycle_state(
+                "disconnected", "eCAL 命令对端未连接"
+            )
+        if connected and not self._peer_connected:
+            self._peer_connected = True
+            reconnected_state = "active" if self._role == "peer" else "waiting_peer"
+            return publish_lifecycle_state(reconnected_state, "")
+        if not connected and self._peer_connected:
+            self._peer_connected = False
+            self._generation += 1
+            return publish_lifecycle_state("disconnected", "eCAL 对端已断开")
+        return None
+
+    def _apply_peer_states_locked(
+        self,
+        observed: dict[str, bool],
+    ) -> str | None:
+        """原子提交六话题 discovery，命令边沿单独驱动 mailbox 生命周期。"""
+        command_topic = self._config.wheel_command.topic
+        command_quality = self._topic_quality[command_topic]
+        command_previously_known = command_quality.peer_connected is not None
+        for topic, connected in observed.items():
+            self._set_topic_peer_connected_locked(topic, connected)
+        return self._apply_peer_state_locked(
+            observed[command_topic],
+            previously_known=command_previously_known,
+        )
+
+    def _drain_deferred_peer_state(self) -> None:
+        """在 delivery gate 内处理用户回调重入时暂存的最新 discovery 结果。"""
+        while True:
+            with self._condition:
+                if self._state in _STOPPING_STATES:
+                    self._deferred_peer_connected = None
+                    return
+                observed = self._deferred_peer_connected
+                self._deferred_peer_connected = None
+                if observed is None:
+                    return
+                transition = self._apply_peer_states_locked(observed)
+            self._notify_peer_transition(transition)
+
+    def _record_error(self, error: Exception) -> None:
+        with self._condition:
+            self._record_error_locked(error)
+
+    def _record_error_locked(self, error: Exception) -> None:
+        """调用方持生命周期锁时原子提交当前代错误。"""
+        if self._state in _STOPPING_STATES:
+            return
+        self._error_count += 1
+        detail = str(error)
+        self._state = "error"
+        self._detail = (
+            f"{type(error).__name__}: {detail}" if detail else type(error).__name__
+        )
+
+    def _record_publish_error_locked(self, topic: str, error: Exception) -> None:
+        """同步累计全局和话题发送错误，关闭期不得改写 lifecycle 状态。"""
+        detail = _error_detail(error)
+        self._error_count += 1
+        self._update_topic_quality_locked(
+            topic,
+            error_delta=1,
+            state="error",
+            detail=detail,
+        )
+        if self._state not in _STOPPING_STATES:
+            self._state = "error"
+            self._detail = detail
+
+    def _update_topic_quality_locked(
+        self,
+        topic: str,
+        *,
+        error_delta: int = 0,
+        dropped_delta: int = 0,
+        state: str,
+        detail: str,
+    ) -> None:
+        """调用方持锁时原子累计单话题质量并推进 revision。"""
+        current = self._topic_quality[topic]
+        self._topic_quality[topic] = TransportTopicQuality(
+            topic=topic,
+            error_count=current.error_count + error_delta,
+            dropped_count=current.dropped_count + dropped_delta,
+            state=state,
+            detail=detail,
+            revision=current.revision + 1,
+            last_error_detail=(
+                detail if error_delta else current.last_error_detail
+            ),
+            last_drop_detail=(
+                detail if dropped_delta else current.last_drop_detail
+            ),
+            peer_connected=current.peer_connected,
+        )
+
+    def _set_topic_peer_connected_locked(self, topic: str, connected: bool) -> None:
+        """只在单话题 discovery 值变化时推进质量 revision。"""
+        current = self._topic_quality[topic]
+        if current.peer_connected is connected:
+            return
+        self._topic_quality[topic] = TransportTopicQuality(
+            topic=topic,
+            error_count=current.error_count,
+            dropped_count=current.dropped_count,
+            state=current.state,
+            detail=current.detail,
+            revision=current.revision + 1,
+            last_error_detail=current.last_error_detail,
+            last_drop_detail=current.last_drop_detail,
+            peer_connected=connected,
+        )
+
+    def _recover_topic_quality_locked(self, topic: str) -> None:
+        """成功发送清除该话题活动故障，但保留累计 error/drop。"""
+        current = self._topic_quality[topic]
+        if current.state == "active":
+            return
+        self._topic_quality[topic] = TransportTopicQuality(
+            topic=topic,
+            error_count=current.error_count,
+            dropped_count=current.dropped_count,
+            state="active",
+            detail="",
+            revision=current.revision + 1,
+            last_error_detail=current.last_error_detail,
+            last_drop_detail=current.last_drop_detail,
+            peer_connected=current.peer_connected,
+        )
+
+    def poll_peer_state(self) -> str:
+        """逐话题轮询 discovery；只有命令边沿改变安全代际。"""
+        with self._condition:
+            self._require_open_locked()
+            monitored = self._discovery_resources_locked()
+        try:
+            observed = {
+                topic: self._bindings.is_peer_connected(resource)
+                for topic, resource in monitored
+            }
+        except Exception as exc:
+            self._record_error(exc)
+            raise
+
+        # 同线程用户回调已经持有 delivery gate，结果留到整个 delivery 返回前处理。
+        if _inside_transport_callback(self):
+            with self._condition:
+                self._require_open_locked()
+                self._deferred_peer_connected = observed
+                return self._state
+
+        # delivery 与 discovery 共用独立门，确保断线清邮箱后旧 payload 不再进入上层。
+        with self._delivery_gate:
+            with self._condition:
+                self._require_open_locked()
+                transition = self._apply_peer_states_locked(observed)
+            self._notify_peer_transition(transition)
+            self._drain_deferred_peer_state()
+            with self._condition:
+                return self._state
+
+    def _discovery_resources_locked(self) -> tuple[tuple[str, object], ...]:
+        """按集中配置顺序返回本角色六个 publisher/subscriber 资源。"""
+        resources: list[tuple[str, object]] = []
+        for channel in self._channels:
+            resource_map = (
+                self._subscriber_by_topic
+                if channel.direction == "subscribe"
+                else self._publisher_by_topic
+            )
+            channel_resource = resource_map.get(channel.topic)
+            if channel_resource is None:
+                raise RuntimeError(
+                    f"eCAL discovery resource is unavailable: {channel.topic}"
+                )
+            resources.append((channel.topic, channel_resource[1]))
+        return tuple(resources)
+
+    def _worker_main(self) -> None:
+        """保证 worker 自身触发关闭时在退出安全点接管延期清理。"""
+        try:
+            self._worker_loop()
+        finally:
+            with self._condition:
+                if self._quiesce_started:
+                    self._quiesce_complete = True
+                    if self._state == "quiescing":
+                        self._state = "quiesced"
+                    self._condition.notify_all()
+            self._run_deferred_cleanup_if_safe(worker_epilogue=True)
+
+    def _worker_loop(self) -> None:
+        """串行发送最新帧并持续刷新 discovery，不阻塞物理发布线程。"""
+        while True:
+            pending: tuple[str, _PendingMessage] | None = None
+            with self._condition:
+                if not self._stop_worker and not self._pending:
+                    self._condition.wait(timeout=0.050)
+                if self._stop_worker or self._state in _STOPPING_STATES:
+                    return
+                if self._pending:
+                    pending = self._pending.popitem(last=False)
+                    if self._claimed_pending is not None:
+                        raise RuntimeError("worker already owns a claimed pending message")
+                    self._claimed_pending = pending
+                    self._claimed_send_started = False
+
+            if pending is not None:
+                topic, message = pending
+                try:
+                    channel, publisher = self._publisher_by_topic[topic]
+                    with self._io_lock:
+                        with self._condition:
+                            if self._state in _STOPPING_STATES:
+                                self._drop_claimed_pending_locked(topic)
+                                return
+                            self._require_claimed_pending_locked(topic)
+                            self._claimed_send_started = True
+                        self._bindings.send(
+                            publisher,
+                            message.payload,
+                            channel.message_type,
+                        )
+                except Exception as exc:
+                    with self._condition:
+                        self._clear_claimed_pending_locked(topic)
+                        self._record_publish_error_locked(topic, exc)
+                else:
+                    with self._condition:
+                        self._clear_claimed_pending_locked(topic)
+                        self._published_count += 1
+                        self._recover_topic_quality_locked(topic)
+                        if (
+                            self._state == "degraded"
+                            and not self._pending
+                            and all(
+                                quality.state == "active"
+                                for quality in self._topic_quality.values()
+                            )
+                        ):
+                            recovered = "active" if self._peer_connected else "waiting_peer"
+                            self._set_state_locked(recovered, "")
+
+            try:
+                self.poll_peer_state()
+            except (RuntimeError, ValueError):
+                with self._condition:
+                    if self._state in _STOPPING_STATES:
+                        return
+
+    def _require_claimed_pending_locked(self, topic: str) -> None:
+        """调用方持锁时确认 worker 仍唯一拥有指定待发送帧。"""
+        if self._claimed_pending is None or self._claimed_pending[0] != topic:
+            raise RuntimeError("worker claimed pending ownership changed unexpectedly")
+
+    def _clear_claimed_pending_locked(self, topic: str) -> None:
+        """发送完成或失败后原子释放 worker 的 claimed 帧。"""
+        self._require_claimed_pending_locked(topic)
+        self._claimed_pending = None
+        self._claimed_send_started = False
+        self._condition.notify_all()
+
+    def _drop_claimed_pending_locked(self, topic: str) -> None:
+        """closing 先于 send 线性化时，将 claimed 帧恰好计为一次 dropped。"""
+        self._require_claimed_pending_locked(topic)
+        if self._claimed_send_started:
+            raise RuntimeError("claimed send already crossed its linearization point")
+        self._claimed_pending = None
+        self._dropped_count += 1
+        self._update_topic_quality_locked(
+            topic,
+            dropped_delta=1,
+            state="degraded",
+            detail="transport closed before claimed message was sent",
+        )
+        self._condition.notify_all()
+
+    def snapshot(self) -> EcalTransportSnapshot:
+        """在一个临界区复制连接语义、代际和全部累计计数。"""
+        with self._condition:
+            return self._snapshot_locked()
+
+    def _snapshot_locked(self) -> EcalTransportSnapshot:
+        """调用方持生命周期锁时构造完整 eCAL 快照。"""
+        return EcalTransportSnapshot(
+            mode="ecal",
+            ecal_connected=self._peer_connected,
+            published_count=self._published_count,
+            received_count=self._received_count,
+            error_count=self._error_count,
+            dropped_count=self._dropped_count,
+            topic_quality=tuple(self._topic_quality.values()),
+            detail=self._detail,
+            state=(
+                "disconnected" if self._state in _STOPPING_STATES else self._state
+            ),
+            generation=self._generation,
+        )
+
+    def _begin_quiesce_locked(self) -> None:
+        """原子关闭入口，并把尚未由 worker 认领的帧恰好计数一次。"""
+        if self._quiesce_started:
+            return
+        self._quiesce_started = True
+        self._state = "quiescing"
+        self._peer_connected = False
+        self._deferred_peer_connected = None
+        self._generation += 1
+        for subscriptions in self._subscriptions.values():
+            for subscription in subscriptions:
+                subscription._active = False
+            subscriptions.clear()
+        for pending_topic in self._pending:
+            self._dropped_count += 1
+            self._update_topic_quality_locked(
+                pending_topic,
+                dropped_delta=1,
+                state="degraded",
+                detail="transport closed before pending message was sent",
+            )
+        self._pending.clear()
+        self._stop_worker = True
+        self._condition.notify_all()
+
+    def _finish_quiesce(self, *, wait_for_deliveries: bool) -> EcalTransportSnapshot:
+        """停止并汇合 publisher worker；外部 quiesce 还等待既有 delivery。"""
+        callback_context = _inside_transport_callback(self)
+        worker_context = current_thread() is self._worker
+        with self._condition:
+            if self._state == "closed":
+                return self._snapshot_locked()
+            self._begin_quiesce_locked()
+            worker = self._worker
+
+        if worker is not None and not worker_context:
+            worker.join()
+
+        with self._condition:
+            if worker is None or worker_context or not worker.is_alive():
+                self._quiesce_complete = True
+                if self._state == "quiescing":
+                    self._state = "quiesced"
+                self._condition.notify_all()
+            if wait_for_deliveries and not callback_context and not worker_context:
+                while self._in_flight_deliveries > 0:
+                    self._condition.wait()
+            return self._snapshot_locked()
+
+    def quiesce(self) -> EcalTransportSnapshot:
+        """停止新 payload 和发布 worker，并返回资源关闭前的最终质量。"""
+        return self._finish_quiesce(wait_for_deliveries=True)
+
+    def close(self) -> None:
+        """关闭资源；callback 内只发起异步清理，外部调用等待同一最终结果。"""
+        callback_context = _inside_transport_callback(self)
+        worker_context = current_thread() is self._worker
+        cleanup_thread: Thread | None = None
+        run_cleanup_inline = False
+
+        with self._condition:
+            if self._state == "closed":
+                close_error = self._close_error
+            elif self._state == "closing":
+                if callback_context or worker_context:
+                    return
+                if not self._cleanup_claimed:
+                    self._cleanup_claimed = True
+                    run_cleanup_inline = True
+                    close_error = None
+                else:
+                    while self._state != "closed":
+                        self._condition.wait()
+                    close_error = self._close_error
+            else:
+                self._begin_quiesce_locked()
+                self._state = "closing"
+
+                if callback_context or worker_context:
+                    cleanup_thread = Thread(
+                        target=self._claim_and_cleanup,
+                        name=f"ecal-{self._role}-cleanup",
+                        daemon=True,
+                    )
+                    self._cleanup_thread = cleanup_thread
+                    close_error = None
+                else:
+                    self._cleanup_claimed = True
+                    run_cleanup_inline = True
+                    close_error = None
+
+        if cleanup_thread is not None:
+            try:
+                cleanup_thread.start()
+            except BaseException as exc:
+                self._remember_close_error(exc)
+                self._run_deferred_cleanup_if_safe()
+                raise
+            return
+        if run_cleanup_inline:
+            self._cleanup_resources()
+            with self._condition:
+                close_error = self._close_error
+        if close_error is not None:
+            raise close_error
+
+    def _claim_and_cleanup(self) -> None:
+        """让第一个安全执行者取得唯一 cleanup 所有权。"""
+        with self._condition:
+            if self._state != "closing" or self._cleanup_claimed:
+                return
+            self._cleanup_claimed = True
+        self._cleanup_resources()
+
+    def _run_deferred_cleanup_if_safe(self, *, worker_epilogue: bool = False) -> None:
+        """callback/worker 退出后接管未成功启动的异步 cleanup。"""
+        if _inside_transport_callback(self):
+            return
+        if current_thread() is self._worker and not worker_epilogue:
+            return
+        with self._condition:
+            if self._in_flight_deliveries != 0 and not worker_epilogue:
+                return
+        self._claim_and_cleanup()
+
+    def _remember_close_error(self, error: BaseException) -> None:
+        """并发 cleanup 阶段只保留按锁顺序观察到的第一个错误。"""
+        with self._condition:
+            if self._close_error is None:
+                self._close_error = error
+            self._condition.notify_all()
+
+    def _cleanup_resources(self) -> None:
+        """唯一清理所有者按固定顺序关闭资源，并发布共享完成结果。"""
+        self._finish_quiesce(wait_for_deliveries=False)
+
+        for _channel, resource in reversed(self._subscriber_resources):
+            try:
+                self._bindings.close(resource)
+            except BaseException as exc:
+                self._remember_close_error(exc)
+
+        # 某些 binding 的 subscriber.close 不带回调屏障，因此再等 transport delivery。
+        with self._condition:
+            while self._in_flight_deliveries > 0:
+                self._condition.wait()
+
+        # 与 worker 的 send 共用 I/O 锁，确保 publisher 销毁时没有正在发送的调用。
+        with self._io_lock:
+            for _channel, resource in reversed(self._publisher_resources):
+                try:
+                    self._bindings.close(resource)
+                except BaseException as exc:
+                    self._remember_close_error(exc)
+
+        participant = self._participant
+        self._participant = None
+        self._publisher_by_topic.clear()
+        self._subscriber_by_topic.clear()
+        self._publisher_resources.clear()
+        self._subscriber_resources.clear()
+        if participant is not None:
+            try:
+                self._bindings.close(participant)
+            except BaseException as exc:
+                self._remember_close_error(exc)
+
+        with self._condition:
+            self._quiesce_complete = True
+            self._state = "closed"
+            self._detail = ""
+            self._condition.notify_all()
+
+
+def create_transport(
+    mode: str,
+    *,
+    config: InterfaceConfig | None = None,
+    bindings: EcalBindings | Any | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
+    start_worker: bool = True,
+    queue_size: int | None = None,
+    participant_name: str = "slope-sim",
+    role: str = "simulation",
+    peer_state_callback: Callable[[str], None] | None = None,
+) -> LocalTransport | EcalTransport:
+    """按严格 ecal、auto 降级或显式 local 模式创建传输。"""
+    if not isinstance(mode, str) or mode not in {"auto", "ecal", "local"}:
+        raise ValueError("mode must be 'auto', 'ecal', or 'local'")
+    if not callable(monotonic):
+        raise ValueError("monotonic must be callable")
+    if mode == "local":
+        return _DetailedLocalTransport(monotonic=monotonic)
+
+    selected_bindings = bindings
+    if selected_bindings is None:
+        try:
+            selected_bindings = load_ecal_bindings()
+        except EcalUnavailableError as exc:
+            if mode == "ecal":
+                raise
+            return _DetailedLocalTransport(
+                monotonic=monotonic,
+                detail=_error_detail(exc),
+            )
+
+    selected_config = InterfaceConfig.default(transport_mode=mode) if config is None else config
+    return EcalTransport(
+        selected_config,
+        bindings=selected_bindings,
+        monotonic=monotonic,
+        start_worker=start_worker,
+        queue_size=queue_size,
+        participant_name=participant_name,
+        role=role,
+        peer_state_callback=peer_state_callback,
+    )

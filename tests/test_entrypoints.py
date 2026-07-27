@@ -1,5 +1,7 @@
 # 入口测试：覆盖 main/analysis 的参数解析和日志分析入口。
 from pathlib import Path
+import subprocess
+import sys
 
 import pandas as pd
 import pytest
@@ -8,6 +10,24 @@ from analysis import analyze_log
 import main as main_module
 from main import parse_args
 from slope_sim.simulation import SimulationResult
+
+
+def test_simulation_and_coordinator_import_without_cycle_in_fresh_process():
+    """入口模块必须保持单向依赖，不能依靠当前进程的模块缓存碰巧导入成功。"""
+    repository_root = Path(__file__).resolve().parents[1]
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import slope_sim.simulation; import slope_sim.coordinator",
+        ],
+        cwd=repository_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
 
 
 @pytest.mark.parametrize(
@@ -134,6 +154,87 @@ def test_main_reports_obstacle_event_log_when_present(tmp_path: Path, monkeypatc
     assert main_module.main(["--mode", "direct"]) == 0
 
     assert f"obstacle_event_log: {tmp_path / 'obstacles.jsonl'}" in capsys.readouterr().out
+
+
+def test_task12_parse_args_and_main_propagate_interface_overrides(tmp_path: Path, monkeypatch):
+    args = parse_args(
+        [
+            "--interface-mode",
+            "ecal",
+            "--no-interface",
+            "--no-interface-log",
+            "--scene-in",
+            str(tmp_path / "in.yaml"),
+            "--scene-out",
+            str(tmp_path / "out.yaml"),
+            "--developer-diagnostics",
+        ]
+    )
+    assert args.interface_mode == "ecal"
+    assert args.no_interface is True
+    assert args.no_interface_log is True
+    assert args.scene_in == tmp_path / "in.yaml"
+    assert args.scene_out == tmp_path / "out.yaml"
+    assert args.developer_diagnostics is True
+
+    captured = {}
+    from slope_sim.config import ExperimentConfig
+
+    def fake_load_config(path, overrides):
+        captured["path"] = path
+        captured["overrides"] = overrides
+        return ExperimentConfig()
+
+    monkeypatch.setattr(main_module, "load_config", fake_load_config)
+    monkeypatch.setattr(
+        main_module,
+        "run_experiment",
+        lambda _config: SimulationResult(Path("run.csv"), Path("run.png"), {}),
+    )
+
+    assert main_module.main(
+        [
+            "--interface-mode",
+            "local",
+            "--no-interface",
+            "--no-interface-log",
+            "--scene-in",
+            str(tmp_path / "in.yaml"),
+            "--scene-out",
+            str(tmp_path / "out.yaml"),
+            "--developer-diagnostics",
+        ]
+    ) == 0
+
+    overrides = captured["overrides"]
+    assert overrides["interface_mode"] == "local"
+    assert overrides["no_interface"] is True
+    assert overrides["no_interface_log"] is True
+    assert overrides["scene_in"] == tmp_path / "in.yaml"
+    assert overrides["scene_out"] == tmp_path / "out.yaml"
+    assert overrides["developer_diagnostics"] is True
+
+
+def test_task12_main_reports_interface_and_scene_outputs(tmp_path: Path, monkeypatch, capsys):
+    monkeypatch.setattr(
+        main_module,
+        "run_experiment",
+        lambda _config: SimulationResult(
+            tmp_path / "run.csv",
+            tmp_path / "run.png",
+            {},
+            interface_binary_log=tmp_path / "interface.bin",
+            interface_event_log=tmp_path / "interface.jsonl",
+            scene_export=tmp_path / "scene.yaml",
+        ),
+    )
+
+    assert main_module.main(["--mode", "direct"]) == 0
+
+    output = capsys.readouterr().out
+    assert f"interface_binary_log: {tmp_path / 'interface.bin'}" in output
+    assert f"interface_event_log: {tmp_path / 'interface.jsonl'}" in output
+    assert f"scene_export: {tmp_path / 'scene.yaml'}" in output
 
 
 def test_analyze_log_generates_metrics_and_figure(tmp_path: Path):
