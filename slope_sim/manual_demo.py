@@ -2,16 +2,24 @@
 from __future__ import annotations
 
 from collections import deque
+import os
 from pathlib import Path
+import sys
 import time
 
 import pandas as pd
 import pybullet as p
 
 from slope_sim.config import ExperimentConfig
-from slope_sim.coordinator import SimulationCoordinator, create_obstacle_manager, load_manual_robot, load_manual_world, reload_manual_robot
+from slope_sim.coordinator import (
+    SimulationCoordinator,
+    build_world_from_scene_document,
+    load_manual_robot,
+    reload_manual_robot,
+)
 from slope_sim.dashboard import DashboardCommand, TelemetryDashboard
 from slope_sim.diagnostics import compute_diagnostic_summary, write_diagnostic_summary
+from slope_sim.interfaces.config import InterfaceConfig
 from slope_sim.logger import CsvSimulationLogger, ObstacleEventLogger
 from slope_sim.manual_control import ManualCommand, ManualControlSettings, command_from_keyboard
 from slope_sim.metrics import compute_tracking_metrics
@@ -27,12 +35,28 @@ from slope_sim.runtime_actions import (
     is_safe_stop_action,
 )
 from slope_sim.scene import configure_gui_visualizer, update_follow_camera
+from slope_sim.scene_config import dump_scene_atomic
 from slope_sim.simulation import (
+    InterfaceSession,
     SimulationResult,
     _probe_terrain_for_robot,
     _read_lidar_for_robot,
+    create_interface_session,
+    initial_scene_document,
     plot_feedback_figures,
     plot_trajectory,
+)
+from slope_sim.window_layout import (
+    PYBULLET_WINDOW_TITLE,
+    PYBULLET_WINDOW_TOKEN_ENV,
+    WindowLayoutError,
+    align_window_layout_to_scale,
+    apply_main_window_rect,
+    calculate_window_layout,
+    connect_pybullet_gui,
+    primary_display_metrics,
+    search_x11_window_ids,
+    x11_available_geometry,
 )
 
 
@@ -55,6 +79,7 @@ def merge_manual_commands(dashboard_command: DashboardCommand, keyboard_command:
         return DashboardCommand(
             0.0,
             0.0,
+            paused=dashboard_command.paused,
             should_exit=True,
             structural_action=dashboard_command.structural_action,
             camera_follow_enabled=dashboard_command.camera_follow_enabled,
@@ -65,12 +90,23 @@ def merge_manual_commands(dashboard_command: DashboardCommand, keyboard_command:
         return DashboardCommand(
             0.0,
             0.0,
+            paused=dashboard_command.paused,
             should_exit=dashboard_command.should_exit,
             structural_action=dashboard_command.structural_action,
             camera_follow_enabled=dashboard_command.camera_follow_enabled,
             camera_follow_view=dashboard_command.camera_follow_view,
         )
     dashboard_has_motion = abs(dashboard_command.linear_velocity) > 1e-12 or abs(dashboard_command.angular_velocity) > 1e-12
+    if dashboard_command.paused:
+        return DashboardCommand(
+            0.0,
+            0.0,
+            paused=True,
+            should_exit=dashboard_command.should_exit,
+            structural_action=dashboard_command.structural_action,
+            camera_follow_enabled=dashboard_command.camera_follow_enabled,
+            camera_follow_view=dashboard_command.camera_follow_view,
+        )
     if dashboard_has_motion or dashboard_command.should_exit:
         return dashboard_command
     keyboard_has_motion = abs(keyboard_command.linear_velocity) > 1e-12 or abs(keyboard_command.angular_velocity) > 1e-12
@@ -79,6 +115,7 @@ def merge_manual_commands(dashboard_command: DashboardCommand, keyboard_command:
     return DashboardCommand(
         keyboard_command.linear_velocity,
         keyboard_command.angular_velocity,
+        paused=dashboard_command.paused,
         should_exit=dashboard_command.should_exit,
         structural_action=dashboard_command.structural_action,
         camera_follow_enabled=dashboard_command.camera_follow_enabled,
@@ -102,11 +139,13 @@ def limit_manual_command_step(
         raise ValueError("angular_acceleration_limit must be positive")
     if (
         target_command.should_exit
+        or target_command.paused
         or is_safe_stop_action(target_command.structural_action)
     ):
         return DashboardCommand(
             0.0,
             0.0,
+            paused=target_command.paused,
             should_exit=target_command.should_exit,
             structural_action=target_command.structural_action,
             camera_follow_enabled=target_command.camera_follow_enabled,
@@ -115,6 +154,7 @@ def limit_manual_command_step(
     return DashboardCommand(
         _step_toward(previous_command.linear_velocity, target_command.linear_velocity, linear_acceleration_limit * dt),
         _step_toward(previous_command.angular_velocity, target_command.angular_velocity, angular_acceleration_limit * dt),
+        paused=target_command.paused,
         should_exit=target_command.should_exit,
         structural_action=target_command.structural_action,
         camera_follow_enabled=target_command.camera_follow_enabled,
@@ -249,24 +289,66 @@ def run_manual_demo(config: ExperimentConfig, *, duration_limit_sec: float | Non
     if config.mode != "gui":
         raise ValueError("manual demo requires GUI mode; use --gui --manual")
 
-    client_id = p.connect(p.GUI)
-    if client_id < 0:
-        raise RuntimeError("Failed to connect to PyBullet GUI")
+    # 配置文件先完成全量验证，失败时不能创建任何 PyBullet scene/robot body。
+    document = initial_scene_document(config)
+
+    # GUI 手动入口才创建 QApplication；局部引用需保留到两个窗口均关闭。
+    from PySide6 import QtWidgets
+
+    qt_application = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    display_metrics = primary_display_metrics()
+    available = x11_available_geometry(display_metrics)
+    layout = align_window_layout_to_scale(
+        calculate_window_layout(available, config.dashboard_enabled),
+        display_metrics.device_pixel_ratio,
+    )
+    existing_pybullet_windows = search_x11_window_ids(
+        PYBULLET_WINDOW_TITLE,
+        only_visible=False,
+    )
+    client_id = connect_pybullet_gui(layout.main, pybullet_module=p)
 
     logger: CsvSimulationLogger | None = None
     obstacle_event_logger: ObstacleEventLogger | None = None
     dashboard: TelemetryDashboard | None = None
+    interface_session: InterfaceSession | None = None
+    interface_log_paths = None
+    log_path: Path | None = None
     event_log_path: Path | None = None
+    scene_export: Path | None = None
     try:
-        # 场景和机器人仍复用自动仿真的构建逻辑，避免两套世界配置不一致。
-        terrain = TerrainSelection(
-            terrain_model=config.terrain_model,
-            slope_deg=config.slope_deg,
-            golf_seed=config.golf_seed,
-            golf_relief=config.golf_relief,
+        claim_token = os.environ.get(PYBULLET_WINDOW_TOKEN_ENV)
+        claim_kwargs = {} if claim_token is None else {"claim_token": claim_token}
+        if existing_pybullet_windows:
+            apply_main_window_rect(
+                layout.main,
+                excluded_window_ids=existing_pybullet_windows,
+                **claim_kwargs,
+            )
+        else:
+            apply_main_window_rect(layout.main, **claim_kwargs)
+        world, obstacle_manager = build_world_from_scene_document(
+            client_id,
+            config,
+            document,
         )
-        world = load_manual_world(client_id, config, terrain, config.robot_model)
-        coordinator = SimulationCoordinator(client_id, config, world, create_obstacle_manager(client_id, world))
+        if config.interface_enabled:
+            interface_session = create_interface_session(
+                config,
+                client_id=client_id,
+                coordinator_world=world,
+                obstacle_manager=obstacle_manager,
+                document=document,
+            )
+        coordinator = SimulationCoordinator(
+            client_id,
+            config,
+            world,
+            obstacle_manager,
+            interface_runtime=None if interface_session is None else interface_session.runtime,
+            sensor_document=document.sensors,
+        )
+        terrain = world.terrain
         scene = world.scene
         active_robot = world.active_robot
         robot = active_robot.robot
@@ -277,13 +359,18 @@ def run_manual_demo(config: ExperimentConfig, *, duration_limit_sec: float | Non
             config.camera_pitch,
             config.camera_target,
         )
-        manual_prefix = f"manual_{config.terrain_model}_{active_robot.robot_model}_{config.slope_deg:g}"
+        manual_prefix = (
+            f"manual_{terrain.terrain_model}_{active_robot.robot_model}_{terrain.slope_deg:g}"
+        )
         logger = CsvSimulationLogger(config.log_dir, prefix=manual_prefix)
         obstacle_event_logger = ObstacleEventLogger(config.log_dir, prefix=f"{manual_prefix}_obstacles")
 
         linear_slider = None
         angular_slider = None
         if config.dashboard_enabled:
+            interface_config = InterfaceConfig.default(
+                transport_mode=config.interface_mode
+            )
             try:
                 dashboard = TelemetryDashboard(
                     max_linear_speed=config.target_linear_velocity,
@@ -302,12 +389,22 @@ def run_manual_demo(config: ExperimentConfig, *, duration_limit_sec: float | Non
                     plot_snapshot_dir=config.figure_dir,
                     camera_follow_enabled=config.camera_follow_enabled,
                     camera_follow_view=config.camera_follow_view,
+                    interface_config=interface_config,
+                    developer_diagnostics_enabled=config.developer_diagnostics_enabled,
                 )
             except Exception as exc:
-                print(f"Dashboard unavailable, fallback to PyBullet debug sliders: {exc}")
+                raise RuntimeError(f"dashboard construction failed: {exc}") from exc
+            if layout.dashboard is None:
+                raise WindowLayoutError(
+                    "dashboard layout is unavailable while Dashboard is enabled"
+                )
+            dashboard.apply_window_rect(
+                layout.dashboard,
+                display_metrics=display_metrics,
+            )
 
         if dashboard is None:
-            # PyBullet 自带调参滑条作为兜底，不额外依赖侧窗。
+            # 仅 Dashboard 明确禁用时保留 PyBullet 自带调参滑条。
             linear_slider = p.addUserDebugParameter("max linear speed [m/s]", 0.0, 1.2, config.target_linear_velocity)
             angular_slider = p.addUserDebugParameter("max angular speed [rad/s]", 0.0, 2.0, 0.8)
 
@@ -320,10 +417,12 @@ def run_manual_demo(config: ExperimentConfig, *, duration_limit_sec: float | Non
         limited_command = DashboardCommand(
             0.0,
             0.0,
+            paused=False,
             camera_follow_enabled=camera_follow_enabled,
             camera_follow_view=camera_follow_view,
         )
         handled_result = None
+        runtime_paused = False
         pending_event_actions: deque[RuntimeAction] = deque()
         while max_steps is None or step < max_steps:
             if dashboard is not None:
@@ -348,6 +447,7 @@ def run_manual_demo(config: ExperimentConfig, *, duration_limit_sec: float | Non
                 command = DashboardCommand(
                     keyboard_command.linear_velocity,
                     keyboard_command.angular_velocity,
+                    paused=False,
                     should_exit=keyboard_command.should_exit,
                     camera_follow_enabled=camera_follow_enabled,
                     camera_follow_view=camera_follow_view,
@@ -364,8 +464,9 @@ def run_manual_demo(config: ExperimentConfig, *, duration_limit_sec: float | Non
                     dashboard.set_switch_busy(True, "应用中")
 
             target_command = DashboardCommand(
-                0.0 if out_of_bounds_latched or safe_stop_requested else command.linear_velocity,
-                0.0 if out_of_bounds_latched or safe_stop_requested else command.angular_velocity,
+                0.0 if out_of_bounds_latched or safe_stop_requested or command.paused else command.linear_velocity,
+                0.0 if out_of_bounds_latched or safe_stop_requested or command.paused else command.angular_velocity,
+                paused=command.paused,
                 should_exit=command.should_exit,
                 structural_action=structural_action,
                 camera_follow_enabled=camera_follow_enabled,
@@ -383,25 +484,63 @@ def run_manual_demo(config: ExperimentConfig, *, duration_limit_sec: float | Non
                 )
             linear_velocity = limited_command.linear_velocity
             angular_velocity = limited_command.angular_velocity
-            robot.command_twist(linear_velocity, angular_velocity, dt=config.time_step)
             t = step * config.time_step
-            if config.drive_model == "physics":
-                try:
-                    result = coordinator.step(config.time_step)
-                except Exception as exc:
+            if interface_session is not None:
+                runtime = interface_session.runtime
+                runtime.poll_transport()
+                if command.paused:
+                    if not runtime_paused:
+                        runtime.pause()
+                        runtime_paused = True
                     if dashboard is not None:
-                        dashboard.show_switch_status(f"切换失败: {exc}", is_error=True)
-                    raise
-                world = coordinator.world
-                scene = world.scene
-                terrain = world.terrain
-                active_robot = world.active_robot
-                robot = active_robot.robot
+                        dashboard.update_interface_snapshot(runtime.dashboard_snapshot())
+                    time.sleep(config.time_step)
+                    continue
+                if runtime_paused:
+                    runtime.resume()
+                    runtime_paused = False
+                if interface_session.actual_transport_mode == "local":
+                    runtime.submit_local_twist(
+                        linear_velocity,
+                        angular_velocity,
+                        config.time_step,
+                    )
+                    reported_linear_velocity = linear_velocity
+                    reported_angular_velocity = angular_velocity
+                else:
+                    # 真实 eCAL 只消费外部 WheelCommand，Dashboard 速度不构成控制输入。
+                    reported_linear_velocity = 0.0
+                    reported_angular_velocity = 0.0
+                runtime.before_physics_step(config.time_step)
+            else:
+                if command.paused:
+                    time.sleep(config.time_step)
+                    continue
+                robot.command_twist(linear_velocity, angular_velocity, dt=config.time_step)
+                reported_linear_velocity = linear_velocity
+                reported_angular_velocity = angular_velocity
+
+            try:
+                result = coordinator.step(config.time_step)
+            except Exception as exc:
+                if dashboard is not None:
+                    dashboard.show_switch_status(f"切换失败: {exc}", is_error=True)
+                raise
+            if interface_session is not None:
+                interface_session.runtime.after_physics_step(config.time_step)
+
+            # 结构事务可能替换整个 world，后续读取必须重新取得当前 robot 引用。
+            world = coordinator.world
+            scene = world.scene
+            terrain = world.terrain
+            active_robot = world.active_robot
+            robot = active_robot.robot
+            if config.drive_model == "physics":
                 lidar_summary = _read_lidar_for_robot(client_id, robot, config)
                 state = robot.read_physics_state(
                     t=t,
-                    command_linear_velocity=linear_velocity,
-                    command_angular_velocity=angular_velocity,
+                    command_linear_velocity=reported_linear_velocity,
+                    command_angular_velocity=reported_angular_velocity,
                     ground_lateral_friction=config.ground_lateral_friction,
                     drive_lateral_friction=config.drive_lateral_friction,
                     ground_rolling_friction=config.ground_rolling_friction,
@@ -413,19 +552,11 @@ def run_manual_demo(config: ExperimentConfig, *, duration_limit_sec: float | Non
                     lidar_summary=lidar_summary,
                 )
             else:
-                # 当前阶段保留运动学推进，保证初学阶段的轨迹稳定、容易观察。
-                state = robot.step_kinematic(dt=config.time_step, slope_deg=scene.slope_deg, t=t)
-                try:
-                    result = coordinator.step(config.time_step)
-                except Exception as exc:
-                    if dashboard is not None:
-                        dashboard.show_switch_status(f"切换失败: {exc}", is_error=True)
-                    raise
-                world = coordinator.world
-                scene = world.scene
-                terrain = world.terrain
-                active_robot = world.active_robot
-                robot = active_robot.robot
+                state = robot.step_kinematic(
+                    dt=config.time_step,
+                    slope_deg=scene.slope_deg,
+                    t=t,
+                )
             if result is not None and result is not handled_result:
                 handled_result = result
                 event_action = pending_event_actions[0] if pending_event_actions else None
@@ -451,12 +582,14 @@ def run_manual_demo(config: ExperimentConfig, *, duration_limit_sec: float | Non
                     limited_command = DashboardCommand(
                         0.0,
                         0.0,
+                        paused=False,
                         camera_follow_enabled=camera_follow_enabled,
                         camera_follow_view=camera_follow_view,
                     )
                 if dashboard is not None:
                     dashboard.sync_active_selection(result.world.active_robot.robot_model, result.world.terrain)
-                    if result.state_changed:
+                    # 障碍物增删清不替换车辆或 runtime generation，需保留监控历史。
+                    if result.state_changed and result.obstacle_result is None:
                         dashboard.reset_feedback_history()
                     queue_still_busy = getattr(coordinator, "has_pending_action", False)
                     obstacle_still_busy = result.obstacle_result is not None and not result.obstacle_result.done
@@ -479,7 +612,15 @@ def run_manual_demo(config: ExperimentConfig, *, duration_limit_sec: float | Non
                     camera_follow_view,
                 )
             if dashboard is not None:
-                dashboard.update_obstacle_snapshots(coordinator.obstacle_manager.snapshot(include_body_id=False))
+                if interface_session is not None:
+                    dashboard.update_interface_snapshot(
+                        interface_session.runtime.dashboard_snapshot()
+                    )
+                dashboard.update_obstacle_snapshots(
+                    lambda manager=coordinator.obstacle_manager: manager.snapshot(
+                        include_body_id=False
+                    )
+                )
                 dashboard.update(state)
             logger.record(
                 state,
@@ -491,20 +632,49 @@ def run_manual_demo(config: ExperimentConfig, *, duration_limit_sec: float | Non
             time.sleep(config.time_step)
             step += 1
 
-        log_path = logger.close()
-        logger = None
-        event_log_path = obstacle_event_logger.close()
-        obstacle_event_logger = None
+        if config.scene_out is not None:
+            scene_export = dump_scene_atomic(
+                coordinator.logical_scene_document(),
+                config.scene_out,
+            )
     finally:
-        if logger is not None:
-            log_path = logger.close()
-        if obstacle_event_logger is not None:
-            event_log_path = obstacle_event_logger.close()
+        # 正常和异常共用同一清理路径；主异常存续时只记录次生清理错误。
+        primary_exception_active = sys.exc_info()[0] is not None
+        cleanup_error: BaseException | None = None
+        if interface_session is not None:
+            try:
+                interface_log_paths = interface_session.close()
+            except BaseException as exc:
+                cleanup_error = exc
         if dashboard is not None:
-            dashboard.close()
-        # 不管中途是否退出，都要断开 PyBullet，避免 GUI/物理客户端残留。
-        p.disconnect(client_id)
+            try:
+                dashboard.close()
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+        if logger is not None:
+            try:
+                log_path = logger.close()
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+        if obstacle_event_logger is not None:
+            try:
+                event_log_path = obstacle_event_logger.close()
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+        try:
+            # PyBullet 必须最后断开，runtime.close 的安全停车和传感器读取仍依赖 client。
+            p.disconnect(client_id)
+        except BaseException as exc:
+            if cleanup_error is None:
+                cleanup_error = exc
+        if not primary_exception_active and cleanup_error is not None:
+            raise cleanup_error
 
+    if log_path is None:
+        raise RuntimeError("manual CSV logger did not return a path")
     frame = pd.read_csv(log_path)
     diagnostic_summary = compute_diagnostic_summary(frame)
     diagnostic_summary_path = write_diagnostic_summary(log_path, diagnostic_summary)
@@ -520,4 +690,11 @@ def run_manual_demo(config: ExperimentConfig, *, duration_limit_sec: float | Non
         diagnostic_summary=diagnostic_summary.to_dict(),
         diagnostic_summary_path=diagnostic_summary_path,
         obstacle_event_log_path=event_log_path,
+        interface_binary_log=(
+            None if interface_log_paths is None else interface_log_paths.binary_path
+        ),
+        interface_event_log=(
+            None if interface_log_paths is None else interface_log_paths.event_path
+        ),
+        scene_export=scene_export,
     )
