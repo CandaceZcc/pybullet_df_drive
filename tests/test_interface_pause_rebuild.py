@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 from threading import Event, Lock, Thread
+import time
 
 import pytest
 
 from slope_sim.interfaces.codec import ProtoCodec
+from slope_sim.interfaces.config import InterfaceConfig
 from slope_sim.interfaces.dashboard_snapshot import LidarTopViewFrame
 from slope_sim.interfaces.models import LidarPointCloud, WheelCommand
+from slope_sim.interfaces.runtime import InterfaceRuntime
 from slope_sim.lidar_pointcloud import LidarScanResult
 
 from test_interface_runtime_integration import (
@@ -21,6 +24,26 @@ from test_interface_runtime_integration import (
     make_runtime,
     scene_document,
 )
+
+
+def _make_runtime_with_robot(
+    robot: Robot,
+    *,
+    backend: Backend | None = None,
+    document=None,
+):
+    """允许生命周期并发测试注入可阻塞的真实 wheel 端口。"""
+    clock = Clock()
+    transport = Transport()
+    runtime = InterfaceRuntime(
+        robot,
+        config=InterfaceConfig.default(transport_mode="local"),
+        transport=transport,
+        monotonic=clock,
+        sensor_backend=backend,
+        scene_document=document,
+    )
+    return runtime, robot, transport, clock
 
 
 class BlockingFrontPublishTransport(Transport):
@@ -816,39 +839,393 @@ class BlockingLidar:
         return self.scan_with_top_view(timestamp_ns).message
 
 
-def test_expensive_old_sensor_scan_cannot_publish_after_rebuild() -> None:
-    runtime, _robot, transport, clock = make_runtime(
-        backend=Backend(),
+class BlockingWheelRobot(Robot):
+    """阻塞旧世界轮速读取，暴露重建或关闭是否过早触碰机器人。"""
+
+    def __init__(self, robot_id: int = 1) -> None:
+        super().__init__(robot_id)
+        self.read_entered = Event()
+        self.release_read = Event()
+
+    def read_interface_wheel_state(self, timestamp_ns: int):
+        self.read_entered.set()
+        assert self.release_read.wait(timeout=3.0)
+        return super().read_interface_wheel_state(timestamp_ns)
+
+
+class BlockingBindBackend(Backend):
+    """阻塞场景分类绑定，记录 backend 是否在绑定结束前被关闭。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.bind_entered = Event()
+        self.release_bind = Event()
+        self.bind_exited = Event()
+        self.closed_while_binding = False
+
+    def bind_scene(self, terrain_ids, snapshots) -> None:
+        self.bind_entered.set()
+        try:
+            assert self.release_bind.wait(timeout=3.0)
+            super().bind_scene(terrain_ids, snapshots)
+        finally:
+            self.bind_exited.set()
+            self.trace.append("bind_scene.exited")
+
+    def close(self) -> None:
+        if self.bind_entered.is_set() and not self.bind_exited.is_set():
+            self.closed_while_binding = True
+        super().close()
+
+
+def test_expensive_old_sensor_scan_blocks_prepare_commit_until_reader_exits() -> None:
+    old_backend = Backend()
+    runtime, robot, transport, clock = make_runtime(
+        backend=old_backend,
         document=scene_document(),
     )
     blocking = BlockingLidar()
     runtime._front_lidar = blocking
     runtime._rear_lidar = StubLidar("lidar_rear", 2)
     runtime._truth_sensor_suite = StubTruth()
-    errors: list[BaseException] = []
+    after_errors: list[BaseException] = []
+    rebuild_errors: list[BaseException] = []
+    prepare_returned = Event()
+    commit_returned = Event()
 
     def run_after() -> None:
         try:
             runtime.after_physics_step(0.1)
         except BaseException as exc:  # pragma: no cover - 汇合后断言
-            errors.append(exc)
+            after_errors.append(exc)
 
-    worker = Thread(target=run_after, daemon=True)
+    def run_rebuild() -> None:
+        try:
+            runtime.prepare_world_rebuild()
+            prepare_returned.set()
+            runtime.commit_world_rebuild(Robot(8), Backend(), scene_document())
+            commit_returned.set()
+        except BaseException as exc:  # pragma: no cover - 汇合后断言
+            rebuild_errors.append(exc)
+
+    after_thread = Thread(target=run_after, daemon=True)
+    rebuild_thread = Thread(target=run_rebuild, daemon=True)
     try:
         clock.advance(0.1)
-        worker.start()
+        after_thread.start()
         assert blocking.entered.wait(timeout=2.0)
-        runtime.prepare_world_rebuild()
-        runtime.commit_world_rebuild(Robot(8), Backend(), scene_document())
-        blocking.release.set()
-        worker.join(timeout=2.0)
+        rebuild_thread.start()
 
-        assert not worker.is_alive()
-        assert errors == []
+        assert not prepare_returned.wait(timeout=0.2)
+        assert not commit_returned.is_set()
+        assert robot.safe_stops == 0
+        assert old_backend.trace == []
+
+        blocking.release.set()
+        after_thread.join(timeout=2.0)
+        rebuild_thread.join(timeout=2.0)
+
+        assert not after_thread.is_alive() and not rebuild_thread.is_alive()
+        assert after_errors == rebuild_errors == []
+        assert prepare_returned.is_set() and commit_returned.is_set()
+        assert old_backend.trace == ["backend.close"]
         assert runtime.config.lidar_front.topic not in [item[0] for item in transport.published]
     finally:
         blocking.release.set()
-        worker.join(timeout=2.0)
+        after_thread.join(timeout=2.0)
+        rebuild_thread.join(timeout=2.0)
+        runtime.close()
+
+
+def test_old_wheel_reader_blocks_prepare_before_safe_stop() -> None:
+    robot = BlockingWheelRobot()
+    runtime, _selected_robot, _transport, _clock = _make_runtime_with_robot(robot)
+    after_errors: list[BaseException] = []
+    prepare_errors: list[BaseException] = []
+    prepare_returned = Event()
+
+    def run_after() -> None:
+        try:
+            runtime.after_physics_step(0.01)
+        except BaseException as exc:  # pragma: no cover - 汇合后断言
+            after_errors.append(exc)
+
+    def run_prepare() -> None:
+        try:
+            runtime.prepare_world_rebuild()
+            prepare_returned.set()
+        except BaseException as exc:  # pragma: no cover - 汇合后断言
+            prepare_errors.append(exc)
+
+    after_thread = Thread(target=run_after, daemon=True)
+    prepare_thread = Thread(target=run_prepare, daemon=True)
+    try:
+        after_thread.start()
+        assert robot.read_entered.wait(timeout=2.0)
+        prepare_thread.start()
+
+        assert not prepare_returned.wait(timeout=0.2)
+        assert robot.safe_stops == 0
+
+        robot.release_read.set()
+        after_thread.join(timeout=2.0)
+        prepare_thread.join(timeout=2.0)
+        assert not after_thread.is_alive() and not prepare_thread.is_alive()
+        assert after_errors == prepare_errors == []
+        assert prepare_returned.is_set()
+        assert robot.safe_stops == 1
+    finally:
+        robot.release_read.set()
+        after_thread.join(timeout=2.0)
+        prepare_thread.join(timeout=2.0)
+        runtime.close()
+
+
+def test_old_wheel_reader_blocks_rebind_before_safe_stop_and_swap() -> None:
+    robot = BlockingWheelRobot(robot_id=31)
+    runtime, _selected_robot, _transport, _clock = _make_runtime_with_robot(robot)
+    new_robot = Robot(32)
+    after_errors: list[BaseException] = []
+    rebind_errors: list[BaseException] = []
+    rebind_returned = Event()
+
+    def run_after() -> None:
+        try:
+            runtime.after_physics_step(0.01)
+        except BaseException as exc:  # pragma: no cover - 汇合后断言
+            after_errors.append(exc)
+
+    def run_rebind() -> None:
+        try:
+            runtime.rebind_robot(new_robot)
+        except BaseException as exc:  # pragma: no cover - 汇合后断言
+            rebind_errors.append(exc)
+        finally:
+            rebind_returned.set()
+
+    after_thread = Thread(target=run_after, daemon=True)
+    rebind_thread = Thread(target=run_rebind, daemon=True)
+    try:
+        after_thread.start()
+        assert robot.read_entered.wait(timeout=2.0)
+        rebind_thread.start()
+
+        blocked_before_release = not rebind_returned.wait(timeout=0.2)
+        safe_stops_before_release = robot.safe_stops
+        binding_before_release = runtime.bound_robot_id
+
+        robot.release_read.set()
+        after_thread.join(timeout=2.0)
+        rebind_thread.join(timeout=2.0)
+
+        assert blocked_before_release
+        assert safe_stops_before_release == 0
+        assert binding_before_release == 31
+        assert not after_thread.is_alive() and not rebind_thread.is_alive()
+        assert after_errors == rebind_errors == []
+        assert rebind_returned.is_set()
+        assert robot.safe_stops == 1
+        assert runtime.bound_robot_id == 32
+    finally:
+        robot.release_read.set()
+        after_thread.join(timeout=2.0)
+        rebind_thread.join(timeout=2.0)
+        runtime.close()
+
+
+@pytest.mark.parametrize("lifecycle", ("rebuild", "close"))
+def test_scene_binding_blocks_backend_release_until_operation_exits(
+    lifecycle: str,
+) -> None:
+    backend = BlockingBindBackend()
+    runtime, _robot, _transport, _clock = make_runtime(
+        backend=backend,
+        document=scene_document(),
+    )
+    refresh_errors: list[BaseException] = []
+    lifecycle_errors: list[BaseException] = []
+    lifecycle_returned = Event()
+
+    def run_refresh() -> None:
+        try:
+            runtime.refresh_scene_bindings((17,), (object(),))
+        except BaseException as exc:  # pragma: no cover - 汇合后断言
+            refresh_errors.append(exc)
+
+    def run_lifecycle() -> None:
+        try:
+            if lifecycle == "rebuild":
+                runtime.prepare_world_rebuild()
+                runtime.commit_world_rebuild(Robot(41), Backend(), scene_document())
+            else:
+                runtime.close()
+        except BaseException as exc:  # pragma: no cover - 汇合后断言
+            lifecycle_errors.append(exc)
+        finally:
+            lifecycle_returned.set()
+
+    refresh_thread = Thread(target=run_refresh, daemon=True)
+    lifecycle_thread = Thread(target=run_lifecycle, daemon=True)
+    try:
+        refresh_thread.start()
+        assert backend.bind_entered.wait(timeout=2.0)
+        lifecycle_thread.start()
+
+        deadline = time.monotonic() + 2.0
+        while True:
+            with runtime._condition:
+                transition_owned = (
+                    lifecycle == "rebuild"
+                    and runtime._prepare_in_progress
+                    and not runtime._world_ready
+                ) or (
+                    lifecycle == "close"
+                    and runtime._state == "closing"
+                    and not runtime._world_ready
+                )
+            if transition_owned:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                pytest.fail(f"{lifecycle} did not acquire the lifecycle transition")
+            time.sleep(min(0.005, remaining))
+
+        blocked_before_release = not lifecycle_returned.is_set()
+        close_count_before_release = backend.trace.count("backend.close")
+        closed_while_binding = backend.closed_while_binding
+
+        backend.release_bind.set()
+        refresh_thread.join(timeout=2.0)
+        lifecycle_thread.join(timeout=2.0)
+
+        assert blocked_before_release
+        assert close_count_before_release == 0
+        assert not closed_while_binding
+        assert not refresh_thread.is_alive() and not lifecycle_thread.is_alive()
+        assert len(refresh_errors) == 1
+        assert isinstance(refresh_errors[0], RuntimeError)
+        assert str(refresh_errors[0]) == "world changed while refreshing scene bindings"
+        assert lifecycle_errors == []
+        assert lifecycle_returned.is_set()
+        assert backend.trace.index("bind_scene.exited") < backend.trace.index(
+            "backend.close"
+        )
+    finally:
+        backend.release_bind.set()
+        if refresh_thread.ident is not None:
+            refresh_thread.join(timeout=2.0)
+        if lifecycle_thread.ident is not None:
+            lifecycle_thread.join(timeout=2.0)
+        runtime.close()
+
+
+@pytest.mark.parametrize("reader_kind", ("wheel", "sensor"))
+def test_close_waits_for_world_reader_before_releasing_resources(reader_kind: str) -> None:
+    backend = Backend()
+    robot = BlockingWheelRobot() if reader_kind == "wheel" else Robot()
+    runtime, _selected_robot, _transport, clock = _make_runtime_with_robot(
+        robot,
+        backend=backend if reader_kind == "sensor" else None,
+        document=scene_document() if reader_kind == "sensor" else None,
+    )
+    blocking_lidar = BlockingLidar() if reader_kind == "sensor" else None
+    if blocking_lidar is not None:
+        runtime._front_lidar = blocking_lidar
+        runtime._rear_lidar = StubLidar("lidar_rear", 2)
+        runtime._truth_sensor_suite = StubTruth()
+        clock.advance(0.1)
+    after_errors: list[BaseException] = []
+    close_errors: list[BaseException] = []
+    close_returned = Event()
+
+    def run_after() -> None:
+        try:
+            runtime.after_physics_step(0.01 if reader_kind == "wheel" else 0.1)
+        except BaseException as exc:  # pragma: no cover - 汇合后断言
+            after_errors.append(exc)
+
+    def run_close() -> None:
+        try:
+            runtime.close()
+            close_returned.set()
+        except BaseException as exc:  # pragma: no cover - 汇合后断言
+            close_errors.append(exc)
+
+    after_thread = Thread(target=run_after, daemon=True)
+    close_thread = Thread(target=run_close, daemon=True)
+    try:
+        after_thread.start()
+        entered = (
+            robot.read_entered
+            if isinstance(robot, BlockingWheelRobot)
+            else blocking_lidar.entered
+        )
+        assert entered.wait(timeout=2.0)
+        close_thread.start()
+
+        assert not close_returned.wait(timeout=0.2)
+        assert robot.safe_stops == 0
+        assert backend.trace == []
+
+        if isinstance(robot, BlockingWheelRobot):
+            robot.release_read.set()
+        else:
+            blocking_lidar.release.set()
+        after_thread.join(timeout=2.0)
+        close_thread.join(timeout=2.0)
+        assert not after_thread.is_alive() and not close_thread.is_alive()
+        assert after_errors == close_errors == []
+        assert close_returned.is_set()
+        assert robot.safe_stops == 1
+        assert backend.trace == (["backend.close"] if reader_kind == "sensor" else [])
+    finally:
+        if isinstance(robot, BlockingWheelRobot):
+            robot.release_read.set()
+        else:
+            blocking_lidar.release.set()
+        after_thread.join(timeout=2.0)
+        close_thread.join(timeout=2.0)
+        runtime.close()
+
+
+@pytest.mark.parametrize("operation", ("prepare", "close", "rebind"))
+def test_world_reader_rejects_reentrant_lifecycle_without_partial_transition(
+    operation: str,
+) -> None:
+    class ReentrantWheelRobot(Robot):
+        def __init__(self) -> None:
+            super().__init__()
+            self.runtime = None
+            self.lifecycle_errors: list[BaseException] = []
+
+        def read_interface_wheel_state(self, timestamp_ns: int):
+            try:
+                if operation == "rebind":
+                    self.runtime.rebind_robot(Robot(99))
+                else:
+                    getattr(
+                        self.runtime,
+                        operation if operation == "close" else "prepare_world_rebuild",
+                    )()
+            except BaseException as exc:
+                self.lifecycle_errors.append(exc)
+            return super().read_interface_wheel_state(timestamp_ns)
+
+    robot = ReentrantWheelRobot()
+    runtime, _selected_robot, _transport, clock = _make_runtime_with_robot(robot)
+    robot.runtime = runtime
+    try:
+        states = runtime.after_physics_step(0.01)
+
+        assert len(states) == 1
+        assert len(robot.lifecycle_errors) == 1
+        assert isinstance(robot.lifecycle_errors[0], RuntimeError)
+        assert "world" in str(robot.lifecycle_errors[0])
+        assert runtime.accept_local_command(
+            WheelCommand(100, (1.0, 1.0), ()),
+            received_at=clock(),
+        )
+    finally:
         runtime.close()
 
 

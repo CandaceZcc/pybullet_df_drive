@@ -103,6 +103,55 @@ def _obstacle_snapshots() -> tuple[ObstacleSnapshot, ObstacleSnapshot]:
     )
 
 
+def _edge_obstacle_snapshots() -> tuple[ObstacleSnapshot, ObstacleSnapshot]:
+    """构造 flat 合法且靠近 +X 边界的静态/移动障碍布局。"""
+    return (
+        ObstacleSnapshot(
+            logical_id=31,
+            body_id=None,
+            mode="static",
+            shape="box",
+            position=(8.5, -1.0, 0.25),
+            orientation=(0.0, 0.0, 0.0, 1.0),
+            geometry=ObstacleGeometry("box", (0.2, 0.2, 0.25)),
+        ),
+        ObstacleSnapshot(
+            logical_id=32,
+            body_id=None,
+            mode="moving",
+            shape="sphere",
+            position=(8.6, 1.0, 0.2),
+            orientation=(0.0, 0.0, 0.0, 1.0),
+            path=ObstaclePath(
+                start_xy=(8.0, 1.0),
+                end_xy=(9.5, 1.0),
+                speed=0.4,
+                progress=0.4,
+                direction=-1,
+            ),
+            geometry=ObstacleGeometry("sphere", (0.2, 0.2, 0.2)),
+        ),
+    )
+
+
+def _twenty_obstacle_snapshots() -> tuple[ObstacleSnapshot, ...]:
+    """构造含 flat X 边界障碍的 20 个可恢复逻辑对象。"""
+    interior = tuple(
+        ObstacleSnapshot(
+            logical_id=100 + row * 9 + column,
+            body_id=None,
+            mode="static",
+            shape="box",
+            position=(x, y, 0.2),
+            orientation=(0.0, 0.0, 0.0, 1.0),
+            geometry=ObstacleGeometry("box", (0.15, 0.15, 0.2)),
+        )
+        for row, y in enumerate((-3.0, 3.0))
+        for column, x in enumerate((-7.2, -5.4, -3.6, -1.8, 0.0, 1.8, 3.6, 5.4, 7.2))
+    )
+    return (*interior, *_edge_obstacle_snapshots())
+
+
 def _target_obstacles() -> tuple[ObstacleSpec, ObstacleSpec]:
     return (
         ObstacleSpec(
@@ -156,6 +205,7 @@ def _runtime_document(
 @contextmanager
 def _real_runtime_coordinator(
     *,
+    initial_robot_model: str = "df_back",
     initial_obstacles: tuple[ObstacleSnapshot, ...] = (),
     sensors: SensorDocument | None = None,
 ):
@@ -163,8 +213,17 @@ def _real_runtime_coordinator(
     client_id = p.connect(p.DIRECT)
     runtime: InterfaceRuntime | None = None
     try:
-        config = ExperimentConfig(mode="gui", robot_model="df_back", terrain_model="flat")
-        world = load_manual_world(client_id, config, TerrainSelection("flat"), "df_back")
+        config = ExperimentConfig(
+            mode="gui",
+            robot_model=initial_robot_model,
+            terrain_model="flat",
+        )
+        world = load_manual_world(
+            client_id,
+            config,
+            TerrainSelection("flat"),
+            initial_robot_model,
+        )
         manager = _manager(client_id, world)
         if initial_obstacles:
             assert manager.restore(initial_obstacles).succeeded is True
@@ -515,6 +574,103 @@ def test_load_scene_rebuilds_all_domains_and_preserves_runtime_transport() -> No
         assert runtime.scene_document.terrain == target.terrain
         assert runtime.scene_document.sensors == target.sensors
         assert runtime.scene_document == logical
+        _assert_runtime_categories(runtime, coordinator)
+        _assert_single_world_partition(client_id, coordinator)
+
+
+def test_flat_edge_layout_switches_to_golf_and_commits_runtime_document() -> None:
+    """带接口运行时切换 golf 时，边界障碍布局不能触发 flat 回滚。"""
+    with _real_runtime_coordinator(
+        initial_obstacles=_edge_obstacle_snapshots(),
+    ) as (client_id, _config, coordinator, runtime):
+        before = coordinator.logical_scene_document()
+
+        result = coordinator.apply_action(
+            SwitchTerrainAction(
+                TerrainSelection("golf_heightfield", golf_seed=13, golf_relief="high")
+            )
+        )
+
+        logical = coordinator.logical_scene_document()
+        assert result.state_changed is True
+        assert result.world_reset is True
+        assert result.error_message is None
+        assert logical.terrain == TerrainDocument("golf_heightfield", 0.0, 13, "high")
+        assert runtime.scene_document == logical
+        assert [item.logical_id for item in logical.obstacles] == [31, 32]
+        assert [(item.position[0], item.position[1]) for item in logical.obstacles] == [
+            (item.position[0], item.position[1]) for item in before.obstacles
+        ]
+        assert logical.obstacles[1].path == before.obstacles[1].path
+        _assert_runtime_categories(runtime, coordinator)
+        _assert_single_world_partition(client_id, coordinator)
+
+
+@pytest.mark.parametrize(
+    "initial_obstacles",
+    ((), _twenty_obstacle_snapshots()),
+    ids=("empty", "twenty-retained"),
+)
+def test_active_steering_four_wheel_switches_from_flat_to_golf_without_rollback(
+    initial_obstacles: tuple[ObstacleSnapshot, ...],
+) -> None:
+    """精确覆盖 GUI 反馈：四驱车型切高尔夫后不得回弹到 flat。"""
+    with _real_runtime_coordinator(
+        initial_robot_model="active_steering_4wd",
+        initial_obstacles=initial_obstacles,
+    ) as (client_id, _config, coordinator, runtime):
+        before = coordinator.logical_scene_document()
+        transport = runtime._transport
+
+        result = coordinator.apply_action(
+            SwitchTerrainAction(
+                TerrainSelection(
+                    "golf_heightfield",
+                    golf_seed=73,
+                    golf_relief="medium",
+                )
+            )
+        )
+
+        logical = coordinator.logical_scene_document()
+        assert result.state_changed is True
+        assert result.world_reset is True
+        assert result.error_message is None
+        assert coordinator.world.active_robot.robot_model == "active_steering_4wd"
+        assert coordinator.world.terrain == TerrainSelection(
+            "golf_heightfield",
+            golf_seed=73,
+            golf_relief="medium",
+        )
+        assert logical.robot_model == "active_steering_4wd"
+        assert logical.terrain == TerrainDocument(
+            "golf_heightfield",
+            0.0,
+            73,
+            "medium",
+        )
+        assert runtime._transport is transport
+        assert runtime.scene_document == logical
+        assert runtime.bound_robot_id == coordinator.world.active_robot.robot.robot_id
+        assert [
+            (
+                item.logical_id,
+                item.mode,
+                item.geometry,
+                item.position[:2],
+                item.path,
+            )
+            for item in logical.obstacles
+        ] == [
+            (
+                item.logical_id,
+                item.mode,
+                item.geometry,
+                item.position[:2],
+                item.path,
+            )
+            for item in before.obstacles
+        ]
         _assert_runtime_categories(runtime, coordinator)
         _assert_single_world_partition(client_id, coordinator)
 
@@ -1848,7 +2004,7 @@ def test_cross_frame_clear_refreshes_runtime_after_each_deleted_slice() -> None:
 def test_moving_step_uses_manager_metadata_and_reuses_scene_document_cache(
     monkeypatch,
 ) -> None:
-    """每帧移动同步不得构造快照两次，revision 未变时也不得重建文档。"""
+    """每帧移动同步不得重复快照或重新深度校验整份场景文档。"""
     client_id = p.connect(p.DIRECT)
     try:
         config = ExperimentConfig(mode="gui", robot_model="df_back", terrain_model="flat")
@@ -1895,9 +2051,9 @@ def test_moving_step_uses_manager_metadata_and_reuses_scene_document_cache(
         coordinator.step(config.time_step)
 
         assert snapshot_calls == 0
-        assert document_build_calls == 1
+        assert document_build_calls == 0
         assert runtime.scene_document == coordinator.logical_scene_document()
         assert snapshot_calls == 0
-        assert document_build_calls == 1
+        assert document_build_calls == 0
     finally:
         p.disconnect(client_id)

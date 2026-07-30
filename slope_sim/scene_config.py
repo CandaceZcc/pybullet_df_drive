@@ -488,6 +488,29 @@ class SceneDocument:
             tuple(sorted(normalized_obstacles, key=lambda item: item.logical_id)),
         )
 
+    def _replace_validated_runtime_obstacles(
+        self,
+        obstacles: tuple[ObstacleSpec, ...],
+    ) -> "SceneDocument":
+        """只替换管理器已验证的冻结规格，避免移动帧重复深度校验静态场景。"""
+        if type(obstacles) is not tuple or len(obstacles) > _MAX_OBSTACLES:
+            raise ValueError("runtime obstacles must be a bounded tuple")
+        if any(type(obstacle) is not ObstacleSpec for obstacle in obstacles):
+            raise ValueError("runtime obstacles must contain exact ObstacleSpec values")
+        ordered = tuple(sorted(obstacles, key=lambda item: item.logical_id))
+        logical_ids = tuple(obstacle.logical_id for obstacle in ordered)
+        if len(set(logical_ids)) != len(logical_ids):
+            raise ValueError("runtime obstacles must have unique logical ids")
+
+        # self 和规格均来自已提交领域对象；公开构造/导入入口仍执行完整重校验。
+        document = object.__new__(type(self))
+        object.__setattr__(document, "schema_version", self.schema_version)
+        object.__setattr__(document, "robot_model", self.robot_model)
+        object.__setattr__(document, "terrain", self.terrain)
+        object.__setattr__(document, "obstacles", ordered)
+        object.__setattr__(document, "sensors", self.sensors)
+        return document
+
     @classmethod
     def from_runtime(
         cls,

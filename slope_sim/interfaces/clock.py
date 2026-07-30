@@ -13,26 +13,26 @@ _UINT64_MAX = (1 << 64) - 1
 MAX_CATCH_UP_DEADLINES = 10_000
 
 
-def _positive_time_fraction(dt: object) -> Fraction:
+def _positive_time_fraction(value: object, *, name: str = "dt") -> Fraction:
     """把正有限时间步规范为有界分母的有理数。"""
-    if isinstance(dt, bool) or not isinstance(dt, Real):
-        raise ValueError("dt must be a positive finite number")
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"{name} must be a positive finite number")
 
-    if isinstance(dt, Fraction):
-        step = dt
-    elif isinstance(dt, int):
-        step = Fraction(dt)
+    if isinstance(value, Fraction):
+        step = value
+    elif isinstance(value, int):
+        step = Fraction(value)
     else:
         try:
-            normalized = float(dt)
+            normalized = float(value)
         except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError("dt must be a positive finite number") from exc
+            raise ValueError(f"{name} must be a positive finite number") from exc
         if not math.isfinite(normalized):
-            raise ValueError("dt must be a positive finite number")
+            raise ValueError(f"{name} must be a positive finite number")
         step = Fraction(normalized).limit_denominator(_NANOSECONDS_PER_SECOND)
 
     if step <= 0:
-        raise ValueError("dt must be a positive finite number")
+        raise ValueError(f"{name} must be a positive finite number")
     return step
 
 
@@ -43,13 +43,14 @@ def _require_uint64_now(now_ns: object) -> int:
     return now_ns
 
 
-def _round_deadline_ns(deadline_index: int, rate_hz: int) -> int:
+def _round_deadline_ns(deadline_seconds: Fraction) -> int:
     """用整数商余数精确实现正 Fraction 的 ties-to-even 舍入。"""
-    numerator = deadline_index * _NANOSECONDS_PER_SECOND
-    quotient, remainder = divmod(numerator, rate_hz)
+    numerator = deadline_seconds.numerator * _NANOSECONDS_PER_SECOND
+    denominator = deadline_seconds.denominator
+    quotient, remainder = divmod(numerator, denominator)
     doubled_remainder = remainder * 2
-    if doubled_remainder > rate_hz or (
-        doubled_remainder == rate_hz and quotient % 2 == 1
+    if doubled_remainder > denominator or (
+        doubled_remainder == denominator and quotient % 2 == 1
     ):
         return quotient + 1
     return quotient
@@ -87,7 +88,12 @@ class SimulationClock:
 class PeriodicScheduler:
     """按有理数期限累计并一次弹出所有已到期时间戳。"""
 
-    def __init__(self, rate_hz: int) -> None:
+    def __init__(
+        self,
+        rate_hz: int,
+        *,
+        first_deadline_sec: Real | Fraction | None = None,
+    ) -> None:
         if (
             isinstance(rate_hz, bool)
             or not isinstance(rate_hz, int)
@@ -96,8 +102,19 @@ class PeriodicScheduler:
             raise ValueError("rate_hz must be an integer in range 1..1000000000")
         self._rate_hz = rate_hz
         self._period_seconds = Fraction(1, rate_hz)
-        self._next_deadline_seconds = self._period_seconds
-        self._next_deadline_index = 1
+        first_deadline = (
+            self._period_seconds
+            if first_deadline_sec is None
+            else _positive_time_fraction(
+                first_deadline_sec,
+                name="first_deadline_sec",
+            )
+        )
+        if first_deadline > self._period_seconds:
+            raise ValueError("first_deadline_sec must not exceed one period")
+        self._first_deadline_seconds = first_deadline
+        self._next_deadline_seconds = first_deadline
+        self._next_deadline_index = 0
         self._last_now_ns: int | None = None
 
     def _calculate_due(self, now_ns: int) -> tuple[int, tuple[int, ...]]:
@@ -119,7 +136,10 @@ class PeriodicScheduler:
         # 用整数生成时间戳，完整构造结果后再原子提交 Fraction 期限。
         first_deadline_index = self._next_deadline_index
         due = tuple(
-            _round_deadline_ns(deadline_index, self._rate_hz)
+            _round_deadline_ns(
+                self._first_deadline_seconds
+                + deadline_index * self._period_seconds
+            )
             for deadline_index in range(
                 first_deadline_index,
                 first_deadline_index + due_count,
@@ -137,7 +157,10 @@ class PeriodicScheduler:
         normalized_now, due = self._calculate_due(now_ns)
         due_count = len(due)
         self._next_deadline_index += due_count
-        self._next_deadline_seconds += due_count * self._period_seconds
+        self._next_deadline_seconds = (
+            self._first_deadline_seconds
+            + self._next_deadline_index * self._period_seconds
+        )
 
         self._last_now_ns = normalized_now
         return due

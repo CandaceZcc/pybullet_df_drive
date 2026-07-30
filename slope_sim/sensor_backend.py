@@ -330,6 +330,16 @@ class PyBulletSensorBackend:
         normalized_points = self._normalize_ray_points("points", points)
         return self._inverse_transform_points_trusted(pose, normalized_points)
 
+    def inverse_transform_points_prevalidated(
+        self,
+        pose: Pose,
+        points: tuple[Vec3, ...],
+    ) -> tuple[Vec3, ...]:
+        """转换同一后端刚验证的命中点，避免 LiDAR 热路径再次逐点检查。"""
+        if type(pose) is not Pose or type(points) is not tuple:
+            raise ValueError("prevalidated inverse transform requires Pose and tuple inputs")
+        return self._inverse_transform_points_trusted(pose, points)
+
     @staticmethod
     def _inverse_transform_points_trusted(
         pose: Pose,
@@ -470,6 +480,44 @@ class PyBulletSensorBackend:
                 f"for {len(normalized_starts)} rays"
             )
         return self._ray_hits_from_pybullet(results)
+
+    def ray_test_indexed_hits(
+        self,
+        starts: tuple[Vec3, ...],
+        ends: tuple[Vec3, ...],
+        *,
+        collision_mask: int,
+    ) -> tuple[tuple[int, RayHit], ...]:
+        """查询内部已验证射线，只返回命中项及原始索引供实时点云使用。"""
+        mask = _require_collision_mask(collision_mask)
+        if type(starts) is not tuple or type(ends) is not tuple:
+            raise ValueError("indexed ray inputs must be prevalidated tuples")
+        if len(starts) != len(ends):
+            raise ValueError("starts and ends must have the same length")
+        if len(starts) > PYBULLET_MAX_RAY_BATCH_SIZE:
+            raise ValueError(
+                f"ray batch must contain at most {PYBULLET_MAX_RAY_BATCH_SIZE} rays"
+            )
+        if not starts:
+            return ()
+
+        raw_results = p.rayTestBatch(
+            starts,
+            ends,
+            numThreads=0,
+            collisionFilterMask=mask,
+            physicsClientId=self.client_id,
+        )
+        try:
+            results = tuple(raw_results)
+        except TypeError as exc:
+            raise RuntimeError("PyBullet rayTestBatch returned a non-sequence") from exc
+        if len(results) != len(starts):
+            raise RuntimeError(
+                f"PyBullet rayTestBatch returned {len(results)} results "
+                f"for {len(starts)} rays"
+            )
+        return self._indexed_hits_from_pybullet(results)
 
     @staticmethod
     def _require_ray_sequence(name: str, points: object) -> int:
@@ -622,6 +670,75 @@ class PyBulletSensorBackend:
                 )
             )
         return tuple(hits)
+
+    def _indexed_hits_from_pybullet(
+        self,
+        results: tuple[object, ...],
+    ) -> tuple[tuple[int, RayHit], ...]:
+        """官方 tuple/内建数值走紧凑快路，异常扩展类型回退完整边界校验。"""
+        categories = self._hit_categories
+        trusted_hit = RayHit._from_trusted_pybullet
+        isfinite = math.isfinite
+        indexed_hits: list[tuple[int, RayHit]] = []
+        append_hit = indexed_hits.append
+
+        for ray_index, fields in enumerate(results):
+            if type(fields) is not tuple or len(fields) != 5:
+                break
+            body_id, link_index, hit_fraction, position, normal = fields
+            if (
+                type(body_id) is not int
+                or type(link_index) is not int
+                or type(hit_fraction) is not float
+                or type(position) is not tuple
+                or len(position) != 3
+                or type(normal) is not tuple
+                or len(normal) != 3
+            ):
+                break
+            px, py, pz = position
+            nx, ny, nz = normal
+            if (
+                type(px) is not float
+                or type(py) is not float
+                or type(pz) is not float
+                or type(nx) is not float
+                or type(ny) is not float
+                or type(nz) is not float
+                or body_id < -1
+                or link_index < -1
+                or not isfinite(hit_fraction)
+                or not 0.0 <= hit_fraction <= 1.0
+                or not isfinite(px)
+                or not isfinite(py)
+                or not isfinite(pz)
+                or not isfinite(nx)
+                or not isfinite(ny)
+                or not isfinite(nz)
+                or (body_id < 0 and link_index != -1)
+            ):
+                break
+            if body_id >= 0:
+                append_hit(
+                    (
+                        ray_index,
+                        trusted_hit(
+                            position,
+                            body_id,
+                            link_index,
+                            categories.get(body_id, "unknown"),
+                        ),
+                    )
+                )
+        else:
+            return tuple(indexed_hits)
+
+        # 非官方形状仍由原严格入口给出精确诊断，快路径不吞掉坏帧。
+        return tuple(
+            (ray_index, hit)
+            for ray_index, hit in enumerate(self._ray_hits_from_pybullet(results))
+            if hit.hit
+        )
 
     @staticmethod
     def _normalize_pybullet_result_vector(

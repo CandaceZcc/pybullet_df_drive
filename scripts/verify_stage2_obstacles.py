@@ -551,7 +551,7 @@ def _run_coordinator_transaction_checks() -> tuple[VerificationCheck, ...]:
         flat_result = coordinator.apply_action(SwitchTerrainAction(TerrainSelection("flat")))
         if not flat_result.world_reset:
             return (VerificationCheck("coordinator_transactions", False, flat_result.status_message),)
-        coordinator.obstacle_manager.restore(
+        edge_restore = coordinator.obstacle_manager.restore(
             (
                 ObstacleSnapshot(
                     901,
@@ -564,22 +564,24 @@ def _run_coordinator_transaction_checks() -> tuple[VerificationCheck, ...]:
                 ),
             )
         )
-        rollback_before = coordinator.obstacle_manager.snapshot()
-        rollback_digest = layout_digest(rollback_before)
-        rollback_result = coordinator.apply_action(SwitchTerrainAction(TerrainSelection("golf_heightfield", golf_seed=3)))
-        rollback_after = coordinator.obstacle_manager.snapshot()
-        rollback_body_ids = {item.physics_body_id for item in rollback_after}
-        rollback_passed = (
-            rollback_result.world_reset
-            and rollback_result.error_message is not None
-            and coordinator.world.terrain == TerrainSelection("flat")
-            and layout_digest(rollback_after) == rollback_digest
-            and None not in rollback_body_ids
-            and rollback_body_ids <= _body_ids(client_id)
+        edge_before = coordinator.obstacle_manager.snapshot()
+        golf_target = TerrainSelection("golf_heightfield", golf_seed=3)
+        edge_result = coordinator.apply_action(SwitchTerrainAction(golf_target))
+        edge_after = coordinator.obstacle_manager.snapshot()
+        edge_body_ids = {item.physics_body_id for item in edge_after}
+        edge_switch_passed = (
+            edge_restore.succeeded
+            and edge_result.state_changed
+            and edge_result.world_reset
+            and edge_result.error_message is None
+            and coordinator.world.terrain == golf_target
+            and snapshot_layout_state(edge_after) == snapshot_layout_state(edge_before)
+            and None not in edge_body_ids
+            and edge_body_ids <= _body_ids(client_id)
             and _body_ids(client_id)
             == set(coordinator.world.scene.body_ids)
             | {coordinator.world.active_robot.robot.robot_id}
-            | rollback_body_ids
+            | edge_body_ids
         )
         return (
             VerificationCheck(
@@ -594,9 +596,13 @@ def _run_coordinator_transaction_checks() -> tuple[VerificationCheck, ...]:
             ),
             VerificationCheck("coordinator_rebuild", rebuild_passed, f"obstacles={len(after)}"),
             VerificationCheck(
-                "coordinator_rollback",
-                rollback_passed,
-                "restored=flat" if rollback_passed else rollback_result.status_message,
+                "coordinator_edge_terrain_switch",
+                edge_switch_passed,
+                (
+                    "terrain=golf_heightfield layout=preserved"
+                    if edge_switch_passed
+                    else edge_result.status_message
+                ),
             ),
         )
     except Exception as exc:

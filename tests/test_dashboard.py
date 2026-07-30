@@ -7,7 +7,6 @@ import slope_sim.dashboard as dashboard_module
 from slope_sim.dashboard import (
     DashboardCommand,
     DASHBOARD_CONTROL_SPINBOX_WIDTH,
-    DASHBOARD_DIRECTION_BUTTON_SIZE,
     DASHBOARD_PLOT_LEGEND_STYLE,
     TelemetryDashboard,
     TelemetryPlotBuffer,
@@ -287,8 +286,6 @@ def test_dashboard_top_tabs_include_obstacle_table(monkeypatch):
             "障碍物",
             "轨迹",
             "速度/命令",
-            "打滑",
-            "接触",
             "驱动命令",
             "驱动反馈",
             "转向命令",
@@ -338,6 +335,37 @@ def test_dashboard_obstacle_snapshot_refresh_preserves_selection_by_logical_id(m
         assert len(selected_rows) == 1
         assert dashboard.obstacle_table.item(selected_rows[0].row(), 0).data(dashboard.QtCore.Qt.UserRole) == 2
         assert dashboard.obstacle_table.item(selected_rows[0].row(), 3).text() == "3.50, 4.50, 0.50"
+    finally:
+        dashboard.close()
+
+
+def test_dashboard_obstacle_rows_expand_to_wrapped_position_at_real_client_width(
+    monkeypatch,
+):
+    """33% 真实客户区内，长位置文本换行后不得被固定行高裁切。"""
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    dashboard = TelemetryDashboard(max_linear_speed=0.4, max_angular_speed=0.8)
+    try:
+        dashboard.apply_window_rect(SimpleNamespace(x=0, y=0, width=404, height=651))
+        dashboard.tabs.setCurrentIndex(1)
+        dashboard.update_obstacle_snapshots(
+            (
+                ObstacleSnapshot(
+                    1,
+                    None,
+                    "moving",
+                    "sphere",
+                    (12345.67, -98765.43, 123.45),
+                    (0.0, 0.0, 0.0, 1.0),
+                ),
+            ),
+            force=True,
+        )
+        dashboard.process_events()
+
+        table = dashboard.obstacle_table
+        assert table.horizontalScrollBar().maximum() == 0
+        assert table.rowHeight(0) >= table.sizeHintForRow(0)
     finally:
         dashboard.close()
 
@@ -425,6 +453,35 @@ def test_dashboard_control_scroll_includes_obstacle_group(monkeypatch):
         assert dashboard.obstacle_group.parentWidget() is dashboard.control_content
         assert dashboard.control_scroll.isAncestorOf(dashboard.obstacle_group)
         assert not dashboard.tabs.isAncestorOf(dashboard.obstacle_group)
+    finally:
+        dashboard.close()
+
+
+def test_dashboard_speed_limits_are_visible_in_simulation_controls(monkeypatch):
+    """线速度和角速度应是默认驾驶控件，而不是隐藏的诊断参数。"""
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    dashboard = TelemetryDashboard(max_linear_speed=0.45, max_angular_speed=0.85)
+    try:
+        simulation_group = dashboard.control_groups[0]
+        labels = {
+            label.text()
+            for label in simulation_group.findChildren(dashboard.QtWidgets.QLabel)
+        }
+
+        assert simulation_group.title() == "仿真控制"
+        assert isinstance(dashboard.linear_spin, dashboard.QtWidgets.QDoubleSpinBox)
+        assert isinstance(dashboard.angular_spin, dashboard.QtWidgets.QDoubleSpinBox)
+        assert simulation_group.isAncestorOf(dashboard.linear_spin)
+        assert simulation_group.isAncestorOf(dashboard.angular_spin)
+        assert {"线速度", "角速度"} <= labels
+        assert dashboard.linear_spin.minimum() == pytest.approx(0.0)
+        assert dashboard.linear_spin.maximum() == pytest.approx(2.0)
+        assert dashboard.linear_spin.singleStep() == pytest.approx(0.05)
+        assert dashboard.linear_spin.value() == pytest.approx(0.45)
+        assert dashboard.angular_spin.minimum() == pytest.approx(0.0)
+        assert dashboard.angular_spin.maximum() == pytest.approx(4.0)
+        assert dashboard.angular_spin.singleStep() == pytest.approx(0.05)
+        assert dashboard.angular_spin.value() == pytest.approx(0.85)
     finally:
         dashboard.close()
 
@@ -807,12 +864,9 @@ def test_telemetry_plot_buffer_keeps_recent_window_and_series():
 def test_dashboard_plot_specs_use_one_chart_per_tab_with_compact_legend():
     specs = dashboard_plot_specs()
 
-    assert [spec.tab_label for spec in specs] == ["轨迹", "速度/命令", "打滑", "接触"]
+    assert [spec.tab_label for spec in specs] == ["轨迹", "速度/命令"]
     assert all(spec.tab_label != "曲线" for spec in specs)
     assert all(len(spec.lines) >= 1 for spec in specs)
-    slip_spec = next(spec for spec in specs if spec.tab_label == "打滑")
-    assert slip_spec.title == "slip severity"
-    assert [line.y_field for line in slip_spec.lines[:2]] == ["left_abs_slip_ratio", "right_abs_slip_ratio"]
     assert DASHBOARD_PLOT_LEGEND_STYLE == {
         "fontsize": 7,
         "framealpha": 0.65,
@@ -822,10 +876,10 @@ def test_dashboard_plot_specs_use_one_chart_per_tab_with_compact_legend():
     }
 
 
-def test_dashboard_window_size_uses_twenty_percent_width_and_full_height():
-    assert dashboard_window_size(available_width=900, available_height=700) == (180, 700)
-    assert dashboard_window_size(available_width=5000, available_height=3000) == (1000, 3000)
-    assert dashboard_window_size(available_width=320, available_height=320) == (64, 320)
+def test_dashboard_window_size_uses_exact_thirty_three_percent_width_and_full_height():
+    assert dashboard_window_size(available_width=900, available_height=700) == (297, 700)
+    assert dashboard_window_size(available_width=5000, available_height=3000) == (1650, 3000)
+    assert dashboard_window_size(available_width=320, available_height=320) == (106, 320)
 
 
 def test_dashboard_applied_rect_keeps_enterprise_and_diagnostic_scrolls_separate(monkeypatch):
@@ -867,7 +921,7 @@ def test_dashboard_applied_rect_keeps_enterprise_and_diagnostic_scrolls_separate
         assert dashboard.telemetry_scroll is not dashboard.control_scroll
         assert dashboard.tabs.isAncestorOf(dashboard.telemetry_scroll)
         assert dashboard.diagnostic_control_scroll.widget() is dashboard.diagnostic_control_content
-        assert [group.title() for group in dashboard.diagnostic_control_groups] == ["参数", "相机"]
+        assert [group.title() for group in dashboard.diagnostic_control_groups] == ["相机"]
         assert all(
             group.parentWidget() is dashboard.diagnostic_control_content
             for group in dashboard.diagnostic_control_groups
@@ -886,8 +940,8 @@ def test_dashboard_applied_rect_keeps_enterprise_and_diagnostic_scrolls_separate
         assert all(upper.bottom() < lower.top() for upper, lower in zip(group_rects, group_rects[1:]))
 
         key_widgets = (
-            ("参数", dashboard.linear_spin),
-            ("参数", dashboard.angular_spin),
+            ("仿真控制", dashboard.linear_spin),
+            ("仿真控制", dashboard.angular_spin),
             ("机器人", dashboard.robot_combo),
             ("机器人", dashboard.apply_robot_button),
             ("仿真控制", dashboard.reset_button),
@@ -910,7 +964,7 @@ def test_dashboard_applied_rect_keeps_enterprise_and_diagnostic_scrolls_separate
             ("相机", dashboard.camera_view_combo),
         )
         label_texts = {
-            "参数": ("最大线速度", "最大角速度"),
+            "仿真控制": ("线速度", "角速度"),
             "场地": ("场地", "坡度", "随机种子", "起伏"),
             "障碍物": ("模式", "形状", "数量", "随机种子", "速度", "移动占比"),
             "相机": ("视角",),
@@ -944,7 +998,72 @@ def _assert_plot_artists_inside_canvas(label, axis, canvas):
         assert bounds.y1 <= canvas_height, f"{label} {artist_name} top={bounds.y1} > {canvas_height}"
 
 
-def test_dashboard_small_fixed_window_keeps_plot_content_and_controls_visible(monkeypatch):
+def test_layout_report_outward_rounds_fractional_matplotlib_bounds():
+    """报告矩形必须外包亚像素 bbox，不能吞掉轻微越界或重叠。"""
+
+    class Point:
+        def __init__(self, x, y):
+            self._x = x
+            self._y = y
+
+        def x(self):
+            return self._x
+
+        def y(self):
+            return self._y
+
+    bounds = SimpleNamespace(
+        x0=-0.4,
+        x1=20.4,
+        y0=79.4,
+        y1=90.2,
+        width=20.8,
+        height=10.8,
+    )
+
+    class Canvas:
+        device_pixel_ratio = 1.0
+
+        def get_renderer(self):
+            return object()
+
+        def height(self):
+            return 100
+
+        def mapToGlobal(self, point):
+            return Point(point.x() + 100, point.y() + 50)
+
+    class Artist:
+        def get_visible(self):
+            return True
+
+        def get_text(self):
+            return "axis label"
+
+        def get_window_extent(self, *, renderer):
+            assert renderer is not None
+            return bounds
+
+    dashboard = object.__new__(TelemetryDashboard)
+    dashboard.QtCore = SimpleNamespace(QPoint=Point)
+    dashboard.plot_canvases = {"轨迹": Canvas()}
+    dashboard.plot_legends = {"轨迹": Artist()}
+
+    artist_rect = dashboard._plot_artist_global_rect("轨迹", Artist())
+    legend_rect = dashboard._legend_global_rect("轨迹")
+
+    assert artist_rect == {
+        "text": "axis label",
+        "rect": [99, 59, 22, 12],
+    }
+    assert legend_rect == [99, 59, 22, 12]
+
+
+@pytest.mark.parametrize("height", (304, 320))
+def test_dashboard_small_fixed_window_keeps_plot_content_and_controls_visible(
+    monkeypatch,
+    height,
+):
     """极小屏幕不能重叠区域，也不能裁掉图表控件或实际绘制内容。"""
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     from PySide6 import QtCore, QtWidgets
@@ -957,7 +1076,7 @@ def test_dashboard_small_fixed_window_keeps_plot_content_and_controls_visible(mo
         developer_diagnostics_enabled=True,
     )
     try:
-        dashboard.apply_window_rect(SimpleNamespace(x=0, y=0, width=420, height=304))
+        dashboard.apply_window_rect(SimpleNamespace(x=0, y=0, width=420, height=height))
         dashboard.process_events()
 
         def window_rect(widget):
@@ -1002,14 +1121,60 @@ def test_dashboard_small_fixed_window_keeps_plot_content_and_controls_visible(mo
         dashboard.close()
 
 
+@pytest.mark.parametrize("height", (304, 320))
+def test_dashboard_compact_content_layout_keeps_geometry_and_controls_reachable(
+    monkeypatch,
+    height,
+):
+    """小窗口直接验证根布局和逐个滚动可达，不冒充正式门禁尺寸。"""
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from slope_sim.window_layout import Rect
+
+    dashboard = TelemetryDashboard(max_linear_speed=0.4, max_angular_speed=0.8)
+    try:
+        dashboard.apply_window_rect(
+            SimpleNamespace(x=0, y=0, width=420, height=height)
+        )
+        dashboard.process_events()
+
+        report = dashboard._layout_report()
+
+        assert report is not None
+        window = Rect(*report["window_rect"])
+        title = Rect(*report["title_rect"])
+        tabs = Rect(*report["tabs_rect"])
+        controls = Rect(*report["controls_rect"])
+        assert title.x == tabs.x == controls.x == window.x + 8
+        assert title.right == tabs.right == controls.right == window.right - 8
+        assert title.y == window.y + 8
+        assert tabs.y - title.bottom == 6
+        assert controls.y - tabs.bottom == 6
+        assert controls.bottom == window.bottom - 8
+        assert abs(tabs.height - controls.height) <= 1
+        assert report["control_scroll_range"][1] > 0
+
+        for evidence in report["critical_control_rects"].values():
+            control = Rect(*evidence["rect"])
+            viewport = Rect(*evidence["viewport_rect"])
+            assert (
+                control.x >= viewport.x
+                and control.y >= viewport.y
+                and control.right <= viewport.right
+                and control.bottom <= viewport.bottom
+            )
+    finally:
+        dashboard.close()
+
+
 def test_dashboard_layout_constants_describe_vertical_sidebar():
-    assert dashboard_module.DASHBOARD_DEFAULT_WIDTH_RATIO == pytest.approx(0.2)
-    assert dashboard_module.DASHBOARD_TOP_AREA_STRETCH == 45
-    assert dashboard_module.DASHBOARD_CONTROL_AREA_STRETCH == 55
+    assert dashboard_module.DASHBOARD_DEFAULT_WIDTH_RATIO.numerator == 33
+    assert dashboard_module.DASHBOARD_DEFAULT_WIDTH_RATIO.denominator == 100
+    assert dashboard_module.DASHBOARD_TOP_AREA_STRETCH == 50
+    assert dashboard_module.DASHBOARD_CONTROL_AREA_STRETCH == 50
     assert dashboard_module.DASHBOARD_TOP_TABS_MIN_HEIGHT == 320
     assert dashboard_module.DASHBOARD_PLOT_FIGURE_SIZE == (4.0, 3.2)
     assert dashboard_module.DASHBOARD_PLOT_MARGINS == {
-        "left": 0.24,
+        "left": 0.26,
         "right": 0.96,
         "bottom": 0.20,
         "top": 0.86,
@@ -1021,8 +1186,121 @@ def test_dashboard_layout_constants_describe_vertical_sidebar():
         "top": 0.69,
     }
     assert dashboard_module.DASHBOARD_COMPACT_CONTROL_SCROLL_HEIGHT == 20
-    assert 34 <= DASHBOARD_DIRECTION_BUTTON_SIZE <= 38
     assert 90 <= DASHBOARD_CONTROL_SPINBOX_WIDTH <= 110
+
+
+def test_dashboard_plot_uses_full_width_without_legacy_half_width_left_margin(
+    monkeypatch,
+):
+    """33% Dashboard 应让绘图区使用主体宽度，同时保留完整轴标签。"""
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    dashboard = TelemetryDashboard(max_linear_speed=0.4, max_angular_speed=0.8)
+    try:
+        dashboard.apply_window_rect(SimpleNamespace(x=0, y=0, width=404, height=651))
+        for index in _dashboard_plot_tab_indices(dashboard):
+            dashboard.tabs.setCurrentIndex(index)
+            dashboard.process_events()
+            label = dashboard.tabs.tabText(index)
+            figure = dashboard.plot_figures[label]
+
+            assert figure.subplotpars.left == pytest.approx(
+                dashboard_module.DASHBOARD_PLOT_MARGINS["left"]
+            )
+            assert figure.subplotpars.right - figure.subplotpars.left >= 0.70
+            _assert_plot_artists_inside_canvas(
+                label,
+                dashboard.plot_axes[label],
+                dashboard.plot_canvases[label],
+            )
+    finally:
+        dashboard.close()
+
+
+def test_dashboard_plot_axes_fill_normal_top_area(monkeypatch):
+    """正常 33% 侧栏中，每个绘图区都应占满画布主体而非缩成小方块。"""
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    dashboard = TelemetryDashboard(max_linear_speed=0.4, max_angular_speed=0.8)
+    try:
+        dashboard.apply_window_rect(SimpleNamespace(x=0, y=0, width=404, height=651))
+        for index in _dashboard_plot_tab_indices(dashboard):
+            dashboard.tabs.setCurrentIndex(index)
+            dashboard.process_events()
+            label = dashboard.tabs.tabText(index)
+            canvas = dashboard.plot_canvases[label]
+            canvas.draw()
+            canvas_width, canvas_height = canvas.get_width_height()
+            axis_box = dashboard.plot_axes[label].get_window_extent(canvas.get_renderer())
+
+            assert axis_box.width >= canvas_width * 0.60, label
+            assert axis_box.height >= canvas_height * 0.50, label
+    finally:
+        dashboard.close()
+
+
+def test_dashboard_top_and_control_areas_use_real_fifty_fifty_split(monkeypatch):
+    """真实 404x651 客户区必须等分上下区，不能由 320px 下限挤成近似比例。"""
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    dashboard = TelemetryDashboard(max_linear_speed=0.4, max_angular_speed=0.8)
+    try:
+        dashboard.apply_window_rect(SimpleNamespace(x=0, y=0, width=404, height=651))
+        dashboard.process_events()
+
+        report = dashboard._layout_report()
+        assert report is not None
+        assert report["title_rect"] == dashboard._widget_global_rect(
+            dashboard.title_label
+        )
+        assert abs(dashboard.tabs.height() - dashboard.control_scroll.height()) <= 1
+        for index in _dashboard_plot_tab_indices(dashboard):
+            dashboard.tabs.setCurrentIndex(index)
+            dashboard.process_events()
+            page = dashboard.tabs.widget(index)
+            canvas = dashboard.plot_canvases[dashboard.tabs.tabText(index)]
+            assert canvas.height() >= page.height() * 0.75
+    finally:
+        dashboard.close()
+
+
+def test_dashboard_rtk_heading_samples_keep_ylabel_inside_real_client_canvas(
+    monkeypatch,
+):
+    """真实 RTK 小角度样本不得把 y 轴标签挤出 404px 客户区。"""
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    dashboard = TelemetryDashboard(max_linear_speed=0.4, max_angular_speed=0.8)
+    try:
+        dashboard.apply_window_rect(SimpleNamespace(x=0, y=0, width=404, height=651))
+        index = next(
+            index
+            for index in _dashboard_plot_tab_indices(dashboard)
+            if dashboard.tabs.tabText(index) == "RTK航向"
+        )
+        dashboard.tabs.setCurrentIndex(index)
+        dashboard.process_events()
+
+        # 取自失败门禁的生产接口日志，覆盖小负角度生成长刻度文本的边界。
+        headings = (
+            -0.00010058156455545885,
+            -0.00011595560217040517,
+            -0.00011344566003845589,
+            -0.00011335957931465497,
+            -0.00011878466741851436,
+            -0.00011223033751492162,
+        )
+        axis = dashboard.plot_axes["RTK航向"]
+        dashboard.plot_lines["rtk_yaw"].set_data(
+            (0.1, 0.2, 0.3, 0.4, 0.5, 0.6),
+            headings,
+        )
+        axis.relim()
+        axis.autoscale_view()
+
+        _assert_plot_artists_inside_canvas(
+            "RTK航向",
+            axis,
+            dashboard.plot_canvases["RTK航向"],
+        )
+    finally:
+        dashboard.close()
 
 
 def test_dashboard_narrow_plot_layout_keeps_axes_and_buttons_in_top_tabs(monkeypatch):
@@ -1119,39 +1397,21 @@ def test_dashboard_keyboard_controls_work_when_child_widget_has_focus(monkeypatc
         dashboard.close()
 
 
-def test_dashboard_button_click_pulse_lasts_long_enough_for_visible_motion(monkeypatch):
+def test_dashboard_removes_direction_buttons_and_button_pulse_state(monkeypatch):
+    """驾驶只保留键盘路径，避免方向按钮遮挡下方控制。"""
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
-    from PySide6 import QtCore
-
-    now = {"value": 100.0}
-    monkeypatch.setattr(dashboard_module.time, "monotonic", lambda: now["value"])
-    dashboard = TelemetryDashboard(max_linear_speed=0.4, max_angular_speed=0.8)
-    try:
-        dashboard._pulse_button_key(QtCore.Qt.Key_Up)
-
-        # 鼠标短点击也要跨过多帧仿真，避免 10 度坡面上位移太小看不出来。
-        now["value"] = 100.5
-        assert dashboard.current_command().linear_velocity == pytest.approx(0.4)
-
-        now["value"] = 101.2
-        assert dashboard.current_command().linear_velocity == 0.0
-    finally:
-        dashboard.close()
-
-
-def test_dashboard_direction_button_click_sends_forward_command(monkeypatch):
-    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
-    from PySide6 import QtCore, QtTest, QtWidgets
+    from PySide6 import QtWidgets
 
     dashboard = TelemetryDashboard(max_linear_speed=0.4, max_angular_speed=0.8)
     try:
-        up_buttons = [button for button in dashboard.window.findChildren(QtWidgets.QPushButton) if button.text() == "↑"]
-        assert len(up_buttons) == 1
-
-        QtTest.QTest.mouseClick(up_buttons[0], QtCore.Qt.LeftButton)
-        dashboard.process_events()
-
-        assert dashboard.current_command().linear_velocity == pytest.approx(0.4)
+        assert dashboard.direction_buttons == []
+        assert not hasattr(dashboard, "_button_keys")
+        assert not hasattr(dashboard, "_button_pulses")
+        assert not hasattr(dashboard, "_pulse_button_key")
+        assert not {
+            button.text()
+            for button in dashboard.window.findChildren(QtWidgets.QPushButton)
+        } & {"↑", "←", "■", "→", "↓"}
     finally:
         dashboard.close()
 
@@ -1366,9 +1626,9 @@ def test_dashboard_clear_plots_redraws_only_the_visible_canvas(monkeypatch):
         dashboard.close()
 
 
-def test_dashboard_controls_still_work_after_each_plot_tab_is_selected(monkeypatch):
+def test_dashboard_keyboard_controls_work_after_each_plot_tab_is_selected(monkeypatch):
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
-    from PySide6 import QtCore, QtGui, QtWidgets
+    from PySide6 import QtCore, QtGui
 
     dashboard = TelemetryDashboard(
         max_linear_speed=0.4,
@@ -1376,7 +1636,6 @@ def test_dashboard_controls_still_work_after_each_plot_tab_is_selected(monkeypat
         developer_diagnostics_enabled=True,
     )
     try:
-        up_button = next(button for button in dashboard.window.findChildren(QtWidgets.QPushButton) if button.text() == "↑")
         for index in _dashboard_plot_tab_indices(dashboard):
             dashboard.tabs.setCurrentIndex(index)
             canvas = dashboard.plot_canvases[dashboard.tabs.tabText(index)]
@@ -1386,41 +1645,7 @@ def test_dashboard_controls_still_work_after_each_plot_tab_is_selected(monkeypat
 
             release = QtGui.QKeyEvent(QtCore.QEvent.KeyRelease, QtCore.Qt.Key_Up, QtCore.Qt.NoModifier)
             dashboard.app.sendEvent(canvas, release)
-            up_button.pressed.emit()
-            assert dashboard.current_command().linear_velocity == pytest.approx(0.4)
-            up_button.released.emit()
-    finally:
-        dashboard.close()
-
-
-def test_dashboard_direction_button_outputs_command_while_pressed(monkeypatch):
-    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
-    from PySide6 import QtWidgets
-
-    dashboard = TelemetryDashboard(max_linear_speed=0.4, max_angular_speed=0.8)
-    try:
-        up_button = next(button for button in dashboard.window.findChildren(QtWidgets.QPushButton) if button.text() == "↑")
-        up_button.pressed.emit()
-
-        assert dashboard.current_command().linear_velocity == 0.4
-
-        up_button.released.emit()
-
-        assert dashboard.current_command().linear_velocity == 0.0
-    finally:
-        dashboard.close()
-
-
-def test_dashboard_direction_button_click_outputs_short_command_pulse(monkeypatch):
-    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
-    from PySide6 import QtWidgets
-
-    dashboard = TelemetryDashboard(max_linear_speed=0.4, max_angular_speed=0.8)
-    try:
-        up_button = next(button for button in dashboard.window.findChildren(QtWidgets.QPushButton) if button.text() == "↑")
-        up_button.clicked.emit()
-
-        assert dashboard.current_command().linear_velocity == 0.4
+            assert dashboard.current_command().linear_velocity == 0.0
     finally:
         dashboard.close()
 

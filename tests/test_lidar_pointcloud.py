@@ -1,4 +1,4 @@
-# 多线点云单元测试：锁定 16x180 射线、安装外参、字段顺序和严格输入边界。
+# 多线点云单元测试：锁定 16x180 原子射线批次、安装外参与严格边界。
 from __future__ import annotations
 
 from collections import deque
@@ -151,6 +151,33 @@ class FakeLidarBackend:
         self.local_hits.clear()
 
 
+class IndexedHitLidarBackend(FakeLidarBackend):
+    """提供生产后端的紧凑命中入口，证明算法会优先使用实时快路径。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.indexed_hit_calls = 0
+        self.prevalidated_inverse_calls = 0
+
+    def ray_test_indexed_hits(self, starts, ends, *, collision_mask: int):
+        self.indexed_hit_calls += 1
+        hits = FakeLidarBackend.ray_test_batch(
+            self,
+            starts,
+            ends,
+            collision_mask=collision_mask,
+        )
+        return tuple(
+            (ray_index, hit)
+            for ray_index, hit in enumerate(hits)
+            if hit.hit
+        )
+
+    def inverse_transform_points_prevalidated(self, pose: Pose, points):
+        self.prevalidated_inverse_calls += 1
+        return FakeLidarBackend.inverse_transform_points(self, pose, tuple(points))
+
+
 def test_default_lidar_scan_geometry_is_stable_and_immutable():
     config = LidarConfig.default()
 
@@ -250,9 +277,7 @@ def test_front_and_rear_use_frozen_mounts_and_transform_the_same_fixed_ray_table
 
     assert backend.world_pose_calls == [
         "lidar_front_mount",
-        "base_link",
         "lidar_rear_mount",
-        "base_link",
     ]
     assert backend.mount_locals[0] == Pose((0.0, 0.0, 0.0), IDENTITY_QUATERNION)
     assert backend.mount_locals[1] == Pose((0.0, 0.0, 0.0), (0.0, 0.0, 1.0, 0.0))
@@ -337,9 +362,8 @@ def test_cloud_preserves_field_order_ray_order_line_categories_and_offsets():
         (2, 160),
         (3, 200),
     )
-    assert len(backend.inverse_batches) == 2
+    assert len(backend.inverse_batches) == 1
     assert len(backend.inverse_batches[0]) == 3
-    assert len(backend.inverse_batches[1]) == 3
     for point, expected in zip(
         cloud.points,
         ((0.10, 0.0, 0.0), (2.0, -0.5, 0.25), (29.0, 1.0, 0.5)),
@@ -351,6 +375,23 @@ def test_cloud_preserves_field_order_ray_order_line_categories_and_offsets():
         for point in cloud.points
         for value in (point.x, point.y, point.z)
     )
+
+
+def test_scan_prefers_compact_indexed_hits_and_prevalidated_inverse_transform():
+    backend = IndexedHitLidarBackend()
+    backend.hit_ray(
+        180,
+        local_point=(2.0, -0.5, 0.25),
+        category="static_obstacle",
+    )
+
+    cloud = MultiLineLidar.front(backend, LidarConfig.default()).scan(1)
+
+    assert backend.indexed_hit_calls == 1
+    assert backend.prevalidated_inverse_calls == 1
+    assert cloud.point_num == 1
+    assert cloud.points[0].line == 1
+    assert cloud.points[0].tag == 2
 
 
 def test_empty_cloud_keeps_scan_time_and_zero_count():
@@ -543,10 +584,14 @@ def test_scan_with_top_view_keeps_empty_frames_and_scan_compatibility_uses_one_b
     assert len(backend.ray_batches) == 1
 
     backend.ray_batches.clear()
+    backend.world_pose_calls.clear()
+    backend.inverse_batches.clear()
     cloud = lidar.scan(20)
     assert type(cloud) is LidarPointCloud
     assert cloud.timebase_ns == 20
     assert len(backend.ray_batches) == 1
+    assert backend.world_pose_calls == ["lidar_front_mount"]
+    assert len(backend.inverse_batches) == 1
 
 
 @pytest.mark.parametrize("subclass_field", ("message", "top_view"))
@@ -661,3 +706,10 @@ def test_scan_with_top_view_rejects_invalid_base_inverse_transform(
         MultiLineLidar.front(backend, LidarConfig.default()).scan_with_top_view(1)
 
     assert len(backend.ray_batches) == 1
+
+
+def test_lidar_public_api_does_not_expose_cross_frame_incremental_scans() -> None:
+    """阶段三点云只能在一个发布时刻完成，不能留下 rolling 扫描入口。"""
+    lidar = MultiLineLidar.front(FakeLidarBackend(), LidarConfig.default())
+
+    assert not hasattr(lidar, "begin_incremental_scan")

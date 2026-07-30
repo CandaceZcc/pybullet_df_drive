@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict
+import hashlib
 import json
 import math
 from pathlib import Path
 import sys
 from threading import Lock
 import time
-from typing import Callable, Sequence
+from typing import Callable, Mapping, Sequence
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -29,10 +30,12 @@ from slope_sim.interfaces.models import (
     WheelCommand,
     WheelState,
 )
+from slope_sim.model_registry import get_robot_model, robot_model_names
 
 
 _NANOSECONDS_PER_SECOND = 1_000_000_000
-_SCENARIO_ACK_TIMEOUT_SEC = 1.5
+# 官方默认 10 秒判定注册失联；额外两秒只用于跨进程调度余量。
+_SCENARIO_ACK_TIMEOUT_SEC = 12.0
 
 
 def _positive_finite(name: str, value: float) -> float:
@@ -103,6 +106,24 @@ def _decode_output_event(
     return timestamp_ns, codec.type_name(message)
 
 
+def _rtk_position_evidence(
+    config: InterfaceConfig,
+    codec: ProtoCodec,
+    topic: str,
+    payload: bytes,
+) -> dict[str, object]:
+    """仅为真实解码的 RTK 事件附加三维位置，保持通用解码契约不变。"""
+    if topic != config.rtk.topic:
+        return {}
+    message = codec.decode_rtk_state(payload)
+    return {"position_m": [message.main_x, message.main_y, message.main_z]}
+
+
+def _payload_evidence(payload: bytes) -> dict[str, str]:
+    """保存确定性 Protobuf 负载摘要，供原始日志到 peer 的逐帧核验。"""
+    return {"payload_sha256": hashlib.sha256(payload).hexdigest()}
+
+
 def _command_topic_type(config: InterfaceConfig, codec: ProtoCodec) -> str:
     """由 codec 生成轮子命令 registration 类型。"""
     return codec.type_name(WheelCommand(0, (), ()))
@@ -116,6 +137,25 @@ def _channel_period_sec(channel: ChannelConfig) -> float:
 def _message_timestamp_ns(index: int, channel: ChannelConfig) -> int:
     """由消息序号和通道频率计算仿真时间戳。"""
     return round(index * _NANOSECONDS_PER_SECOND / channel.rate_hz)
+
+
+def _simulation_command_for_model(
+    robot_model: str,
+    timestamp_ns: int,
+    *,
+    drive_speed_rad_s: float,
+) -> WheelCommand:
+    """按车型构造正式场景命令，锁定差速 2+0 与主动转向 4+2。"""
+    speed = float(drive_speed_rad_s)
+    if not math.isfinite(speed) or speed <= 0.0:
+        raise ValueError("drive_speed_rad_s must be a positive finite number")
+    model = get_robot_model(robot_model)
+    if model.controller_kind == "differential":
+        drive = (speed, speed * 0.75)
+    else:
+        drive = (speed,) * len(model.drive_joint_names)
+    steering = (0.6,) * len(model.steering_joint_names)
+    return WheelCommand(timestamp_ns, drive, steering)
 
 
 def _run_command_schedule(
@@ -194,6 +234,99 @@ def _wait_for_file(path: Path, timeout_sec: float, description: str) -> None:
         time.sleep(0.005)
 
 
+def _wait_for_json_object(
+    path: Path,
+    timeout_sec: float,
+    description: str,
+    *,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> dict[str, object]:
+    """等待完整 JSON 回执；文件存在但仍在写入时继续有界重试。"""
+    deadline = monotonic() + _positive_finite("timeout_sec", timeout_sec)
+    while True:
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError):
+            loaded = None
+        if loaded is not None:
+            if not isinstance(loaded, dict):
+                raise ValueError(f"{description} must contain a JSON object")
+            return loaded
+        now = monotonic()
+        if now >= deadline:
+            raise TimeoutError(f"timed out waiting for {description}: {path}")
+        sleep(min(0.005, deadline - now))
+
+
+def _ack_sim_time_ns(payload: Mapping[str, object], key: str) -> int:
+    """从屏障回执严格读取 uint64 仿真边界。"""
+    value = payload.get(key)
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 0 <= value < 1 << 64
+    ):
+        raise ValueError(f"{key} must be a uint64 integer")
+    return value
+
+
+def _events_in_sim_window(
+    events: Sequence[Mapping[str, object]],
+    *,
+    start_sim_time_ns: int,
+    end_sim_time_ns: int,
+) -> list[Mapping[str, object]]:
+    """按 runtime 共享仿真边界选择 `(start, end]` 的输出事件。"""
+    start = _ack_sim_time_ns(
+        {"start_sim_time_ns": start_sim_time_ns},
+        "start_sim_time_ns",
+    )
+    end = _ack_sim_time_ns(
+        {"end_sim_time_ns": end_sim_time_ns},
+        "end_sim_time_ns",
+    )
+    if start >= end:
+        raise ValueError("simulation measurement window must be increasing")
+    selected: list[Mapping[str, object]] = []
+    for event in events:
+        timestamp_ns = _ack_sim_time_ns(event, "timestamp_ns")
+        if start < timestamp_ns <= end:
+            selected.append(event)
+    return selected
+
+
+def _wait_for_output_fence(
+    received: Mapping[str, list[dict[str, object]]],
+    event_lock: object,
+    *,
+    topic: str,
+    after_timestamp_ns: int,
+    timeout_sec: float,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> int:
+    """等待同 publisher 的 post-window 帧，证明此前 callback 已越过窗口尾。"""
+    boundary = _ack_sim_time_ns(
+        {"after_timestamp_ns": after_timestamp_ns},
+        "after_timestamp_ns",
+    )
+    deadline = monotonic() + _positive_finite("timeout_sec", timeout_sec)
+    while True:
+        with event_lock:  # type: ignore[attr-defined]
+            timestamps = tuple(
+                _ack_sim_time_ns(event, "timestamp_ns")
+                for event in received.get(topic, ())
+            )
+        candidates = tuple(value for value in timestamps if value > boundary)
+        if candidates:
+            return min(candidates)
+        now = monotonic()
+        if now >= deadline:
+            raise TimeoutError("timed out waiting for wheel-state delivery fence")
+        sleep(min(0.005, deadline - now))
+
+
 def _wait_for_all_transport_peers(
     transport: EcalTransport,
     timeout_sec: float,
@@ -210,8 +343,53 @@ def _wait_for_all_transport_peers(
         time.sleep(0.01)
 
 
+def _wait_for_v61_resource_peer(
+    bindings: object,
+    resource: object,
+    timeout_sec: float,
+    description: str,
+) -> None:
+    """有界等待一个重建后的官方 v6 资源重新发现对应端点。"""
+    deadline = time.monotonic() + timeout_sec
+    while not bindings.is_peer_connected(resource):
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"timed out waiting for {description}")
+        time.sleep(0.01)
+
+
 def _write_marker(path: Path, payload: object) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+
+def _complete_measurement_window(
+    scenario_dir: Path,
+    *,
+    duration_sec: float,
+    measurement_start: float,
+    measurement_end: float,
+) -> dict[str, object]:
+    """冻结 runtime 正常窗口，并返回含仿真尾边界的完整 JSON 回执。"""
+    duration = _positive_finite("duration_sec", duration_sec)
+    start = float(measurement_start)
+    end = float(measurement_end)
+    if not math.isfinite(start) or not math.isfinite(end) or end <= start:
+        raise ValueError("measurement window must be finite and increasing")
+    marker = scenario_dir / "measurement_complete.active"
+    _write_marker(
+        marker,
+        {
+            "duration_sec": duration,
+            "measurement_start": start,
+            "measurement_end": end,
+        },
+    )
+    payload = _wait_for_json_object(
+        scenario_dir / "measurement_complete.ack",
+        _SCENARIO_ACK_TIMEOUT_SEC,
+        "normal-load transport snapshot",
+    )
+    marker.unlink(missing_ok=True)
+    return payload
 
 
 def _send_v61_command(bindings, publisher, command: WheelCommand, codec: ProtoCodec) -> None:
@@ -226,26 +404,30 @@ def _run_v61_command_schedule(
     duration_sec: float,
     config: InterfaceConfig,
     codec: ProtoCodec,
+    robot_model: str = "active_steering_4wd",
+    start_index: int = 1,
 ) -> tuple[list[dict[str, object]], float, float]:
-    """以 100 Hz 发送主动转向命令，并返回精确测量窗口。"""
+    """以 100 Hz 发送当前车型命令，并返回精确测量窗口。"""
+    if isinstance(start_index, bool) or not isinstance(start_index, int) or start_index <= 0:
+        raise ValueError("start_index must be a positive integer")
     channel = config.wheel_command
     period_sec = _channel_period_sec(channel)
     started_at = time.monotonic()
     ended_at = started_at + duration_sec
     next_send = started_at
-    index = 0
+    sent_count = 0
     events: list[dict[str, object]] = []
     while True:
         now = time.monotonic()
         if now >= ended_at:
             break
         while next_send <= now and next_send < ended_at:
-            index += 1
+            index = start_index + sent_count
             timestamp_ns = _message_timestamp_ns(index, channel)
-            command = WheelCommand(
+            command = _simulation_command_for_model(
+                robot_model,
                 timestamp_ns,
-                (4.0, 4.0, 4.0, 4.0),
-                (0.6, 0.6),
+                drive_speed_rad_s=4.0,
             )
             sent_at = time.monotonic()
             _send_v61_command(bindings, publisher, command, codec)
@@ -254,9 +436,14 @@ def _run_v61_command_schedule(
                     "wall_time": sent_at,
                     "timestamp_ns": timestamp_ns,
                     "type": codec.type_name(command),
+                    "drive_wheel_count": len(command.drive_wheel_speed_rad_s),
+                    "steering_wheel_count": len(
+                        command.steering_wheel_speed_rad_s
+                    ),
                 }
             )
-            next_send = started_at + index * period_sec
+            sent_count += 1
+            next_send = started_at + sent_count * period_sec
         delay = min(next_send, ended_at) - time.monotonic()
         if delay > 0.0:
             time.sleep(delay)
@@ -268,14 +455,18 @@ def run_simulation_peer(
     result_json: Path,
     scenario_dir: Path,
     duration_sec: float,
+    warmup_sec: float,
     participant_name: str,
     ready_file: Path,
     start_file: Path,
     start_timeout_sec: float = 15.0,
+    robot_model: str = "active_steering_4wd",
 ) -> None:
     """驱动真实 PyBullet 对端，并逐个断开/恢复六个官方 eCAL 端点。"""
     duration = _positive_finite("duration_sec", duration_sec)
+    warmup = _positive_finite("warmup_sec", warmup_sec)
     timeout = _positive_finite("start_timeout_sec", start_timeout_sec)
+    selected_robot_model = get_robot_model(robot_model).name
     config = InterfaceConfig.default(transport_mode="ecal")
     codec = ProtoCodec()
     bindings = load_ecal_bindings()
@@ -292,14 +483,15 @@ def run_simulation_peer(
             timestamp_ns, decoded_type = _decode_output_event(
                 config, codec, topic, payload
             )
+            event = {
+                "wall_time": time.monotonic(),
+                "timestamp_ns": timestamp_ns,
+                "type": decoded_type,
+                **_payload_evidence(payload),
+                **_rtk_position_evidence(config, codec, topic, payload),
+            }
             with event_lock:
-                received[topic].append(
-                    {
-                        "wall_time": time.monotonic(),
-                        "timestamp_ns": timestamp_ns,
-                        "type": decoded_type,
-                    }
-                )
+                received[topic].append(event)
 
         return record
 
@@ -327,23 +519,69 @@ def run_simulation_peer(
                 raise TimeoutError("all six eCAL peers were not discovered before measurement")
             time.sleep(0.01)
 
-        with event_lock:
-            for events in received.values():
-                events.clear()
+        # 共享 start 门闩之后用同一正式 peer 驱动真实生产预热。
+        warmup_events, _warmup_start, _warmup_end = _run_v61_command_schedule(
+            bindings,
+            command_publisher,
+            duration_sec=warmup,
+            config=config,
+            codec=codec,
+            robot_model=selected_robot_model,
+        )
+
+        measurement_start_marker = scenario_dir / "measurement_start.active"
+        _write_marker(
+            measurement_start_marker,
+            {"warmup_sec": warmup, "duration_sec": duration},
+        )
+        measurement_start_ack = _wait_for_json_object(
+            scenario_dir / "measurement_start.ack",
+            _SCENARIO_ACK_TIMEOUT_SEC,
+            "normal-load transport baseline",
+        )
+        window_start_sim_time_ns = _ack_sim_time_ns(
+            measurement_start_ack,
+            "window_start_sim_time_ns",
+        )
+        measurement_start_marker.unlink(missing_ok=True)
+
         command_events, measurement_start, measurement_end = _run_v61_command_schedule(
             bindings,
             command_publisher,
             duration_sec=duration,
             config=config,
             codec=codec,
+            robot_model=selected_robot_model,
+            start_index=len(warmup_events) + 1,
         )
-        time.sleep(0.03)
+        measurement_complete_ack = _complete_measurement_window(
+            scenario_dir,
+            duration_sec=duration,
+            measurement_start=measurement_start,
+            measurement_end=measurement_end,
+        )
+        window_end_sim_time_ns = _ack_sim_time_ns(
+            measurement_complete_ack,
+            "window_end_sim_time_ns",
+        )
+        if window_end_sim_time_ns <= window_start_sim_time_ns:
+            raise ValueError("simulation measurement window must be increasing")
+        delivery_fence_timestamp_ns = _wait_for_output_fence(
+            received,
+            event_lock,
+            topic=config.wheel_state.topic,
+            after_timestamp_ns=window_end_sim_time_ns,
+            timeout_sec=_SCENARIO_ACK_TIMEOUT_SEC,
+        )
         with event_lock:
             measured_received = {
                 topic: [
-                    event
-                    for event in events
-                    if measurement_start <= float(event["wall_time"]) < measurement_end
+                    dict(event)
+                    for event in _events_in_sim_window(
+                        events,
+                        start_sim_time_ns=window_start_sim_time_ns,
+                        end_sim_time_ns=window_end_sim_time_ns,
+                    )
                 ]
                 for topic, events in received.items()
             }
@@ -389,8 +627,45 @@ def run_simulation_peer(
                 _official_output_message_types()[topic],
                 make_callback(topic),
             )
+            _wait_for_v61_resource_peer(
+                bindings,
+                subscribers[topic],
+                _SCENARIO_ACK_TIMEOUT_SEC,
+                f"restored subscriber discovery {topic}",
+            )
+            restored_marker = scenario_dir / f"drop_{index}.restored"
+            _write_marker(restored_marker, {"topic": topic})
+            _wait_for_file(
+                scenario_dir / f"drop_{index}.restored.ack",
+                _SCENARIO_ACK_TIMEOUT_SEC,
+                f"restored output discovery {topic}",
+            )
+            restored_marker.unlink(missing_ok=True)
             marker.unlink(missing_ok=True)
-            time.sleep(0.05)
+
+        prepare_marker = scenario_dir / "command_disconnect_prepare.active"
+        prepare_ack = scenario_dir / "command_disconnect_prepare.ack"
+        _write_marker(prepare_marker, {})
+        prepare_started = time.monotonic()
+        prepare_index = 0
+        while not prepare_ack.exists():
+            if time.monotonic() - prepare_started >= _SCENARIO_ACK_TIMEOUT_SEC:
+                raise TimeoutError(
+                    f"timed out waiting for active command generation: {prepare_ack}"
+                )
+            prepare_index += 1
+            _send_v61_command(
+                bindings,
+                command_publisher,
+                _simulation_command_for_model(
+                    selected_robot_model,
+                    invalid_timestamp + prepare_index * 10_000_000,
+                    drive_speed_rad_s=3.0,
+                ),
+                codec,
+            )
+            time.sleep(0.01)
+        prepare_marker.unlink(missing_ok=True)
 
         disconnected_marker = scenario_dir / "command_disconnected.active"
         _write_marker(disconnected_marker, {})
@@ -413,6 +688,12 @@ def run_simulation_peer(
             _SCENARIO_ACK_TIMEOUT_SEC,
             "reconnected peer waiting for a new command",
         )
+        _wait_for_v61_resource_peer(
+            bindings,
+            command_publisher,
+            _SCENARIO_ACK_TIMEOUT_SEC,
+            "reconnected command publisher discovery",
+        )
         reconnect_marker.unlink(missing_ok=True)
 
         new_marker = scenario_dir / "new_command.active"
@@ -424,10 +705,10 @@ def run_simulation_peer(
             _send_v61_command(
                 bindings,
                 command_publisher,
-                WheelCommand(
+                _simulation_command_for_model(
+                    selected_robot_model,
                     invalid_timestamp + new_index * 10_000_000,
-                    (3.0, 3.0, 3.0, 3.0),
-                    (0.0, 0.0),
+                    drive_speed_rad_s=3.0,
                 ),
                 codec,
             )
@@ -449,10 +730,23 @@ def run_simulation_peer(
         result = {
             "transport": "ecal",
             "runtime": "simulation",
+            "robot_model": selected_robot_model,
             "commands": command_events,
+            "warmup_command_count": len(warmup_events),
             "received": measured_received,
+            "requested_duration_sec": duration,
+            "peer_measurement_duration_sec": measurement_end - measurement_start,
             "measurement_start": measurement_start,
             "measurement_end": measurement_end,
+            "window_start_sim_time_ns": window_start_sim_time_ns,
+            "window_end_sim_time_ns": window_end_sim_time_ns,
+            "measurement_sim_duration_sec": (
+                window_end_sim_time_ns - window_start_sim_time_ns
+            )
+            / _NANOSECONDS_PER_SECOND,
+            "wheel_drain_complete": True,
+            "wheel_drain_timestamp_ns": delivery_fence_timestamp_ns,
+            "wheel_delivery_fence_timestamp_ns": delivery_fence_timestamp_ns,
             "final_peer_states": final_peer_states,
             "snapshot": {"dropped_count": 0, "error_count": 0},
         }
@@ -582,6 +876,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the real eCAL roundtrip peer")
     parser.add_argument("--result-json", type=Path, required=True)
     parser.add_argument("--duration-sec", type=float, default=2.5)
+    parser.add_argument("--warmup-sec", type=float, default=1.0)
     parser.add_argument("--drive-command", type=float, nargs=2, default=(4.0, 4.0))
     parser.add_argument("--participant-name", default="slope-sim-roundtrip-peer")
     parser.add_argument("--ready-file", type=Path)
@@ -591,6 +886,11 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--settle-sec", type=float, default=0.20)
     parser.add_argument("--simulation-scenario", action="store_true")
     parser.add_argument("--scenario-dir", type=Path)
+    parser.add_argument(
+        "--robot-model",
+        choices=robot_model_names(),
+        default="active_steering_4wd",
+    )
     return parser.parse_args(argv)
 
 
@@ -606,10 +906,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 result_json=args.result_json,
                 scenario_dir=args.scenario_dir,
                 duration_sec=args.duration_sec,
+                warmup_sec=args.warmup_sec,
                 participant_name=args.participant_name,
                 ready_file=args.ready_file,
                 start_file=args.start_file,
                 start_timeout_sec=args.start_timeout_sec,
+                robot_model=args.robot_model,
             )
         else:
             run_peer(

@@ -421,33 +421,60 @@ def test_disabled_terrain_switch_recovers_when_active_body_removal_fails_once(
         p.disconnect(client_id)
 
 
-def test_target_terrain_cannot_contain_snapshot_rolls_back_world_robot_and_obstacles():
+def test_flat_edge_obstacles_switch_to_golf_and_preserve_logical_state():
     client_id = p.connect(p.DIRECT)
     try:
         config = ExperimentConfig(mode="gui", robot_model="df_back", terrain_model="flat")
         world = load_manual_world(client_id, config, TerrainSelection("flat"), "df_back")
         manager = _manager(client_id, world)
-        far_snapshot = ObstacleSnapshot(
-            logical_id=7,
-            body_id=None,
-            mode="static",
-            shape="box",
-            position=(8.5, 0.0, 0.2),
-            orientation=(0.0, 0.0, 0.0, 1.0),
-            geometry=ObstacleGeometry("box", (0.2, 0.2, 0.2)),
+        edge_snapshots = (
+            ObstacleSnapshot(
+                logical_id=7,
+                body_id=None,
+                mode="static",
+                shape="box",
+                position=(8.5, -1.0, 0.2),
+                orientation=(0.0, 0.0, 0.0, 1.0),
+                geometry=ObstacleGeometry("box", (0.2, 0.2, 0.2)),
+            ),
+            ObstacleSnapshot(
+                logical_id=8,
+                body_id=None,
+                mode="moving",
+                shape="sphere",
+                position=(8.6, 1.0, 0.2),
+                orientation=(0.0, 0.0, 0.0, 1.0),
+                path=ObstaclePath(
+                    start_xy=(8.0, 1.0),
+                    end_xy=(9.5, 1.0),
+                    speed=0.4,
+                    progress=0.4,
+                    direction=-1,
+                ),
+                geometry=ObstacleGeometry("sphere", (0.2, 0.2, 0.2)),
+            ),
         )
-        assert manager.restore((far_snapshot,)).succeeded is True
+        assert manager.restore(edge_snapshots).succeeded is True
+        before = manager.snapshot(include_body_id=False)
         coordinator = SimulationCoordinator(client_id, config, world, manager)
 
         result = coordinator.apply_action(SwitchTerrainAction(TerrainSelection("golf_heightfield", golf_seed=3)))
 
-        restored = coordinator.obstacle_manager.snapshot()
+        restored = coordinator.obstacle_manager.snapshot(include_body_id=False)
         assert result.state_changed is True
         assert result.world_reset is True
-        assert result.error_message is not None
-        assert coordinator.world.terrain == TerrainSelection("flat")
+        assert result.error_message is None
+        assert coordinator.world.terrain == TerrainSelection(
+            "golf_heightfield",
+            golf_seed=3,
+        )
         assert coordinator.world.active_robot.robot_model == "df_back"
-        assert [(item.logical_id, item.position[0], item.position[1]) for item in restored] == [(7, 8.5, 0.0)]
+        assert [item.logical_id for item in restored] == [item.logical_id for item in before]
+        assert [(item.position[0], item.position[1]) for item in restored] == [
+            (item.position[0], item.position[1]) for item in before
+        ]
+        assert [item.geometry for item in restored] == [item.geometry for item in before]
+        assert restored[1].path == before[1].path
     finally:
         p.disconnect(client_id)
 

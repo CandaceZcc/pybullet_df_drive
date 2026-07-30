@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import FrozenInstanceError, dataclass, field, replace
 import json
-from threading import Event, Thread, get_ident
+from threading import Event, Lock, Thread, current_thread, get_ident
 import time
 from types import SimpleNamespace
 
@@ -236,6 +236,38 @@ def _fake_v61_importer():
 
 def _config(mode: str = "ecal") -> InterfaceConfig:
     return InterfaceConfig.default(transport_mode=mode)
+
+
+def _capture_transport_thread_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[list[BaseException], Event]:
+    """保留 transport 线程逸出的原始异常，同时维持真实线程生命周期。"""
+    errors: list[BaseException] = []
+    failed = Event()
+
+    class CapturingThread:
+        def __init__(self, *, target, args=(), **kwargs) -> None:
+            self._thread = Thread(target=self._run, args=(target, args), **kwargs)
+
+        @staticmethod
+        def _run(target, args) -> None:
+            try:
+                target(*args)
+            except BaseException as exc:
+                errors.append(exc)
+                failed.set()
+
+        def start(self) -> None:
+            self._thread.start()
+
+        def is_alive(self) -> bool:
+            return self._thread.is_alive()
+
+        def join(self) -> None:
+            self._thread.join()
+
+    monkeypatch.setattr(ecal_transport_module, "Thread", CapturingThread)
+    return errors, failed
 
 
 def _command_subscriber(bindings: FakeEcalBindings) -> FakeResource:
@@ -1050,6 +1082,7 @@ def test_worker_sends_pending_payload_and_close_is_ordered_and_idempotent():
         transport.close()
 
     assert transport.worker_alive is False
+    assert transport.snapshot().error_count == 0
     assert participant.closed
     subscriber_indexes = [
         index
@@ -1063,6 +1096,592 @@ def test_worker_sends_pending_payload_and_close_is_ordered_and_idempotent():
     ]
     participant_index = bindings.close_log.index("participant:slope-sim")
     assert max(subscriber_indexes) < min(publisher_indexes) < participant_index
+
+
+def test_blocked_lidar_lane_does_not_delay_wheel_state_send():
+    """点云 publisher 阻塞时，轮速 publisher 必须由独立 lane 继续发送。"""
+    bindings = FakeEcalBindings()
+    lidar_started = Event()
+    release_lidar = Event()
+    wheel_sent = Event()
+
+    def topic_blocking_send(publisher, payload: bytes, _message_type) -> None:
+        if publisher.topic == TEST_CONFIG.lidar_front.topic:
+            lidar_started.set()
+            if not release_lidar.wait(timeout=2.0):
+                raise TimeoutError("test lidar send was not released")
+        bindings.sent.append((publisher.topic, bytes(payload)))
+        if publisher.topic == WHEEL_STATE_TOPIC:
+            wheel_sent.set()
+
+    bindings.send = topic_blocking_send
+    transport = EcalTransport(_config(), bindings=bindings, start_worker=True)
+    try:
+        transport.publish(
+            TEST_CONFIG.lidar_front.topic,
+            b"front",
+            _expected_types()[TEST_CONFIG.lidar_front.topic],
+            1,
+        )
+        assert lidar_started.wait(timeout=1.0)
+
+        transport.publish(WHEEL_STATE_TOPIC, b"wheel", WHEEL_STATE_TYPE, 2)
+
+        assert wheel_sent.wait(timeout=0.3)
+        wheel_quality = {
+            item.topic: item for item in transport.snapshot().topic_quality
+        }[WHEEL_STATE_TOPIC]
+        assert wheel_quality.dropped_count == 0
+    finally:
+        release_lidar.set()
+        transport.close()
+
+
+def test_publishers_run_in_parallel_but_each_topic_send_is_serial():
+    """不同 publisher 可并行，同一 publisher 的 send 调用不可重入。"""
+    bindings = FakeEcalBindings()
+    guard = Lock()
+    release_first_sends = Event()
+    parallel_started = Event()
+    active_by_topic: dict[str, int] = {}
+    maximum_by_topic: dict[str, int] = {}
+    maximum_global = 0
+
+    def observed_send(publisher, payload: bytes, _message_type) -> None:
+        nonlocal maximum_global
+        topic = publisher.topic
+        with guard:
+            active_by_topic[topic] = active_by_topic.get(topic, 0) + 1
+            maximum_by_topic[topic] = max(
+                maximum_by_topic.get(topic, 0),
+                active_by_topic[topic],
+            )
+            maximum_global = max(maximum_global, sum(active_by_topic.values()))
+            if maximum_global >= 2:
+                parallel_started.set()
+        try:
+            if payload in {b"front-1", b"wheel-1"}:
+                if not release_first_sends.wait(timeout=2.0):
+                    raise TimeoutError("test parallel sends were not released")
+            bindings.sent.append((topic, bytes(payload)))
+        finally:
+            with guard:
+                active_by_topic[topic] -= 1
+
+    bindings.send = observed_send
+    transport = EcalTransport(_config(), bindings=bindings, start_worker=True)
+    types = _expected_types()
+    try:
+        transport.publish(
+            TEST_CONFIG.lidar_front.topic,
+            b"front-1",
+            types[TEST_CONFIG.lidar_front.topic],
+            1,
+        )
+        transport.publish(WHEEL_STATE_TOPIC, b"wheel-1", WHEEL_STATE_TYPE, 2)
+        assert parallel_started.wait(timeout=0.3)
+
+        transport.publish(WHEEL_STATE_TOPIC, b"wheel-2", WHEEL_STATE_TYPE, 3)
+        release_first_sends.set()
+        transport.wait_idle(timeout_sec=1.0)
+
+        assert maximum_global >= 2
+        assert maximum_by_topic[WHEEL_STATE_TOPIC] == 1
+        assert maximum_by_topic[TEST_CONFIG.lidar_front.topic] == 1
+        assert [
+            payload for topic, payload in bindings.sent if topic == WHEEL_STATE_TOPIC
+        ] == [b"wheel-1", b"wheel-2"]
+        assert transport.snapshot().dropped_count == 0
+    finally:
+        release_first_sends.set()
+        transport.close()
+
+
+def test_publish_hands_first_frame_to_lane_before_worker_is_scheduled(monkeypatch):
+    """lane 尚未获调度时保留首帧和 latest，第三帧才覆盖中间帧。"""
+    release_workers = Event()
+
+    class GatedThread:
+        def __init__(self, *, target, args=(), **kwargs) -> None:
+            self._thread = Thread(
+                target=self._run,
+                args=(target, args),
+                **kwargs,
+            )
+
+        @staticmethod
+        def _run(target, args) -> None:
+            if not release_workers.wait(timeout=2.0):
+                raise TimeoutError("test workers were not released")
+            target(*args)
+
+        def start(self) -> None:
+            self._thread.start()
+
+        def is_alive(self) -> bool:
+            return self._thread.is_alive()
+
+        def join(self) -> None:
+            self._thread.join()
+
+    monkeypatch.setattr(ecal_transport_module, "Thread", GatedThread)
+    bindings = FakeEcalBindings()
+    transport = EcalTransport(_config(), bindings=bindings, start_worker=True)
+    try:
+        transport.publish(WHEEL_STATE_TOPIC, b"first", WHEEL_STATE_TYPE, 1)
+        transport.publish(WHEEL_STATE_TOPIC, b"second", WHEEL_STATE_TYPE, 2)
+
+        assert transport.snapshot().dropped_count == 0
+        assert transport.pending_payload(WHEEL_STATE_TOPIC) == b"second"
+
+        transport.publish(WHEEL_STATE_TOPIC, b"latest", WHEEL_STATE_TYPE, 3)
+
+        assert transport.snapshot().dropped_count == 1
+        assert transport.pending_payload(WHEEL_STATE_TOPIC) == b"latest"
+
+        release_workers.set()
+        transport.wait_idle(timeout_sec=1.0)
+        assert bindings.sent == [
+            (WHEEL_STATE_TOPIC, b"first"),
+            (WHEEL_STATE_TOPIC, b"latest"),
+        ]
+    finally:
+        release_workers.set()
+        transport.close()
+
+
+def test_threaded_queue_size_limits_latest_buffer_not_each_lane_ready(monkeypatch):
+    """每条 lane 自带 ready 槽，公开 queue_size 只限制全局 latest 合并缓冲。"""
+    release_workers = Event()
+
+    class GatedThread:
+        def __init__(self, *, target, args=(), **kwargs) -> None:
+            self._thread = Thread(target=self._run, args=(target, args), **kwargs)
+
+        @staticmethod
+        def _run(target, args) -> None:
+            if not release_workers.wait(timeout=2.0):
+                raise TimeoutError("test workers were not released")
+            target(*args)
+
+        def start(self) -> None:
+            self._thread.start()
+
+        def is_alive(self) -> bool:
+            return self._thread.is_alive()
+
+        def join(self) -> None:
+            self._thread.join()
+
+    monkeypatch.setattr(ecal_transport_module, "Thread", GatedThread)
+    bindings = FakeEcalBindings()
+    transport = EcalTransport(
+        _config(),
+        bindings=bindings,
+        start_worker=True,
+        queue_size=1,
+    )
+    front_topic = TEST_CONFIG.lidar_front.topic
+    front_type = _expected_types()[front_topic]
+    try:
+        transport.publish(WHEEL_STATE_TOPIC, b"wheel-ready", WHEEL_STATE_TYPE, 1)
+        transport.publish(front_topic, b"front-ready", front_type, 2)
+        transport.publish(WHEEL_STATE_TOPIC, b"wheel-latest", WHEEL_STATE_TYPE, 3)
+        transport.publish(front_topic, b"front-latest", front_type, 4)
+
+        assert transport.snapshot().dropped_count == 1
+        assert transport.pending_payload(WHEEL_STATE_TOPIC) is None
+        assert transport.pending_payload(front_topic) == b"front-latest"
+
+        release_workers.set()
+        transport.wait_idle(timeout_sec=1.0)
+        sent_by_topic = {
+            topic: [payload for sent_topic, payload in bindings.sent if sent_topic == topic]
+            for topic in (WHEEL_STATE_TOPIC, front_topic)
+        }
+        assert sent_by_topic == {
+            WHEEL_STATE_TOPIC: [b"wheel-ready"],
+            front_topic: [b"front-ready", b"front-latest"],
+        }
+    finally:
+        release_workers.set()
+        transport.close()
+
+
+def test_in_flight_send_keeps_only_latest_pending_frame() -> None:
+    """真实 send 进行中允许一个 latest pending，覆盖中间帧且不阻塞 publish。"""
+    bindings = FakeEcalBindings()
+    send_started = Event()
+    release_send = Event()
+
+    def block_first_send(publisher, payload: bytes, _message_type) -> None:
+        if payload == b"first":
+            send_started.set()
+            if not release_send.wait(timeout=2.0):
+                raise TimeoutError("test send was not released")
+        bindings.sent.append((publisher.topic, bytes(payload)))
+
+    bindings.send = block_first_send
+    transport = EcalTransport(_config(), bindings=bindings, start_worker=True)
+    publish_finished = Event()
+    publish_errors: list[BaseException] = []
+
+    def publish_replacements() -> None:
+        try:
+            transport.publish(WHEEL_STATE_TOPIC, b"middle", WHEEL_STATE_TYPE, 2)
+            transport.publish(WHEEL_STATE_TOPIC, b"new", WHEEL_STATE_TYPE, 3)
+        except BaseException as exc:  # pragma: no cover - 汇合后断言
+            publish_errors.append(exc)
+        finally:
+            publish_finished.set()
+
+    publisher = Thread(target=publish_replacements, daemon=True)
+    try:
+        transport.publish(WHEEL_STATE_TOPIC, b"first", WHEEL_STATE_TYPE, 1)
+        assert send_started.wait(timeout=1.0)
+
+        publisher.start()
+        assert publish_finished.wait(timeout=0.3)
+        assert publish_errors == []
+        assert transport.pending_payload(WHEEL_STATE_TOPIC) == b"new"
+        assert transport.snapshot().dropped_count == 1
+
+        release_send.set()
+        publisher.join(timeout=2.0)
+        transport.wait_idle(timeout_sec=1.0)
+
+        assert bindings.sent == [
+            (WHEEL_STATE_TOPIC, b"first"),
+            (WHEEL_STATE_TOPIC, b"new"),
+        ]
+    finally:
+        release_send.set()
+        publisher.join(timeout=2.0)
+        transport.close()
+
+
+def test_publish_wakes_only_its_topic_lane(monkeypatch):
+    """单话题发布不得唤醒其余 publisher lane 争抢共享状态锁。"""
+    stats_lock = Lock()
+    waiting_names: set[str] = set()
+    awakened_names: set[str] = set()
+
+    class ObservedEvent(Event):
+        def wait(self, timeout=None):
+            name = current_thread().name
+            is_publisher = "-publisher-" in name
+            if is_publisher:
+                with stats_lock:
+                    waiting_names.add(name)
+            result = super().wait(timeout=timeout)
+            if is_publisher:
+                with stats_lock:
+                    awakened_names.add(name)
+            return result
+
+    monkeypatch.setattr(ecal_transport_module, "Event", ObservedEvent)
+    bindings = FakeEcalBindings()
+    transport = EcalTransport(_config(), bindings=bindings, start_worker=True)
+    try:
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            with stats_lock:
+                if len(waiting_names) == len(transport._workers):
+                    break
+            time.sleep(0.005)
+        with stats_lock:
+            awakened_names.clear()
+
+        transport.publish(WHEEL_STATE_TOPIC, b"wheel", WHEEL_STATE_TYPE, 1)
+        transport.wait_idle(timeout_sec=1.0)
+        time.sleep(0.02)
+
+        wheel_worker_name = transport._workers[WHEEL_STATE_TOPIC].name
+        with stats_lock:
+            assert awakened_names == {wheel_worker_name}
+    finally:
+        transport.close()
+
+
+def test_blocked_discovery_does_not_stall_publisher_worker():
+    """显式 discovery 变慢时，publisher worker 仍须持续排空发送队列。"""
+
+    class BlockingDiscoveryBindings(FakeEcalBindings):
+        def __init__(self) -> None:
+            super().__init__()
+            self.discovery_started = Event()
+            self.release_discovery = Event()
+            self.discovery_calls = 0
+
+        def is_peer_connected(self, resource: FakeResource) -> bool:
+            self.discovery_calls += 1
+            self.discovery_started.set()
+            if not self.release_discovery.wait(timeout=2.0):
+                raise TimeoutError("test discovery was not released")
+            return resource.connected
+
+    bindings = BlockingDiscoveryBindings()
+    transport = EcalTransport(_config(), bindings=bindings, start_worker=True)
+    poll_errors: list[BaseException] = []
+
+    def poll_discovery() -> None:
+        try:
+            transport.poll_peer_state()
+        except BaseException as exc:  # pragma: no cover - 汇合后断言
+            poll_errors.append(exc)
+
+    poller = Thread(target=poll_discovery, daemon=True)
+    try:
+        poller.start()
+        assert bindings.discovery_started.wait(timeout=1.0)
+
+        types = _expected_types()
+        topics = (WHEEL_STATE_TOPIC, TEST_CONFIG.lidar_front.topic)
+        for timestamp_ns, topic in enumerate(topics, start=1):
+            transport.publish(
+                topic,
+                f"payload-{timestamp_ns}".encode(),
+                types[topic],
+                timestamp_ns,
+            )
+
+        deadline = time.monotonic() + 0.3
+        while len(bindings.sent) < len(topics) and time.monotonic() < deadline:
+            time.sleep(0.005)
+
+        assert set(bindings.sent) == {
+            (WHEEL_STATE_TOPIC, b"payload-1"),
+            (TEST_CONFIG.lidar_front.topic, b"payload-2"),
+        }
+        assert bindings.discovery_calls == 1
+    finally:
+        bindings.release_discovery.set()
+        poller.join(timeout=2.0)
+        transport.close()
+
+    assert not poller.is_alive()
+    assert poll_errors == []
+
+
+def test_close_waits_for_in_flight_discovery_before_closing_native_resources():
+    """close 必须等待已受理的 discovery，不能让 count API 访问已关闭资源。"""
+
+    class BlockingDiscoveryBindings(FakeEcalBindings):
+        def __init__(self) -> None:
+            super().__init__()
+            self.discovery_started = Event()
+            self.release_discovery = Event()
+            self.closed_seen_by_discovery: list[bool] = []
+
+        def is_peer_connected(self, resource: FakeResource) -> bool:
+            self.discovery_started.set()
+            if not self.release_discovery.wait(timeout=3.0):
+                raise TimeoutError("test discovery was not released")
+            self.closed_seen_by_discovery.append(resource.closed)
+            return resource.connected
+
+    bindings = BlockingDiscoveryBindings()
+    transport = EcalTransport(_config(), bindings=bindings, start_worker=False)
+    poll_errors: list[BaseException] = []
+    close_errors: list[BaseException] = []
+    close_finished = Event()
+
+    def poll_discovery() -> None:
+        try:
+            transport.poll_peer_state()
+        except BaseException as exc:  # pragma: no cover - 汇合后断言
+            poll_errors.append(exc)
+
+    def close_transport() -> None:
+        try:
+            transport.close()
+        except BaseException as exc:  # pragma: no cover - 汇合后断言
+            close_errors.append(exc)
+        finally:
+            close_finished.set()
+
+    poller = Thread(target=poll_discovery, daemon=True)
+    closer = Thread(target=close_transport, daemon=True)
+    poller.start()
+    assert bindings.discovery_started.wait(timeout=1.0)
+    closer.start()
+    close_finished_before_release = close_finished.wait(timeout=0.2)
+
+    bindings.release_discovery.set()
+    poller.join(timeout=2.0)
+    closer.join(timeout=2.0)
+
+    assert close_finished_before_release is False
+    assert not poller.is_alive() and not closer.is_alive()
+    assert bindings.closed_seen_by_discovery == [False] * len(transport._channels)
+    assert poll_errors == []
+    assert close_errors == []
+    assert transport._state == "closed"
+
+
+def test_concurrent_discovery_polls_cannot_commit_older_observation_last():
+    """旧 poll 延迟返回时不得覆盖较新的全连接观察或误增代际。"""
+
+    class ReorderedDiscoveryBindings(FakeEcalBindings):
+        def __init__(self) -> None:
+            super().__init__()
+            self.old_observation_ready = Event()
+            self.release_old_observation = Event()
+            self.first_thread_id: int | None = None
+            self.calls_by_thread: dict[int, int] = {}
+            self.calls_lock = Lock()
+
+        def is_peer_connected(self, resource: FakeResource) -> bool:
+            thread_id = get_ident()
+            with self.calls_lock:
+                if self.first_thread_id is None:
+                    self.first_thread_id = thread_id
+                call_count = self.calls_by_thread.get(thread_id, 0) + 1
+                self.calls_by_thread[thread_id] = call_count
+                is_old_poll = thread_id == self.first_thread_id
+            observed = resource.connected
+            if is_old_poll and call_count == 6:
+                self.old_observation_ready.set()
+                if not self.release_old_observation.wait(timeout=3.0):
+                    raise TimeoutError("old discovery observation was not released")
+            return observed
+
+    bindings = ReorderedDiscoveryBindings()
+    transport = EcalTransport(_config(), bindings=bindings, start_worker=False)
+    poll_errors: list[BaseException] = []
+    new_poll_finished = Event()
+
+    def poll(*, mark_new: bool = False) -> None:
+        try:
+            transport.poll_peer_state()
+        except BaseException as exc:  # pragma: no cover - 汇合后断言
+            poll_errors.append(exc)
+        finally:
+            if mark_new:
+                new_poll_finished.set()
+
+    old_poller = Thread(target=poll, daemon=True)
+    new_poller = Thread(target=poll, kwargs={"mark_new": True}, daemon=True)
+    try:
+        old_poller.start()
+        assert bindings.old_observation_ready.wait(timeout=1.0)
+        for resource in (*bindings.subscribers, *bindings.publishers):
+            resource.connected = True
+        new_poller.start()
+        new_finished_before_old_release = new_poll_finished.wait(timeout=0.2)
+
+        bindings.release_old_observation.set()
+        old_poller.join(timeout=2.0)
+        new_poller.join(timeout=2.0)
+
+        snapshot = transport.snapshot()
+        command_quality = next(
+            item
+            for item in snapshot.topic_quality
+            if item.topic == WHEEL_COMMAND_TOPIC
+        )
+        assert new_finished_before_old_release is False
+        assert not old_poller.is_alive() and not new_poller.is_alive()
+        assert poll_errors == []
+        assert snapshot.state == "waiting_peer"
+        assert command_quality.peer_connected is True
+        assert snapshot.generation == 0
+    finally:
+        bindings.release_old_observation.set()
+        old_poller.join(timeout=2.0)
+        new_poller.join(timeout=2.0)
+        transport.close()
+
+
+def test_stale_discovery_revision_cannot_roll_back_newer_connected_state():
+    """较旧观察即使迟到提交，也不得断开当前 peer 或推进 generation。"""
+    bindings = FakeEcalBindings()
+    transport = EcalTransport(_config(), bindings=bindings, start_worker=False)
+    connected = {channel.topic: True for channel in transport._channels}
+    disconnected = {channel.topic: False for channel in transport._channels}
+    try:
+        with transport._condition:
+            transport._apply_discovery_observation_locked(
+                1,
+                connected,
+            )
+            stale_transition = transport._apply_discovery_observation_locked(
+                0,
+                disconnected,
+            )
+
+        snapshot = transport.snapshot()
+        command_quality = next(
+            item
+            for item in snapshot.topic_quality
+            if item.topic == WHEEL_COMMAND_TOPIC
+        )
+        assert stale_transition is None
+        assert snapshot.state == "waiting_peer"
+        assert command_quality.peer_connected is True
+        assert snapshot.generation == 0
+    finally:
+        transport.close()
+
+
+def test_wait_idle_times_out_while_pending_queue_cannot_drain():
+    """没有 worker 时 pending 队列不能被误判为空闲。"""
+    bindings = FakeEcalBindings()
+    transport = EcalTransport(_config(), bindings=bindings, start_worker=False)
+    try:
+        transport.publish(WHEEL_STATE_TOPIC, b"pending", WHEEL_STATE_TYPE, 1)
+
+        with pytest.raises(TimeoutError, match="did not become idle"):
+            transport.wait_idle(timeout_sec=0.02)
+
+        assert transport.pending_payload(WHEEL_STATE_TOPIC) == b"pending"
+    finally:
+        transport.close()
+
+
+def test_wait_idle_blocks_until_claimed_send_completes():
+    """pending 已被认领仍不算空闲，必须等实际 send 返回。"""
+    bindings = FakeEcalBindings()
+    send_started = Event()
+    release_send = Event()
+
+    def blocked_send(publisher, payload: bytes, _message_type) -> None:
+        send_started.set()
+        if not release_send.wait(timeout=2.0):
+            raise TimeoutError("test send was not released")
+        bindings.sent.append((publisher.topic, bytes(payload)))
+
+    bindings.send = blocked_send
+    transport = EcalTransport(_config(), bindings=bindings, start_worker=True)
+    wait_finished = Event()
+    wait_errors: list[BaseException] = []
+
+    def wait_for_idle() -> None:
+        try:
+            transport.wait_idle(timeout_sec=1.0)
+        except BaseException as exc:  # pragma: no cover - 汇合后断言
+            wait_errors.append(exc)
+        finally:
+            wait_finished.set()
+
+    waiter = Thread(target=wait_for_idle, daemon=True)
+    try:
+        transport.publish(WHEEL_STATE_TOPIC, b"claimed", WHEEL_STATE_TYPE, 1)
+        assert send_started.wait(timeout=1.0)
+        assert transport.pending_payload(WHEEL_STATE_TOPIC) is None
+
+        waiter.start()
+        assert not wait_finished.wait(timeout=0.05)
+        release_send.set()
+        waiter.join(timeout=2.0)
+
+        assert not waiter.is_alive()
+        assert wait_errors == []
+        assert bindings.sent == [(WHEEL_STATE_TOPIC, b"claimed")]
+    finally:
+        release_send.set()
+        waiter.join(timeout=2.0)
+        transport.close()
 
 
 def test_queue_overwrite_snapshot_attributes_drop_to_evicted_topic_and_is_immutable():
@@ -1166,6 +1785,8 @@ def test_quiesce_counts_pending_once_and_close_only_finalizes_resources():
     first = transport.quiesce()
     second = transport.quiesce()
 
+    assert first.error_count == 0
+    assert second.error_count == 0
     assert first.dropped_count == len(pending_topics)
     assert second.dropped_count == first.dropped_count
     assert second.topic_quality == first.topic_quality
@@ -1178,6 +1799,7 @@ def test_quiesce_counts_pending_once_and_close_only_finalizes_resources():
     transport.close()
     transport.close()
     final = transport.snapshot()
+    assert final.error_count == 0
     assert final.dropped_count == first.dropped_count
     assert final.topic_quality == first.topic_quality
     assert bindings.open_participants == 0
@@ -1340,11 +1962,13 @@ def test_runtime_close_prioritizes_terminal_transport_drop_under_logger_backpres
     assert logger.snapshot().dropped_events == 1
 
 
-def test_close_counts_worker_claimed_frame_if_send_has_not_started() -> None:
+def test_close_counts_ready_handoff_and_latest_pending_without_publishing() -> None:
     bindings = FakeEcalBindings()
     transport = EcalTransport(_config(), bindings=bindings, start_worker=True)
-    transport._io_lock.acquire()
-    io_lock_held = True
+    send_lock = transport._send_locks[WHEEL_STATE_TOPIC]
+    send_lock.acquire()
+    send_lock_held = True
+    closer_started = False
     close_errors: list[BaseException] = []
 
     def close_transport() -> None:
@@ -1355,16 +1979,13 @@ def test_close_counts_worker_claimed_frame_if_send_has_not_started() -> None:
 
     closer = Thread(target=close_transport, daemon=True)
     try:
-        transport.publish(WHEEL_STATE_TOPIC, b"claimed", WHEEL_STATE_TYPE, 1)
-        deadline = time.monotonic() + 2.0
-        while time.monotonic() < deadline:
-            if transport.pending_payload(WHEEL_STATE_TOPIC) is None:
-                break
-            time.sleep(0.005)
-        else:  # pragma: no cover - 超时路径由断言报告
-            raise AssertionError("worker did not claim pending frame")
+        transport.publish(WHEEL_STATE_TOPIC, b"ready", WHEEL_STATE_TYPE, 1)
+        assert transport.pending_payload(WHEEL_STATE_TOPIC) is None
+        transport.publish(WHEEL_STATE_TOPIC, b"latest", WHEEL_STATE_TYPE, 2)
+        assert transport.pending_payload(WHEEL_STATE_TOPIC) == b"latest"
 
         closer.start()
+        closer_started = True
         deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline:
             with transport._condition:
@@ -1374,8 +1995,8 @@ def test_close_counts_worker_claimed_frame_if_send_has_not_started() -> None:
         else:  # pragma: no cover - 超时路径由断言报告
             raise AssertionError("close did not enter closing state")
 
-        transport._io_lock.release()
-        io_lock_held = False
+        send_lock.release()
+        send_lock_held = False
         closer.join(timeout=2.0)
         assert not closer.is_alive()
         assert close_errors == []
@@ -1386,25 +2007,26 @@ def test_close_counts_worker_claimed_frame_if_send_has_not_started() -> None:
         }[WHEEL_STATE_TOPIC]
         assert bindings.sent == []
         assert first.published_count == 0
-        assert first.dropped_count == 1
-        assert quality.dropped_count == 1
+        assert first.dropped_count == 2
+        assert quality.dropped_count == 2
         assert quality.revision == 1
         assert quality.state == "degraded"
-        assert quality.detail == "transport closed before claimed message was sent"
+        assert quality.detail == "transport closed before pending message was sent"
 
         transport.close()
         second = transport.snapshot()
         assert second.dropped_count == first.dropped_count
         assert second.topic_quality == first.topic_quality
     finally:
-        if io_lock_held:
-            transport._io_lock.release()
-        closer.join(timeout=2.0)
+        if send_lock_held:
+            send_lock.release()
+        if closer_started:
+            closer.join(timeout=2.0)
         if transport._state != "closed":
             transport.close()
 
 
-def test_close_after_send_start_counts_successful_claim_as_published() -> None:
+def test_close_finishes_in_flight_send_but_drops_latest_pending_terminally() -> None:
     bindings = FakeEcalBindings()
     send_started = Event()
     allow_send = Event()
@@ -1428,6 +2050,8 @@ def test_close_after_send_start_counts_successful_claim_as_published() -> None:
     try:
         transport.publish(WHEEL_STATE_TOPIC, b"sending", WHEEL_STATE_TYPE, 1)
         assert send_started.wait(timeout=2.0)
+        transport.publish(WHEEL_STATE_TOPIC, b"latest", WHEEL_STATE_TYPE, 2)
+        assert transport.pending_payload(WHEEL_STATE_TOPIC) == b"latest"
         closer.start()
         deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline:
@@ -1449,9 +2073,11 @@ def test_close_after_send_start_counts_successful_claim_as_published() -> None:
         }[WHEEL_STATE_TOPIC]
         assert bindings.sent == [(WHEEL_STATE_TOPIC, b"sending")]
         assert first.published_count == 1
-        assert first.dropped_count == 0
-        assert quality.dropped_count == 0
-        assert quality.revision == 0
+        assert first.dropped_count == 1
+        assert quality.dropped_count == 1
+        assert quality.revision == 1
+        assert quality.state == "degraded"
+        assert quality.detail == "transport closed before pending message was sent"
 
         transport.close()
         second = transport.snapshot()
@@ -1522,6 +2148,216 @@ def test_close_after_send_start_counts_failure_without_reopening_transport() -> 
     finally:
         allow_send_failure.set()
         closer.join(timeout=2.0)
+        if transport._state != "closed":
+            transport.close()
+
+
+def test_fatal_worker_exit_latches_transport_and_close_reclaims_owner_once(
+    monkeypatch,
+):
+    """publisher lane 致命退出后全局拒绝服务，close 仍只回收一次 owner。"""
+    worker_errors, worker_failed = _capture_transport_thread_errors(monkeypatch)
+    bindings = FakeEcalBindings()
+    fatal_send_started = Event()
+    release_fatal_send = Event()
+    fatal_error = KeyboardInterrupt("native send aborted")
+    send_attempts: list[tuple[str, bytes]] = []
+
+    def abort_send(publisher, payload: bytes, _message_type) -> None:
+        send_attempts.append((publisher.topic, bytes(payload)))
+        if publisher.topic == WHEEL_STATE_TOPIC:
+            fatal_send_started.set()
+            release_fatal_send.wait()
+            raise fatal_error
+        bindings.sent.append((publisher.topic, bytes(payload)))
+
+    bindings.send = abort_send
+    transport = EcalTransport(_config(), bindings=bindings, start_worker=True)
+    blocked_topic = TEST_CONFIG.rtk.topic
+    blocked_send_lock = transport._send_locks[blocked_topic]
+    blocked_send_lock_held = False
+    try:
+        blocked_send_lock.acquire()
+        blocked_send_lock_held = True
+        transport.publish(
+            blocked_topic,
+            b"other-lane",
+            _expected_types()[blocked_topic],
+            1,
+        )
+        transport.publish(WHEEL_STATE_TOPIC, b"owner", WHEEL_STATE_TYPE, 2)
+        assert fatal_send_started.wait(timeout=2.0)
+        transport.publish(WHEEL_STATE_TOPIC, b"latest", WHEEL_STATE_TYPE, 3)
+        assert transport.pending_payload(WHEEL_STATE_TOPIC) == b"latest"
+
+        release_fatal_send.set()
+        assert worker_failed.wait(timeout=2.0)
+        blocked_send_lock.release()
+        blocked_send_lock_held = False
+
+        with transport._condition:
+            all_workers_exited = transport._condition.wait_for(
+                lambda: set(transport._workers) <= transport._worker_exited_topics,
+                timeout=2.0,
+            )
+
+        assert len(worker_errors) == 1
+        assert worker_errors[0] is fatal_error
+        assert all_workers_exited is True
+        assert transport._worker_exited_topics == set(transport._workers)
+        assert send_attempts == [(WHEEL_STATE_TOPIC, b"owner")]
+        assert bindings.sent == []
+        with transport._condition:
+            assert transport._claimed_pending[WHEEL_STATE_TOPIC].payload == b"owner"
+            assert transport._pending[WHEEL_STATE_TOPIC].payload == b"latest"
+            assert transport._claimed_pending[blocked_topic].payload == b"other-lane"
+            assert transport._claimed_send_started == set()
+
+        fatal_snapshot = transport.snapshot()
+        fatal_quality = {
+            item.topic: item for item in fatal_snapshot.topic_quality
+        }
+        quality = fatal_quality[WHEEL_STATE_TOPIC]
+        assert fatal_snapshot.state == "error"
+        assert fatal_snapshot.error_count == 1
+        assert quality.error_count == 1
+        assert quality.state == "error"
+        assert quality.detail == fatal_snapshot.detail
+        for fragment in (
+            "publisher worker",
+            WHEEL_STATE_TOPIC,
+            "KeyboardInterrupt",
+            "native send aborted",
+        ):
+            assert fragment in fatal_snapshot.detail
+
+        with pytest.raises(RuntimeError, match="publisher worker fatal fault"):
+            transport.publish(WHEEL_STATE_TOPIC, b"rejected", WHEEL_STATE_TYPE, 4)
+        assert transport.pending_payload(WHEEL_STATE_TOPIC) == b"latest"
+
+        wait_calls = 0
+
+        def unexpected_wait(*, timeout=None) -> None:
+            nonlocal wait_calls
+            wait_calls += 1
+            raise AssertionError(f"fatal wait_idle blocked for {timeout!r}s")
+
+        with monkeypatch.context() as wait_patch:
+            wait_patch.setattr(transport._condition, "wait", unexpected_wait)
+            with pytest.raises(RuntimeError, match="publisher worker fatal fault"):
+                transport.wait_idle(timeout_sec=3600.0)
+        assert wait_calls == 0
+
+        discovery_calls = 0
+
+        def count_discovery(_resource: FakeResource) -> bool:
+            nonlocal discovery_calls
+            discovery_calls += 1
+            return False
+
+        bindings.is_peer_connected = count_discovery
+        with pytest.raises(RuntimeError, match="publisher worker fatal fault"):
+            transport.poll_peer_state()
+        assert discovery_calls == 0
+
+        transport.close()
+
+        assert transport._claimed_pending == {}
+        assert transport._claimed_send_started == set()
+        closed_snapshot = transport.snapshot()
+        closed_quality = {
+            item.topic: item for item in closed_snapshot.topic_quality
+        }[WHEEL_STATE_TOPIC]
+        assert closed_snapshot.error_count == 1
+        assert closed_snapshot.dropped_count == 3
+        assert closed_quality.error_count == 1
+        assert closed_quality.dropped_count == 2
+        assert {
+            item.topic: item for item in closed_snapshot.topic_quality
+        }[blocked_topic].dropped_count == 1
+        assert closed_quality.last_error_detail == fatal_snapshot.detail
+        assert closed_quality.detail == (
+            "transport closed before pending message was sent"
+        )
+
+        transport.close()
+        second_closed_snapshot = transport.snapshot()
+        assert second_closed_snapshot.error_count == closed_snapshot.error_count
+        assert second_closed_snapshot.dropped_count == closed_snapshot.dropped_count
+        assert second_closed_snapshot.topic_quality == closed_snapshot.topic_quality
+    finally:
+        release_fatal_send.set()
+        if blocked_send_lock_held:
+            blocked_send_lock.release()
+        if transport._state != "closed":
+            transport.close()
+
+
+@pytest.mark.parametrize(
+    ("method_name", "message", "expected_send_count"),
+    (
+        ("_claim_next_send_locked", "claim ownership aborted", 0),
+        ("_complete_claimed_send_locked", "completion aborted", 1),
+    ),
+    ids=("claim", "completion"),
+)
+def test_worker_phase_base_exception_latches_fatal_and_close_reclaims_owner(
+    monkeypatch,
+    method_name: str,
+    message: str,
+    expected_send_count: int,
+) -> None:
+    """claim/completion 逸出原始 BaseException 时统一进入 fatal epilogue。"""
+    worker_errors, worker_failed = _capture_transport_thread_errors(monkeypatch)
+    bindings = FakeEcalBindings()
+    transport = EcalTransport(_config(), bindings=bindings, start_worker=True)
+    injected_error = KeyboardInterrupt(message)
+
+    def abort_worker_phase(_topic: str) -> None:
+        raise injected_error
+
+    monkeypatch.setattr(transport, method_name, abort_worker_phase)
+    try:
+        transport.publish(WHEEL_STATE_TOPIC, b"owner", WHEEL_STATE_TYPE, 1)
+        assert worker_failed.wait(timeout=2.0)
+        with transport._condition:
+            all_workers_exited = transport._condition.wait_for(
+                lambda: set(transport._workers) <= transport._worker_exited_topics,
+                timeout=2.0,
+            )
+            claimed = transport._claimed_pending[WHEEL_STATE_TOPIC]
+            assert claimed.payload == b"owner"
+            assert transport._claimed_send_started == set()
+
+        fatal_snapshot = transport.snapshot()
+        fatal_quality = {
+            item.topic: item for item in fatal_snapshot.topic_quality
+        }[WHEEL_STATE_TOPIC]
+        assert worker_errors == [injected_error]
+        assert all_workers_exited is True
+        assert fatal_snapshot.state == "error"
+        assert fatal_snapshot.error_count == 1
+        assert fatal_quality.error_count == 1
+        assert message in fatal_snapshot.detail
+        assert len(bindings.sent) == expected_send_count
+        assert fatal_snapshot.published_count == 0
+
+        transport.close()
+        closed_snapshot = transport.snapshot()
+        closed_quality = {
+            item.topic: item for item in closed_snapshot.topic_quality
+        }[WHEEL_STATE_TOPIC]
+        assert closed_snapshot.error_count == 1
+        assert closed_snapshot.dropped_count == 1
+        assert closed_quality.error_count == 1
+        assert closed_quality.dropped_count == 1
+
+        transport.close()
+        second_closed_snapshot = transport.snapshot()
+        assert second_closed_snapshot.error_count == closed_snapshot.error_count
+        assert second_closed_snapshot.dropped_count == closed_snapshot.dropped_count
+        assert second_closed_snapshot.topic_quality == closed_snapshot.topic_quality
+    finally:
         if transport._state != "closed":
             transport.close()
 
@@ -1942,6 +2778,8 @@ def test_reconnect_evidence_requires_forced_exit_and_nonzero_targets():
         transport_name="ecal",
         states=("active", "disconnected", "waiting_peer", "active"),
         drive_target_before_disconnect=(4.0, 4.0),
+        mailbox_generation_before_disconnect=7,
+        mailbox_generation_after_disconnect=8,
         first_peer_terminated=True,
         first_peer_returncode=-15,
         first_peer_runtime_sec=0.25,
@@ -1957,6 +2795,7 @@ def test_reconnect_evidence_requires_forced_exit_and_nonzero_targets():
 
     for field_name, invalid_value in (
         ("drive_target_before_disconnect", (0.0, 0.0)),
+        ("mailbox_generation_after_disconnect", 7),
         ("first_peer_returncode", 0),
         ("silence_observed_sec", 0.05),
         ("silence_all_zero", False),
@@ -2332,7 +3171,7 @@ def test_worker_defers_failed_cleanup_dispatch_until_after_send_epilogue(
             original_cleanup()
             return
 
-        # 旧实现会在持有 _io_lock 时错误地同步进入这里；异步收尾仅防测试挂死。
+        # lane 尚在 send 调用栈时不能同步清理；异步收尾仅防测试挂死。
         def finish_after_send() -> None:
             assert send_returned.wait(timeout=2.0)
             original_cleanup()
@@ -2493,6 +3332,9 @@ def test_roundtrip_gate_uses_custom_channel_rates_for_every_topic():
         dropped_count=0,
         duration_sec=duration_sec,
         event_span_sec={topic: 0.9 for topic in expected_types},
+        max_interarrival_gap_sec={
+            topic: 1.0 / rate for topic, rate in rates.items()
+        },
         peer_dropped_count=0,
         transport_error_count=0,
         peer_error_count=0,

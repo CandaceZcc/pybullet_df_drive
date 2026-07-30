@@ -195,14 +195,28 @@ def test_window_layout_is_frozen():
 
 
 @pytest.mark.parametrize(
-    "width,height",
-    ((1366, 768), (1920, 1080), (2560, 1440)),
+    "width,height,main_width,dashboard_width",
+    (
+        (1366, 768, 915, 451),
+        (1920, 1080, 1286, 634),
+        (2560, 1440, 1715, 845),
+    ),
 )
-def test_layout_fills_available_geometry_at_four_to_one_split(width, height):
+def test_layout_fills_available_geometry_at_exact_sixty_seven_thirty_three_split(
+    width,
+    height,
+    main_width,
+    dashboard_width,
+):
     layout = calculate_window_layout(Rect(0, 0, width, height), dashboard_enabled=True)
 
-    assert layout.main == Rect(0, 0, width - width // 5, height)
-    assert layout.dashboard == Rect(width - width // 5, 0, width // 5, height)
+    assert layout.main == Rect(0, 0, main_width, height)
+    assert layout.dashboard == Rect(
+        width - dashboard_width,
+        0,
+        dashboard_width,
+        height,
+    )
     assert layout.main.right == layout.dashboard.x
     assert layout.dashboard.right == width
     assert layout.main.bottom == layout.dashboard.bottom == height
@@ -213,8 +227,8 @@ def test_layout_preserves_nonzero_origin_and_nondivisible_width_without_a_seam()
 
     layout = calculate_window_layout(available, dashboard_enabled=True)
 
-    assert layout.main == Rect(37, 53, 1094, 701)
-    assert layout.dashboard == Rect(1131, 53, 273, 701)
+    assert layout.main == Rect(37, 53, 916, 701)
+    assert layout.dashboard == Rect(953, 53, 451, 701)
     assert layout.main.right == layout.dashboard.x
     assert layout.dashboard.right == available.right
     assert layout.dashboard.bottom == available.bottom
@@ -235,10 +249,36 @@ def test_dashboard_split_aligns_to_two_physical_pixels_without_changing_coverage
 
     aligned = window_layout_module.align_window_layout_to_scale(layout, 2.0)
 
-    assert aligned.main == Rect(112, 64, 1958, 1376)
-    assert aligned.dashboard == Rect(2070, 64, 490, 1376)
+    assert aligned.main == Rect(112, 64, 1640, 1376)
+    assert aligned.dashboard == Rect(1752, 64, 808, 1376)
     assert aligned.main.right == aligned.dashboard.x
     assert aligned.dashboard.right == available.right
+
+
+@pytest.mark.parametrize("available_width", (50, 1250))
+def test_dashboard_scale_alignment_uses_half_up_at_exact_half_pixel(available_width):
+    """DPR 对齐不得用 ties-to-even 改写 33% 的 half-up 契约。"""
+    layout = calculate_window_layout(
+        Rect(0, 0, available_width, 700),
+        dashboard_enabled=True,
+    )
+
+    aligned = window_layout_module.align_window_layout_to_scale(layout, 1.0)
+
+    assert aligned == layout
+
+
+def test_dashboard_scale_alignment_uses_exact_ratio_at_decimal_dpr_half_boundary():
+    """十进制 DPR 的精确 .5 边界不得被二进制浮点向下扰动。"""
+    layout = calculate_window_layout(
+        Rect(0, 0, 1365, 700),
+        dashboard_enabled=True,
+    )
+
+    aligned = window_layout_module.align_window_layout_to_scale(layout, 1.1)
+
+    assert aligned.main == Rect(0, 0, 914, 700)
+    assert aligned.dashboard == Rect(914, 0, 451, 700)
 
 
 def test_x11_available_geometry_uses_current_desktop_workarea_and_primary_screen():

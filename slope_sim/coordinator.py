@@ -364,6 +364,7 @@ class SimulationCoordinator:
             selected_sensors = explicit_sensors or SensorDocument.default()
         # 协调器只持有重构后的唯一传感器配置，不保存第二份可漂移来源。
         self.sensor_document = selected_sensors
+        initial_scene_document: SceneDocument | None = None
         if isinstance(runtime_document, SceneDocument):
             expected_document = _logical_document_for_world(
                 world,
@@ -374,14 +375,23 @@ class SimulationCoordinator:
                 raise ValueError(
                     "runtime scene_document must match coordinator logical scene"
                 )
+            initial_scene_document = expected_document
         self.last_result: ManualSwitchResult | None = None
         self._queue: deque[RuntimeAction] = deque()
         self._active_action: RuntimeAction | None = None
         self._active_clear_synced_deleted_count = 0
         self._scene_document_cache_token: tuple[int, int, int, int] | None = None
-        self._scene_document_cache: SceneDocument | None = None
+        self._scene_document_cache: SceneDocument | None = initial_scene_document
         self._step_physics = step_physics or (lambda client_id: p.stepSimulation(physicsClientId=client_id))
         self._bind_obstacle_manager_to_current_robot()
+        initial_revision = getattr(self.obstacle_manager, "revision", None)
+        if initial_scene_document is not None and isinstance(initial_revision, int):
+            self._scene_document_cache_token = (
+                id(self.world),
+                id(self.obstacle_manager),
+                initial_revision,
+                id(self.sensor_document),
+            )
 
     def enqueue(self, action: RuntimeAction) -> None:
         """把 Dashboard 的一次性结构操作放入 FIFO。"""
@@ -546,11 +556,26 @@ class SimulationCoordinator:
             and self._scene_document_cache is not None
         ):
             return self._scene_document_cache
-        document = _logical_document_for_world(
-            self.world,
-            self.obstacle_manager,
-            self.sensor_document,
-        )
+        cached_token = self._scene_document_cache_token
+        logical_specs = getattr(self.obstacle_manager, "logical_specs", None)
+        if (
+            cache_token is not None
+            and cached_token is not None
+            and self._scene_document_cache is not None
+            and cache_token[0] == cached_token[0]
+            and cache_token[1] == cached_token[1]
+            and cache_token[3] == cached_token[3]
+            and callable(logical_specs)
+        ):
+            document = self._scene_document_cache._replace_validated_runtime_obstacles(
+                logical_specs()
+            )
+        else:
+            document = _logical_document_for_world(
+                self.world,
+                self.obstacle_manager,
+                self.sensor_document,
+            )
         if cache_token is not None:
             self._scene_document_cache_token = cache_token
             self._scene_document_cache = document

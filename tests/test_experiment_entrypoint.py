@@ -44,7 +44,7 @@ def test_stage2_obstacle_verifier_works_when_executed_by_path():
     assert "PASS ground_flat_box" in result.stdout
     assert "PASS coordinator_robot_switch" in result.stdout
     assert "PASS coordinator_robot_reset" in result.stdout
-    assert "PASS coordinator_rollback" in result.stdout
+    assert "PASS coordinator_edge_terrain_switch" in result.stdout
     assert "operation=add_50_clear_100" in result.stdout
     assert "SUMMARY pass=" in result.stdout
     assert "fail=0" in result.stdout

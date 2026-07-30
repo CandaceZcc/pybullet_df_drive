@@ -12,7 +12,7 @@ from slope_sim.model_registry import RobotModelSpec
 from slope_sim.telemetry import RobotTelemetry
 
 
-LEGACY_PLOT_TABS = ("轨迹", "速度/命令", "打滑", "接触")
+LEGACY_PLOT_TABS = ("轨迹", "速度/命令")
 INTERFACE_LINE_PLOT_TABS = (
     "驱动命令",
     "驱动反馈",
@@ -139,7 +139,7 @@ class InterfaceChartSpec:
 
 
 def dashboard_plot_specs() -> list[DashboardPlotSpec]:
-    """返回四个阶段三前实时图规格，名称和字段保持不变。"""
+    """返回主 Dashboard 保留的两张实时图，诊断指标不进入一级页签。"""
     return [
         DashboardPlotSpec(
             "轨迹",
@@ -159,32 +159,6 @@ def dashboard_plot_specs() -> list[DashboardPlotSpec]:
                 DashboardPlotLine("body_forward_speed", "t", "body_forward_speed", "body v"),
                 DashboardPlotLine("command_angular_velocity", "t", "command_angular_velocity", "cmd yaw"),
                 DashboardPlotLine("yaw_rate", "t", "yaw_rate", "yaw_rate"),
-            ),
-        ),
-        DashboardPlotSpec(
-            "打滑",
-            "slip severity",
-            "t [s]",
-            "|ratio| / signed m/s",
-            (
-                DashboardPlotLine("left_abs_slip_ratio", "t", "left_abs_slip_ratio", "L |ratio|"),
-                DashboardPlotLine("right_abs_slip_ratio", "t", "right_abs_slip_ratio", "R |ratio|"),
-                DashboardPlotLine("left_slip_speed", "t", "left_slip_speed", "L signed speed"),
-                DashboardPlotLine("right_slip_speed", "t", "right_slip_speed", "R signed speed"),
-            ),
-        ),
-        DashboardPlotSpec(
-            "接触",
-            "contact",
-            "t [s]",
-            "force / count",
-            (
-                DashboardPlotLine("left_contact_normal_force", "t", "left_contact_normal_force", "L N"),
-                DashboardPlotLine("right_contact_normal_force", "t", "right_contact_normal_force", "R N"),
-                DashboardPlotLine("left_contact_friction_force", "t", "left_contact_friction_force", "L F"),
-                DashboardPlotLine("right_contact_friction_force", "t", "right_contact_friction_force", "R F"),
-                DashboardPlotLine("left_contact_count", "t", "left_contact_count", "L cnt"),
-                DashboardPlotLine("right_contact_count", "t", "right_contact_count", "R cnt"),
             ),
         ),
     ]

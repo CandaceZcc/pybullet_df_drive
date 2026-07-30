@@ -145,11 +145,14 @@ def test_run_experiment_actual_ecal_uses_drift_free_deadline_pacing(
     monkeypatch,
 ) -> None:
     class EcalLoopbackTransport(LocalTransport):
-        def __init__(self, peer_state_callback) -> None:
-            super().__init__()
+        def __init__(self, peer_state_callback, monotonic) -> None:
+            super().__init__(monotonic=monotonic)
             self._peer_state_callback = peer_state_callback
+            self.peer_poll_times: list[float] = []
+            self._monotonic_for_test = monotonic
 
         def poll_peer_state(self) -> str:
+            self.peer_poll_times.append(self._monotonic_for_test())
             return "waiting_peer"
 
         def snapshot(self) -> TransportSnapshot:
@@ -163,12 +166,23 @@ def test_run_experiment_actual_ecal_uses_drift_free_deadline_pacing(
                 base.dropped_count,
             )
 
-    def create_ecal_transport(_mode, *, config, peer_state_callback):
+    transports: list[EcalLoopbackTransport] = []
+
+    def create_ecal_transport(
+        _mode,
+        *,
+        config,
+        peer_state_callback,
+        monotonic,
+    ):
         assert config.transport_mode == "ecal"
-        return EcalLoopbackTransport(peer_state_callback)
+        transport = EcalLoopbackTransport(peer_state_callback, monotonic)
+        transports.append(transport)
+        return transport
 
     clock = [0.0]
     sleeps: list[float] = []
+    gc_events: list[object] = []
 
     def monotonic() -> float:
         return clock[0]
@@ -179,12 +193,24 @@ def test_run_experiment_actual_ecal_uses_drift_free_deadline_pacing(
         clock[0] += delay
 
     monkeypatch.setattr(simulation_module, "create_transport", create_ecal_transport)
+    monkeypatch.setattr(
+        simulation_module,
+        "_suspend_cyclic_gc",
+        lambda: (gc_events.append("suspend"), True)[1],
+        raising=False,
+    )
+    monkeypatch.setattr(
+        simulation_module,
+        "_restore_cyclic_gc",
+        lambda was_enabled: gc_events.append(("restore", was_enabled)),
+        raising=False,
+    )
 
     run_experiment(
         ExperimentConfig(
             mode="direct",
-            duration_sec=0.03,
-            time_step=0.01,
+            duration_sec=1.0,
+            time_step=1.0 / 240.0,
             interface_mode="ecal",
             interface_enabled=True,
             interface_log_enabled=False,
@@ -195,17 +221,58 @@ def test_run_experiment_actual_ecal_uses_drift_free_deadline_pacing(
         sleep=sleep,
     )
 
-    assert sleeps == pytest.approx([0.01, 0.01, 0.01])
-    assert clock[0] == pytest.approx(0.03)
+    assert len(sleeps) == 240
+    assert sleeps == pytest.approx([1.0 / 240.0] * 240)
+    assert clock[0] == pytest.approx(1.0)
+    assert len(transports) == 1
+    # attach 的一次初始化 poll 不得混入循环内 20 Hz cadence 计数。
+    assert len(transports[0].peer_poll_times) - 1 in {19, 20}
+    assert gc_events == ["suspend", ("restore", True)]
 
 
-def test_deadline_pacer_skips_sleep_when_frame_has_overrun() -> None:
+@pytest.mark.parametrize("initially_enabled", (False, True))
+def test_cyclic_gc_pause_restores_the_callers_original_state(
+    initially_enabled: bool,
+    monkeypatch,
+) -> None:
+    enabled = [initially_enabled]
+    events: list[str] = []
+
+    monkeypatch.setattr(simulation_module.gc, "isenabled", lambda: enabled[0])
+
+    def disable() -> None:
+        events.append("disable")
+        enabled[0] = False
+
+    def enable() -> None:
+        events.append("enable")
+        enabled[0] = True
+
+    monkeypatch.setattr(simulation_module.gc, "disable", disable)
+    monkeypatch.setattr(simulation_module.gc, "enable", enable)
+
+    was_enabled = simulation_module._suspend_cyclic_gc()
+    assert was_enabled is initially_enabled
+    assert enabled[0] is False
+
+    simulation_module._restore_cyclic_gc(was_enabled)
+    assert enabled[0] is initially_enabled
+    assert events == (["disable", "enable"] if initially_enabled else [])
+
+
+def test_deadline_pacer_yields_without_adding_positive_delay_when_frame_has_overrun() -> None:
+    """超期追赶只让出执行权，不能用固定正延时持续扩大墙钟欠债。"""
     clock = [0.0]
     sleeps: list[float] = []
+
+    def sleep(delay: float) -> None:
+        sleeps.append(delay)
+        clock[0] += delay
+
     pacer = simulation_module._DeadlinePacer(
         0.01,
         monotonic=lambda: clock[0],
-        sleep=sleeps.append,
+        sleep=sleep,
     )
     pacer.start()
 
@@ -214,7 +281,62 @@ def test_deadline_pacer_skips_sleep_when_frame_has_overrun() -> None:
     clock[0] = 0.026
     pacer.wait_for_next_deadline()
 
-    assert sleeps == []
+    assert sleeps == [0.0, 0.0]
+    assert clock[0] == pytest.approx(0.026)
+
+
+def test_interface_frames_share_20hz_observation_without_skipping_safety_steps() -> None:
+    """240 Hz 物理循环只能低频 discovery，但安全决策和物理步不得降频。"""
+    cadence_type = getattr(simulation_module, "RuntimeObservationCadence", None)
+    assert callable(cadence_type), "simulation entry needs the shared observation cadence"
+
+    clock = [0.0]
+    polls: list[float] = []
+    decision_times: list[float] = []
+    after_count = 0
+
+    class Runtime:
+        def poll_transport(self) -> None:
+            polls.append(clock[0])
+
+        def submit_local_twist(self, _linear: float, _angular: float, _dt: float) -> bool:
+            return True
+
+        def before_physics_step(self, _dt: float, *, wall_time: float) -> None:
+            decision_times.append(wall_time)
+
+        def after_physics_step(self, _dt: float) -> None:
+            nonlocal after_count
+            after_count += 1
+
+    class Coordinator:
+        def __init__(self) -> None:
+            self.step_count = 0
+
+        def step(self, dt: float) -> None:
+            self.step_count += 1
+            clock[0] += dt
+
+    runtime = Runtime()
+    coordinator = Coordinator()
+    cadence = cadence_type(monotonic=lambda: clock[0])
+
+    for _frame in range(240):
+        simulation_module.run_interface_physics_frame(
+            runtime,
+            coordinator,
+            actual_transport_mode="local",
+            linear_velocity=0.4,
+            angular_velocity=0.1,
+            dt=1.0 / 240.0,
+            observation_cadence=cadence,
+        )
+
+    assert 19 <= len(polls) <= 20
+    assert len(decision_times) == coordinator.step_count == after_count == 240
+    assert decision_times == pytest.approx(
+        [frame / 240.0 for frame in range(240)]
+    )
 
 
 def test_run_experiment_local_mode_does_not_use_wall_clock_pacer(
@@ -426,10 +548,17 @@ def test_strict_ecal_runtime_initialization_failure_cleans_before_disconnect(
     class FailingRuntime:
         def __init__(self, *_args, **_kwargs):
             trace.append("runtime")
+            trace.append(
+                (
+                    "capture_lidar_top_view",
+                    _kwargs.get("capture_lidar_top_view"),
+                )
+            )
             raise RuntimeError("primary strict initialization failure")
 
-    def create_strict_transport(mode, *, config, peer_state_callback):
+    def create_strict_transport(mode, *, config, peer_state_callback, monotonic):
         assert callable(peer_state_callback)
+        assert callable(monotonic)
         trace.append(("transport", mode, config.transport_mode))
         return Transport()
 
@@ -461,6 +590,7 @@ def test_strict_ecal_runtime_initialization_failure_cleans_before_disconnect(
         "disconnect",
     ]
     assert ("transport", "ecal", "ecal") in trace
+    assert ("capture_lidar_top_view", False) in trace
 
 
 @pytest.mark.parametrize("terrain_model", terrain_model_names())

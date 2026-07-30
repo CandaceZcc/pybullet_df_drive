@@ -15,6 +15,17 @@ def _probe(client_id: int, scene: scene_module.SceneInfo, x: float):
     return scene_module.probe_terrain(client_id, x, 0.0, bounds=scene.bounds)
 
 
+def test_golf_heightfield_covers_the_common_flat_terrain_footprint() -> None:
+    """高尔夫地形不得让 flat 中合法的障碍布局在切换时越界。"""
+    cell_size = scene_module.GOLF_HEIGHTFIELD_CELL_SIZE
+    x_span = (scene_module.GOLF_HEIGHTFIELD_COLUMNS - 1) * cell_size
+    y_span = (scene_module.GOLF_HEIGHTFIELD_ROWS - 1) * cell_size
+
+    assert x_span >= scene_module.STAGE1_TERRAIN_LENGTH
+    assert x_span - cell_size < scene_module.STAGE1_TERRAIN_LENGTH
+    assert y_span >= scene_module.STAGE1_TERRAIN_WIDTH
+
+
 def test_golf_non_square_heightfield_uses_rows_as_y_and_columns_as_x(monkeypatch):
     """以真实碰撞体检查非方形网格的公共 rows=y、columns=x 语义。"""
     rows, columns = 4, 6

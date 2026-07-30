@@ -131,6 +131,32 @@ class Transport:
         self.close_count += 1
 
 
+class MissingOutputPeerTransport(Transport):
+    """保持 transport 正常，仅把一个输出话题报告为无订阅端。"""
+
+    def __init__(self, target_topic: str) -> None:
+        super().__init__(mode="ecal")
+        self.target_topic = target_topic
+        self.config = InterfaceConfig.default(transport_mode="ecal")
+
+    def snapshot(self) -> TransportSnapshot:
+        return TransportSnapshot(
+            mode="ecal",
+            ecal_connected=True,
+            published_count=len(self.published),
+            received_count=0,
+            error_count=0,
+            dropped_count=0,
+            topic_quality=tuple(
+                TransportTopicQuality(
+                    channel.topic,
+                    peer_connected=channel.topic != self.target_topic,
+                )
+                for channel in self.config.channels
+            ),
+        )
+
+
 class Robot:
     """实现运行时需要的轮子端口，并记录纯 twist 转换调用。"""
 
@@ -674,6 +700,129 @@ def test_production_session_keeps_complete_scene_document_without_body_ids(monke
         session.close()
 
 
+def test_production_session_forwards_participant_name_and_exposes_transport(
+    monkeypatch,
+) -> None:
+    """真实外部门禁必须复用生产 session wiring，同时使用独立 participant。"""
+    transport = Transport(mode="ecal")
+    captured: dict[str, object] = {}
+
+    def create_named_transport(
+        mode,
+        *,
+        config,
+        peer_state_callback,
+        participant_name,
+        monotonic,
+    ):
+        assert callable(monotonic)
+        captured.update(
+            mode=mode,
+            config=config,
+            peer_state_callback=peer_state_callback,
+            participant_name=participant_name,
+        )
+        return transport
+
+    world = SimpleNamespace(
+        scene=SimpleNamespace(body_ids=(10,)),
+        active_robot=SimpleNamespace(robot=Robot()),
+    )
+
+    class Manager:
+        def snapshot(self, *, include_body_id=False):
+            return ()
+
+    monkeypatch.setattr(simulation_module, "PyBulletSensorBackend", lambda *_args: Backend())
+    monkeypatch.setattr(simulation_module, "create_transport", create_named_transport)
+
+    session = simulation_module.create_interface_session(
+        ExperimentConfig(
+            interface_mode="ecal",
+            interface_enabled=True,
+            interface_log_enabled=False,
+        ),
+        client_id=3,
+        coordinator_world=world,
+        obstacle_manager=Manager(),
+        document=scene_document(),
+        participant_name="stage3-real-ecal-gate",
+    )
+    assert session is not None
+    try:
+        assert session.transport is transport
+        assert captured["participant_name"] == "stage3-real-ecal-gate"
+    finally:
+        session.close()
+
+
+def test_production_session_polls_transport_before_initial_lifecycle_snapshot(
+    monkeypatch,
+) -> None:
+    """session attach 必须先推进 discovery，再读取用于初始化的最新状态。"""
+    transport = Transport(mode="ecal")
+    trace: list[str] = []
+    discovery_polled = False
+
+    def poll_peer_state() -> str:
+        nonlocal discovery_polled
+        trace.append("poll")
+        discovery_polled = True
+        return "waiting_peer"
+
+    def snapshot() -> TransportSnapshot:
+        trace.append("snapshot")
+        if not discovery_polled:
+            raise AssertionError("snapshot read before poll_peer_state")
+        return TransportSnapshot(
+            mode="ecal",
+            ecal_connected=True,
+            published_count=0,
+            received_count=0,
+            error_count=0,
+            dropped_count=0,
+        )
+
+    transport.poll_peer_state = poll_peer_state
+    transport.snapshot = snapshot
+    world = SimpleNamespace(
+        scene=SimpleNamespace(body_ids=(10,)),
+        active_robot=SimpleNamespace(robot=Robot()),
+    )
+
+    class Manager:
+        def snapshot(self, *, include_body_id=False):
+            return ()
+
+    monkeypatch.setattr(
+        simulation_module,
+        "PyBulletSensorBackend",
+        lambda *_args: Backend(),
+    )
+    monkeypatch.setattr(
+        simulation_module,
+        "create_transport",
+        lambda *_args, **_kwargs: transport,
+    )
+
+    session = simulation_module.create_interface_session(
+        ExperimentConfig(
+            interface_mode="ecal",
+            interface_enabled=True,
+            interface_log_enabled=False,
+        ),
+        client_id=3,
+        coordinator_world=world,
+        obstacle_manager=Manager(),
+        document=scene_document(),
+    )
+    assert session is not None
+    try:
+        assert trace[:2] == ["poll", "snapshot"]
+    finally:
+        session.close()
+
+
 def test_production_session_wires_peer_lifecycle_to_runtime_generation(monkeypatch) -> None:
     """session 必须把真实 discovery 边沿接到 runtime，而非只更新 transport。"""
     transport = Transport(mode="ecal")
@@ -692,9 +841,10 @@ def test_production_session_wires_peer_lifecycle_to_runtime_generation(monkeypat
 
     transport.snapshot = snapshot
 
-    def create_peer_transport(_mode, *, config, peer_state_callback):
+    def create_peer_transport(_mode, *, config, peer_state_callback, monotonic):
         nonlocal peer_callback
         assert config.transport_mode == "ecal"
+        assert callable(monotonic)
         peer_callback = peer_state_callback
         return transport
 
@@ -989,9 +1139,9 @@ def test_local_interface_frame_uses_canonical_runtime_order_without_twist_bypass
         trace.append("submit_local"),
         original_submit(linear, angular, dt),
     )[1]
-    runtime.before_physics_step = lambda dt: (
+    runtime.before_physics_step = lambda dt, *, wall_time: (
         trace.append("before"),
-        original_before(dt, wall_time=clock()),
+        original_before(dt, wall_time=wall_time),
     )[1]
     runtime.after_physics_step = lambda dt: (
         trace.append("after"),
@@ -1008,6 +1158,9 @@ def test_local_interface_frame_uses_canonical_runtime_order_without_twist_bypass
             return "advanced"
 
     try:
+        observation_cadence = simulation_module.RuntimeObservationCadence(
+            monotonic=clock,
+        )
         result = simulation_module.run_interface_physics_frame(
             runtime,
             Coordinator(),
@@ -1015,6 +1168,7 @@ def test_local_interface_frame_uses_canonical_runtime_order_without_twist_bypass
             linear_velocity=0.6,
             angular_velocity=0.2,
             dt=0.01,
+            observation_cadence=observation_cadence,
         )
         simulation_module.run_interface_physics_frame(
             runtime,
@@ -1023,6 +1177,7 @@ def test_local_interface_frame_uses_canonical_runtime_order_without_twist_bypass
             linear_velocity=0.6,
             angular_velocity=0.2,
             dt=0.01,
+            observation_cadence=observation_cadence,
         )
 
         assert result == "advanced"
@@ -1032,8 +1187,12 @@ def test_local_interface_frame_uses_canonical_runtime_order_without_twist_bypass
             "before",
             "coordinator.step",
             "after",
-        ] * 2
-        assert transport.poll_count == 2
+            "submit_local",
+            "before",
+            "coordinator.step",
+            "after",
+        ]
+        assert transport.poll_count == 1
         assert robot.twists == [(0.6, 0.2, 10_000_000, 0.01)]
         assert robot.commands[-1][0] == pytest.approx((0.4, 0.8))
         assert direct_twists == []
@@ -1264,6 +1423,9 @@ def test_ecal_interface_frame_never_submits_dashboard_twist() -> None:
 
     coordinator = Coordinator()
     try:
+        observation_cadence = simulation_module.RuntimeObservationCadence(
+            monotonic=clock,
+        )
         simulation_module.run_interface_physics_frame(
             runtime,
             coordinator,
@@ -1271,6 +1433,7 @@ def test_ecal_interface_frame_never_submits_dashboard_twist() -> None:
             linear_velocity=9.0,
             angular_velocity=-4.0,
             dt=0.01,
+            observation_cadence=observation_cadence,
         )
 
         assert coordinator.steps == 1
@@ -1305,8 +1468,74 @@ def test_sensor_failure_isolated_and_status_contains_all_six_channels() -> None:
             status = snapshot.topics[channel.topic]
             assert status.state == "active"
             assert status.message_count == 1
-            assert status.latest_timestamp_ns == 100_000_000
+            expected_timestamp_ns = (
+                50_000_000
+                if channel is runtime.config.lidar_rear
+                else 100_000_000
+            )
+            assert status.latest_timestamp_ns == expected_timestamp_ns
         assert runtime.config.lidar_front.topic not in [item[0] for item in transport.published]
+    finally:
+        runtime.close()
+
+
+def test_sensor_error_outweighs_missing_output_peer() -> None:
+    """输出无订阅端时，真实传感器错误仍必须保留为 error。"""
+    config = InterfaceConfig.default(transport_mode="ecal")
+    transport = MissingOutputPeerTransport(config.lidar_front.topic)
+    runtime, _robot, _transport, clock = make_runtime(
+        mode="ecal",
+        backend=Backend(),
+        document=scene_document(),
+        transport=transport,
+    )
+    runtime._front_lidar = StubLidar(
+        "lidar_front",
+        1,
+        RuntimeError("front ray failed without subscriber"),
+    )
+    runtime._rear_lidar = StubLidar("lidar_rear", 2)
+    runtime._truth_sensor_suite = StubTruth()
+    try:
+        runtime.initialize_peer_lifecycle("ecal", "active", ecal_connected=True)
+        runtime.poll_transport()
+        clock.advance(0.1)
+        runtime.after_physics_step(0.1)
+
+        status = runtime.status_snapshot(wall_time=clock()).topics[
+            config.lidar_front.topic
+        ]
+
+        assert status.state == "error"
+        assert status.error_count == 1
+        assert "front ray failed without subscriber" in status.detail
+    finally:
+        runtime.close()
+
+
+def test_logger_degradation_outweighs_missing_output_peer() -> None:
+    """日志拒收和 peer 缺失并存时，输出话题必须保留 degraded 根因。"""
+    config = InterfaceConfig.default(transport_mode="ecal")
+    transport = MissingOutputPeerTransport(config.wheel_state.topic)
+    logger = Logger(accept_messages=False)
+    runtime, _robot, _transport, clock = make_runtime(
+        mode="ecal",
+        logger=logger,
+        transport=transport,
+    )
+    try:
+        runtime.initialize_peer_lifecycle("ecal", "active", ecal_connected=True)
+        runtime.poll_transport()
+        clock.advance(0.01)
+        runtime.after_physics_step(0.01)
+
+        status = runtime.status_snapshot(wall_time=clock()).topics[
+            config.wheel_state.topic
+        ]
+
+        assert status.state == "degraded"
+        assert status.dropped_count == 1
+        assert status.detail == "interface logger rejected message"
     finally:
         runtime.close()
 
@@ -1445,9 +1674,10 @@ def test_production_session_logs_ecal_lifecycle_before_logger_close(monkeypatch)
 
     transport.snapshot = snapshot
 
-    def create_peer_transport(_mode, *, config, peer_state_callback):
+    def create_peer_transport(_mode, *, config, peer_state_callback, monotonic):
         nonlocal peer_callback
         assert config.transport_mode == "ecal"
+        assert callable(monotonic)
         peer_callback = peer_state_callback
         return transport
 

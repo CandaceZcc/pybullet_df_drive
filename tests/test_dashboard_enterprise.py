@@ -28,7 +28,7 @@ from slope_sim.telemetry import RobotTelemetry
 
 TOPIC_LABELS = ("轮子命令", "轮子状态", "前雷达", "后雷达", "RTK", "IMU")
 EXPECTED_DEFAULT_TABS = [
-    "接口状态", "障碍物", "轨迹", "速度/命令", "打滑", "接触",
+    "接口状态", "障碍物", "轨迹", "速度/命令",
     "驱动命令", "驱动反馈", "转向命令", "转向反馈", "LiDAR点云",
     "RTK位置", "RTK航向", "IMU姿态", "轮组频率", "传感频率", "接口异常",
 ]
@@ -202,16 +202,24 @@ def test_default_dashboard_contains_only_enterprise_tabs_and_controls(monkeypatc
         assert len(dashboard.window.findChildren(dashboard.QtWidgets.QTabWidget)) == 1
         assert all(dashboard.tabs.isAncestorOf(canvas) for canvas in dashboard.plot_canvases.values())
         visible_text = _all_widget_text(dashboard)
-        for required in ("仿真控制", "机器人", "场地", "障碍物", *TOPIC_LABELS):
+        for required in (
+            "仿真控制",
+            "线速度",
+            "角速度",
+            "机器人",
+            "场地",
+            "障碍物",
+            *TOPIC_LABELS,
+        ):
             assert required in visible_text
         for forbidden in (
             "摩擦",
             "地形法向",
-            "线速度",
-            "角速度",
             "导航",
             "自动避障",
             "相机参数",
+            "打滑",
+            "接触",
         ):
             assert forbidden not in visible_text
     finally:
@@ -219,26 +227,316 @@ def test_default_dashboard_contains_only_enterprise_tabs_and_controls(monkeypatc
 
 
 def test_layout_report_serializes_current_plot_and_control_rectangles(monkeypatch, tmp_path):
-    """验收模式只写 JSON 矩形，曲线页必须报告画布、图例和命令按钮。"""
+    """v4 验收报告必须覆盖 active axes、图表文字和全部关键控制。"""
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     report_path = tmp_path / "dashboard-layout.jsonl"
     monkeypatch.setenv(dashboard_module.DASHBOARD_LAYOUT_REPORT_ENV, str(report_path))
     dashboard = TelemetryDashboard(interface_config=InterfaceConfig.default())
     try:
+        scrollbar = dashboard.control_scroll.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+        original_scroll_value = scrollbar.value()
         dashboard.tabs.setCurrentIndex(EXPECTED_DEFAULT_TABS.index("轨迹"))
         dashboard.process_events()
         dashboard.process_events()
 
         rows = [json.loads(line) for line in report_path.read_text(encoding="utf-8").splitlines()]
         report = rows[-1]
-        assert report["tab_count"] == 17
+        assert report["report_version"] == 4
+        assert report["tab_count"] == 15
         assert report["tab_label"] == "轨迹"
         assert report["tab_order"] == EXPECTED_DEFAULT_TABS
+        assert report["page_kind"] == "plot"
+        assert report["required_plot_buttons"] == ["清空曲线", "保存当前图"]
+        assert type(report["rendered_data_revision"]) is int
+        assert report["rendered_data_revision"] >= 0
         assert len(report["tabs_rect"]) == len(report["controls_rect"]) == 4
+        assert len(report["tab_bar_rect"]) == 4
+        assert set(report["tab_scroll_button_rects"]) == {"left", "right"}
         assert len(report["page_rect"]) == len(report["canvas_rect"]) == 4
+        assert len(report["axes_rect"]) == 4
         assert len(report["legend_rect"]) == 4
-        assert len(report["plot_button_rects"]) == 2
-        assert set(report["critical_control_rects"]) == {"暂停", "复位车辆", "退出"}
+        assert set(report["plot_button_rects"]) == {"清空曲线", "保存当前图"}
+        assert report["content_widget_rects"] == {}
+        assert set(report["plot_artist_rects"]) == {
+            "title",
+            "x_label",
+            "y_label",
+            "x_offset",
+            "y_offset",
+        }
+        assert report["plot_artist_rects"]["x_offset"] is None
+        assert report["plot_artist_rects"]["y_offset"] is None
+        assert len(report["control_viewport_rect"]) == 4
+        assert len(report["control_content_rect"]) == 4
+        assert len(report["control_scroll_range"]) == 2
+        assert set(report["critical_control_rects"]) == {
+            "暂停",
+            "复位车辆",
+            "线速度",
+            "角速度",
+            "退出",
+            "车型",
+            "应用车型",
+            "场地",
+            "坡度",
+            "场地随机种子",
+            "起伏",
+            "应用场地",
+            "障碍模式",
+            "障碍形状",
+            "障碍数量",
+            "障碍随机种子",
+            "障碍速度",
+            "障碍移动占比",
+            "添加障碍",
+            "删除选中",
+            "清空障碍",
+            "结构状态",
+        }
+        for control in report["critical_control_rects"].values():
+            assert set(control) == {"rect", "viewport_rect", "scroll_value"}
+            assert len(control["rect"]) == len(control["viewport_rect"]) == 4
+        assert scrollbar.value() == original_scroll_value
+    finally:
+        dashboard.close()
+
+
+def test_layout_report_waits_for_a_new_rendered_revision_before_reemitting_plot(
+    monkeypatch,
+    tmp_path,
+):
+    """切回图表时不能先写新行旧修订；完成新数据绘制后才能追加。"""
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    report_path = tmp_path / "dashboard-layout.jsonl"
+    monkeypatch.setenv(dashboard_module.DASHBOARD_LAYOUT_REPORT_ENV, str(report_path))
+    dashboard = TelemetryDashboard(interface_config=InterfaceConfig.default())
+    try:
+        trajectory_index = EXPECTED_DEFAULT_TABS.index("轨迹")
+        dashboard.tabs.setCurrentIndex(trajectory_index)
+        for _attempt in range(6):
+            dashboard.process_events()
+        first_rows = [
+            json.loads(line)
+            for line in report_path.read_text(encoding="utf-8").splitlines()
+            if json.loads(line)["tab_label"] == "轨迹"
+        ]
+        assert len(first_rows) == 1
+
+        dashboard.tabs.setCurrentIndex(EXPECTED_DEFAULT_TABS.index("速度/命令"))
+        for _attempt in range(6):
+            dashboard.process_events()
+        dashboard.tabs.setCurrentIndex(trajectory_index)
+        for _attempt in range(3):
+            dashboard.process_events()
+        unchanged_rows = [
+            json.loads(line)
+            for line in report_path.read_text(encoding="utf-8").splitlines()
+            if json.loads(line)["tab_label"] == "轨迹"
+        ]
+        assert len(unchanged_rows) == 1
+
+        dashboard._plot_next_draw_time["轨迹"] = 0.0
+        dashboard._mark_plot_data_changed(("轨迹",))
+        for _attempt in range(6):
+            dashboard.process_events()
+        final_rows = [
+            json.loads(line)
+            for line in report_path.read_text(encoding="utf-8").splitlines()
+            if json.loads(line)["tab_label"] == "轨迹"
+        ]
+        assert len(final_rows) == 2
+        assert (
+            final_rows[-1]["rendered_data_revision"]
+            > first_rows[-1]["rendered_data_revision"]
+        )
+    finally:
+        dashboard.close()
+
+
+def test_trajectory_disables_scientific_offsets_and_keeps_axis_artists_separate(monkeypatch):
+    """大坐标轨迹不能让科学计数 offset 与坐标轴标签争用同一位置。"""
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    dashboard = TelemetryDashboard(interface_config=InterfaceConfig.default())
+    try:
+        dashboard.apply_window_rect(RectLike(0, 0, 404, 651))
+        dashboard.tabs.setCurrentIndex(EXPECTED_DEFAULT_TABS.index("轨迹"))
+        for index in range(3):
+            dashboard.plot_buffer.append(
+                RobotTelemetry(
+                    t=float(index),
+                    x=1_000_000.0 + index,
+                    y=2_000_000.0 + index,
+                )
+            )
+        dashboard._apply_plot_series("轨迹")
+        canvas = dashboard.plot_canvases["轨迹"]
+        canvas.draw()
+
+        axis = dashboard.plot_axes["轨迹"]
+        renderer = canvas.get_renderer()
+        x_label = axis.xaxis.label.get_window_extent(renderer=renderer)
+        y_label = axis.yaxis.label.get_window_extent(renderer=renderer)
+        x_offset_artist = axis.xaxis.get_offset_text()
+        y_offset_artist = axis.yaxis.get_offset_text()
+
+        assert x_offset_artist.get_text() == ""
+        assert y_offset_artist.get_text() == ""
+        assert not x_label.overlaps(
+            x_offset_artist.get_window_extent(renderer=renderer)
+        )
+        assert not y_label.overlaps(
+            y_offset_artist.get_window_extent(renderer=renderer)
+        )
+    finally:
+        dashboard.close()
+
+
+def test_wall_time_xlabel_stays_separate_from_scientific_offset(monkeypatch):
+    """窄画布的大墙钟横轴保留 offset，但长 xlabel 必须与其分居左右。"""
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    dashboard = TelemetryDashboard(interface_config=InterfaceConfig.default())
+    try:
+        dashboard.apply_window_rect(RectLike(0, 0, 404, 651))
+        tab_label = "轮组频率"
+        dashboard.tabs.setCurrentIndex(EXPECTED_DEFAULT_TABS.index(tab_label))
+        dashboard.plot_lines["command_hz"].set_data(
+            [17_828.2, 17_828.3, 17_828.4],
+            [100.0, 99.0, 101.0],
+        )
+        axis = dashboard.plot_axes[tab_label]
+        axis.relim()
+        axis.autoscale_view()
+        canvas = dashboard.plot_canvases[tab_label]
+        canvas.draw()
+
+        renderer = canvas.get_renderer()
+        x_label = axis.xaxis.label.get_window_extent(renderer=renderer)
+        x_offset_artist = axis.xaxis.get_offset_text()
+
+        assert x_offset_artist.get_text()
+        assert not x_label.overlaps(
+            x_offset_artist.get_window_extent(renderer=renderer)
+        )
+    finally:
+        dashboard.close()
+
+
+def test_plot_axes_prune_outermost_ticks_for_narrow_dashboard(enterprise_dashboard):
+    """窄画布必须裁掉两端主刻度，避免完整 tick 文字越出 Figure。"""
+    for axis in enterprise_dashboard.plot_axes.values():
+        assert axis.xaxis.get_major_locator()._prune == "both"
+        assert axis.yaxis.get_major_locator()._prune == "both"
+
+
+def test_qt_label_text_report_preserves_full_vertical_contents_rect(
+    enterprise_dashboard,
+):
+    """QLabel 合法字体 bbox 可触及上下边，报告不能人为缩短内容区。"""
+    from PySide6 import QtWidgets
+
+    label = QtWidgets.QLabel("运行状态", enterprise_dashboard.window)
+    label.resize(120, 30)
+    label.show()
+    enterprise_dashboard.process_events()
+
+    report = enterprise_dashboard._qt_text_global_rect(label)
+    contents = label.contentsRect()
+
+    assert report is not None
+    assert report["container_rect"][2:] == [contents.width() - 4, contents.height()]
+
+
+def test_layout_report_fully_contains_all_required_controls_at_real_client_size(monkeypatch):
+    """真实 404x651 客户区中，六个障碍物控件也必须逐个完整滚入 viewport。"""
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from PySide6 import QtCore
+
+    dashboard = TelemetryDashboard(interface_config=InterfaceConfig.default())
+    try:
+        dashboard.apply_window_rect(RectLike(0, 0, 404, 651))
+        dashboard.process_events()
+
+        report = dashboard._layout_report()
+
+        assert report is not None
+        assert {
+            "障碍模式",
+            "障碍形状",
+            "障碍数量",
+            "障碍随机种子",
+            "障碍速度",
+            "障碍移动占比",
+        } <= set(report["critical_control_rects"])
+        for name, control in report["critical_control_rects"].items():
+            viewport = QtCore.QRect(*control["viewport_rect"])
+            rect = QtCore.QRect(*control["rect"])
+            assert viewport.contains(rect), (name, rect, viewport)
+    finally:
+        dashboard.close()
+
+
+def test_all_fifteen_default_layout_reports_pass_content_and_artist_containment(monkeypatch):
+    """15 个默认页面都必须由正式 verifier 证明控件、文字 artist 和画布完整包含。"""
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from scripts.verify_dashboard_manual_drive import validate_dashboard_layout_report
+    from slope_sim.window_layout import Rect
+
+    dashboard = TelemetryDashboard(interface_config=InterfaceConfig.default())
+    try:
+        dashboard.apply_window_rect(RectLike(0, 0, 404, 651))
+        for index, label in enumerate(EXPECTED_DEFAULT_TABS):
+            dashboard.tabs.setCurrentIndex(index)
+            report = None
+            for _attempt in range(12):
+                dashboard.process_events()
+                report = dashboard._layout_report()
+                if report is not None:
+                    break
+
+            assert report is not None, label
+            x, y, width, height = report["window_rect"]
+            result = validate_dashboard_layout_report(
+                report,
+                Rect(x, y, width, height),
+            )
+            assert result.passed, (label, result.detail)
+    finally:
+        dashboard.close()
+
+
+def test_real_dashboard_report_stays_stable_after_new_trajectory_data(monkeypatch):
+    """真实 Dashboard 完成新数据绘制后必须推进修订且不改变五个布局矩形。"""
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from scripts.verify_dashboard_manual_drive import validate_dashboard_layout_stability
+    from slope_sim.window_layout import Rect
+
+    dashboard = TelemetryDashboard(interface_config=InterfaceConfig.default())
+    try:
+        dashboard.apply_window_rect(RectLike(0, 0, 404, 651))
+        dashboard.tabs.setCurrentIndex(EXPECTED_DEFAULT_TABS.index("轨迹"))
+        for _attempt in range(6):
+            dashboard.process_events()
+        before = dashboard._layout_report()
+        assert before is not None
+
+        next_draw_time = dashboard._plot_next_draw_time["轨迹"] + 1.0
+        monkeypatch.setattr(dashboard_module.time, "monotonic", lambda: next_draw_time)
+        dashboard._last_plot_update_time = None
+        dashboard.update(RobotTelemetry(t=1.0, x=1.0, y=2.0))
+        for _attempt in range(6):
+            dashboard.process_events()
+        after = dashboard._layout_report()
+        assert after is not None
+
+        x, y, width, height = before["window_rect"]
+        result = validate_dashboard_layout_stability(
+            before,
+            after,
+            Rect(x, y, width, height),
+        )
+        assert after["rendered_data_revision"] > before["rendered_data_revision"]
+        assert result.passed, result.detail
     finally:
         dashboard.close()
 
@@ -250,6 +548,17 @@ def test_developer_diagnostics_tab_is_opt_in(monkeypatch):
     try:
         assert _tab_names(normal) == EXPECTED_DEFAULT_TABS
         assert _tab_names(diagnostic) == [*EXPECTED_DEFAULT_TABS, "开发者诊断"]
+        diagnostic_text = _all_widget_text(diagnostic)
+        assert "打滑严重度" in diagnostic_text
+        assert "有效接触点" in diagnostic_text
+        assert "接触法向力" in diagnostic_text
+        expected_plot_tabs = set(EXPECTED_DEFAULT_TABS) - {"接口状态", "障碍物"}
+        assert normal.tabs.count() == 15
+        assert diagnostic.tabs.count() == 16
+        assert len(normal.plot_specs) == len(diagnostic.plot_specs) == 12
+        assert set(normal.plot_canvases) == expected_plot_tabs
+        assert set(diagnostic.plot_canvases) == expected_plot_tabs
+        assert len(normal.plot_canvases) == len(diagnostic.plot_canvases) == 13
         assert normal.diagnostic_tabs is diagnostic.diagnostic_tabs is None
         assert len(diagnostic.window.findChildren(diagnostic.QtWidgets.QTabWidget)) == 1
         assert all(diagnostic.tabs.isAncestorOf(canvas) for canvas in diagnostic.plot_canvases.values())
@@ -396,8 +705,8 @@ def test_same_generation_reuses_all_plot_artists_and_lidar_latest_success(monkey
         dashboard.close()
 
 
-def test_lidar_limits_follow_only_latest_offsets_and_resets_to_default(monkeypatch):
-    """点云坐标范围不能累积历史 dataLim，空代际和复位回到固定默认视野。"""
+def test_lidar_viewport_and_artist_geometry_stay_fixed_across_frames(monkeypatch):
+    """点云内容只能更新 artist，不能改变固定车体坐标窗口或绘图区几何。"""
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     now = {"value": 100.0}
     monkeypatch.setattr(dashboard_module.time, "monotonic", lambda: now["value"])
@@ -407,6 +716,11 @@ def test_lidar_limits_follow_only_latest_offsets_and_resets_to_default(monkeypat
         dashboard.process_events()
         canvas = dashboard.plot_canvases["LiDAR点云"]
         canvas._draw_pending = False
+        canvas.draw()
+        initial_canvas_size = canvas.get_width_height()
+        initial_axis_bounds = dashboard.plot_axes["LiDAR点云"].get_window_extent(
+            canvas.get_renderer()
+        ).bounds
         identities = (
             id(dashboard.plot_axes["LiDAR点云"]),
             id(dashboard.lidar_collection),
@@ -424,7 +738,8 @@ def test_lidar_limits_follow_only_latest_offsets_and_resets_to_default(monkeypat
             )
         )
         canvas.draw()
-        assert dashboard.plot_axes["LiDAR点云"].get_xlim()[0] > 20.0
+        assert dashboard.plot_axes["LiDAR点云"].get_xlim() == pytest.approx((-48.0, 48.0))
+        assert dashboard.plot_axes["LiDAR点云"].get_ylim() == pytest.approx((-30.0, 30.0))
 
         canvas._draw_pending = False
         now["value"] = 101.0
@@ -438,10 +753,8 @@ def test_lidar_limits_follow_only_latest_offsets_and_resets_to_default(monkeypat
             )
         )
         canvas.draw()
-        x_limits = dashboard.plot_axes["LiDAR点云"].get_xlim()
-        y_limits = dashboard.plot_axes["LiDAR点云"].get_ylim()
-        assert x_limits[0] < 1.0 < x_limits[1] < 5.0
-        assert y_limits[0] < 1.0 < y_limits[1] < 5.0
+        assert dashboard.plot_axes["LiDAR点云"].get_xlim() == pytest.approx((-48.0, 48.0))
+        assert dashboard.plot_axes["LiDAR点云"].get_ylim() == pytest.approx((-30.0, 30.0))
 
         canvas._draw_pending = False
         now["value"] = 101.5
@@ -465,8 +778,9 @@ def test_lidar_limits_follow_only_latest_offsets_and_resets_to_default(monkeypat
                 lidar_front_view=LidarTopViewFrame(3_000_000_000, ()),
             )
         )
-        assert dashboard.plot_axes["LiDAR点云"].get_xlim() == pytest.approx((-5.0, 5.0))
-        assert dashboard.plot_axes["LiDAR点云"].get_ylim() == pytest.approx((-5.0, 5.0))
+        canvas.draw()
+        assert dashboard.plot_axes["LiDAR点云"].get_xlim() == pytest.approx((-48.0, 48.0))
+        assert dashboard.plot_axes["LiDAR点云"].get_ylim() == pytest.approx((-30.0, 30.0))
 
         canvas._draw_pending = False
         now["value"] = 102.0
@@ -479,19 +793,49 @@ def test_lidar_limits_follow_only_latest_offsets_and_resets_to_default(monkeypat
                 points=((2.0, -2.0, 3, 1),),
             )
         )
-        x_limits = dashboard.plot_axes["LiDAR点云"].get_xlim()
-        y_limits = dashboard.plot_axes["LiDAR点云"].get_ylim()
-        assert x_limits[0] < 2.0 < x_limits[1] < 5.0
-        assert -5.0 < y_limits[0] < -2.0 < y_limits[1]
+        canvas.draw()
         dashboard.reset_feedback_history()
-        assert dashboard.plot_axes["LiDAR点云"].get_xlim() == pytest.approx((-5.0, 5.0))
-        assert dashboard.plot_axes["LiDAR点云"].get_ylim() == pytest.approx((-5.0, 5.0))
+        canvas.draw()
+        assert dashboard.plot_axes["LiDAR点云"].get_xlim() == pytest.approx((-48.0, 48.0))
+        assert dashboard.plot_axes["LiDAR点云"].get_ylim() == pytest.approx((-30.0, 30.0))
+        assert canvas.get_width_height() == initial_canvas_size
+        final_axis_bounds = dashboard.plot_axes["LiDAR点云"].get_window_extent(
+            canvas.get_renderer()
+        ).bounds
+        assert final_axis_bounds == pytest.approx(initial_axis_bounds, abs=1.0)
         assert identities == (
             id(dashboard.plot_axes["LiDAR点云"]),
             id(dashboard.lidar_collection),
             id(dashboard.lidar_front_time_text),
             id(dashboard.lidar_rear_time_text),
         )
+    finally:
+        dashboard.close()
+
+
+def test_lidar_plot_explains_vehicle_frame_and_obstacle_classes(monkeypatch):
+    """LiDAR 页应直接标明车体方向，并用固定图例解释障碍点颜色。"""
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    dashboard = TelemetryDashboard(interface_config=InterfaceConfig.default())
+    try:
+        axis = dashboard.plot_axes["LiDAR点云"]
+        legend = dashboard.plot_legends["LiDAR点云"]
+
+        assert axis.get_xlabel() == "forward x [m]"
+        assert axis.get_ylabel() == "left y [m]"
+        assert list(dashboard.lidar_vehicle_marker.get_xdata()) == [0.0]
+        assert list(dashboard.lidar_vehicle_marker.get_ydata()) == [0.0]
+        assert dashboard.lidar_vehicle_marker.get_marker() == ">"
+        assert [text.get_text() for text in legend.get_texts()] == [
+            "unknown",
+            "terrain",
+            "static obstacle",
+            "moving obstacle",
+            "vehicle forward",
+        ]
+        assert legend._ncols == 2
+        assert legend.columnspacing == pytest.approx(1.0)
+        assert legend.handletextpad == pytest.approx(0.6)
     finally:
         dashboard.close()
 
@@ -722,7 +1066,7 @@ def test_constructor_failure_after_canvas_creation_disposes_mpl_and_qt(monkeypat
         TelemetryDashboard()
     app.processEvents()
 
-    assert len(connections) == 15
+    assert len(connections) == 13
     assert all(
         cid not in registry.callbacks.get(event_name, {})
         for _canvas, event_name, cid, _figure, registry in connections
@@ -869,7 +1213,7 @@ def test_default_title_and_command_buttons_use_icons_and_tooltips(enterprise_das
     dashboard = enterprise_dashboard
     assert dashboard.window.windowTitle() == dashboard_module.DASHBOARD_WINDOW_TITLE == "3D仿真Dashboard"
 
-    command_buttons = (
+    icon_command_buttons = (
         dashboard.pause_button,
         dashboard.reset_button,
         dashboard.quit_button,
@@ -878,10 +1222,22 @@ def test_default_title_and_command_buttons_use_icons_and_tooltips(enterprise_das
         dashboard.add_obstacles_button,
         dashboard.delete_obstacle_button,
         dashboard.clear_obstacles_button,
-        *dashboard.direction_buttons,
     )
-    assert all(button.toolTip() for button in command_buttons)
-    assert all(not button.icon().isNull() for button in command_buttons)
+    assert all(button.toolTip() for button in icon_command_buttons)
+    assert all(not button.icon().isNull() for button in icon_command_buttons)
+
+
+def test_default_dashboard_has_no_direction_buttons(
+    enterprise_dashboard,
+):
+    """方向驾驶统一使用键盘，默认 Dashboard 不再显示遮挡控件的按钮。"""
+    dashboard = enterprise_dashboard
+
+    assert dashboard.direction_buttons == []
+    assert not {
+        button.text()
+        for button in dashboard.window.findChildren(dashboard.QtWidgets.QPushButton)
+    } & {"↑", "←", "■", "→", "↓"}
 
 
 def test_pause_button_exposes_read_only_state_and_persists_in_commands(enterprise_dashboard):
@@ -1136,7 +1492,7 @@ def test_dashboard_frame_extents_wait_for_two_stable_managed_samples():
     ("screen_width", "height"),
     ((1366, 768), (1920, 1080), (2560, 1440)),
 )
-def test_enterprise_controls_are_reachable_at_twenty_percent_width(
+def test_enterprise_controls_are_fully_reachable_at_thirty_three_percent_width(
     screen_width,
     height,
     enterprise_dashboard,
@@ -1144,7 +1500,8 @@ def test_enterprise_controls_are_reachable_at_twenty_percent_width(
     from PySide6 import QtCore
 
     dashboard = enterprise_dashboard
-    dashboard.apply_window_rect(RectLike(0, 0, screen_width // 5, height))
+    dashboard_width = (screen_width * 33 + 50) // 100
+    dashboard.apply_window_rect(RectLike(0, 0, dashboard_width, height))
     dashboard.process_events()
 
     assert dashboard.control_scroll.horizontalScrollBar().maximum() == 0
@@ -1152,33 +1509,36 @@ def test_enterprise_controls_are_reachable_at_twenty_percent_width(
     assert dashboard.obstacle_table.horizontalScrollBar().maximum() == 0
 
     enterprise_controls = (
-        dashboard.pause_button,
-        dashboard.reset_button,
-        dashboard.quit_button,
-        dashboard.robot_combo,
-        dashboard.apply_robot_button,
-        dashboard.terrain_combo,
-        dashboard.slope_spin,
-        dashboard.golf_seed_spin,
-        dashboard.golf_relief_combo,
-        dashboard.apply_terrain_button,
-        dashboard.obstacle_mode_combo,
-        dashboard.obstacle_shape_combo,
-        dashboard.obstacle_count_spin,
-        dashboard.obstacle_seed_spin,
-        dashboard.obstacle_speed_spin,
-        dashboard.obstacle_ratio_spin,
-        dashboard.add_obstacles_button,
-        dashboard.delete_obstacle_button,
-        dashboard.clear_obstacles_button,
-        *dashboard.direction_buttons,
+        ("pause", dashboard.pause_button),
+        ("reset", dashboard.reset_button),
+        ("linear", dashboard.linear_spin),
+        ("angular", dashboard.angular_spin),
+        ("quit", dashboard.quit_button),
+        ("robot", dashboard.robot_combo),
+        ("apply_robot", dashboard.apply_robot_button),
+        ("terrain", dashboard.terrain_combo),
+        ("slope", dashboard.slope_spin),
+        ("golf_seed", dashboard.golf_seed_spin),
+        ("golf_relief", dashboard.golf_relief_combo),
+        ("apply_terrain", dashboard.apply_terrain_button),
+        ("obstacle_mode", dashboard.obstacle_mode_combo),
+        ("obstacle_shape", dashboard.obstacle_shape_combo),
+        ("obstacle_count", dashboard.obstacle_count_spin),
+        ("obstacle_seed", dashboard.obstacle_seed_spin),
+        ("obstacle_speed", dashboard.obstacle_speed_spin),
+        ("obstacle_ratio", dashboard.obstacle_ratio_spin),
+        ("add_obstacles", dashboard.add_obstacles_button),
+        ("delete_obstacle", dashboard.delete_obstacle_button),
+        ("clear_obstacles", dashboard.clear_obstacles_button),
     )
     viewport_rect = dashboard.control_scroll.viewport().rect()
-    for control in enterprise_controls:
-        dashboard.control_scroll.ensureWidgetVisible(control)
+    for name, control in enterprise_controls:
+        dashboard._ensure_control_fully_visible(control)
         dashboard.process_events()
         top_left = control.mapTo(dashboard.control_scroll.viewport(), control.rect().topLeft())
-        assert viewport_rect.intersects(QtCore.QRect(top_left, control.size()))
+        assert viewport_rect.contains(
+            QtCore.QRect(top_left, control.size())
+        ), name
 
     group_rects = [group.geometry() for group in dashboard.control_groups]
     assert all(not upper.intersects(lower) for upper, lower in zip(group_rects, group_rects[1:]))

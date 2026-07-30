@@ -10,7 +10,7 @@
 
 **Design Spec:** `docs/superpowers/specs/2026-07-21-stage3-ecal-enterprise-interfaces-design.md`
 
-**User-added acceptance:** Main GUI 与 Dashboard 按主屏可用区域 4:1 初始平铺，是用户在阶段三设计期间明确补充并确认的硬门禁，即使早期原始需求未列出也不得降级为可选项。
+**User-updated acceptance:** 用户最新将阶段三设计期间补充的原 4:1 门禁替换为名义 `67:33` 初始平铺：Dashboard 宽度精确按 `33/100` 计算，Main 使用余宽。该项仍为硬门禁，即使早期原始需求未列出也不得降级为可选项。根需求规格对产品边界的优先级高于本实施计划：默认 Dashboard 固定为 15 页、13 个图表页，接触力、接触点数和打滑指标只进入显式开发者诊断。
 
 **Selected execution:** 用户已选择子智能体并行执行。Task 1-12 已完成；修订后的 Task 13A、13B、13C 按共享契约顺序串行实现，但可与只读审查和 Task 14 环境调查并行。Task 14 由主线程统一集成、验收和审查。并行任务必须有互不重叠的文件写集，子智能体最大深度为 1，主线程复核全部结果后再运行完整回归。未经用户明确要求不执行 Git commit。
 
@@ -31,24 +31,25 @@
 - `slope_sim/interfaces/wheel.py`：命令 mailbox、超时保护和实际轮子状态。
 - `slope_sim/interfaces/runtime.py`：主循环接口编排与重绑定生命周期。
 - `slope_sim/interfaces/logging.py`：长度前缀 Protobuf 日志和 JSONL 事件日志。
+- `slope_sim/realtime.py`：共享绝对 deadline 和 50 ms runtime 观测节拍。
 - `slope_sim/sensor_backend.py`：传感器需要的窄 PyBullet 后端。
 - `slope_sim/truth_sensors.py`：RTK 与 IMU 真值生成。
 - `slope_sim/lidar_pointcloud.py`：多层射线与点云生成。
 - `slope_sim/scene_config.py`：版本化场景文档、原子导出和事务加载。
-- `slope_sim/window_layout.py`：主屏 4:1 初始窗口布局。
+- `slope_sim/window_layout.py`：主屏 67:33 初始窗口布局。
 - `slope_sim/dashboard_charts.py`：纯 Python 图表规格、20 秒缓冲和接口质量增量计算。
 
 现有 `slope_sim/sensors.py` 的二维摘要只保留内部诊断兼容，不承载企业点云。
 
 ---
 
-## 当前实施证据（2026-07-23 审计）
+## 当前实施证据（2026-07-30 收口复验）
 
-- Task 1-6、8-10 及 Task 12 的非 eCAL 功能已有实现和聚焦测试证据；独立审计未发现额外功能缺口。
-- 新鲜证据包括 1686 项收集、909 项核心/假传输、400 项 DIRECT/集成回归、阶段一 12/12 和阶段二 `SUMMARY pass=19 fail=0`。
-- Task 7 因 `slope-sim` 环境无法 `import ecal` 重新打开；现有脚本只是合成 transport harness，不能作为真实 PyBullet runtime 验收。
-- Task 11 因 logger 队列拒绝和 transport 关停 pending frame 未完整写入 JSONL 重新打开，统一由 Task 12R 修复。
-- 旧 Task 1-12 的未勾选步骤保留为原始 TDD 配方，不代表当前功能全部缺失；从 Task 12R 起的复选框是本轮权威执行状态。
+- Task 1-12、12R、13A-13C、14A 的生产实现和 TDD 回归均已落地；旧 Task 1-12 的未勾选步骤只保留原始配方，从 Task 12R 起的复选框是本轮权威状态。
+- `496 passed`、schema v3/button、旧全量和旧真实 eCAL 数字只保留为历史证据，不能证明当前 schema v4、键盘驾驶或 post-fix eCAL 合同。
+- 当前 fresh 证据为：cadence/自动/手动/eCAL 进程聚焦组 `272 passed, 4 deselected`；transport/runtime/process 组合 `365 passed, 4 deselected`；阶段一 `12/12`、阶段二 `SUMMARY pass=19 fail=0`、阶段三 DIRECT `SUMMARY pass=21 fail=0`；全量非 eCAL `2209 passed, 4 deselected in 102.53s`。四个 deselect 均为真实 eCAL 标记用例，四组 schema v4 GUI 仍按本计划后续步骤补证。
+- DIRECT 首次串行运行曾得到 `accepted=873/1200`；诊断确认是 5 秒墙钟内仿真节拍不足，不是 logger drop。删除未被 runtime 使用的 rolling/incremental LiDAR 容器、恢复直接单批原子路径后，本轮正式复验为 `1200/1200`、`final_pending=0`、transport/logger drop=0、最大 Dashboard 间隔 `54.92 ms`；门槛未下调。
+- 用户已授权并完成本次唯一 post-fix 命令执行，但 Codex 沙箱在正式测量前拒绝 eCAL UDP socket（`Operation not permitted`），退出码 `1`，未生成 peer/runtime 结果 JSON。完整环境阻断证据保留于 `/tmp/pybullet-df-postfix-ecal-gate.CBZyMMKJ`；它不能判定 post-fix P0。未自动重跑，后续有效复验仍需用户重新授权并切换到允许 eCAL socket 的环境，不得用修复前失败、并发污染或本次环境阻断替代。
 - 本阶段改动尚未按任务提交 Git；这是用户要求“未明确请求不 commit”的结果，不得把缺少提交误报为功能通过，也不得擅自补提交。
 
 ---
@@ -1273,7 +1274,7 @@ def load_ecal_bindings() -> EcalBindings:
             ) from legacy_error
 ```
 
-`EcalTransport` 为六个集中配置话题创建真实 Protobuf publisher/subscriber。传输回调只复制 payload、读取单调墙钟并调用上层 callback，不持有或动态查询 mailbox；上层 callback 进入时先从 runtime 原子捕获 `(mailbox_ref, generation)`，再解码，并把命令提交给同一个 mailbox 引用和 token。输出队列按话题只保留最新未发帧，覆盖时递增 dropped 计数并标记 degraded。participant、subscriber 或任一 publisher 创建失败时按已创建资源的逆序清理。对端消失后清空命令 mailbox；discovery 恢复只改为 `waiting_peer`，收到新 generation 的命令后才能回到 `active`。`close()` 顺序关闭 subscriber、publisher、worker、participant，允许重复调用。
+`EcalTransport` 为六个集中配置话题创建真实 Protobuf publisher/subscriber。传输回调只复制 payload、读取单调墙钟并调用上层 callback，不持有或动态查询 mailbox；上层 callback 进入时先从 runtime 原子捕获 `(mailbox_ref, generation)`，再解码，并把命令提交给同一个 mailbox 引用和 token。每个 publisher lane 固定拥有一个 `ready/in-flight` 槽；物理线程向空闲 lane 原子交接首帧，公开 `outgoing_queue_size` 只限制共享 latest 合并缓冲，每个话题在缓冲中至多保留一个最新帧。覆盖 latest 时递增 dropped 并标记 degraded，不引入 FIFO。participant、subscriber 或任一 publisher 创建失败时按已创建资源的逆序清理。对端消失后清空命令 mailbox；discovery 恢复只改为 `waiting_peer`，收到新 generation 的命令后才能回到 `active`。`close()` 先禁止新 publish/delivery/discovery并收敛 worker，把未开始 send 的 ready/latest 计为 terminal drop，再等待在途 discovery/count API，最后移除 subscriber callback、释放 subscriber/publisher 引用并 finalize participant；允许重复调用。
 
 - [ ] **Step 6: 实现两个独立进程的验收脚本**
 
@@ -2070,6 +2071,8 @@ developer_diagnostics_enabled: bool = False
 - [ ] **Step 6: 把运行时接入唯一物理主线程**
 
 ```python
+pacer = _DeadlinePacer(config.time_step)
+pacer.start()
 while not should_exit:
     dashboard_command = dashboard.current_command() if dashboard else DashboardCommand.idle()
     paused = dashboard_command.paused
@@ -2080,8 +2083,10 @@ while not should_exit:
         interface_runtime.after_physics_step(config.time_step)
     if dashboard:
         dashboard.update_interface_status(interface_runtime.status_snapshot())
-    time.sleep(config.time_step)
+    pacer.wait_for_next_deadline()
 ```
+
+`_DeadlinePacer` 使用上一绝对期限累加下一期限；帧内工作只消耗本帧余量，超期时调用 `sleep(0)` 让出执行权，不能追加固定正延时扩大墙钟欠债。
 
 本地模式把现有键盘/按钮 `linear_velocity`、`angular_velocity` 在 100 Hz deadline 转换为当前车型的 `WheelCommand`，再走同一 codec、mailbox、限位和超时；eCAL 模式忽略 Dashboard 直接运动值。eCAL 命令 callback 的第一步是在 runtime lifecycle 锁内捕获 `(mailbox_ref, generation)`，解码完成后只向该引用提交 token；重建或关闭不能让旧 payload 通过动态 `runtime._mailbox` 进入新 mailbox。主循环不再在接口启用时同时调用 `command_twist()` 和接口轮速控制。
 
@@ -2139,7 +2144,7 @@ git commit -m "阶段三: 1. 运行时集成"
 - Test: `tests/test_ecal_transport.py`
 - Test: `tests/test_interface_runtime_integration.py`
 
-- [ ] **Step 1: 写 logger 队列拒绝最终必须落盘的失败测试**
+- [x] **Step 1: 写 logger 队列拒绝最终必须落盘的失败测试**
 
 ```python
 def test_logger_queue_rejection_is_persisted_after_capacity_recovers(tmp_path):
@@ -2168,7 +2173,7 @@ def test_terminal_logger_drop_event_waits_for_capacity_only_during_close(tmp_pat
 
 物理循环中的正常 `record_message`/`record_event` 仍必须无等待；只有关闭路径可使用有界等待提交终态质量事件。
 
-- [ ] **Step 2: 写 transport quiesce 在 logger 关闭前暴露最终丢帧的失败测试**
+- [x] **Step 2: 写 transport quiesce 在 logger 关闭前暴露最终丢帧的失败测试**
 
 ```python
 def test_runtime_logs_transport_pending_drop_before_logger_closes(runtime_fixture):
@@ -2186,7 +2191,7 @@ def test_runtime_logs_transport_pending_drop_before_logger_closes(runtime_fixtur
 
 同时测试 `LocalTransport.quiesce()`、重复 quiesce/close、回调上下文 close 和 quiesce 后禁止启动新回调。
 
-- [ ] **Step 3: 运行红灯**
+- [x] **Step 3: 运行红灯**
 
 ```bash
 conda run -n slope-sim python -m pytest tests/test_interface_logging.py tests/test_local_transport.py tests/test_ecal_transport.py tests/test_interface_runtime_integration.py -q
@@ -2194,7 +2199,7 @@ conda run -n slope-sim python -m pytest tests/test_interface_logging.py tests/te
 
 Expected: FAIL，缺少 terminal event、transport quiesce 和新的关闭轨迹；失败不得来自已有日志 round-trip。
 
-- [ ] **Step 4: 实现 logger 有界终态事件**
+- [x] **Step 4: 实现 logger 有界终态事件**
 
 ```python
 def record_terminal_event(
@@ -2211,7 +2216,7 @@ def record_terminal_event(
 
 `InterfaceRuntime` 维护 `_pending_logger_drops`；正常运行中下一次成功事件前尝试非阻塞聚合提交，关闭时调用 `record_terminal_event("queue_dropped", source="interface_logger", count=self._pending_logger_drops)`。不能递归把该终态事件自身拒绝再次加入 pending。
 
-- [ ] **Step 5: 增加 transport quiesce 生命周期**
+- [x] **Step 5: 增加 transport quiesce 生命周期**
 
 ```python
 class Transport(Protocol):
@@ -2226,7 +2231,9 @@ class Transport(Protocol):
 
 `InterfaceRuntime.close()` 顺序改为：停止命令、车辆安全停止、停止传感器、transport quiesce、消费最终质量并写聚合事件、关闭 logger、关闭 transport 资源、关闭传感器。该顺序保持日志在所有丢帧计数确定后才终结。
 
-- [ ] **Step 6: 运行聚焦和生命周期回归**
+当前生命周期补充合同：轮速/传感器读取和 `bind_scene()` 统一登记为 world operation；prepare、wheel-only rebind 和 close 封锁新操作后等待旧操作退出。rebind 不等待已经进入 transport 的旧 publish。`publish/receive/logger` 回调和 lifecycle owner 的同线程 `prepare/rebind/commit/abort/fault/close` 立即抛错，不进入 condition 等待；其他线程遇到已有 owner 时串行等待后重新竞争。rebind 在 safe-stop 前失败恢复旧准入；safe-stop 后提交异常恢复旧 robot/model/mailbox/subscription 引用但进入 `faulted`，不重新激活旧 token，候选 subscription 关闭且统一 `close()` 仍可释放旧引用。
+
+- [x] **Step 6: 运行聚焦和生命周期回归**
 
 ```bash
 conda run -n slope-sim python -m pytest tests/test_interface_logging.py tests/test_local_transport.py tests/test_ecal_transport.py tests/test_interface_runtime.py tests/test_interface_runtime_integration.py tests/test_interface_pause_rebuild.py -q
@@ -2235,7 +2242,7 @@ git diff --check
 
 Expected: 全部 PASS；物理路径仍无阻塞，close trace 与设计一致，JSONL 包含 logger 和 transport 两类 `queue_dropped`。
 
-- [ ] **Step 7: 完成 Task 12R 规格审查和代码质量审查**
+- [x] **Step 7: 完成 Task 12R 规格审查和代码质量审查**
 
 规格审查核对两类丢帧都持久化且关闭顺序符合日志完整性；质量审查检查 callback-close 死锁、semaphore 泄漏、终态事件递归、重复 close 计数和 writer 失败路径。发现问题先补红灯测试。
 
@@ -2253,7 +2260,7 @@ Expected: 全部 PASS；物理路径仍无阻塞，close trace 与设计一致�
 - Test: `tests/test_interface_runtime.py`
 - Test: `tests/test_lidar_pointcloud.py`
 
-- [ ] **Step 1: 写组合快照冻结和字段校验失败测试**
+- [x] **Step 1: 写组合快照冻结和字段校验失败测试**
 
 ```python
 def test_interface_dashboard_snapshot_copies_lidar_points_and_keeps_payloads_immutable():
@@ -2293,7 +2300,7 @@ def test_lidar_top_view_point_rejects_invalid_values(factory, match):
         factory()
 ```
 
-- [ ] **Step 2: 写前后雷达到 `base_link` 的数值投影失败测试**
+- [x] **Step 2: 写前后雷达到 `base_link` 的数值投影失败测试**
 
 ```python
 def test_scan_with_top_view_projects_sensor_hits_into_base_link(recording_backend):
@@ -2313,7 +2320,7 @@ def test_scan_with_top_view_projects_sensor_hits_into_base_link(recording_backen
 
 同时增加后雷达 yaw=pi、空点云、所有 5760 条射线命中和未知命中类别测试。`scan()` 必须继续只返回原 `LidarPointCloud`，现有企业消息调用方不破坏。
 
-- [ ] **Step 3: 写 runtime 成功提交、失败隔离和 generation 清理失败测试**
+- [x] **Step 3: 写 runtime 成功提交、失败隔离和 generation 清理失败测试**
 
 ```python
 def test_dashboard_snapshot_only_advances_after_valid_command_and_successful_publish(runtime_fixture):
@@ -2359,7 +2366,7 @@ def test_world_rebuild_changes_dashboard_generation_and_clears_every_latest_payl
     )
 ```
 
-- [ ] **Step 4: 运行红灯并确认失败原因**
+- [x] **Step 4: 运行红灯并确认失败原因**
 
 ```bash
 conda run -n slope-sim python -m pytest tests/test_interface_dashboard_snapshot.py tests/test_lidar_pointcloud.py tests/test_interface_runtime.py -q
@@ -2367,7 +2374,7 @@ conda run -n slope-sim python -m pytest tests/test_interface_dashboard_snapshot.
 
 Expected: FAIL，缺少 `dashboard_snapshot` 模块、`scan_with_top_view()` 和 runtime 最新消息边界；不得因已有 `InterfaceStatusSnapshot` 测试失败。
 
-- [ ] **Step 5: 实现冻结快照与单次扫描投影**
+- [x] **Step 5: 实现冻结快照与单次扫描投影**
 
 ```python
 # slope_sim/interfaces/dashboard_snapshot.py
@@ -2412,25 +2419,28 @@ class LidarScanResult:
     top_view: LidarTopViewFrame
 
 
-def scan_with_top_view(self, timebase_ns: int) -> LidarScanResult:
-    base_pose = self._backend.world_pose("base_link")
-    message, accepted_world_hits = self._scan_message_and_world_hits(timebase_ns)
-    base_hits = self._backend.inverse_transform_points(base_pose, accepted_world_hits)
-    view = LidarTopViewFrame(
-        timebase_ns,
-        tuple(
-            LidarTopViewPoint(x, y, point.tag, self.lidar_id)
-            for (x, y, _z), point in zip(base_hits, message.points, strict=True)
-        ),
-    )
-    return LidarScanResult(message, view)
-
-
 def scan(self, timebase_ns: int) -> LidarPointCloud:
-    return self.scan_with_top_view(timebase_ns).message
+    message, _ = self._scan_message_at_mount(
+        timebase_ns,
+        self._world_mount(),
+        capture_world_points=False,
+    )
+    return message
+
+
+def scan_with_top_view(self, timebase_ns: int) -> LidarScanResult:
+    message, accepted_world_hits = self._scan_message_at_mount(
+        timebase_ns,
+        self._world_mount(),
+        capture_world_points=True,
+    )
+    # 只有 GUI Dashboard 路径再把已接受命中投影到 base_link。
+    ...
 ```
 
-- [ ] **Step 6: 实现 runtime 原子最新值和组合快照**
+生产 `PyBulletSensorBackend` 暴露 `ray_test_indexed_hits()`，直接省略 miss 并保留原射线索引；`MultiLineLidar` 对该紧凑结果使用 `inverse_transform_points_prevalidated()`，异常扩展类型仍回退完整严格校验。`InterfaceRuntime(capture_lidar_top_view=False)` 的 DIRECT/headless 路径只调用 `scan()`，不读取 `base_link` 或构造俯视副本；GUI Dashboard 才调用 `scan_with_top_view()`。
+
+- [x] **Step 6: 实现 runtime 原子最新值和组合快照**
 
 `InterfaceRuntime` 新增 `_latest_dashboard_payloads`、`_latest_lidar_views`、`_last_wheel_command` 和 `_last_wheel_command_received_sim_time_ns`。有效命令在 mailbox 成功提交且 generation 仍匹配时，将命令与当前 `_clock.now_ns` 原子保存；输出在 `_publish_message(topic, message, timestamp_ns, generation) is True` 后保存。将状态构造提取为仅在持锁时调用的 `_status_snapshot_locked(captured_at, transport_snapshot)`，让 `status_snapshot()` 和 `dashboard_snapshot()` 复用且不嵌套获取 `Condition`。
 
@@ -2458,7 +2468,7 @@ def dashboard_snapshot(self, wall_time: float | None = None) -> InterfaceDashboa
 
 所有 prepare/commit/rollback/disconnect/close 清理路径通过一个 `_clear_dashboard_payloads_locked()` 统一清空，不增加新的锁。
 
-- [ ] **Step 7: 运行聚焦测试和既有接口回归**
+- [x] **Step 7: 运行聚焦测试和既有接口回归**
 
 ```bash
 conda run -n slope-sim python -m pytest tests/test_interface_dashboard_snapshot.py tests/test_lidar_pointcloud.py tests/test_lidar_pointcloud_direct.py tests/test_interface_runtime.py tests/test_interface_runtime_integration.py tests/test_interface_pause_rebuild.py -q
@@ -2467,13 +2477,15 @@ git diff --check
 
 Expected: 全部 PASS；企业 Protobuf descriptor 与 payload 不增加字段。
 
-- [ ] **Step 8: 完成 Task 13A 规格审查和代码质量审查**
+- [x] **Step 8: 完成 Task 13A 规格审查和代码质量审查**
 
 先由独立只读线程逐条核对冻结边界、成功发布语义、LiDAR 坐标和 generation 清理；通过后再启动第二个只读线程检查锁顺序、重复变换、点云复制、类型窄化和测试稳定性。任何 Important 结论先补红灯测试再修复。
 
+性能复验后的修订：生产 runtime 仍在每个扫描 deadline 用一次 `rayTestBatch` 生成 2880-ray 原子点云，保持阶段三“单发布时刻、无运动畸变”合同。热路径改用紧凑 indexed hit 和预验证批量逆变换，headless 不构造 Dashboard 俯视副本；前后 50 ms 相位及 100 ms 消息时间戳周期不变，不以跨物理帧拼接世界状态换取墙钟性能。
+
 ---
 
-## Task 13B：17 个一级页签与低密度图表
+## Task 13B：15 个默认一级页签与低密度图表
 
 **Files:**
 
@@ -2485,18 +2497,18 @@ Expected: 全部 PASS；企业 Protobuf descriptor 与 payload 不增加字段�
 - Test: `tests/test_dashboard_enterprise.py`
 - Test: `tests/test_manual_demo.py`
 
-- [ ] **Step 1: 写精确页签、标题和开发者诊断边界失败测试**
+- [x] **Step 1: 写精确页签、标题和开发者诊断边界失败测试**
 
 ```python
 EXPECTED_DEFAULT_TABS = [
-    "接口状态", "障碍物", "轨迹", "速度/命令", "打滑", "接触",
+    "接口状态", "障碍物", "轨迹", "速度/命令",
     "驱动命令", "驱动反馈", "转向命令", "转向反馈",
     "LiDAR点云", "RTK位置", "RTK航向", "IMU姿态",
     "轮组频率", "传感频率", "接口异常",
 ]
 
 
-def test_default_dashboard_exposes_all_seventeen_peer_tabs(monkeypatch):
+def test_default_dashboard_exposes_all_fifteen_enterprise_tabs(monkeypatch):
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     dashboard = TelemetryDashboard(interface_config=InterfaceConfig.default())
     try:
@@ -2522,7 +2534,7 @@ def test_developer_diagnostics_adds_only_internal_page_without_duplicate_plots(m
         dashboard.close()
 ```
 
-- [ ] **Step 2: 写纯图表缓存的时间、代际和低密度失败测试**
+- [x] **Step 2: 写纯图表缓存的时间、代际和低密度失败测试**
 
 ```python
 def test_interface_chart_buffer_deduplicates_messages_and_clears_on_generation_change():
@@ -2565,7 +2577,7 @@ def test_interface_error_rate_resets_baseline_without_negative_spike():
 
 补充 20 秒边界、逆序时间、NaN、四车型 2/4 驱动轮、0/2 转向轮和暂停业务冻结测试。
 
-- [ ] **Step 3: 写仅可见页绘制和 LiDAR artist 复用失败测试**
+- [x] **Step 3: 写仅可见页绘制和 LiDAR artist 复用失败测试**
 
 ```python
 def test_hidden_tabs_buffer_data_but_only_active_plot_draws(dashboard, complete_dashboard_snapshot):
@@ -2588,7 +2600,7 @@ def test_lidar_tab_reuses_one_path_collection_and_updates_latest_offsets(dashboa
     assert collection.get_offsets().tolist() == [[3.0, 4.0]]
 ```
 
-- [ ] **Step 4: 运行红灯**
+- [x] **Step 4: 运行红灯**
 
 ```bash
 QT_QPA_PLATFORM=offscreen conda run -n slope-sim python -m pytest tests/test_dashboard_charts.py tests/test_dashboard.py tests/test_dashboard_enterprise.py tests/test_manual_demo.py -q
@@ -2596,9 +2608,9 @@ QT_QPA_PLATFORM=offscreen conda run -n slope-sim python -m pytest tests/test_das
 
 Expected: FAIL，当前默认仅有两个页签，旧图仍嵌套在开发者诊断，且没有接口图表缓冲或 LiDAR artist。
 
-- [ ] **Step 5: 创建纯 Python 图表模块**
+- [x] **Step 5: 创建纯 Python 图表模块**
 
-`dashboard_charts.py` 承担 `TelemetryPlotBuffer`、旧四图规格、`InterfaceChartBuffer`、接口图规格、20 秒裁剪、消息时间戳去重、generation 清理和错误/丢帧增量。`dashboard.py` 从该模块导入并重新导出旧公共名称，避免既有测试和调用方断裂。
+`dashboard_charts.py` 承担 `TelemetryPlotBuffer`、默认保留的轨迹/速度两张旧图规格、`InterfaceChartBuffer`、接口图规格、20 秒裁剪、消息时间戳去重、generation 清理和错误/丢帧增量。`dashboard.py` 从该模块导入并重新导出旧公共名称，避免既有测试和调用方断裂；接触/打滑只保留在显式开发者诊断表中。
 
 ```python
 @dataclass(frozen=True, slots=True)
@@ -2627,9 +2639,9 @@ class InterfaceChartBuffer:
         """清空业务、质量和计数基线。"""
 ```
 
-- [ ] **Step 6: 把 15 个图表迁到顶层标签栏**
+- [x] **Step 6: 把 13 个默认图表迁到顶层标签栏**
 
-构造顺序严格使用 `EXPECTED_DEFAULT_TABS`。旧四图无条件创建；`开发者诊断` 只创建内部遥测表和调参控件。`_active_plot_label()` 从 `self.tabs` 读取，`currentChanged` 只标记新当前图。折线页共用 `_add_line_plot_tab()`，LiDAR 使用单独 `_add_lidar_plot_tab()`；每个 artist 只创建一次。
+构造顺序严格使用 `EXPECTED_DEFAULT_TABS`。旧图只默认创建 `轨迹`、`速度/命令`；`开发者诊断` 显式开启时创建含接触/打滑的内部遥测表和调参控件。`_active_plot_label()` 从 `self.tabs` 读取，`currentChanged` 只标记新当前图。折线页共用 `_add_line_plot_tab()`，LiDAR 使用单独 `_add_lidar_plot_tab()`；每个 artist 只创建一次。
 
 ```python
 def update_interface_snapshot(self, snapshot: InterfaceDashboardSnapshot) -> None:
@@ -2645,7 +2657,7 @@ def update_interface_snapshot(self, snapshot: InterfaceDashboardSnapshot) -> Non
 
 默认标题改为 `3D仿真Dashboard`，`self.tabs.setUsesScrollButtons(True)`。折线页保留 Qt 标准清空/保存图标和 tooltip；LiDAR 只保留保存。无转向车型在画布内显示状态文字并保持空 line data。
 
-- [ ] **Step 7: 接入主循环并清理重建历史**
+- [x] **Step 7: 接入主循环并清理重建历史**
 
 `manual_demo.py` 的暂停和正常路径都只调用一次 `runtime.dashboard_snapshot()`，再传给 `dashboard.update_interface_snapshot()`；不先后获取两个可能跨 generation 的快照。车型、复位、场地或场景事务仍调用 `reset_feedback_history()`，该方法同时清空旧遥测和接口缓存。
 
@@ -2656,7 +2668,7 @@ if dashboard is not None and interface_session is not None:
     )
 ```
 
-- [ ] **Step 8: 运行聚焦 Qt、主循环和性能契约测试**
+- [x] **Step 8: 运行聚焦 Qt、主循环和性能契约测试**
 
 ```bash
 QT_QPA_PLATFORM=offscreen conda run -n slope-sim python -m pytest tests/test_dashboard_charts.py tests/test_dashboard.py tests/test_dashboard_enterprise.py tests/test_manual_demo.py tests/test_interface_runtime_integration.py -q
@@ -2665,9 +2677,9 @@ git diff --check
 
 Expected: 全部 PASS；测试断言隐藏页 `draw_idle` 为 0、当前页不超过 2 Hz、点云对象身份不变。
 
-- [ ] **Step 9: 完成 Task 13B 规格审查和代码质量审查**
+- [x] **Step 9: 完成 Task 13B 规格审查和代码质量审查**
 
-规格审查逐项核对标题、17 页顺序、15 图内容、时间语义、暂停和保存/清空；质量审查重点检查 240 Hz 深拷贝、Matplotlib artist 泄漏、图例越界、动态车型标签、重复缓冲和 Qt 全局事件过滤器清理。发现问题先补红灯再修复。
+规格审查逐项核对标题、15 个默认页顺序、13 个默认图表、接触/打滑诊断边界、时间语义、暂停和保存/清空；质量审查重点检查 240 Hz 深拷贝、Matplotlib artist 泄漏、图例越界、动态车型标签、重复缓冲和 Qt 全局事件过滤器清理。发现问题先补红灯再修复。
 
 ---
 
@@ -2685,21 +2697,21 @@ Expected: 全部 PASS；测试断言隐藏页 `draw_idle` 为 0、当前页不�
 - Test: `tests/test_dashboard.py`
 - Test: `tests/test_dashboard_enterprise.py`
 
-- [ ] **Step 1: 写真实页签遍历、标题和像素门禁失败测试**
+- [x] **Step 1: 写真实页签遍历、标题和像素门禁失败测试**
 
 ```python
-def test_verifier_cycles_all_seventeen_tabs_and_rejects_blank_capture(fake_x11, fake_capture):
+def test_verifier_cycles_all_fifteen_tabs_and_rejects_blank_capture(fake_x11, fake_capture):
     fake_x11.windows = dashboard_and_pybullet_windows()
-    fake_capture.frames = [nonblank_frame()] * 16 + [blank_frame()]
+    fake_capture.frames = [nonblank_frame()] * 14 + [blank_frame()]
     result = verify_dashboard_tabs(
         display=":99",
         expected_title="3D仿真Dashboard",
-        tab_count=17,
+        tab_count=15,
         hold_drive_sec=4.0,
     )
     assert not result.passed
-    assert result.visited_tabs == 17
-    assert "tab 17" in result.detail
+    assert result.visited_tabs == 15
+    assert "tab 15" in result.detail
 
 
 def test_verifier_rejects_old_dashboard_title(fake_x11):
@@ -2739,23 +2751,23 @@ def test_real_layout_report_rejects_overlapping_top_and_control_areas():
 
 像素门禁对每次 Dashboard client-area 截图计算至少两个通道的 `max-min` 与非背景像素比例；阈值通过合成纯色、文字页、折线页和点云页夹具固定，不能只检查文件非空。
 
-- [ ] **Step 2: 运行红灯**
+- [x] **Step 2: 运行红灯**
 
 ```bash
 conda run -n slope-sim python -m pytest tests/test_dashboard_manual_verifier.py tests/test_window_layout.py tests/test_dashboard.py tests/test_dashboard_enterprise.py -q
 ```
 
-Expected: FAIL，当前 verifier 不遍历 17 页，也未锁定新标题和画布像素。
+Expected: FAIL，当前 verifier 不遍历 15 个默认页，也未锁定新标题和画布像素。
 
-- [ ] **Step 3: 扩展真实 verifier**
+- [x] **Step 3: 扩展真实 verifier**
 
 使用现有 X11 窗口查找和外框读回，并新增基于 `libXRes` 的 client PID 查询：候选必须同时满足精确 PyBullet 标题、属于启动后新增窗口、XRes client PID 等于当前进程；窗口管理器 frame 先解析到 client 再查询。`_NET_WM_PID` 可作为一致性证据，但缺失时不得退化为纯标题；XRes 扩展不可用或所有权不一致时明确失败。找到后立即把 Main client 标题改为本次运行唯一 token，后续 verifier 只跟踪该已认领窗口。
 
-Dashboard 构造、显示、frame extents 或矩形应用在 `dashboard_enabled=True` 时任一失败都清理并终止本次手动仿真，不再扩展 Main GUI 后静默继续。4:1 只适用于 `--gui --manual` 且 Dashboard 启用的工作流；非手动 `--gui` 保持现有批量实验窗口语义，并在设计/README 明确该范围。
+Dashboard 构造、显示、frame extents 或矩形应用在 `dashboard_enabled=True` 时任一失败都清理并终止本次手动仿真，不再扩展 Main GUI 后静默继续。67:33 只适用于 `--gui --manual` 且 Dashboard 启用的工作流；非手动 `--gui` 保持现有批量实验窗口语义，并在设计/README 明确该范围。
 
-激活 Dashboard 后以 `Ctrl+Tab` 顺序循环 17 次；每次等待 Qt 事件和 2 Hz 绘制冷却后，用 Pillow `ImageGrab.grab(bbox=client_rect, xdisplay=display)` 读取 client area，记录像素统计。验证进程通过专用环境变量请求 Dashboard 输出只读 JSON 布局报告，报告包含顶层页签区、下半控制区、当前画布、图例、按钮和关键控件的真实 global rectangles；父 verifier 拒绝上下区域重叠、越出 client area 或滚动后仍不可达的控件。该报告不改变正常 GUI，也不把 Qt 对象写入文件。
+激活 Dashboard 后先实际点击页签栏右滚动按钮，再有界重复点击左滚动按钮直到截图恢复；随后用冻结索引的 `Ctrl+Tab` 顺序循环两轮 15 页。每次等待 Qt 事件和 2 Hz 绘制冷却后，用 Pillow `ImageGrab.grab(bbox=client_rect, xdisplay=display)` 读取 client area，记录像素统计。验证进程通过专用环境变量请求 Dashboard 输出只读 JSON schema v4 布局报告；报告包含 DPR、页签顺序、左右按钮、page/canvas/axes/legend/plot buttons/content controls、title/xlabel/ylabel/offset/tick/legend artists、Qt 文字、关键控件的 viewport/scroll value，以及图表 `rendered_data_revision`。父 verifier 用物理 JSONL 行游标拒绝旧 occurrence，独立核对上下区 `1:1`、真实矩形 `contains`、artist-overlap 和 `axes_rect` 最小覆盖；第二轮要求数据修订增长且 `tabs/controls/page/canvas/axes` 五个矩形不变。任一页文字/控件越出 viewport，或轨迹 xlabel、科学计数 offset、tick、legend 和 Qt 文字互相遮挡均失败；完整图表按钮路径还需执行真实点击。该报告不改变正常 GUI，也不把 Qt 对象写入文件。
 
-遍历期间持续按住驾驶键 4 秒，结束后验证 `dx` 位移门禁。所有按键在 `finally` 中释放，关闭等待上限保持 20 秒。父 verifier 必须把 `--log-dir` 原样传给 `main.py`，避免读取其他运行留下的日志。
+遍历期间使用键盘持续驾驶，结束后验证 `dx` 位移门禁。Dashboard 不再创建方向按钮，CLI 的 `--input-method` 只接受 `key`；线速度和角速度位于默认“仿真控制”区并必须完整进入 viewport。子进程在目标时长外预留找窗/报告预算，启动耗时不得侵占持续驾驶窗口。所有按键在 `finally` 中释放，关闭等待上限保持 20 秒。父 verifier 必须把 `--log-dir` 原样传给 `main.py`，避免读取其他运行留下的日志。
 
 ```python
 @dataclass(frozen=True, slots=True)
@@ -2766,29 +2778,31 @@ class DashboardTabVerification:
     detail: str
 ```
 
-- [ ] **Step 4: 运行既有窗口回归和新增聚焦测试**
+- [x] **Step 4: 运行既有窗口回归和新增聚焦测试**
 
 ```bash
 QT_QPA_PLATFORM=offscreen conda run -n slope-sim python -m pytest tests/test_window_layout.py tests/test_dashboard_enterprise.py tests/test_dashboard.py tests/test_manual_demo.py tests/test_dashboard_manual_verifier.py -q
 git diff --check
 ```
 
-Expected: 全部 PASS；既有 4:1、DPR、Mutter frame、窗口标题冲突和关闭竞态用例不回归；新增用例证明纯标题候选不能被移动、Dashboard 硬失败不能降级、`--log-dir` 确实传入子进程。
+Expected: 全部 PASS；既有 67:33/33%、DPR、Mutter frame、窗口标题冲突和关闭竞态用例不回归；新增用例证明纯标题候选不能被移动、Dashboard 硬失败不能降级、`--log-dir` 确实传入子进程。
 
 - [ ] **Step 5: 运行真实桌面和三个 Xvfb 门禁**
 
 ```bash
-DISPLAY=:0 XAUTHORITY=/home/cancade/.Xauthority conda run -n slope-sim python scripts/verify_dashboard_manual_drive.py --verify-window-layout --verify-dashboard-tabs --duration-sec 4
+DISPLAY=:1 XAUTHORITY=/home/cancade/.Xauthority conda run -n slope-sim python scripts/verify_dashboard_manual_drive.py --verify-window-layout --verify-dashboard-tabs --duration-sec 4
 xvfb-run -a -s "-screen 0 1366x768x24" conda run -n slope-sim python scripts/verify_dashboard_manual_drive.py --verify-window-layout --verify-dashboard-tabs --expected-available-size 1366x768 --duration-sec 4
 xvfb-run -a -s "-screen 0 1920x1080x24" conda run -n slope-sim python scripts/verify_dashboard_manual_drive.py --verify-window-layout --verify-dashboard-tabs --expected-available-size 1920x1080 --duration-sec 4
 xvfb-run -a -s "-screen 0 2560x1440x24" conda run -n slope-sim python scripts/verify_dashboard_manual_drive.py --verify-window-layout --verify-dashboard-tabs --expected-available-size 2560x1440 --duration-sec 4
 ```
 
-Expected: 每次输出 XRes 所有权、available/main/dashboard 矩形、`tabs=17 nonblank=17` 和满足现有阈值的 `dx`；两窗覆盖工作区且宽度为 4:1。DPR 需要共享物理边界时，单个逻辑 pane 可偏离理想 floor split 至多一个 DPR 对齐量，但总宽、公共边和外框必须精确。不得用 offscreen 单元测试替代。
+Expected: 每次输出 XRes 所有权、available/main/dashboard 矩形、`tabs=15 nonblank=15` 和满足现有阈值的 `dx`；两窗覆盖工作区且目标宽度为 Main 67%、Dashboard 33%（67:33）。verifier 必须独立按 `33/100` 和 half-up/DPR 对齐规则计算唯一物理边界，不得复用生产布局 helper；总宽、公共边和外框必须精确。不得用 offscreen 单元测试替代。
 
-- [ ] **Step 6: 完成 Task 13C 规格审查和代码质量审查**
+- [x] **Step 6: 完成 Task 13C 规格审查和代码质量审查**
 
-规格审查核对三分辨率、真实桌面、17 页、非空和持续驾驶；质量审查核对 X11 frame/client 坐标、DPR、截图范围、按键释放、超时、临时文件和无窗口管理器路径。修复后重跑 Step 4-5。
+当前执行状态：schema v4 生产实现、聚焦测试和规格/质量审查已完成；Step 5 保持未勾选，因为当前 managed sandbox 无法连接宿主 X11，也不能创建临时 Xvfb socket。旧 schema v3/17 页数据只作为历史证据，不能替代四组 schema v4 实机门禁。
+
+规格审查核对三分辨率、真实桌面、15 个默认页、诊断边界、非空和持续驾驶；质量审查核对 X11 frame/client 坐标、DPR、截图范围、按键释放、超时、临时文件和无窗口管理器路径。修复后重跑 Step 4-5。
 
 ---
 
@@ -2813,7 +2827,7 @@ Expected: 每次输出 XRes 所有权、available/main/dashboard 矩形、`tabs=
 - Test: `tests/test_ecal_process_roundtrip.py`
 - Test: `tests/test_interface_runtime.py`
 
-- [ ] **Step 1: 写官方版本锁和真实导入失败测试**
+- [x] **Step 1: 写官方版本锁和真实导入失败测试**
 
 ```python
 def flatten_conda_and_pip_dependencies(items):
@@ -2851,7 +2865,7 @@ conda run -n slope-sim python -m pytest tests/test_ecal_installation.py tests/te
 
 Expected: FAIL，当前环境仍为 Protobuf 7.35.1、无 `eclipse-ecal`，不能 skip 或用 PyPI `ecal==1.0.2` 替代。
 
-- [ ] **Step 2: 安装官方系统运行时并统一 Python 依赖**
+- [x] **Step 2: 安装官方系统运行时并统一 Python 依赖**
 
 ```bash
 sudo add-apt-repository -y ppa:ecal/ecal-6.1
@@ -2867,7 +2881,7 @@ conda run -n slope-sim python -m pip install \
 
 `environment.yml` 固定 `protobuf=6.33.6`、`grpcio-tools=1.76.0`、`packaging=26.2`、`pip` 和 pip 子依赖 `eclipse-ecal==6.1.1`；`pyproject.toml` 固定 `protobuf>=6.33.6,<6.34`，dev 固定 `grpcio-tools==1.76.0`，接口可选依赖固定 `eclipse-ecal==6.1.1`。官方 wheel 为 `eclipse_ecal-6.1.1-cp310-cp310-manylinux_2_28_x86_64.whl`，不得使用 `--no-deps` 绕过兼容约束。
 
-- [ ] **Step 3: 重新生成 Protobuf 并证明 wire contract 未变**
+- [x] **Step 3: 重新生成 Protobuf 并证明 wire contract 未变**
 
 ```bash
 conda run -n slope-sim python scripts/generate_protos.py
@@ -2877,7 +2891,7 @@ conda run -n slope-sim python -c "import google.protobuf; import ecal.nanobind_c
 
 Expected: 输出 `6.33.6 6.1.1`；descriptor 的包名、字段名、编号、类型和序列化 round-trip 与 Task 1 完全一致。生成文件的 runtime version 检查必须由 1.76.0 工具产生，不手改。
 
-- [ ] **Step 4: 写官方 v6 resource 生命周期和逐话题 discovery 失败测试**
+- [x] **Step 4: 写官方 v6 resource 生命周期和逐话题 discovery 失败测试**
 
 ```python
 def test_v6_bindings_use_nanobind_proto_api(fake_ecal_v6_modules):
@@ -2911,7 +2925,7 @@ def test_runtime_does_not_apply_command_peer_state_to_output_topics(runtime_fixt
     assert snapshot.topics["/sim/lidar/front/points"].state == "waiting_peer"
 ```
 
-- [ ] **Step 5: 实现官方 eCAL 6.1 binding**
+- [x] **Step 5: 实现官方 eCAL 6.1 binding**
 
 `load_ecal_bindings()` 首先且只支持已固定的官方 v6 路径：
 
@@ -2924,9 +2938,11 @@ return EcalBindings.v61(core, proto_core, common_core)
 
 初始化调用 `core.initialize(process_name)`，最终调用 `core.finalize()`。publisher 构造为 `proto_core.Publisher(MessageType, topic)` 并调用 `send(message)`；subscriber 构造为 `proto_core.Subscriber(MessageType, topic)` 并调用 `set_receive_callback(callback)`，回调从 `ReceiveCallbackData.message` 复制确定性 Protobuf bytes。关闭 subscriber 时先 `remove_receive_callback()`；v6 publisher/subscriber 没有虚构的 `close()`/`destroy()`，清空 Python 引用后再 finalize participant。部分构造失败仍按 subscriber 回调、资源引用、participant 的逆序清理。
 
-- [ ] **Step 6: 扩展传输快照和逐话题轮询**
+- [x] **Step 6: 扩展传输快照和逐话题轮询**
 
 `TransportTopicQuality` 增加 `peer_connected: bool | None = None`。本地模式保持 `None`；真实 eCAL simulation role 对命令 subscriber 调用 `get_publisher_count()`，对五个输出 publisher 分别调用 `get_subscriber_count()`。peer role 使用相反端点。轮子命令对端仍独立驱动 mailbox generation；runtime 只用每个质量项自身的 peer 值把对应话题标为 `waiting_peer`，不能用全局 `_peer_state` 覆盖五个输出。
+
+新 production session 的 relay attach 和周期刷新都固定为先 `poll_peer_state()`、再读取 `snapshot()`；attach 的 poll 位于 relay 非重入锁外，允许同步 callback。transport 使用独立 discovery gate、in-flight 计数和递增 revision，迟到旧观察不能回退状态或误增 generation；`close()` 在移除 callback、释放 native 资源和 finalize participant 前等待全部在途 count API 返回。
 
 ```python
 def _resource_peer_connected(resource: _ProtoResource) -> bool:
@@ -2941,7 +2957,7 @@ def _resource_peer_connected(resource: _ProtoResource) -> bool:
     return count > 0
 ```
 
-- [ ] **Step 7: 写真实 PyBullet runtime 环回红灯并实现 simulation 模式**
+- [x] **Step 7: 写真实 PyBullet runtime 环回红灯并实现 simulation 模式**
 
 ```python
 @pytest.mark.ecal
@@ -2959,7 +2975,7 @@ def test_real_ecal_simulation_runtime_uses_physics_feedback_and_all_six_topics()
     assert result.reconnect_required_new_command
 ```
 
-`scripts/ecal_simulation_runtime.py` 在独立进程使用 PyBullet DIRECT、正式 `SimulationCoordinator`、`PyBulletSensorBackend` 和 `InterfaceRuntime`，按 240 Hz 推进真实物理，不生成合成输出。`verify_ecal_roundtrip.py` 增加 `--runtime {transport,simulation}` 和 `--warmup-sec`；simulation 模式由 peer 发送有效/非法/静默/重连命令并订阅五个输出，验证实际反馈不是输入回显、前后点云/RTK/IMU 有效、六话题频率和逐话题 subscriber 退出状态。
+`scripts/ecal_simulation_runtime.py` 在独立进程使用 PyBullet DIRECT、正式 `SimulationCoordinator`、`PyBulletSensorBackend` 和 `InterfaceRuntime`，按 240 Hz 推进真实物理，不生成合成输出。前后 2880 射线错相 50 ms，共享 100 ms 消息时间戳周期；每个扫描 deadline 用单次批量射线生成同一发布时刻的完整点云。headless runtime 不构造俯视副本，绝对期限追赶的超期帧只用 `sleep(0)` 让出执行权，并只在实时循环期间暂停 cyclic GC。自动、GUI 手动和独立 eCAL 三条入口复用 `RuntimeObservationCadence`，native discovery 与组合状态快照为 20 Hz；慢 poll 后重建期限且不突发追赶，但每个 240 Hz 帧仍使用新墙钟检查命令超时。`verify_ecal_roundtrip.py` 增加 `--runtime {transport,simulation}`、`--warmup-sec` 和 `--robot-model`；simulation 模式由 peer 按当前车型发送有效/非法/静默/重连命令并订阅五个输出。正式路径分别覆盖主动转向 `4+2` 和代表性差速 `2+0`，要求 peer/runtime 车型、命令事件基数和真实关节反馈一致，同时验证前后点云/RTK/IMU、六话题频率和逐话题 subscriber 退出状态。
 
 - [ ] **Step 8: 运行官方 eCAL 聚焦门禁**
 
@@ -2969,13 +2985,17 @@ conda run -n slope-sim python -m pytest \
   tests/test_ecal_process_roundtrip.py tests/test_interface_runtime.py \
   -q -m "ecal or not ecal"
 conda run -n slope-sim python scripts/verify_ecal_roundtrip.py \
-  --runtime simulation --warmup-sec 1 --duration-sec 5
+  --runtime simulation --robot-model active_steering_4wd --warmup-sec 1 --duration-sec 5
+conda run -n slope-sim python scripts/verify_ecal_roundtrip.py \
+  --runtime simulation --robot-model df_back --warmup-sec 1 --duration-sec 5
 git diff --check
 ```
 
 Expected: 测试全部 PASS；脚本输出 `runtime=simulation transport=ecal`、六话题频率、逐话题 peer 状态、超时和重连全部 PASS。任何 local fallback、合成输出或 skip 都是失败。
 
-- [ ] **Step 9: 完成 Task 14A 规格审查和代码质量审查**
+- [x] **Step 9: 完成 Task 14A 规格审查和代码质量审查**
+
+当前执行状态：官方 binding、逐话题 discovery、active `4+2` 与 differential `2+0` 双进程链路及纯测试已完成并通过独立审查；Step 8 保持未勾选。2026-07-29 获授权的一次 post-fix 执行在 discovery 前被 Codex 沙箱禁止 UDP socket，未形成有效产品结论；下一次真实运行仍需重新授权并在允许 socket 的环境中严格串行执行。
 
 规格审查核对官方版本、wire contract、六话题真实进程、逐话题 discovery 和物理反馈；质量审查检查 Protobuf ABI、v6 回调复制、资源析构、finalize 顺序、peer count 异常、进程超时和临时文件。修复后重跑 Step 3、8。
 
@@ -2991,7 +3011,7 @@ Expected: 测试全部 PASS；脚本输出 `runtime=simulation transport=ecal`�
 - Modify: `README.md`
 - Modify: `3d仿真平台需求规格.md`
 
-- [ ] **Step 1: 写验收脚本聚合和非零退出失败测试**
+- [x] **Step 1: 写验收脚本聚合和非零退出失败测试**
 
 ```python
 # 阶段三验收脚本测试：任何门禁失败都必须进入汇总并返回非零。
@@ -3007,7 +3027,7 @@ def test_stage3_summary_counts_pass_and_fail_and_returns_nonzero():
     assert exit_code(checks) == 1
 ```
 
-- [ ] **Step 2: 实现可独立运行的 DIRECT/性能验收脚本**
+- [x] **Step 2: 实现可独立运行的 DIRECT/性能验收脚本**
 
 `scripts/verify_stage3_interfaces.py` 必须逐项输出 `PASS/FAIL name detail` 并覆盖：
 
@@ -3022,7 +3042,7 @@ def run_stage3_checks() -> tuple[VerificationCheck, ...]:
         run_static_and_moving_obstacle_lidar_check(),
         run_lidar_collision_contact_check(),
         *run_three_terrain_truth_sensor_checks(tolerance=1e-4),
-        run_pause_rebuild_and_rollback_check(),
+        run_pause_rebuild_and_edge_switch_check(),
         run_scene_roundtrip_check(),
         run_interface_log_roundtrip_check(),
         run_dashboard_snapshot_and_chart_check(),
@@ -3031,33 +3051,34 @@ def run_stage3_checks() -> tuple[VerificationCheck, ...]:
     )
 ```
 
-DIRECT 调度频率按 10 秒仿真时间的消息计数/时间戳检查：轮子 1000 帧、每个传感器 100 帧。20 个障碍物性能门禁预热 1 秒后连续运行 5 秒墙钟；每 100 ms 采样一次队列深度，任何队列连续 1 秒不下降即为持续积压，传输/日志 dropped 必须为 0，Dashboard 单次事件间隔不得超过 100 ms。
+DIRECT 调度频率按 10 秒仿真时间的消息计数/时间戳检查：轮子 1000 帧、每个传感器 100 帧。20 个障碍物性能门禁使用 local transport 与生产 runtime/logger wiring，预热 1 秒后连续运行 5 秒墙钟；它验证物理、传感器、Dashboard 快照和接口日志联合负载，但不能替代真实 eCAL。每 100 ms 同时采样日志 `pending` 和 `completed=accepted-pending`：首次实际增长起连续 1 秒不下降，或正深度下完成数停滞 1 秒，判为持续积压；稳定单项 in-flight 但完成数前进不误报。accepted 消息数至少达到六通道名义总量的 90%，终态 pending、传输/日志 dropped 必须为 0，Dashboard 单次事件间隔不得超过 100 ms。后两条真实 eCAL production 命令各自在同一测量窗口绑定 20 个障碍物、六话题、物理反馈和接口日志。
 
 - [ ] **Step 3: 运行阶段三 DIRECT 与真实 eCAL 门禁**
 
 ```bash
 conda run -n slope-sim python scripts/verify_stage3_interfaces.py
-conda run -n slope-sim python scripts/verify_ecal_roundtrip.py --runtime simulation --warmup-sec 1 --duration-sec 5
+conda run -n slope-sim python scripts/verify_ecal_roundtrip.py --runtime simulation --robot-model active_steering_4wd --warmup-sec 1 --duration-sec 5
+conda run -n slope-sim python scripts/verify_ecal_roundtrip.py --runtime simulation --robot-model df_back --warmup-sec 1 --duration-sec 5
 ```
 
-Expected: 第一条最终输出匹配 `^SUMMARY pass=[1-9][0-9]* fail=0$` 且退出码 0，测试同时断言 pass 数等于实际检查 tuple 长度；第二条必须输出 `runtime=simulation transport=ecal`。真实 eCAL 接收进程在 1 秒 discovery 预热后，用每条到达消息的单调墙钟同时逐话题计算：轮子命令和状态 `95..105 Hz`，前后点云、RTK、IMU 各 `9..11 Hz`；消息自身仿真时间戳也分别为 100/10 Hz。非法命令、停止发送、逐输出 subscriber 退出、命令对端退出/重启、物理反馈变化和“重连后旧命令不恢复”全部 PASS。真实 eCAL 失败时阶段三不得声明完成。
+Expected: 第一条最终输出匹配 `^SUMMARY pass=[1-9][0-9]* fail=0$` 且退出码 0，测试同时断言 pass 数等于实际检查 tuple 长度；后两条必须输出 `runtime=simulation transport=ecal` 并分别证明 `4+2`、`2+0`。真实 eCAL 接收进程在 1 秒 discovery 预热后，用每条到达消息的单调墙钟同时逐话题计算：轮子命令和状态 `95..105 Hz`，前后点云、RTK、IMU 各 `9..11 Hz`；消息自身仿真时间戳也分别为 100/10 Hz，`sim/wall` 必须在 `0.98..1.02`。非法命令、停止发送、逐输出 subscriber 退出、命令对端退出/重启、物理反馈变化和“重连后旧命令不恢复”全部 PASS。真实 eCAL 失败时阶段三不得声明完成。
 
 - [ ] **Step 4: 运行 GUI 窗口门禁和完整回归**
 
 ```bash
-DISPLAY=:0 XAUTHORITY=/home/cancade/.Xauthority conda run -n slope-sim python scripts/verify_dashboard_manual_drive.py --verify-window-layout --verify-dashboard-tabs --duration-sec 4
+DISPLAY=:1 XAUTHORITY=/home/cancade/.Xauthority conda run -n slope-sim python scripts/verify_dashboard_manual_drive.py --verify-window-layout --verify-dashboard-tabs --duration-sec 4
 xvfb-run -a -s "-screen 0 1366x768x24" conda run -n slope-sim python scripts/verify_dashboard_manual_drive.py --verify-window-layout --verify-dashboard-tabs --expected-available-size 1366x768 --duration-sec 4
 xvfb-run -a -s "-screen 0 1920x1080x24" conda run -n slope-sim python scripts/verify_dashboard_manual_drive.py --verify-window-layout --verify-dashboard-tabs --expected-available-size 1920x1080 --duration-sec 4
 xvfb-run -a -s "-screen 0 2560x1440x24" conda run -n slope-sim python scripts/verify_dashboard_manual_drive.py --verify-window-layout --verify-dashboard-tabs --expected-available-size 2560x1440 --duration-sec 4
 conda run -n slope-sim python scripts/verify_stage1_matrix.py
 conda run -n slope-sim python scripts/verify_stage2_obstacles.py
-conda run -n slope-sim python -m pytest -q
+conda run -n slope-sim python -m pytest -q -m "not ecal"
 git diff --check
 ```
 
-Expected: 真实桌面和三个 Xvfb 均报告 XRes 所有权、4:1 几何、17 个非空页签及驾驶位移 PASS；阶段一 12 项矩阵、阶段二全部门禁、阶段三及全量 pytest 均无失败；`git diff --check` 无输出。
+Expected: 真实桌面和三个 Xvfb 均报告 XRes 所有权、67:33（Dashboard 33%）几何、15 个默认页签非空及驾驶位移 PASS；阶段一 12 项矩阵、阶段二全部门禁、阶段三及全量 pytest 均无失败；`git diff --check` 无输出。
 
-- [ ] **Step 5: 做六维独立只读审查**
+- [x] **Step 5: 做六维独立只读审查**
 
 启动独立审查线程，只读比较两个原始需求、阶段三设计、提交范围、全部测试输出和实际 GUI/eCAL 结果，不直接修改代码。审查报告按以下六节给出文件/行号和严重级别：
 
@@ -3068,11 +3089,13 @@ Expected: 真实桌面和三个 Xvfb 均报告 XRes 所有权、4:1 几何、17 
 5. 测试覆盖。
 6. 实际运行结果。
 
-任何 `Critical`/`Important` 结论由实施线程先补失败测试再修复，随后重跑对应聚焦门禁、全量 pytest 和六维复审；不能通过降低 100/10 Hz、100 ms、`1e-4`、4:1 或性能阈值关闭问题。
+任何 `Critical`/`Important` 结论由实施线程先补失败测试再修复，随后重跑对应聚焦门禁、全量 pytest 和六维复审；不能通过降低 100/10 Hz、100 ms、`1e-4`、67:33/33% 或性能阈值关闭问题。
 
-- [ ] **Step 6: 更新文档和交付报告**
+当前执行状态：最终六维只读复审结论为 `Critical=0`、`Important=0`；上一轮唯一 Important（文档仍把旧测试数量标为 current/fresh）已通过同步 `272/365/2209` 等本轮证据关闭。复审保留的两个局部 oracle 问题均为 Minor，已列入交付报告残余风险，不影响外层正式门禁拒绝假通过。
 
-`README.md` 增加环境创建、Protobuf 生成、`auto/ecal/local`、场景导入导出、阶段三验收和 GUI 启动命令。`3d仿真平台需求规格.md` 只把阶段三状态改为“开发方自动验收完成，等待用户 GUI/eCAL 人工验收”，不得提前标记用户通过。
+- [x] **Step 6: 更新文档和交付报告**
+
+`README.md` 增加环境创建、Protobuf 生成、`auto/ecal/local`、场景导入导出、阶段三验收和 GUI 启动命令。当前 schema v4 GUI 尚未补证、post-fix eCAL 又只形成环境阻断证据时，`3d仿真平台需求规格.md` 和交付文档只允许写“开发方自动复验中”，不得提前标记开发方或用户验收通过。
 
 `docs/阶段三交付报告.md` 必须包含：
 
@@ -3080,9 +3103,11 @@ Expected: 真实桌面和三个 Xvfb 均报告 XRes 所有权、4:1 几何、17 
 - 精确变更列表和文件边界；若用户尚未要求提交，记录 base HEAD 和全部未提交文件，不伪造提交列表。
 - Protobuf/eCAL 版本及安装命令。
 - 阶段一、二、三、全量 pytest、真实 eCAL 和 GUI 几何的实际输出摘要。
-- 用户人工验收步骤：eCAL Monitor 六话题、两车型命令、前后障碍点云、三地形 RTK/IMU、暂停/复位/重建/断线、企业 Dashboard 和 4:1 窗口。
-- 已知限制：真值无噪声、点云无运动畸变、本地模式不是正式 eCAL、阶段四导航未实现。
+- 用户人工验收步骤：eCAL Monitor 六话题、两车型命令、前后障碍点云、三地形 RTK/IMU、暂停/复位/重建/断线、企业 Dashboard 和 67:33 窗口。
+- 已知限制：真值无噪声；点云按发布时刻一次采样，`offset_time_ns` 只表达射线顺序，不模拟真实雷达的自运动、运动畸变、回波或光电效应；本地模式不是正式 eCAL；阶段四导航未实现。
 - 面向 PyBullet 初学者说明 `getLinkState`/坐标变换、`rayTestBatch`、碰撞 group/mask 和主线程隔离。
+
+当前执行状态：README、权威需求规格、阶段三设计/实施计划和交付报告已同步本轮 fresh 非 eCAL 证据、post-fix eCAL socket 环境阻断、schema v4 GUI X11 环境阻断、用户手动教程及残余风险。Step 3、Step 4 继续保持未勾选；文档同步不能替代外部门禁。
 
 - [ ] **Step 7: 准备提交范围并停止在阶段三人工验收门禁**
 
@@ -3092,3 +3117,5 @@ git diff --check
 ```
 
 Expected: 向用户报告完整待提交文件、测试证据和 GUI/eCAL 操作步骤后停止，不开始阶段四。只有用户明确要求 commit/push 后，才按 AGENTS.md 的阶段三提交格式执行 Git 写入。
+
+当前执行状态：仍停在 Step 7 之前。需要先取得两车型 post-fix 真实 eCAL 有效结果、四组 schema v4 GUI 结果和用户人工验收反馈；中间状态按用户要求不提交，不开始阶段四。

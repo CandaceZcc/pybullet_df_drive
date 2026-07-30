@@ -3,8 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-import math
-from numbers import Real
+import gc
 from pathlib import Path
 import sys
 from threading import Lock
@@ -30,6 +29,10 @@ from slope_sim.interfaces.runtime import InterfaceRuntime
 from slope_sim.logger import CsvSimulationLogger
 from slope_sim.metrics import compute_tracking_metrics
 from slope_sim.model_registry import get_robot_model
+from slope_sim.realtime import (
+    DeadlinePacer as _DeadlinePacer,
+    RuntimeObservationCadence,
+)
 from slope_sim.robot import DifferentialDriveRobot
 from slope_sim.runtime_actions import TerrainSelection
 from slope_sim.scene import SceneInfo, configure_gui_visualizer, probe_terrain, update_follow_camera
@@ -43,6 +46,20 @@ from slope_sim.sensor_backend import PyBulletSensorBackend
 from slope_sim.sensors import LidarSummary, read_lidar
 
 
+def _suspend_cyclic_gc() -> bool:
+    """实时循环只暂停循环垃圾回收，普通引用计数仍即时释放对象。"""
+    was_enabled = gc.isenabled()
+    if was_enabled:
+        gc.disable()
+    return was_enabled
+
+
+def _restore_cyclic_gc(was_enabled: bool) -> None:
+    """按进入实时循环前的状态恢复循环垃圾回收。"""
+    if was_enabled:
+        gc.enable()
+
+
 def run_interface_physics_frame(
     runtime,
     coordinator,
@@ -51,51 +68,17 @@ def run_interface_physics_frame(
     linear_velocity: float,
     angular_velocity: float,
     dt: float,
+    observation_cadence: RuntimeObservationCadence,
 ):
     """按企业接口约定顺序推进一个未暂停物理帧。"""
-    runtime.poll_transport()
+    _observation_due, decision_wall_time = observation_cadence.poll_if_due(runtime)
     if actual_transport_mode == "local":
         # 本地控制也必须经过 codec、transport 和 mailbox，不能直达机器人。
         runtime.submit_local_twist(linear_velocity, angular_velocity, dt)
-    runtime.before_physics_step(dt)
+    runtime.before_physics_step(dt, wall_time=decision_wall_time)
     result = coordinator.step(dt)
     runtime.after_physics_step(dt)
     return result
-
-
-@dataclass
-class _DeadlinePacer:
-    """按绝对墙钟期限节流真实 eCAL 循环，超期时不追加漂移。"""
-
-    period_sec: float
-    monotonic: Callable[[], float] = time.monotonic
-    sleep: Callable[[float], None] = time.sleep
-    _next_deadline: float | None = None
-
-    def __post_init__(self) -> None:
-        if (
-            isinstance(self.period_sec, bool)
-            or not isinstance(self.period_sec, Real)
-            or not math.isfinite(float(self.period_sec))
-            or float(self.period_sec) <= 0.0
-        ):
-            raise ValueError("period_sec must be a positive finite number")
-        if not callable(self.monotonic) or not callable(self.sleep):
-            raise ValueError("monotonic and sleep must be callable")
-        self.period_sec = float(self.period_sec)
-
-    def start(self) -> None:
-        """只读取一次起点，后续期限始终从上一 deadline 累加。"""
-        self._next_deadline = float(self.monotonic()) + self.period_sec
-
-    def wait_for_next_deadline(self) -> None:
-        if self._next_deadline is None:
-            raise RuntimeError("deadline pacer has not started")
-        deadline = self._next_deadline
-        self._next_deadline = deadline + self.period_sec
-        delay = deadline - float(self.monotonic())
-        if delay > 0.0:
-            self.sleep(delay)
 
 
 class InterfaceSession:
@@ -106,10 +89,13 @@ class InterfaceSession:
         runtime: InterfaceRuntime,
         logger: InterfaceEventLogger | None,
         actual_transport_mode: str,
+        *,
+        transport: object,
     ) -> None:
         self.runtime = runtime
         self.logger = logger
         self.actual_transport_mode = actual_transport_mode
+        self.transport = transport
         self._closed = False
         self._log_paths: InterfaceLogPaths | None = None
 
@@ -153,7 +139,11 @@ class _PeerStateRelay:
                 self._runtime.consume_transport_snapshot(snapshot)
 
     def attach(self, runtime: InterfaceRuntime, transport: object) -> object:
-        """锁住并发 callback 后读取最新快照，旧边沿只会重复而不会倒序。"""
+        """先推进 discovery，再锁住 callback 读取用于初始化的最新快照。"""
+        # poll 可能同步触发 relay callback，必须在进入非重入锁之前完成。
+        poll = getattr(transport, "poll_peer_state", None)
+        if callable(poll):
+            poll()
         with self._lock:
             snapshot = transport.snapshot()
             state = getattr(
@@ -211,6 +201,8 @@ def create_interface_session(
     coordinator_world,
     obstacle_manager,
     document: SceneDocument,
+    participant_name: str | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> InterfaceSession | None:
     """按配置创建唯一 transport/runtime/logger/backend 所有权链。"""
     if not config.interface_enabled:
@@ -239,11 +231,14 @@ def create_interface_session(
             obstacle_manager.snapshot(include_body_id=True),
         )
         # auto 的唯一降级点在 create_transport 内；其余初始化异常一律向上传播。
-        transport = create_transport(
-            config.interface_mode,
-            config=interface_config,
-            peer_state_callback=peer_state_relay,
-        )
+        transport_kwargs: dict[str, object] = {
+            "config": interface_config,
+            "peer_state_callback": peer_state_relay,
+            "monotonic": monotonic,
+        }
+        if participant_name is not None:
+            transport_kwargs["participant_name"] = participant_name
+        transport = create_transport(config.interface_mode, **transport_kwargs)
         if config.interface_log_enabled:
             interface_logger = InterfaceEventLogger(
                 config.log_dir,
@@ -253,9 +248,13 @@ def create_interface_session(
             coordinator_world.active_robot.robot,
             config=interface_config,
             transport=transport,
+            monotonic=monotonic,
             sensor_backend=backend,
             scene_document=runtime_document,
             logger=interface_logger,
+            capture_lidar_top_view=(
+                config.mode == "gui" and config.dashboard_enabled
+            ),
         )
         actual_transport_mode = peer_state_relay.attach(runtime, transport).mode
     except BaseException:
@@ -268,7 +267,12 @@ def create_interface_session(
             _close_resource_quietly(transport)
             _close_resource_quietly(backend)
         raise
-    return InterfaceSession(runtime, interface_logger, actual_transport_mode)
+    return InterfaceSession(
+        runtime,
+        interface_logger,
+        actual_transport_mode,
+        transport=transport,
+    )
 
 
 @dataclass(frozen=True)
@@ -306,6 +310,7 @@ def run_experiment(
     interface_log_paths: InterfaceLogPaths | None = None
     log_path: Path | None = None
     scene_export: Path | None = None
+    cyclic_gc_was_enabled: bool | None = None
     try:
         world, obstacle_manager = build_world_from_scene_document(
             client_id,
@@ -319,6 +324,7 @@ def run_experiment(
                 coordinator_world=world,
                 obstacle_manager=obstacle_manager,
                 document=document,
+                monotonic=monotonic,
             )
         coordinator = SimulationCoordinator(
             client_id,
@@ -340,6 +346,9 @@ def run_experiment(
         logger = CsvSimulationLogger(config.log_dir, prefix=f"slope_{world.terrain.slope_deg:g}")
         steps = max(1, int(config.duration_sec / config.time_step))
         pacer: _DeadlinePacer | None = None
+        observation_cadence: RuntimeObservationCadence | None = None
+        if interface_session is not None:
+            observation_cadence = RuntimeObservationCadence(monotonic=monotonic)
         if (
             interface_session is not None
             and interface_session.actual_transport_mode == "ecal"
@@ -350,6 +359,7 @@ def run_experiment(
                 sleep=sleep,
             )
             pacer.start()
+            cyclic_gc_was_enabled = _suspend_cyclic_gc()
 
         # 自动目标在 local 下进入接口回环；严格 eCAL 只接受外部 WheelCommand。
         for step in range(steps):
@@ -372,6 +382,7 @@ def run_experiment(
                     linear_velocity=config.target_linear_velocity,
                     angular_velocity=config.target_angular_velocity,
                     dt=config.time_step,
+                    observation_cadence=observation_cadence,
                 )
                 local_control = interface_session.actual_transport_mode == "local"
                 reported_linear_velocity = config.target_linear_velocity if local_control else 0.0
@@ -428,6 +439,8 @@ def run_experiment(
         # 清理异常不能覆盖正在传播的主异常；PyBullet 始终最后断开。
         primary_exception_active = sys.exc_info()[0] is not None
         cleanup_error: BaseException | None = None
+        if cyclic_gc_was_enabled is not None:
+            _restore_cyclic_gc(cyclic_gc_was_enabled)
         if interface_session is not None:
             try:
                 interface_log_paths = interface_session.close()

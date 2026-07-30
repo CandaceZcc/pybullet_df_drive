@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Callable
 import os
 from pathlib import Path
 import sys
@@ -23,6 +24,7 @@ from slope_sim.interfaces.config import InterfaceConfig
 from slope_sim.logger import CsvSimulationLogger, ObstacleEventLogger
 from slope_sim.manual_control import ManualCommand, ManualControlSettings, command_from_keyboard
 from slope_sim.metrics import compute_tracking_metrics
+from slope_sim.realtime import DeadlinePacer, RuntimeObservationCadence
 from slope_sim.runtime_actions import (
     AddObstaclesAction,
     ClearObstaclesAction,
@@ -284,10 +286,17 @@ def _record_manual_structural_event(
         )
 
 
-def run_manual_demo(config: ExperimentConfig, *, duration_limit_sec: float | None = None) -> SimulationResult:
+def run_manual_demo(
+    config: ExperimentConfig,
+    *,
+    duration_limit_sec: float | None = None,
+    monotonic: Callable[[], float] | None = None,
+    sleep: Callable[[float], None] | None = None,
+) -> SimulationResult:
     """启动 PyBullet GUI，使用方向键手动控制当前地形中的车辆。"""
     if config.mode != "gui":
         raise ValueError("manual demo requires GUI mode; use --gui --manual")
+    runtime_monotonic = time.monotonic if monotonic is None else monotonic
 
     # 配置文件先完成全量验证，失败时不能创建任何 PyBullet scene/robot body。
     document = initial_scene_document(config)
@@ -339,6 +348,7 @@ def run_manual_demo(config: ExperimentConfig, *, duration_limit_sec: float | Non
                 coordinator_world=world,
                 obstacle_manager=obstacle_manager,
                 document=document,
+                monotonic=runtime_monotonic,
             )
         coordinator = SimulationCoordinator(
             client_id,
@@ -422,8 +432,17 @@ def run_manual_demo(config: ExperimentConfig, *, duration_limit_sec: float | Non
             camera_follow_view=camera_follow_view,
         )
         handled_result = None
-        runtime_paused = False
+        manual_paused = False
         pending_event_actions: deque[RuntimeAction] = deque()
+        pacer = DeadlinePacer(
+            config.time_step,
+            monotonic=runtime_monotonic,
+            sleep=time.sleep if sleep is None else sleep,
+        )
+        observation_cadence = RuntimeObservationCadence(
+            monotonic=runtime_monotonic,
+        )
+        pacer.start()
         while max_steps is None or step < max_steps:
             if dashboard is not None:
                 dashboard.process_events()
@@ -485,20 +504,37 @@ def run_manual_demo(config: ExperimentConfig, *, duration_limit_sec: float | Non
             linear_velocity = limited_command.linear_velocity
             angular_velocity = limited_command.angular_velocity
             t = step * config.time_step
+            interface_snapshot_due = False
+            interface_snapshot_wall_time = runtime_monotonic()
             if interface_session is not None:
                 runtime = interface_session.runtime
-                runtime.poll_transport()
                 if command.paused:
-                    if not runtime_paused:
+                    (
+                        interface_snapshot_due,
+                        interface_snapshot_wall_time,
+                    ) = observation_cadence.poll_if_due(runtime)
+                    if not manual_paused:
                         runtime.pause()
-                        runtime_paused = True
-                    if dashboard is not None:
-                        dashboard.update_interface_snapshot(runtime.dashboard_snapshot())
-                    time.sleep(config.time_step)
+                        manual_paused = True
+                    if dashboard is not None and interface_snapshot_due:
+                        snapshot_wall_time = runtime_monotonic()
+                        dashboard.update_interface_snapshot(
+                            runtime.dashboard_snapshot(
+                                wall_time=snapshot_wall_time,
+                            )
+                        )
+                    pacer.wait_for_next_deadline()
                     continue
-                if runtime_paused:
-                    runtime.resume()
-                    runtime_paused = False
+                if manual_paused:
+                    observation_cadence.reset()
+                (
+                    interface_snapshot_due,
+                    interface_snapshot_wall_time,
+                ) = observation_cadence.poll_if_due(runtime)
+                if manual_paused:
+                    runtime.resume(wall_time=interface_snapshot_wall_time)
+                    manual_paused = False
+                    pacer.reset_deadline()
                 if interface_session.actual_transport_mode == "local":
                     runtime.submit_local_twist(
                         linear_velocity,
@@ -511,11 +547,18 @@ def run_manual_demo(config: ExperimentConfig, *, duration_limit_sec: float | Non
                     # 真实 eCAL 只消费外部 WheelCommand，Dashboard 速度不构成控制输入。
                     reported_linear_velocity = 0.0
                     reported_angular_velocity = 0.0
-                runtime.before_physics_step(config.time_step)
+                runtime.before_physics_step(
+                    config.time_step,
+                    wall_time=interface_snapshot_wall_time,
+                )
             else:
                 if command.paused:
-                    time.sleep(config.time_step)
+                    manual_paused = True
+                    pacer.wait_for_next_deadline()
                     continue
+                if manual_paused:
+                    manual_paused = False
+                    pacer.reset_deadline()
                 robot.command_twist(linear_velocity, angular_velocity, dt=config.time_step)
                 reported_linear_velocity = linear_velocity
                 reported_angular_velocity = angular_velocity
@@ -571,6 +614,8 @@ def run_manual_demo(config: ExperimentConfig, *, duration_limit_sec: float | Non
                     if pending_event_actions:
                         pending_event_actions.popleft()
                 if result.world_reset:
+                    # 新 world 已切换 runtime generation，下一帧必须立即刷新 discovery。
+                    observation_cadence.reset()
                     configure_gui_visualizer(
                         client_id,
                         config.camera_distance,
@@ -612,9 +657,12 @@ def run_manual_demo(config: ExperimentConfig, *, duration_limit_sec: float | Non
                     camera_follow_view,
                 )
             if dashboard is not None:
-                if interface_session is not None:
+                if interface_session is not None and interface_snapshot_due:
+                    snapshot_wall_time = runtime_monotonic()
                     dashboard.update_interface_snapshot(
-                        interface_session.runtime.dashboard_snapshot()
+                        interface_session.runtime.dashboard_snapshot(
+                            wall_time=snapshot_wall_time,
+                        )
                     )
                 dashboard.update_obstacle_snapshots(
                     lambda manager=coordinator.obstacle_manager: manager.snapshot(
@@ -629,8 +677,8 @@ def run_manual_demo(config: ExperimentConfig, *, duration_limit_sec: float | Non
                 estimated_x=state.x,
                 estimated_y=state.y,
             )
-            time.sleep(config.time_step)
             step += 1
+            pacer.wait_for_next_deadline()
 
         if config.scene_out is not None:
             scene_export = dump_scene_atomic(

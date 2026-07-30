@@ -1,4 +1,4 @@
-# 多线点云模块：用固定前后安装外参和 16x180 批量射线生成雷达局部坐标点云。
+# 多线点云模块：用冻结安装外参和可分片 16x180 射线生成原子雷达点云。
 from __future__ import annotations
 
 from collections.abc import Iterator, Mapping, Sequence
@@ -424,16 +424,48 @@ class MultiLineLidar:
             ray_index // self.config.horizontal_samples,
         )
 
-    def scan_with_top_view(self, timebase_ns: int) -> LidarScanResult:
-        """用一次射线批次同步生成雷达局部点云和 base_link 俯视帧。"""
-        scan_time = _require_uint64("timebase_ns", timebase_ns)
-        mount = self._world_mount()
-        base_pose = self._backend.world_pose("base_link")
-        if not isinstance(base_pose, Pose):
-            raise RuntimeError("sensor backend world_pose must return Pose")
-        starts, ends = self._world_rays(mount)
-        if len(starts) != self.config.ray_count or len(ends) != self.config.ray_count:
-            raise RuntimeError("lidar ray input batches must match config.ray_count")
+    def _indexed_hits(
+        self,
+        starts: tuple[Vec3, ...],
+        ends: tuple[Vec3, ...],
+    ) -> tuple[tuple[tuple[int, RayHit], ...], bool]:
+        """优先读取生产后端紧凑命中；测试替身继续使用完整定长结果。"""
+        compact_query = getattr(self._backend, "ray_test_indexed_hits", None)
+        compact_declared = "ray_test_indexed_hits" in type(self._backend).__dict__
+        if compact_declared and callable(compact_query):
+            raw_indexed = compact_query(
+                starts,
+                ends,
+                collision_mask=LIDAR_VISIBLE_GROUP,
+            )
+            invalid_types = (str, bytes, set, frozenset, Mapping, Iterator)
+            if isinstance(raw_indexed, invalid_types) or not isinstance(
+                raw_indexed,
+                Sequence,
+            ):
+                raise RuntimeError(
+                    "sensor backend ray_test_indexed_hits must return an ordered sequence"
+                )
+            indexed = tuple(raw_indexed)
+            previous_index = -1
+            for item_index, item in enumerate(indexed):
+                if type(item) is not tuple or len(item) != 2:
+                    raise RuntimeError(
+                        f"sensor backend indexed hit {item_index} must contain index and RayHit"
+                    )
+                ray_index, hit = item
+                if (
+                    type(ray_index) is not int
+                    or not previous_index < ray_index < self.config.ray_count
+                    or type(hit) is not RayHit
+                    or not hit.hit
+                ):
+                    raise RuntimeError(
+                        f"sensor backend indexed hit {item_index} is invalid"
+                    )
+                previous_index = ray_index
+            return indexed, True
+
         raw_hits = self._backend.ray_test_batch(
             starts,
             ends,
@@ -452,21 +484,48 @@ class MultiLineLidar:
                 raise RuntimeError(
                     f"sensor backend ray result {ray_index} must be a RayHit"
                 )
-
-        indexed_hits = tuple(
+        return tuple(
             (ray_index, hit)
             for ray_index, hit in enumerate(hits)
             if hit.hit
-        )
+        ), False
+
+    def _scan_message_at_mount(
+        self,
+        scan_time: int,
+        mount: Pose,
+        *,
+        capture_world_points: bool,
+    ) -> tuple[LidarPointCloud, tuple[Vec3, ...]]:
+        """执行一次射线批次，并按需保留构建俯视帧所需的世界命中点。"""
+        starts, ends = self._world_rays(mount)
+        if len(starts) != self.config.ray_count or len(ends) != self.config.ray_count:
+            raise RuntimeError("lidar ray input batches must match config.ray_count")
+        indexed_hits, used_compact_query = self._indexed_hits(starts, ends)
         world_hit_points = tuple(hit.hit_position for _ray_index, hit in indexed_hits)
-        raw_local_points = self._backend.inverse_transform_points(
-            mount,
-            world_hit_points,
+        prevalidated_inverse = getattr(
+            self._backend,
+            "inverse_transform_points_prevalidated",
+            None,
         )
-        local_points = _require_inverse_points(raw_local_points, len(indexed_hits))
+        if used_compact_query and callable(prevalidated_inverse):
+            raw_local_points = prevalidated_inverse(mount, world_hit_points)
+            if type(raw_local_points) is not tuple or len(raw_local_points) != len(
+                indexed_hits
+            ):
+                raise RuntimeError(
+                    "prevalidated inverse transform returned an unexpected result"
+                )
+            local_points = raw_local_points
+        else:
+            raw_local_points = self._backend.inverse_transform_points(
+                mount,
+                world_hit_points,
+            )
+            local_points = _require_inverse_points(raw_local_points, len(indexed_hits))
 
         points: list[LidarPoint] = []
-        accepted_world_points: list[Vec3] = []
+        accepted_world_points: list[Vec3] | None = [] if capture_world_points else None
         for (ray_index, hit), local_point in zip(
             indexed_hits,
             local_points,
@@ -475,7 +534,8 @@ class MultiLineLidar:
             point = self._point_from_hit(ray_index, hit, local_point)
             if point is not None:
                 points.append(point)
-                accepted_world_points.append(hit.hit_position)
+                if accepted_world_points is not None:
+                    accepted_world_points.append(hit.hit_position)
         frozen_points = tuple(points)
         message = LidarPointCloud(
             scan_time,
@@ -484,12 +544,28 @@ class MultiLineLidar:
             self.lidar_id,
             frozen_points,
         )
+        return message, (
+            () if accepted_world_points is None else tuple(accepted_world_points)
+        )
+
+    def scan_with_top_view(self, timebase_ns: int) -> LidarScanResult:
+        """用一次射线批次同步生成雷达局部点云和 base_link 俯视帧。"""
+        scan_time = _require_uint64("timebase_ns", timebase_ns)
+        mount = self._world_mount()
+        base_pose = self._backend.world_pose("base_link")
+        if not isinstance(base_pose, Pose):
+            raise RuntimeError("sensor backend world_pose must return Pose")
+        message, accepted_world_points = self._scan_message_at_mount(
+            scan_time,
+            mount,
+            capture_world_points=True,
+        )
         # 只转换企业点云已接受的同一批 world hit，天然保持 message 严格同序。
         raw_base_points = self._backend.inverse_transform_points(
             base_pose,
-            tuple(accepted_world_points),
+            accepted_world_points,
         )
-        base_points = _require_inverse_points(raw_base_points, len(frozen_points))
+        base_points = _require_inverse_points(raw_base_points, len(message.points))
         top_view = LidarTopViewFrame(
             scan_time,
             tuple(
@@ -500,7 +576,7 @@ class MultiLineLidar:
                     self.lidar_id,
                 )
                 for message_point, base_point in zip(
-                    frozen_points,
+                    message.points,
                     base_points,
                     strict=True,
                 )
@@ -509,5 +585,11 @@ class MultiLineLidar:
         return LidarScanResult(message, top_view)
 
     def scan(self, timebase_ns: int) -> LidarPointCloud:
-        """兼容旧入口；复用组合扫描结果且不重复执行射线。"""
-        return self.scan_with_top_view(timebase_ns).message
+        """生成企业点云，不构造仅供 Dashboard 使用的 base_link 俯视帧。"""
+        scan_time = _require_uint64("timebase_ns", timebase_ns)
+        message, _world_points = self._scan_message_at_mount(
+            scan_time,
+            self._world_mount(),
+            capture_world_points=False,
+        )
+        return message

@@ -541,6 +541,55 @@ def test_ray_batch_passes_collision_mask_and_rejects_return_length_mismatch(monk
         p.disconnect(client_id)
 
 
+def test_indexed_hit_batch_uses_parallel_pybullet_and_omits_missed_rays(monkeypatch):
+    client_id, backend = _create_backend()
+    backend.bind_scene((7,), ())
+    observed: dict[str, object] = {}
+    raw_results = (
+        (-1, -1, 1.0, (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)),
+        (7, -1, 0.5, (1.0, 2.0, 3.0), (0.0, 0.0, 1.0)),
+    )
+
+    def indexed_results(
+        starts,
+        ends,
+        *,
+        numThreads,
+        collisionFilterMask,
+        physicsClientId,
+    ):
+        observed.update(
+            starts=starts,
+            ends=ends,
+            num_threads=numThreads,
+            collision_mask=collisionFilterMask,
+            client_id=physicsClientId,
+        )
+        return raw_results
+
+    starts = ((0.0, 0.0, 0.0), (0.0, 1.0, 0.0))
+    ends = ((2.0, 0.0, 0.0), (2.0, 1.0, 0.0))
+    try:
+        monkeypatch.setattr(sensor_backend_module.p, "rayTestBatch", indexed_results)
+
+        indexed_hits = backend.ray_test_indexed_hits(
+            starts,
+            ends,
+            collision_mask=0x10,
+        )
+
+        assert indexed_hits == ((1, RayHit((1.0, 2.0, 3.0), 7, -1, "terrain")),)
+        assert observed == {
+            "starts": starts,
+            "ends": ends,
+            "num_threads": 0,
+            "collision_mask": 0x10,
+            "client_id": client_id,
+        }
+    finally:
+        p.disconnect(client_id)
+
+
 def test_ray_batch_rejects_result_with_extra_fields(monkeypatch):
     client_id, backend = _create_backend()
     raw_hit = (1, -1, 0.5, (0.0, 0.0, 0.0), (0.0, 0.0, 1.0), "extra")

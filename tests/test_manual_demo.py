@@ -759,11 +759,13 @@ def test_limit_manual_command_step_keeps_slew_for_obstacle_actions(action):
     assert limited.structural_action == action
 
 
-def test_manual_demo_dashboard_disabled_keeps_configured_camera_state(monkeypatch):
-    """Dashboard 明确禁用时，PyBullet 滑条循环仍沿用配置的相机状态。"""
+def test_manual_demo_uses_absolute_deadline_and_keeps_configured_camera_state(monkeypatch):
+    """手动循环只等待当前帧余量，且禁用 Dashboard 时沿用配置相机状态。"""
     client_id = 17
     robot_id = 23
     camera_calls = []
+    sleep_delays = []
+    clock = {"now": 0.0}
     state = SimpleNamespace(x=0.0, y=0.0, out_of_bounds=False)
     robot = SimpleNamespace(
         robot_id=robot_id,
@@ -810,8 +812,17 @@ def test_manual_demo_dashboard_disabled_keeps_configured_camera_state(monkeypatc
     monkeypatch.setattr(manual_demo_module, "command_from_keyboard", lambda *_args: ManualCommand(0.0, 0.0))
     monkeypatch.setattr(manual_demo_module, "_read_lidar_for_robot", lambda *_args: None)
     monkeypatch.setattr(manual_demo_module, "_probe_terrain_for_robot", lambda *_args: None)
-    monkeypatch.setattr(manual_demo_module, "update_follow_camera", lambda *args: camera_calls.append(args))
-    monkeypatch.setattr(manual_demo_module.time, "sleep", lambda _seconds: None)
+    def update_follow_camera(*args):
+        camera_calls.append(args)
+        clock["now"] += 0.004
+
+    def sleep(seconds):
+        sleep_delays.append(seconds)
+        clock["now"] += seconds
+
+    monkeypatch.setattr(manual_demo_module, "update_follow_camera", update_follow_camera)
+    monkeypatch.setattr(manual_demo_module.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(manual_demo_module.time, "sleep", sleep)
     monkeypatch.setattr(manual_demo_module.pd, "read_csv", lambda _path: object())
     monkeypatch.setattr(manual_demo_module, "compute_diagnostic_summary", lambda _frame: FakeDiagnosticSummary())
     monkeypatch.setattr(manual_demo_module, "write_diagnostic_summary", lambda *_args: Path("diagnostics.json"))
@@ -832,6 +843,8 @@ def test_manual_demo_dashboard_disabled_keeps_configured_camera_state(monkeypatc
     )
 
     assert camera_calls == [(client_id, robot_id, 6.0, -35.0, 45.0, "side")]
+    assert sleep_delays == pytest.approx([0.006])
+    assert clock["now"] == pytest.approx(0.01)
 
 
 def test_manual_demo_keeps_dashboard_busy_while_obstacle_operation_is_pending(monkeypatch):
@@ -1712,7 +1725,7 @@ def test_manual_enabled_local_loop_pauses_polls_rebinds_and_returns_interface_lo
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    """手动入口只通过 runtime 控车，暂停边沿不推进物理但持续刷新接口状态。"""
+    """手动入口低频观测，暂停仍发现对端，恢复后立即重建观测边界。"""
     from slope_sim.interfaces.logging import InterfaceLogPaths
     from slope_sim.interfaces.status import InterfaceStatusSnapshot, WheelCommandStatus
     from slope_sim.scene_config import SceneDocument, SensorDocument, TerrainDocument
@@ -1721,7 +1734,15 @@ def test_manual_enabled_local_loop_pauses_polls_rebinds_and_returns_interface_lo
     direct_twists: list[tuple[str, float, float]] = []
     controlled_robot_ids: list[int] = []
     statuses: list[InterfaceStatusSnapshot] = []
+    decision_wall_times: list[float] = []
+    resume_wall_times: list[float] = []
+    clock = [0.0]
+    sleeps: list[float] = []
     state = SimpleNamespace(x=0.0, y=0.0, out_of_bounds=False)
+
+    def sleep(delay: float) -> None:
+        sleeps.append(delay)
+        clock[0] += delay
 
     def make_robot(robot_id: int):
         return SimpleNamespace(
@@ -1768,6 +1789,19 @@ def test_manual_enabled_local_loop_pauses_polls_rebinds_and_returns_interface_lo
             return ()
 
     manager = FakeManager()
+    cadence_resets: list[float] = []
+    real_cadence_type = manual_demo_module.RuntimeObservationCadence
+
+    class RecordingCadence(real_cadence_type):
+        def reset(self) -> None:
+            cadence_resets.append(clock[0])
+            super().reset()
+
+    monkeypatch.setattr(
+        manual_demo_module,
+        "RuntimeObservationCadence",
+        RecordingCadence,
+    )
 
     class FakeRuntime:
         def __init__(self):
@@ -1780,8 +1814,9 @@ def test_manual_enabled_local_loop_pauses_polls_rebinds_and_returns_interface_lo
             trace.append(("submit", linear, angular, dt))
             return True
 
-        def before_physics_step(self, _dt):
+        def before_physics_step(self, _dt, *, wall_time):
             trace.append("before")
+            decision_wall_times.append(wall_time)
             controlled_robot_ids.append(self.bound_robot.robot_id)
 
         def after_physics_step(self, _dt):
@@ -1790,10 +1825,12 @@ def test_manual_enabled_local_loop_pauses_polls_rebinds_and_returns_interface_lo
         def pause(self):
             trace.append("pause")
 
-        def resume(self):
+        def resume(self, *, wall_time):
             trace.append("resume")
+            resume_wall_times.append(wall_time)
 
-        def dashboard_snapshot(self):
+        def dashboard_snapshot(self, *, wall_time):
+            assert wall_time == pytest.approx(clock[0])
             trace.append("dashboard_snapshot")
             return dashboard_snapshot
 
@@ -1831,6 +1868,7 @@ def test_manual_enabled_local_loop_pauses_polls_rebinds_and_returns_interface_lo
         def step(self, _dt):
             trace.append("coordinator.step")
             self.steps += 1
+            clock[0] += 0.002
             if self.steps == 1:
                 self.world = SimpleNamespace(
                     scene=scene,
@@ -1838,7 +1876,7 @@ def test_manual_enabled_local_loop_pauses_polls_rebinds_and_returns_interface_lo
                     terrain=terrain,
                 )
                 runtime.bound_robot = new_robot
-            return None
+            return persistent_result
 
         def logical_scene_document(self):
             return document
@@ -1851,6 +1889,18 @@ def test_manual_enabled_local_loop_pauses_polls_rebinds_and_returns_interface_lo
             DashboardCommand(0.2, -0.1),
         )
     )
+    persistent_result = SimpleNamespace(
+        world=SimpleNamespace(
+            scene=scene,
+            active_robot=SimpleNamespace(robot=new_robot, robot_model="df_mid"),
+            terrain=terrain,
+        ),
+        state_changed=True,
+        world_reset=True,
+        status_message="车型已切换为 df_mid",
+        error_message=None,
+        obstacle_result=None,
+    )
 
     class FakeDashboard(_WindowedFakeDashboard):
         def __init__(self, *_args, **_kwargs):
@@ -1859,12 +1909,22 @@ def test_manual_enabled_local_loop_pauses_polls_rebinds_and_returns_interface_lo
 
         def process_events(self):
             trace.append("events")
+            clock[0] += 0.030
 
         def current_command(self):
             return next(commands)
 
         def update_interface_snapshot(self, value):
             statuses.append(value)
+
+        def sync_active_selection(self, *_args):
+            pass
+
+        def reset_feedback_history(self):
+            pass
+
+        def show_switch_status(self, *_args, **_kwargs):
+            pass
 
         def update_obstacle_snapshots(self, _snapshots):
             pass
@@ -1905,7 +1965,6 @@ def test_manual_enabled_local_loop_pauses_polls_rebinds_and_returns_interface_lo
     monkeypatch.setattr(manual_demo_module, "_probe_terrain_for_robot", lambda *_args: None)
     monkeypatch.setattr(manual_demo_module, "update_follow_camera", lambda *_args: None)
     monkeypatch.setattr(manual_demo_module, "dump_scene_atomic", lambda value, path: (trace.append(("export", value)), path)[1], raising=False)
-    monkeypatch.setattr(manual_demo_module.time, "sleep", lambda _seconds: trace.append("sleep"))
     monkeypatch.setattr(manual_demo_module.pd, "read_csv", lambda _path: object())
     monkeypatch.setattr(manual_demo_module, "compute_diagnostic_summary", lambda _frame: FakeDiagnosticSummary())
     monkeypatch.setattr(manual_demo_module, "write_diagnostic_summary", lambda *_args: tmp_path / "diagnostics.json")
@@ -1923,16 +1982,26 @@ def test_manual_enabled_local_loop_pauses_polls_rebinds_and_returns_interface_lo
             scene_out=tmp_path / "scene.yaml",
         ),
         duration_limit_sec=0.02,
+        monotonic=lambda: clock[0],
+        sleep=sleep,
     )
 
     assert direct_twists == []
     assert controlled_robot_ids == [31, 32]
-    assert trace.count("poll") == 4
+    assert trace.count("poll") == 3
     assert trace.count("coordinator.step") == 2
     assert trace.count("before") == trace.count("after") == 2
     assert trace.count("pause") == trace.count("resume") == 1
-    assert statuses == [dashboard_snapshot] * 4
-    assert trace.count("dashboard_snapshot") == 4
+    assert decision_wall_times == pytest.approx([0.030, 0.122])
+    assert resume_wall_times == pytest.approx([0.122])
+    assert cadence_resets == pytest.approx([0.032, 0.122])
+    assert max(index for index, value in enumerate(trace) if value == "poll") < trace.index(
+        "resume"
+    ) < max(index for index, value in enumerate(trace) if value == "before")
+    assert statuses == [dashboard_snapshot] * 3
+    assert trace.count("dashboard_snapshot") == 3
+    assert sleeps == pytest.approx([0.0, 0.0, 0.0, 0.008])
+    assert clock[0] == pytest.approx(0.132)
     assert result.interface_binary_log == tmp_path / "interfaces.bin"
     assert result.interface_event_log == tmp_path / "interfaces.jsonl"
     assert result.scene_export == tmp_path / "scene.yaml"

@@ -354,12 +354,15 @@ def test_log_snapshot_is_immutable_and_strictly_validated():
     InterfaceLogSnapshot = interface_logging.InterfaceLogSnapshot
     snapshot = InterfaceLogSnapshot(1, 2, 3, 4, False, False)
 
+    assert snapshot.pending_count == 0
     with pytest.raises(FrozenInstanceError):
         snapshot.dropped_messages = 5
     with pytest.raises(ValueError, match="accepted_messages"):
         InterfaceLogSnapshot(True, 2, 3, 4, False, False)
     with pytest.raises(ValueError, match="closed"):
         InterfaceLogSnapshot(1, 2, 3, 4, 0, False)
+    with pytest.raises(ValueError, match="pending_count"):
+        InterfaceLogSnapshot(1, 2, 3, 4, False, False, pending_count=True)
 
 
 @pytest.mark.parametrize(
@@ -726,6 +729,7 @@ def test_full_queue_never_blocks_and_counts_each_dropped_message(tmp_path):
         assert submission_errors == []
         assert not submitter.is_alive()
         assert not writer.release.is_set()
+        assert logger.snapshot().pending_count == 2
         assert logger.snapshot() == interface_logging.InterfaceLogSnapshot(
             accepted_messages=2,
             accepted_events=0,
@@ -733,12 +737,14 @@ def test_full_queue_never_blocks_and_counts_each_dropped_message(tmp_path):
             dropped_events=0,
             closed=False,
             writer_failed=False,
+            pending_count=2,
         )
     finally:
         writer.release.set()
         submitter.join(timeout=1.0)
 
     paths = logger.close()
+    assert logger.snapshot().pending_count == 0
     assert [record.sequence for record in read_interface_log(paths.binary_path)] == [0, 1]
     assert writer.calls == ["message", "message"]
 
@@ -1015,6 +1021,7 @@ def test_messages_and_events_share_capacity_without_overwriting_accepted_items(t
             dropped_events=0,
             closed=False,
             writer_failed=False,
+            pending_count=2,
         )
     finally:
         writer.release.set()

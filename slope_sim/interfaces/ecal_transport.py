@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from importlib import import_module
 import math
 from numbers import Real
-from threading import Condition, Lock, RLock, Thread, current_thread, local
+from threading import Condition, Event, Lock, RLock, Thread, current_thread, local
 import time
 from typing import Any
 
@@ -462,18 +462,21 @@ class EcalTransport:
         self._role = role
         self._peer_state_callback = peer_state_callback
         self._condition = Condition()
-        self._io_lock = Lock()
         self._delivery_gate = RLock()
+        self._discovery_gate = RLock()
         self._state = "initializing"
         self._stop_worker = False
         self._in_flight_deliveries = 0
+        self._in_flight_discoveries = 0
         self._cleanup_thread: Thread | None = None
         self._cleanup_claimed = False
         self._close_error: BaseException | None = None
         self._quiesce_started = False
         self._quiesce_complete = False
         self._peer_connected = False
-        self._deferred_peer_connected: dict[str, bool] | None = None
+        self._deferred_peer_connected: tuple[int, dict[str, bool]] | None = None
+        self._next_discovery_revision = 0
+        self._applied_discovery_revision = -1
         self._generation = 0
         self._detail = ""
         self._published_count = 0
@@ -481,15 +484,19 @@ class EcalTransport:
         self._error_count = 0
         self._dropped_count = 0
         self._pending: OrderedDict[str, _PendingMessage] = OrderedDict()
-        self._claimed_pending: tuple[str, _PendingMessage] | None = None
-        self._claimed_send_started = False
+        self._claimed_pending: dict[str, _PendingMessage] = {}
+        self._claimed_send_started: set[str] = set()
         self._subscriptions: dict[str, list[EcalSubscription]] = {}
         self._subscriber_resources: list[tuple[_ChannelBinding, object]] = []
         self._publisher_resources: list[tuple[_ChannelBinding, object]] = []
         self._publisher_by_topic: dict[str, tuple[_ChannelBinding, object]] = {}
         self._subscriber_by_topic: dict[str, tuple[_ChannelBinding, object]] = {}
+        self._send_locks: dict[str, Lock] = {}
+        self._worker_events: dict[str, Event] = {}
         self._participant: object | None = None
-        self._worker: Thread | None = None
+        self._workers: dict[str, Thread] = {}
+        self._worker_exited_topics: set[str] = set()
+        self._fatal_worker_fault: tuple[str, BaseException] | None = None
 
         channels = _channel_bindings(selected_config)
         if role == "peer":
@@ -531,35 +538,52 @@ class EcalTransport:
                 )
                 self._publisher_resources.append((channel, resource))
                 self._publisher_by_topic[channel.topic] = (channel, resource)
+                self._send_locks[channel.topic] = Lock()
+                self._worker_events[channel.topic] = Event()
             self._state = "waiting_peer"
             if start_worker:
-                self._worker = Thread(
-                    target=self._worker_main,
-                    name=f"ecal-{role}-publisher",
-                    daemon=True,
-                )
-                self._worker.start()
+                for index, (channel, _resource) in enumerate(
+                    self._publisher_resources,
+                    start=1,
+                ):
+                    worker = Thread(
+                        target=self._worker_main,
+                        args=(channel.topic,),
+                        name=f"ecal-{role}-publisher-{index}",
+                        daemon=True,
+                    )
+                    self._workers[channel.topic] = worker
+                    worker.start()
         except BaseException:
             self._cleanup_partial_initialization()
             raise
 
     @property
     def worker_alive(self) -> bool:
-        worker = self._worker
-        return worker is not None and worker.is_alive()
+        return any(
+            worker.is_alive() and topic not in self._worker_exited_topics
+            for topic, worker in self._workers.items()
+        )
 
     @property
     def role(self) -> str:
         return self._role
+
+    def _is_worker_thread(self) -> bool:
+        """判断当前调用是否来自任一 publisher lane。"""
+        caller = current_thread()
+        return any(caller is worker for worker in self._workers.values())
 
     def _cleanup_partial_initialization(self) -> None:
         """初始化失败时继续清理全部资源，并保留最初的创建异常。"""
         with self._condition:
             self._stop_worker = True
             self._pending.clear()
-            self._condition.notify_all()
-        worker = self._worker
-        if worker is not None:
+            self._claimed_pending.clear()
+            self._claimed_send_started.clear()
+            for worker_event in self._worker_events.values():
+                worker_event.set()
+        for worker in tuple(self._workers.values()):
             try:
                 is_alive = getattr(worker, "is_alive", None)
                 join = getattr(worker, "join", None)
@@ -567,7 +591,8 @@ class EcalTransport:
                     join()
             except BaseException:
                 pass
-        self._worker = None
+        self._workers.clear()
+        self._worker_exited_topics.clear()
         for _channel, resource in reversed(self._publisher_resources):
             try:
                 self._bindings.close(resource)
@@ -582,6 +607,8 @@ class EcalTransport:
         self._participant = None
         self._publisher_by_topic.clear()
         self._subscriber_by_topic.clear()
+        self._send_locks.clear()
+        self._worker_events.clear()
         self._publisher_resources.clear()
         self._subscriber_resources.clear()
         if participant is not None:
@@ -593,6 +620,46 @@ class EcalTransport:
     def _require_open_locked(self) -> None:
         if self._state in _STOPPING_STATES:
             raise RuntimeError("transport is closed")
+        fatal_fault = self._fatal_worker_fault
+        if fatal_fault is not None:
+            topic, error = fatal_fault
+            raise RuntimeError(
+                self._worker_fatal_detail(topic, error)
+            ) from error
+
+    @staticmethod
+    def _worker_fatal_detail(topic: str, error: BaseException) -> str:
+        """生成可定位 publisher lane 与原始异常的全局致命故障说明。"""
+        return (
+            f"publisher worker fatal fault on topic {topic!r}: "
+            f"{_error_detail(error)}"
+        )
+
+    def _latch_worker_fatal_locked(
+        self,
+        topic: str,
+        error: BaseException,
+    ) -> None:
+        """调用方持锁时只锁存首个 publisher worker 致命退出。"""
+        if self._fatal_worker_fault is not None:
+            return
+        self._fatal_worker_fault = (topic, error)
+        detail = self._worker_fatal_detail(topic, error)
+        self._error_count += 1
+        self._update_topic_quality_locked(
+            topic,
+            error_delta=1,
+            state="error",
+            detail=detail,
+        )
+        if self._state not in _STOPPING_STATES:
+            self._state = "error"
+            self._detail = detail
+
+        # 任一 lane 丢失后全局传输已不可恢复，唤醒其余 lane 统一退出。
+        self._stop_worker = True
+        for worker_event in self._worker_events.values():
+            worker_event.set()
 
     def subscribe(
         self,
@@ -662,17 +729,27 @@ class EcalTransport:
                     f"topic {normalized_topic!r} requires type {channel.type_name!r}"
                 )
 
-            dropped_topic: str | None = None
-            if normalized_topic in self._pending:
-                del self._pending[normalized_topic]
-                dropped_topic = normalized_topic
-            elif len(self._pending) >= self._queue_size:
-                dropped_topic, _dropped_message = self._pending.popitem(last=False)
-            self._pending[normalized_topic] = _PendingMessage(
+            message = _PendingMessage(
                 copied_payload,
                 normalized_sim_time,
                 normalized_wall_time,
             )
+            dropped_topic: str | None = None
+            if (
+                normalized_topic in self._workers
+                and normalized_topic not in self._claimed_pending
+            ):
+                if normalized_topic in self._pending:
+                    raise RuntimeError("publisher lane pending ownership is inconsistent")
+                # 生产线程只完成 lane 所有权交接，不在物理线程调用 native send。
+                self._claimed_pending[normalized_topic] = message
+            else:
+                if normalized_topic in self._pending:
+                    del self._pending[normalized_topic]
+                    dropped_topic = normalized_topic
+                elif len(self._pending) >= self._queue_size:
+                    dropped_topic, _dropped_message = self._pending.popitem(last=False)
+                self._pending[normalized_topic] = message
             if dropped_topic is not None:
                 self._dropped_count += 1
                 self._state = "degraded"
@@ -683,7 +760,9 @@ class EcalTransport:
                     state="degraded",
                     detail="output queue replaced a pending message",
                 )
-            self._condition.notify_all()
+            worker_event = self._worker_events.get(normalized_topic)
+            if worker_event is not None:
+                worker_event.set()
             return True
 
     def pending_payload(self, topic: str) -> bytes | None:
@@ -692,6 +771,21 @@ class EcalTransport:
         with self._condition:
             pending = self._pending.get(normalized_topic)
             return None if pending is None else bytes(pending.payload)
+
+    def wait_idle(self, *, timeout_sec: float) -> None:
+        """有界等待 pending 与 worker 已认领帧全部发送完成。"""
+        timeout = _require_wall_time("timeout_sec", timeout_sec)
+        deadline = time.monotonic() + timeout
+        with self._condition:
+            self._require_open_locked()
+            while self._pending or self._claimed_pending:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    raise TimeoutError(
+                        f"transport did not become idle within {timeout:g}s"
+                    )
+                self._condition.wait(timeout=remaining)
+                self._require_open_locked()
 
     def _on_payload(self, topic: str, payload: object) -> None:
         """锁外交付负载；至少一次成功且没有明确拒绝时才激活当前代。"""
@@ -847,6 +941,17 @@ class EcalTransport:
             previously_known=command_previously_known,
         )
 
+    def _apply_discovery_observation_locked(
+        self,
+        revision: int,
+        observed: dict[str, bool],
+    ) -> str | None:
+        """只提交最新 discovery revision，迟到旧观察不得回退连接状态。"""
+        if revision <= self._applied_discovery_revision:
+            return None
+        self._applied_discovery_revision = revision
+        return self._apply_peer_states_locked(observed)
+
     def _drain_deferred_peer_state(self) -> None:
         """在 delivery gate 内处理用户回调重入时暂存的最新 discovery 结果。"""
         while True:
@@ -854,11 +959,15 @@ class EcalTransport:
                 if self._state in _STOPPING_STATES:
                     self._deferred_peer_connected = None
                     return
-                observed = self._deferred_peer_connected
+                deferred = self._deferred_peer_connected
                 self._deferred_peer_connected = None
-                if observed is None:
+                if deferred is None:
                     return
-                transition = self._apply_peer_states_locked(observed)
+                revision, observed = deferred
+                transition = self._apply_discovery_observation_locked(
+                    revision,
+                    observed,
+                )
             self._notify_peer_transition(transition)
 
     def _record_error(self, error: Exception) -> None:
@@ -953,34 +1062,62 @@ class EcalTransport:
 
     def poll_peer_state(self) -> str:
         """逐话题轮询 discovery；只有命令边沿改变安全代际。"""
-        with self._condition:
-            self._require_open_locked()
-            monitored = self._discovery_resources_locked()
+        discovery_registered = False
         try:
-            observed = {
-                topic: self._bindings.is_peer_connected(resource)
-                for topic, resource in monitored
-            }
-        except Exception as exc:
-            self._record_error(exc)
-            raise
-
-        # 同线程用户回调已经持有 delivery gate，结果留到整个 delivery 返回前处理。
-        if _inside_transport_callback(self):
             with self._condition:
                 self._require_open_locked()
-                self._deferred_peer_connected = observed
-                return self._state
+            # native count API 彼此串行，但不占 publisher lane 或 transport 状态锁。
+            with self._discovery_gate:
+                with self._condition:
+                    self._require_open_locked()
+                    monitored = self._discovery_resources_locked()
+                    revision = self._next_discovery_revision
+                    self._next_discovery_revision += 1
+                    self._in_flight_discoveries += 1
+                    discovery_registered = True
+                try:
+                    observed = {
+                        topic: self._bindings.is_peer_connected(resource)
+                        for topic, resource in monitored
+                    }
+                except Exception as exc:
+                    self._record_error(exc)
+                    raise
 
-        # delivery 与 discovery 共用独立门，确保断线清邮箱后旧 payload 不再进入上层。
-        with self._delivery_gate:
-            with self._condition:
-                self._require_open_locked()
-                transition = self._apply_peer_states_locked(observed)
-            self._notify_peer_transition(transition)
-            self._drain_deferred_peer_state()
-            with self._condition:
-                return self._state
+            # 同线程用户回调已经持有 delivery gate，结果留到整个 delivery 返回前处理。
+            if _inside_transport_callback(self):
+                with self._condition:
+                    if self._state in _STOPPING_STATES:
+                        return "disconnected"
+                    deferred = self._deferred_peer_connected
+                    if deferred is None or revision > deferred[0]:
+                        self._deferred_peer_connected = (revision, observed)
+                    return self._state
+
+            # delivery 与 discovery 共用独立门，确保断线清邮箱后旧 payload 不再进入上层。
+            with self._delivery_gate:
+                with self._condition:
+                    if self._state in _STOPPING_STATES:
+                        return "disconnected"
+                    transition = self._apply_discovery_observation_locked(
+                        revision,
+                        observed,
+                    )
+                self._notify_peer_transition(transition)
+                self._drain_deferred_peer_state()
+                with self._condition:
+                    if self._state in _STOPPING_STATES:
+                        return "disconnected"
+                    return self._state
+        finally:
+            if discovery_registered:
+                with self._condition:
+                    self._in_flight_discoveries -= 1
+                    self._condition.notify_all()
+                    if self._in_flight_discoveries < 0:
+                        raise RuntimeError(
+                            "in-flight discovery counter became negative"
+                        )
 
     def _discovery_resources_locked(self) -> tuple[tuple[str, object], ...]:
         """按集中配置顺序返回本角色六个 publisher/subscriber 资源。"""
@@ -999,104 +1136,113 @@ class EcalTransport:
             resources.append((channel.topic, channel_resource[1]))
         return tuple(resources)
 
-    def _worker_main(self) -> None:
-        """保证 worker 自身触发关闭时在退出安全点接管延期清理。"""
+    def _worker_main(self, topic: str) -> None:
+        """运行单话题发送 lane，并在退出安全点接管延期清理。"""
+        escaped_error: BaseException | None = None
         try:
-            self._worker_loop()
+            self._worker_loop(topic)
+        except BaseException as exc:
+            escaped_error = exc
+            raise
         finally:
             with self._condition:
+                # BaseException 会绕过普通 send completion；先恢复 ready 所有权。
+                self._claimed_send_started.discard(topic)
+                if escaped_error is not None:
+                    self._latch_worker_fatal_locked(topic, escaped_error)
                 if self._quiesce_started:
+                    self._reclaim_unsent_locked()
+                self._worker_exited_topics.add(topic)
+                if (
+                    self._quiesce_started
+                    and len(self._worker_exited_topics) == len(self._workers)
+                ):
                     self._quiesce_complete = True
                     if self._state == "quiescing":
                         self._state = "quiesced"
-                    self._condition.notify_all()
+                self._condition.notify_all()
             self._run_deferred_cleanup_if_safe(worker_epilogue=True)
 
-    def _worker_loop(self) -> None:
-        """串行发送最新帧并持续刷新 discovery，不阻塞物理发布线程。"""
+    def _worker_loop(self, topic: str) -> None:
+        """持续排空单话题 ready/latest，并把 native send 与 ready 明确区分。"""
+        worker_event = self._worker_events[topic]
+        channel, publisher = self._publisher_by_topic[topic]
         while True:
-            pending: tuple[str, _PendingMessage] | None = None
-            with self._condition:
-                if not self._stop_worker and not self._pending:
-                    self._condition.wait(timeout=0.050)
-                if self._stop_worker or self._state in _STOPPING_STATES:
-                    return
-                if self._pending:
-                    pending = self._pending.popitem(last=False)
-                    if self._claimed_pending is not None:
-                        raise RuntimeError("worker already owns a claimed pending message")
-                    self._claimed_pending = pending
-                    self._claimed_send_started = False
+            worker_event.wait()
+            worker_event.clear()
+            with self._send_locks[topic]:
+                while True:
+                    with self._condition:
+                        if self._stop_worker or self._state in _STOPPING_STATES:
+                            return
+                        message = self._claim_next_send_locked(topic)
+                        if message is None:
+                            break
 
-            if pending is not None:
-                topic, message = pending
-                try:
-                    channel, publisher = self._publisher_by_topic[topic]
-                    with self._io_lock:
-                        with self._condition:
-                            if self._state in _STOPPING_STATES:
-                                self._drop_claimed_pending_locked(topic)
-                                return
-                            self._require_claimed_pending_locked(topic)
-                            self._claimed_send_started = True
+                    send_error: Exception | None = None
+                    try:
                         self._bindings.send(
                             publisher,
                             message.payload,
                             channel.message_type,
                         )
-                except Exception as exc:
-                    with self._condition:
-                        self._clear_claimed_pending_locked(topic)
-                        self._record_publish_error_locked(topic, exc)
-                else:
-                    with self._condition:
-                        self._clear_claimed_pending_locked(topic)
-                        self._published_count += 1
-                        self._recover_topic_quality_locked(topic)
-                        if (
-                            self._state == "degraded"
-                            and not self._pending
-                            and all(
-                                quality.state == "active"
-                                for quality in self._topic_quality.values()
-                            )
-                        ):
-                            recovered = "active" if self._peer_connected else "waiting_peer"
-                            self._set_state_locked(recovered, "")
+                    except Exception as exc:
+                        send_error = exc
 
-            try:
-                self.poll_peer_state()
-            except (RuntimeError, ValueError):
-                with self._condition:
-                    if self._state in _STOPPING_STATES:
-                        return
+                    with self._condition:
+                        has_next = self._complete_claimed_send_locked(topic)
+                        if send_error is not None:
+                            self._record_publish_error_locked(topic, send_error)
+                        else:
+                            self._published_count += 1
+                            if self._state not in _STOPPING_STATES:
+                                self._recover_topic_quality_locked(topic)
+                            if (
+                                self._state == "degraded"
+                                and not self._pending
+                                and not self._claimed_pending
+                                and all(
+                                    quality.state == "active"
+                                    for quality in self._topic_quality.values()
+                                )
+                            ):
+                                recovered = (
+                                    "active" if self._peer_connected else "waiting_peer"
+                                )
+                                self._set_state_locked(recovered, "")
+                        if not has_next:
+                            break
+
+    def _claim_next_send_locked(self, topic: str) -> _PendingMessage | None:
+        """调用方持锁时把 ready 标为 native in-flight，兼容无预交接旧状态。"""
+        message = self._claimed_pending.get(topic)
+        if message is None:
+            message = self._pending.pop(topic, None)
+            if message is None:
+                return None
+            self._claimed_pending[topic] = message
+        if topic in self._claimed_send_started:
+            raise RuntimeError("publisher lane already owns an in-flight message")
+        self._claimed_send_started.add(topic)
+        return message
+
+    def _complete_claimed_send_locked(self, topic: str) -> bool:
+        """结束 native send，并原子提升该话题当前 latest 供同次唤醒继续发送。"""
+        self._require_claimed_pending_locked(topic)
+        if topic not in self._claimed_send_started:
+            raise RuntimeError("publisher lane send completion has no active send")
+        self._claimed_send_started.remove(topic)
+        del self._claimed_pending[topic]
+        next_message = self._pending.pop(topic, None)
+        if next_message is not None:
+            self._claimed_pending[topic] = next_message
+        self._condition.notify_all()
+        return next_message is not None
 
     def _require_claimed_pending_locked(self, topic: str) -> None:
         """调用方持锁时确认 worker 仍唯一拥有指定待发送帧。"""
-        if self._claimed_pending is None or self._claimed_pending[0] != topic:
+        if topic not in self._claimed_pending:
             raise RuntimeError("worker claimed pending ownership changed unexpectedly")
-
-    def _clear_claimed_pending_locked(self, topic: str) -> None:
-        """发送完成或失败后原子释放 worker 的 claimed 帧。"""
-        self._require_claimed_pending_locked(topic)
-        self._claimed_pending = None
-        self._claimed_send_started = False
-        self._condition.notify_all()
-
-    def _drop_claimed_pending_locked(self, topic: str) -> None:
-        """closing 先于 send 线性化时，将 claimed 帧恰好计为一次 dropped。"""
-        self._require_claimed_pending_locked(topic)
-        if self._claimed_send_started:
-            raise RuntimeError("claimed send already crossed its linearization point")
-        self._claimed_pending = None
-        self._dropped_count += 1
-        self._update_topic_quality_locked(
-            topic,
-            dropped_delta=1,
-            state="degraded",
-            detail="transport closed before claimed message was sent",
-        )
-        self._condition.notify_all()
 
     def snapshot(self) -> EcalTransportSnapshot:
         """在一个临界区复制连接语义、代际和全部累计计数。"""
@@ -1105,6 +1251,8 @@ class EcalTransport:
 
     def _snapshot_locked(self) -> EcalTransportSnapshot:
         """调用方持生命周期锁时构造完整 eCAL 快照。"""
+        fatal_fault = self._fatal_worker_fault
+        stopping = self._state in _STOPPING_STATES
         return EcalTransportSnapshot(
             mode="ecal",
             ecal_connected=self._peer_connected,
@@ -1113,9 +1261,17 @@ class EcalTransport:
             error_count=self._error_count,
             dropped_count=self._dropped_count,
             topic_quality=tuple(self._topic_quality.values()),
-            detail=self._detail,
+            detail=(
+                self._worker_fatal_detail(*fatal_fault)
+                if fatal_fault is not None and not stopping
+                else self._detail
+            ),
             state=(
-                "disconnected" if self._state in _STOPPING_STATES else self._state
+                "disconnected"
+                if stopping
+                else "error"
+                if fatal_fault is not None
+                else self._state
             ),
             generation=self._generation,
         )
@@ -1133,39 +1289,58 @@ class EcalTransport:
             for subscription in subscriptions:
                 subscription._active = False
             subscriptions.clear()
+        self._reclaim_unsent_locked()
+        self._stop_worker = True
+        for worker_event in self._worker_events.values():
+            worker_event.set()
+        self._condition.notify_all()
+
+    def _reclaim_unsent_locked(self) -> None:
+        """回收未进入 native send 的 ready/latest，并恰好累计一次 terminal drop。"""
+        unsent_by_topic: dict[str, int] = {}
         for pending_topic in self._pending:
-            self._dropped_count += 1
+            unsent_by_topic[pending_topic] = unsent_by_topic.get(pending_topic, 0) + 1
+        for claimed_topic in tuple(self._claimed_pending):
+            if claimed_topic in self._claimed_send_started:
+                continue
+            unsent_by_topic[claimed_topic] = unsent_by_topic.get(claimed_topic, 0) + 1
+            del self._claimed_pending[claimed_topic]
+        for pending_topic, count in unsent_by_topic.items():
+            self._dropped_count += count
             self._update_topic_quality_locked(
                 pending_topic,
-                dropped_delta=1,
+                dropped_delta=count,
                 state="degraded",
                 detail="transport closed before pending message was sent",
             )
         self._pending.clear()
-        self._stop_worker = True
-        self._condition.notify_all()
 
     def _finish_quiesce(self, *, wait_for_deliveries: bool) -> EcalTransportSnapshot:
-        """停止并汇合 publisher worker；外部 quiesce 还等待既有 delivery。"""
+        """停止并汇合全部 publisher lane；外部 quiesce 还等待既有 delivery。"""
         callback_context = _inside_transport_callback(self)
-        worker_context = current_thread() is self._worker
+        caller = current_thread()
+        worker_context = self._is_worker_thread()
         with self._condition:
             if self._state == "closed":
                 return self._snapshot_locked()
             self._begin_quiesce_locked()
-            worker = self._worker
+            workers = tuple(self._workers.values())
 
-        if worker is not None and not worker_context:
-            worker.join()
+        for worker in workers:
+            if worker is not caller:
+                worker.join()
 
         with self._condition:
-            if worker is None or worker_context or not worker.is_alive():
+            if all(worker is caller or not worker.is_alive() for worker in workers):
                 self._quiesce_complete = True
                 if self._state == "quiescing":
                     self._state = "quiesced"
                 self._condition.notify_all()
             if wait_for_deliveries and not callback_context and not worker_context:
-                while self._in_flight_deliveries > 0:
+                while (
+                    self._in_flight_deliveries > 0
+                    or self._in_flight_discoveries > 0
+                ):
                     self._condition.wait()
             return self._snapshot_locked()
 
@@ -1176,7 +1351,7 @@ class EcalTransport:
     def close(self) -> None:
         """关闭资源；callback 内只发起异步清理，外部调用等待同一最终结果。"""
         callback_context = _inside_transport_callback(self)
-        worker_context = current_thread() is self._worker
+        worker_context = self._is_worker_thread()
         cleanup_thread: Thread | None = None
         run_cleanup_inline = False
 
@@ -1238,7 +1413,7 @@ class EcalTransport:
         """callback/worker 退出后接管未成功启动的异步 cleanup。"""
         if _inside_transport_callback(self):
             return
-        if current_thread() is self._worker and not worker_epilogue:
+        if self._is_worker_thread() and not worker_epilogue:
             return
         with self._condition:
             if self._in_flight_deliveries != 0 and not worker_epilogue:
@@ -1256,6 +1431,11 @@ class EcalTransport:
         """唯一清理所有者按固定顺序关闭资源，并发布共享完成结果。"""
         self._finish_quiesce(wait_for_deliveries=False)
 
+        # discovery 已持有 native 资源引用，必须先等 count API 全部返回。
+        with self._condition:
+            while self._in_flight_discoveries > 0:
+                self._condition.wait()
+
         for _channel, resource in reversed(self._subscriber_resources):
             try:
                 self._bindings.close(resource)
@@ -1267,18 +1447,19 @@ class EcalTransport:
             while self._in_flight_deliveries > 0:
                 self._condition.wait()
 
-        # 与 worker 的 send 共用 I/O 锁，确保 publisher 销毁时没有正在发送的调用。
-        with self._io_lock:
-            for _channel, resource in reversed(self._publisher_resources):
-                try:
-                    self._bindings.close(resource)
-                except BaseException as exc:
-                    self._remember_close_error(exc)
+        # `_finish_quiesce` 已汇合全部 lane，此后 publisher 不会再进入 send。
+        for _channel, resource in reversed(self._publisher_resources):
+            try:
+                self._bindings.close(resource)
+            except BaseException as exc:
+                self._remember_close_error(exc)
 
         participant = self._participant
         self._participant = None
         self._publisher_by_topic.clear()
         self._subscriber_by_topic.clear()
+        self._send_locks.clear()
+        self._worker_events.clear()
         self._publisher_resources.clear()
         self._subscriber_resources.clear()
         if participant is not None:

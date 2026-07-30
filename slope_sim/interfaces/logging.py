@@ -357,7 +357,7 @@ class InterfaceLogPaths:
 
 @dataclass(frozen=True)
 class InterfaceLogSnapshot:
-    """接口日志接受、丢弃及终态计数的不可变快照。"""
+    """接口日志接受、待写、丢弃及终态计数的不可变快照。"""
 
     accepted_messages: int
     accepted_events: int
@@ -365,6 +365,7 @@ class InterfaceLogSnapshot:
     dropped_events: int
     closed: bool
     writer_failed: bool
+    pending_count: int = 0
 
     def __post_init__(self) -> None:
         for name in (
@@ -372,6 +373,7 @@ class InterfaceLogSnapshot:
             "accepted_events",
             "dropped_messages",
             "dropped_events",
+            "pending_count",
         ):
             _require_nonnegative_int(name, getattr(self, name))
         if not isinstance(self.closed, bool):
@@ -644,6 +646,7 @@ class InterfaceEventLogger:
             self._accepted_events = 0
             self._dropped_messages = 0
             self._dropped_events = 0
+            self._pending_count = 0
             worker = Thread(
                 target=self._run_writer,
                 name=f"interface-log-{safe_prefix}",
@@ -741,6 +744,7 @@ class InterfaceEventLogger:
                 self._capacity.release()
                 raise
             self._increment_locked(kind, accepted=True)
+            self._pending_count += 1
             return True
 
     def record_message(self, record: InterfaceLogRecord) -> bool:
@@ -796,7 +800,16 @@ class InterfaceEventLogger:
                 dropped_events=self._dropped_events,
                 closed=self._state in {"closed", "failed"},
                 writer_failed=self._worker_error is not None,
+                pending_count=self._pending_count,
             )
+
+    def _complete_pending_item(self) -> None:
+        """在后台写入或丢弃一项后，原子更新未完成落盘数量。"""
+        with self._condition:
+            if self._pending_count <= 0:
+                raise RuntimeError("interface log pending count underflow")
+            self._pending_count -= 1
+            self._condition.notify_all()
 
     def _record_worker_failure(self, error: BaseException) -> None:
         """保留首个后台错误并原子停止接收后续项目。"""
@@ -814,6 +827,7 @@ class InterfaceEventLogger:
             except Empty:
                 return
             if item is not _STOP:
+                self._complete_pending_item()
                 self._capacity.release()
 
     def _finalize_files(self) -> BaseException | None:
@@ -854,8 +868,10 @@ class InterfaceEventLogger:
                     else:  # pragma: no cover - 队列仅由本模块构造
                         raise RuntimeError("unknown interface log queue item")
                 except BaseException:
+                    self._complete_pending_item()
                     self._capacity.release()
                     raise
+                self._complete_pending_item()
                 self._capacity.release()
         except BaseException as exc:
             self._record_worker_failure(exc)

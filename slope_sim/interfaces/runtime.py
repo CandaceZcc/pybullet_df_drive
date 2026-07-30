@@ -3,9 +3,10 @@ from __future__ import annotations
 
 from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass, replace
+from fractions import Fraction
 import math
 from numbers import Real
-from threading import Condition, Lock, local
+from threading import Condition, Lock, get_ident, local
 import time
 from typing import Protocol, runtime_checkable
 
@@ -198,6 +199,7 @@ class InterfaceRuntime:
         sensor_backend: SensorBackend | None = None,
         scene_document: SceneDocument | None = None,
         logger: InterfaceEventLogger | None = None,
+        capture_lidar_top_view: bool = True,
     ) -> None:
         if not isinstance(config, InterfaceConfig):
             raise ValueError("config must be an InterfaceConfig")
@@ -207,19 +209,26 @@ class InterfaceRuntime:
             raise ValueError("sensor_backend and scene_document must be provided together")
         if scene_document is not None and not isinstance(scene_document, SceneDocument):
             raise ValueError("scene_document must be a SceneDocument")
+        if not isinstance(capture_lidar_top_view, bool):
+            raise ValueError("capture_lidar_top_view must be a bool")
         model = _robot_model(robot)
 
         self._config = config
         self._transport = transport
         self._monotonic = monotonic
+        self._capture_lidar_top_view = capture_lidar_top_view
         self._condition = Condition()
         self._state = "open"
         self._lifecycle_generation = 0
         self._next_subscription_token = 0
         self._active_subscription_token: int | None = None
         self._in_flight_publishes = 0
-        self._publish_context = local()
+        self._callback_context = local()
+        self._in_flight_world_operations = 0
+        self._world_operation_context = local()
+        self._lifecycle_owner_ident: int | None = None
         self._prepare_in_progress = False
+        self._rebind_in_progress = False
         self._rebuild_prepared = False
         self._prepared_robot_parked = False
         self._accepting_commands = True
@@ -247,9 +256,16 @@ class InterfaceRuntime:
             self._clock = SimulationClock()
             self._wheel_scheduler = PeriodicScheduler(config.wheel_state.rate_hz)
             self._local_command_scheduler = PeriodicScheduler(config.wheel_command.rate_hz)
+            # 后雷达提前半周期，避免两批射线在同一物理帧集中执行。
             self._sensor_schedulers = {
                 config.lidar_front.topic: PeriodicScheduler(config.lidar_front.rate_hz),
-                config.lidar_rear.topic: PeriodicScheduler(config.lidar_rear.rate_hz),
+                config.lidar_rear.topic: PeriodicScheduler(
+                    config.lidar_rear.rate_hz,
+                    first_deadline_sec=Fraction(
+                        1,
+                        2 * config.lidar_rear.rate_hz,
+                    ),
+                ),
                 config.rtk.topic: PeriodicScheduler(config.rtk.rate_hz),
                 config.imu.topic: PeriodicScheduler(config.imu.rate_hz),
             }
@@ -323,6 +339,7 @@ class InterfaceRuntime:
         sensor_backend: SensorBackend | None = None,
         scene_document: SceneDocument | None = None,
         logger: InterfaceEventLogger | None = None,
+        capture_lidar_top_view: bool = True,
     ) -> "InterfaceRuntime":
         """为机器人创建只使用进程内传输的运行时。"""
         selected = InterfaceConfig.default(transport_mode="local") if config is None else config
@@ -340,6 +357,7 @@ class InterfaceRuntime:
                 sensor_backend=sensor_backend,
                 scene_document=scene_document,
                 logger=logger,
+                capture_lidar_top_view=capture_lidar_top_view,
             )
         except BaseException:
             try:
@@ -407,9 +425,40 @@ class InterfaceRuntime:
         if (
             not self._world_ready
             or self._prepare_in_progress
+            or self._rebind_in_progress
             or self._rebuild_prepared
         ):
             raise RuntimeError("world rebuild is in progress")
+
+    def _enter_interface_callback(self, kind: str) -> int:
+        """登记当前线程的接口回调类别，供生命周期入口识别同步重入。"""
+        attribute = f"{kind}_depth"
+        previous_depth = getattr(self._callback_context, attribute, 0)
+        setattr(self._callback_context, attribute, previous_depth + 1)
+        return previous_depth
+
+    def _leave_interface_callback(self, kind: str, previous_depth: int) -> None:
+        """恢复进入接口回调前的线程局部深度。"""
+        attribute = f"{kind}_depth"
+        if previous_depth == 0:
+            delattr(self._callback_context, attribute)
+        else:
+            setattr(self._callback_context, attribute, previous_depth)
+
+    def _in_interface_callback(self, *kinds: str) -> bool:
+        """判断当前线程是否位于指定接口回调；省略类别时检查全部类别。"""
+        selected = kinds or ("publish", "receive", "logger")
+        return any(
+            getattr(self._callback_context, f"{kind}_depth", 0) > 0
+            for kind in selected
+        )
+
+    def _reject_lifecycle_owner_reentry_locked(self, operation: str) -> None:
+        """生命周期 owner 调用外部端口时，同线程嵌套入口必须立即失败。"""
+        if self._lifecycle_owner_ident == get_ident():
+            raise RuntimeError(
+                f"{operation} cannot reenter an active lifecycle transition"
+            )
 
     def _build_sensor_objects(
         self,
@@ -462,11 +511,15 @@ class InterfaceRuntime:
         command_type = self._codec.type_name(WheelCommand(0, (), ()))
 
         def receive(payload: bytes, received_at: float) -> bool | None:
-            return self._on_wheel_command_payload(
-                payload,
-                received_at,
-                subscription_token=subscription_token,
-            )
+            previous_depth = self._enter_interface_callback("receive")
+            try:
+                return self._on_wheel_command_payload(
+                    payload,
+                    received_at,
+                    subscription_token=subscription_token,
+                )
+            finally:
+                self._leave_interface_callback("receive", previous_depth)
 
         return (
             self._transport.subscribe(
@@ -954,7 +1007,10 @@ class InterfaceRuntime:
             except Exception as exc:
                 with self._condition:
                     if self._lifecycle_generation == generation:
-                        self._record_topic_error_locked(self._config.wheel_command.topic, exc)
+                        self._record_topic_error_locked(
+                            self._config.wheel_command.topic,
+                            exc,
+                        )
                 continue
             self._publish_message(
                 self._config.wheel_command.topic,
@@ -1057,22 +1113,25 @@ class InterfaceRuntime:
             front_lidar = self._front_lidar
             rear_lidar = self._rear_lidar
             truth_sensor_suite = self._truth_sensor_suite
+            capture_lidar_top_view = self._capture_lidar_top_view
         if sensors_available:
             if front_lidar is None or rear_lidar is None or truth_sensor_suite is None:
                 raise RuntimeError("sensor availability snapshot is inconsistent")
             routes = (
                 (
                     self._config.lidar_front.topic,
-                    lambda timestamp_ns: self._scan_lidar_for_dashboard(
-                        front_lidar,
-                        timestamp_ns,
+                    lambda timestamp_ns: (
+                        self._scan_lidar_for_dashboard(front_lidar, timestamp_ns)
+                        if capture_lidar_top_view
+                        else self._scan_lidar_message(front_lidar, timestamp_ns)
                     ),
                 ),
                 (
                     self._config.lidar_rear.topic,
-                    lambda timestamp_ns: self._scan_lidar_for_dashboard(
-                        rear_lidar,
-                        timestamp_ns,
+                    lambda timestamp_ns: (
+                        self._scan_lidar_for_dashboard(rear_lidar, timestamp_ns)
+                        if capture_lidar_top_view
+                        else self._scan_lidar_message(rear_lidar, timestamp_ns)
                     ),
                 ),
                 (self._config.rtk.topic, truth_sensor_suite.read_rtk),
@@ -1099,6 +1158,17 @@ class InterfaceRuntime:
             raise TypeError("lidar scan_with_top_view must return an exact LidarScanResult")
         return result
 
+    @staticmethod
+    def _scan_lidar_message(lidar: object, timestamp_ns: int) -> LidarPointCloud:
+        """headless 路径只读取企业点云，禁止隐式构造 Dashboard 俯视数据。"""
+        scan = getattr(lidar, "scan", None)
+        if not callable(scan):
+            raise TypeError("lidar must implement scan")
+        message = scan(timestamp_ns)
+        if type(message) is not LidarPointCloud:
+            raise TypeError("lidar scan must return an exact LidarPointCloud")
+        return message
+
     def _publish_wheel_deadlines(
         self,
         deadlines: tuple[int, ...],
@@ -1107,22 +1177,35 @@ class InterfaceRuntime:
         states: list[WheelState] = []
         for timestamp_ns in deadlines:
             with self._condition:
-                if not self._generation_is_publishable_locked(generation):
+                if not self._begin_world_operation_locked(generation):
                     break
                 robot = self._robot
                 model = self._robot_model
+            state: WheelState | None = None
+            read_error: Exception | None = None
             try:
                 state = robot.read_interface_wheel_state(timestamp_ns)
                 if not isinstance(state, WheelState):
                     raise TypeError("robot wheel feedback must be a WheelState")
                 if state.timestamp_ns != timestamp_ns:
-                    raise ValueError("robot wheel feedback timestamp does not match request")
+                    raise ValueError(
+                        "robot wheel feedback timestamp does not match request"
+                    )
                 _validate_wheel_state_lengths(state, model)
             except Exception as exc:
+                read_error = exc
+            finally:
+                self._finish_world_operation()
+            if read_error is not None:
                 with self._condition:
                     if self._lifecycle_generation == generation:
-                        self._record_topic_error_locked(self._config.wheel_state.topic, exc)
+                        self._record_topic_error_locked(
+                            self._config.wheel_state.topic,
+                            read_error,
+                        )
                 continue
+            if state is None:
+                raise RuntimeError("wheel reader completed without a state")
 
             states.append(state)
             self._publish_message(
@@ -1146,21 +1229,27 @@ class InterfaceRuntime:
         """单路扫描失败只污染本话题；代际变化则终止整个旧传感器批次。"""
         for timestamp_ns in deadlines:
             with self._condition:
-                if not self._generation_is_publishable_locked(generation):
+                if not self._begin_world_operation_locked(generation):
                     return False
+            reading: object | None = None
+            read_error: Exception | None = None
             try:
                 reading = reader(timestamp_ns)
             except Exception as exc:
+                read_error = exc
+            finally:
+                self._finish_world_operation()
+            if read_error is not None:
                 with self._condition:
                     if self._lifecycle_generation != generation:
                         return False
-                    self._record_topic_error_locked(topic, exc)
+                    self._record_topic_error_locked(topic, read_error)
                 self._record_event(
                     "sensor_failed",
                     topic,
                     tracker_generation=generation,
                     topic=topic,
-                    reason=_error_detail(exc),
+                    reason=_error_detail(read_error),
                     sim_time_ns=timestamp_ns,
                 )
                 continue
@@ -1193,6 +1282,43 @@ class InterfaceRuntime:
             and self._lifecycle_generation == generation
         )
 
+    def _begin_world_operation_locked(
+        self,
+        generation: int,
+        *,
+        allow_paused: bool = False,
+    ) -> bool:
+        """在当前 world 仍可用时登记一次锁外读取或 backend 绑定。"""
+        active = (
+            self._state == "open"
+            and self._world_ready
+            and self._lifecycle_generation == generation
+            and (allow_paused or not self._paused)
+        )
+        if not active:
+            return False
+        self._in_flight_world_operations += 1
+        depth = getattr(self._world_operation_context, "depth", 0)
+        self._world_operation_context.depth = depth + 1
+        return True
+
+    def _finish_world_operation(self) -> None:
+        """无论操作成功与否都释放 lifecycle barrier，并唤醒生命周期线程。"""
+        previous_depth = getattr(self._world_operation_context, "depth", 0)
+        if previous_depth <= 0:
+            raise RuntimeError("world-operation context depth became invalid")
+        try:
+            with self._condition:
+                self._in_flight_world_operations -= 1
+                self._condition.notify_all()
+                if self._in_flight_world_operations < 0:
+                    raise RuntimeError("in-flight world-operation counter became negative")
+        finally:
+            if previous_depth == 1:
+                del self._world_operation_context.depth
+            else:
+                self._world_operation_context.depth = previous_depth - 1
+
     def _publish_message(
         self,
         topic: str,
@@ -1223,8 +1349,7 @@ class InterfaceRuntime:
             if not self._generation_is_publishable_locked(generation):
                 return False
             self._in_flight_publishes += 1
-        previous_publish_depth = getattr(self._publish_context, "depth", 0)
-        self._publish_context.depth = previous_publish_depth + 1
+        previous_publish_depth = self._enter_interface_callback("publish")
 
         publish_error: Exception | None = None
         try:
@@ -1301,10 +1426,7 @@ class InterfaceRuntime:
                     if self._in_flight_publishes < 0:
                         raise RuntimeError("in-flight publish counter became negative")
             finally:
-                if previous_publish_depth == 0:
-                    del self._publish_context.depth
-                else:
-                    self._publish_context.depth = previous_publish_depth
+                self._leave_interface_callback("publish", previous_publish_depth)
 
     def _store_dashboard_output_locked(
         self,
@@ -1318,21 +1440,25 @@ class InterfaceRuntime:
                 raise TypeError("wheel state topic must publish WheelState")
             self._last_wheel_state = message
         elif topic == self._config.lidar_front.topic:
-            if not isinstance(message, LidarPointCloud) or not isinstance(
-                top_view,
-                LidarTopViewFrame,
-            ):
-                raise TypeError("front lidar topic must publish a cloud and top view")
-            self._latest_lidar_front = message
-            self._latest_lidar_front_view = top_view
+            if not isinstance(message, LidarPointCloud):
+                raise TypeError("front lidar topic must publish a cloud")
+            if self._capture_lidar_top_view:
+                if not isinstance(top_view, LidarTopViewFrame):
+                    raise TypeError("front lidar topic must publish a cloud and top view")
+                self._latest_lidar_front = message
+                self._latest_lidar_front_view = top_view
+            elif top_view is not None:
+                raise TypeError("headless front lidar must not publish a top view")
         elif topic == self._config.lidar_rear.topic:
-            if not isinstance(message, LidarPointCloud) or not isinstance(
-                top_view,
-                LidarTopViewFrame,
-            ):
-                raise TypeError("rear lidar topic must publish a cloud and top view")
-            self._latest_lidar_rear = message
-            self._latest_lidar_rear_view = top_view
+            if not isinstance(message, LidarPointCloud):
+                raise TypeError("rear lidar topic must publish a cloud")
+            if self._capture_lidar_top_view:
+                if not isinstance(top_view, LidarTopViewFrame):
+                    raise TypeError("rear lidar topic must publish a cloud and top view")
+                self._latest_lidar_rear = message
+                self._latest_lidar_rear_view = top_view
+            elif top_view is not None:
+                raise TypeError("headless rear lidar must not publish a top view")
         elif topic == self._config.rtk.topic:
             if not isinstance(message, RtkState):
                 raise TypeError("RTK topic must publish RtkState")
@@ -1397,19 +1523,23 @@ class InterfaceRuntime:
                 ):
                     return
             self._flush_pending_logger_drops_locked(logger, terminal=False)
+            previous_log_depth = self._enter_interface_callback("logger")
             try:
-                accepted = logger.record_message(
-                    self._new_log_record(
-                        topic,
-                        direction,
-                        sim_time_ns,
-                        type_name,
-                        payload,
-                        wall_time,
+                try:
+                    accepted = logger.record_message(
+                        self._new_log_record(
+                            topic,
+                            direction,
+                            sim_time_ns,
+                            type_name,
+                            payload,
+                            wall_time,
+                        )
                     )
-                )
-            except Exception:
-                accepted = False
+                except Exception:
+                    accepted = False
+            finally:
+                self._leave_interface_callback("logger", previous_log_depth)
             if accepted is not True:
                 self._pending_logger_drops += 1
         if accepted is not True:
@@ -1470,10 +1600,14 @@ class InterfaceRuntime:
                 ):
                     return
             self._flush_pending_logger_drops_locked(logger, terminal=False)
+            previous_log_depth = self._enter_interface_callback("logger")
             try:
-                accepted = logger.record_event(event, **event_fields)
-            except Exception:
-                accepted = False
+                try:
+                    accepted = logger.record_event(event, **event_fields)
+                except Exception:
+                    accepted = False
+            finally:
+                self._leave_interface_callback("logger", previous_log_depth)
             if accepted is not True:
                 self._pending_logger_drops += 1
         if accepted is not True:
@@ -1536,17 +1670,21 @@ class InterfaceRuntime:
                 ):
                     return False
             timeout_sec = max(0.0, deadline - time.monotonic())
+            previous_log_depth = self._enter_interface_callback("logger")
             try:
-                return (
-                    logger.record_terminal_event(
-                        event,
-                        timeout_sec=timeout_sec,
-                        **event_fields,
+                try:
+                    return (
+                        logger.record_terminal_event(
+                            event,
+                            timeout_sec=timeout_sec,
+                            **event_fields,
+                        )
+                        is True
                     )
-                    is True
-                )
-            except Exception:
-                return False
+                except Exception:
+                    return False
+            finally:
+                self._leave_interface_callback("logger", previous_log_depth)
 
     def _flush_pending_logger_drops_locked(
         self,
@@ -1559,22 +1697,26 @@ class InterfaceRuntime:
         count = self._pending_logger_drops
         if count == 0:
             return True
+        previous_log_depth = self._enter_interface_callback("logger")
         try:
-            if terminal:
-                accepted = logger.record_terminal_event(
-                    "queue_dropped",
-                    timeout_sec=timeout_sec,
-                    source="interface_logger",
-                    count=count,
-                )
-            else:
-                accepted = logger.record_event(
-                    "queue_dropped",
-                    source="interface_logger",
-                    count=count,
-                )
-        except Exception:
-            accepted = False
+            try:
+                if terminal:
+                    accepted = logger.record_terminal_event(
+                        "queue_dropped",
+                        timeout_sec=timeout_sec,
+                        source="interface_logger",
+                        count=count,
+                    )
+                else:
+                    accepted = logger.record_event(
+                        "queue_dropped",
+                        source="interface_logger",
+                        count=count,
+                    )
+            except Exception:
+                accepted = False
+        finally:
+            self._leave_interface_callback("logger", previous_log_depth)
         if accepted is True:
             self._pending_logger_drops -= count
             return True
@@ -1644,19 +1786,24 @@ class InterfaceRuntime:
             topic_state = tracker.state if self._state == "open" else "disconnected"
             topic_detail = tracker.detail
             transport_quality = self._transport_quality[channel.topic]
+            if self._state == "open" and transport_quality.state != "active":
+                topic_state = transport_quality.state
+                topic_detail = transport_quality.detail
             if self._state == "open" and channel is self._config.wheel_command:
-                if peer_state in {"waiting_peer", "disconnected"}:
+                if (
+                    transport_quality.state == "active"
+                    and peer_state in {"waiting_peer", "disconnected"}
+                ):
                     topic_state = peer_state
             elif (
                 self._state == "open"
                 and self._ecal_lifecycle_enabled
+                and transport_quality.state == "active"
                 and transport_quality.peer_connected is False
+                and topic_state not in {"error", "degraded"}
             ):
                 topic_state = "waiting_peer"
                 topic_detail = "eCAL 话题对端未连接"
-            if self._state == "open" and transport_quality.state != "active":
-                topic_state = transport_quality.state
-                topic_detail = transport_quality.detail
             if self._auto_fallback_detail and not topic_detail:
                 topic_detail = self._auto_fallback_detail
             topics[channel.topic] = TopicStatus(
@@ -1752,15 +1899,21 @@ class InterfaceRuntime:
 
     def prepare_world_rebuild(self) -> None:
         """关闭命令回调入口、清空旧邮箱并安全停止当前机器人。"""
-        if getattr(self._publish_context, "depth", 0) > 0:
+        if self._in_interface_callback():
             raise RuntimeError(
-                "prepare_world_rebuild cannot run from an in-flight publish callback"
+                "prepare_world_rebuild cannot run from an in-flight interface callback"
+            )
+        if getattr(self._world_operation_context, "depth", 0) > 0:
+            raise RuntimeError(
+                "prepare_world_rebuild cannot run from an in-flight world operation"
             )
         with self._condition:
+            self._reject_lifecycle_owner_reentry_locked("prepare_world_rebuild")
             self._require_open_locked()
             if not self._world_ready:
                 raise RuntimeError("world rebuild is already prepared")
             self._prepare_in_progress = True
+            self._lifecycle_owner_ident = get_ident()
             self._rebuild_prepared = False
             self._prepared_robot_parked = False
             self._accepting_commands = False
@@ -1769,8 +1922,11 @@ class InterfaceRuntime:
             subscription = self._command_subscription
             self._command_subscription = None
             robot = self._robot
-            # 已登记 publish 先在旧代完成日志线性化；world_ready=False 已阻止新发布。
-            while self._in_flight_publishes > 0:
+            # 已登记读/发布先在旧代退出；world_ready=False 已阻止新任务准入。
+            while (
+                self._in_flight_world_operations > 0
+                or self._in_flight_publishes > 0
+            ):
                 self._condition.wait()
             self._lifecycle_generation += 1
             self._mailbox.clear()
@@ -1796,6 +1952,7 @@ class InterfaceRuntime:
                 first_error = exc
         with self._condition:
             self._prepare_in_progress = False
+            self._lifecycle_owner_ident = None
             self._rebuild_prepared = True
             self._prepared_robot_parked = robot_parked
             self._condition.notify_all()
@@ -1804,7 +1961,12 @@ class InterfaceRuntime:
 
     def abort_world_rebuild(self) -> None:
         """prepare 失败且旧世界未删除时，恢复旧绑定和全新等待命令态。"""
+        if self._in_interface_callback():
+            raise RuntimeError(
+                "abort_world_rebuild cannot run from an in-flight interface callback"
+            )
         with self._condition:
+            self._reject_lifecycle_owner_reentry_locked("abort_world_rebuild")
             while self._prepare_in_progress and self._state == "open":
                 self._condition.wait()
             self._require_open_locked()
@@ -1874,7 +2036,12 @@ class InterfaceRuntime:
 
     def fault_world_rebuild(self) -> None:
         """物理世界无法恢复时终结 prepared 状态，并保持统一关闭路径可用。"""
+        if self._in_interface_callback():
+            raise RuntimeError(
+                "fault_world_rebuild cannot run from an in-flight interface callback"
+            )
         with self._condition:
+            self._reject_lifecycle_owner_reentry_locked("fault_world_rebuild")
             while self._prepare_in_progress and self._state == "open":
                 self._condition.wait()
             if self._state == "faulted":
@@ -1904,7 +2071,12 @@ class InterfaceRuntime:
         new_document: SceneDocument,
     ) -> None:
         """完整构造新邮箱和传感器后，一次恢复世界绑定与命令订阅。"""
+        if self._in_interface_callback():
+            raise RuntimeError(
+                "commit_world_rebuild cannot run from an in-flight interface callback"
+            )
         with self._condition:
+            self._reject_lifecycle_owner_reentry_locked("commit_world_rebuild")
             while self._prepare_in_progress and self._state == "open":
                 self._condition.wait()
             self._require_open_locked()
@@ -1973,10 +2145,18 @@ class InterfaceRuntime:
                 raise RuntimeError("sensor backend is not bound to an active world")
             backend = self._sensor_backend
             generation = self._lifecycle_generation
-        binder = getattr(backend, "bind_scene", None)
-        if not callable(binder):
-            raise ValueError("sensor backend must implement bind_scene")
-        binder(terrain_ids, snapshots)
+            if not self._begin_world_operation_locked(
+                generation,
+                allow_paused=True,
+            ):
+                raise RuntimeError("sensor backend is not bound to an active world")
+        try:
+            binder = getattr(backend, "bind_scene", None)
+            if not callable(binder):
+                raise ValueError("sensor backend must implement bind_scene")
+            binder(terrain_ids, snapshots)
+        finally:
+            self._finish_world_operation()
         with self._condition:
             if self._lifecycle_generation != generation or not self._world_ready:
                 raise RuntimeError("world changed while refreshing scene bindings")
@@ -1999,6 +2179,12 @@ class InterfaceRuntime:
 
     def rebind_robot(self, robot: WheelRobotPort) -> None:
         """兼容旧 wheel-only API：保留 transport 并原子替换机器人和邮箱。"""
+        if self._in_interface_callback():
+            raise RuntimeError(
+                "rebind_robot cannot run from an in-flight interface callback"
+            )
+        if getattr(self._world_operation_context, "depth", 0) > 0:
+            raise RuntimeError("rebind_robot cannot run from an in-flight world operation")
         model = _robot_model(robot)
         mailbox = WheelCommandMailbox(
             model,
@@ -2007,29 +2193,102 @@ class InterfaceRuntime:
         )
         decision = mailbox.decision(now=self._monotonic())
         with self._condition:
+            self._reject_lifecycle_owner_reentry_locked("rebind_robot")
             self._require_rebind_ready_locked()
         candidate_subscription, candidate_token = self._subscribe_wheel_command()
+        old_subscription: Subscription | None = None
+        old_mailbox: WheelCommandMailbox | None = None
+        old_robot: WheelRobotPort | None = None
+        old_model: RobotModelSpec | None = None
+        robot_parked = False
         try:
             with self._condition:
+                self._reject_lifecycle_owner_reentry_locked("rebind_robot")
                 self._require_rebind_ready_locked()
-                old_mailbox = self._mailbox
-                old_robot = self._robot
-                old_subscription = self._command_subscription
-                old_robot.hold_current_steering_and_stop_drive(_SAFE_STOP_DT)
-                old_mailbox.clear()
-                self._lifecycle_generation += 1
-                self._robot = robot
-                self._robot_model = model
-                self._mailbox = mailbox
-                self._reset_command_tracker_locked()
-                self._begin_new_command_epoch_locked()
-                self._last_decision = decision
-                self._clear_dashboard_payloads_locked()
-                self._local_twist = None
-                self._safe_stop_latched = False
-                self._safe_stop_mode = None
-                self._command_subscription = candidate_subscription
-                self._active_subscription_token = candidate_token
+                old_accepting_commands = self._accepting_commands
+                old_subscription_token = self._active_subscription_token
+                self._rebind_in_progress = True
+                self._lifecycle_owner_ident = get_ident()
+                self._accepting_commands = False
+                self._active_subscription_token = None
+                self._world_ready = False
+                try:
+                    # wheel-only rebind 只等待旧世界访问；已进入 transport 的 publish 可自行退场。
+                    while self._in_flight_world_operations > 0:
+                        self._condition.wait()
+                    self._require_open_locked()
+                    old_mailbox = self._mailbox
+                    old_robot = self._robot
+                    old_model = self._robot_model
+                    old_subscription = self._command_subscription
+                    old_robot.hold_current_steering_and_stop_drive(_SAFE_STOP_DT)
+                    robot_parked = True
+                    old_mailbox.clear()
+                    self._lifecycle_generation += 1
+                    self._robot = robot
+                    self._robot_model = model
+                    self._mailbox = mailbox
+                    self._reset_command_tracker_locked()
+                    self._begin_new_command_epoch_locked()
+                    self._last_decision = decision
+                    self._clear_dashboard_payloads_locked()
+                    self._local_twist = None
+                    self._safe_stop_latched = False
+                    self._safe_stop_mode = None
+                    self._command_subscription = candidate_subscription
+                    self._active_subscription_token = candidate_token
+                    self._accepting_commands = True
+                    self._world_ready = True
+                except BaseException:
+                    if not robot_parked:
+                        self._accepting_commands = old_accepting_commands
+                        self._active_subscription_token = old_subscription_token
+                        self._world_ready = True
+                    else:
+                        # 停车副作用不可回滚；意外提交失败只能恢复旧引用并关闭准入。
+                        if old_mailbox is not None:
+                            try:
+                                old_mailbox.clear()
+                            except BaseException:
+                                pass
+                            self._mailbox = old_mailbox
+                        if old_robot is not None:
+                            self._robot = old_robot
+                        if old_model is not None:
+                            self._robot_model = old_model
+                        self._command_subscription = old_subscription
+                        self._active_subscription_token = None
+                        self._accepting_commands = False
+                        self._world_ready = False
+                        self._state = "faulted"
+                        self._lifecycle_generation += 1
+                        tracker = self._topics[self._config.wheel_command.topic]
+                        tracker.frequency = None
+                        tracker.state = "disconnected"
+                        tracker.detail = "wheel-only rebind commit failed after safe stop"
+                        tracker.message_count = 0
+                        tracker.error_count = 0
+                        tracker.dropped_count = 0
+                        tracker.latest_timestamp_ns = None
+                        self._peer_command_seen = False
+                        self._latest_wheel_command = None
+                        self._latest_wheel_command_received_sim_time_ns = None
+                        self._last_wheel_state = None
+                        self._latest_lidar_front = None
+                        self._latest_lidar_rear = None
+                        self._latest_rtk = None
+                        self._latest_imu = None
+                        self._latest_lidar_front_view = None
+                        self._latest_lidar_rear_view = None
+                        self._last_decision = _waiting_decision(self._robot_model)
+                        self._local_twist = None
+                        self._safe_stop_latched = False
+                        self._safe_stop_mode = None
+                    raise
+                finally:
+                    self._rebind_in_progress = False
+                    self._lifecycle_owner_ident = None
+                    self._condition.notify_all()
         except BaseException:
             try:
                 candidate_subscription.close()
@@ -2079,24 +2338,46 @@ class InterfaceRuntime:
 
     def close(self) -> None:
         """按固定逻辑顺序尽力释放资源，并让并发关闭者共享首错。"""
+        if getattr(self._world_operation_context, "depth", 0) > 0:
+            raise RuntimeError("close cannot run from an in-flight world operation")
+        in_publish_callback = self._in_interface_callback("publish")
+        if self._in_interface_callback("receive", "logger"):
+            raise RuntimeError("close cannot run from an in-flight interface callback")
         with self._condition:
-            if self._state == "closed":
-                return
-            if self._state == "closing":
-                while self._state != "closed":
+            self._reject_lifecycle_owner_reentry_locked("close")
+            # 生命周期失败方必须重新竞争 owner；同步 publish 回调不能参与阻塞等待。
+            while True:
+                if self._state == "closed":
+                    return
+                if self._state == "closing":
+                    if in_publish_callback:
+                        raise RuntimeError(
+                            "close cannot wait for an active lifecycle transition "
+                            "from an in-flight publish callback"
+                        )
+                    while self._state != "closed":
+                        self._condition.wait()
+                    if self._close_error is not None:
+                        raise self._close_error
+                    return
+                if self._prepare_in_progress or self._rebind_in_progress:
+                    if in_publish_callback:
+                        raise RuntimeError(
+                            "close cannot wait for an active lifecycle transition "
+                            "from an in-flight publish callback"
+                        )
                     self._condition.wait()
-                if self._close_error is not None:
-                    raise self._close_error
-                return
+                    continue
+                break
             self._state = "closing"
+            self._lifecycle_owner_ident = get_ident()
             self._lifecycle_generation += 1
             self._accepting_commands = False
             self._active_subscription_token = None
-            # prepare 在锁外停车；close 必须等结果后才能决定是否需要重试。
-            while self._prepare_in_progress:
-                self._condition.wait()
             skip_safe_stop = not self._world_ready and self._prepared_robot_parked
             self._world_ready = False
+            while self._in_flight_world_operations > 0:
+                self._condition.wait()
             self._mailbox.clear()
             self._clear_dashboard_payloads_locked()
             self._last_decision = _waiting_decision(self._robot_model)
@@ -2173,6 +2454,7 @@ class InterfaceRuntime:
         with self._condition:
             self._close_error = first_error
             self._state = "closed"
+            self._lifecycle_owner_ident = None
             self._condition.notify_all()
         if first_error is not None:
             raise first_error

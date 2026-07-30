@@ -5,6 +5,7 @@ from collections.abc import Callable
 import ctypes
 import ctypes.util
 from dataclasses import dataclass
+from fractions import Fraction
 import math
 import os
 import re
@@ -17,6 +18,7 @@ PYBULLET_WINDOW_TITLE = (
     "Bullet Physics ExampleBrowser using OpenGL3+ [btgl] Release build"
 )
 PYBULLET_WINDOW_TOKEN_ENV = "SLOPE_SIM_PYBULLET_WINDOW_TOKEN"
+DASHBOARD_WIDTH_RATIO = Fraction(33, 100)
 _XRES_CLIENT_ID_PID_MASK = 0x02
 _XRES_CLIENT_ID_PID_TYPE = 1
 
@@ -154,8 +156,13 @@ def _positive_scale(value: object, name: str) -> float:
     return normalized
 
 
+def _round_positive_fraction_half_up(value: Fraction) -> int:
+    """用整数交叉乘积执行正有理数 half-up，避开浮点边界漂移。"""
+    return (2 * value.numerator + value.denominator) // (2 * value.denominator)
+
+
 def calculate_window_layout(available: Rect, dashboard_enabled: bool) -> WindowLayout:
-    """按可用工作区计算左侧 80% 主窗和右侧 20% Dashboard。"""
+    """按可用工作区计算左侧余量主窗和右侧 33% Dashboard。"""
     if not isinstance(available, Rect):
         raise TypeError("available must be a Rect")
     if type(dashboard_enabled) is not bool:
@@ -163,7 +170,10 @@ def calculate_window_layout(available: Rect, dashboard_enabled: bool) -> WindowL
     if not dashboard_enabled:
         return WindowLayout(main=available, dashboard=None)
 
-    dashboard_width = available.width // 5
+    dashboard_width = (
+        available.width * DASHBOARD_WIDTH_RATIO.numerator
+        + DASHBOARD_WIDTH_RATIO.denominator // 2
+    ) // DASHBOARD_WIDTH_RATIO.denominator
     if dashboard_width <= 0:
         raise WindowLayoutError("available geometry is too narrow for a dashboard")
     main_width = available.width - dashboard_width
@@ -190,9 +200,16 @@ def align_window_layout_to_scale(
         return layout
 
     available_width = layout.main.width + layout.dashboard.width
-    target_dashboard_width = available_width / 5.0
-    logical_dashboard_width = max(1, round(target_dashboard_width / scale))
-    dashboard_width = max(1, int(round(logical_dashboard_width * scale)))
+    scale_ratio = Fraction(str(scale))
+    target_dashboard_width = available_width * DASHBOARD_WIDTH_RATIO
+    logical_dashboard_width = max(
+        1,
+        _round_positive_fraction_half_up(target_dashboard_width / scale_ratio),
+    )
+    dashboard_width = max(
+        1,
+        _round_positive_fraction_half_up(logical_dashboard_width * scale_ratio),
+    )
     if dashboard_width >= available_width:
         raise WindowLayoutError("available geometry is too narrow for dashboard scale")
     dashboard_right = layout.dashboard.right

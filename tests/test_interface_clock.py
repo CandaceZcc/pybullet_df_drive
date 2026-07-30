@@ -1,6 +1,7 @@
 # 仿真接口时钟测试：锁定精确推进、周期期限和输入边界。
 from __future__ import annotations
 
+from decimal import Decimal
 from fractions import Fraction
 import math
 
@@ -84,6 +85,71 @@ def test_scheduler_first_deadline_is_one_period_not_zero_at_rate_boundaries():
     assert one_hz.pop_due(1_000_000_000) == (1_000_000_000,)
     assert one_ghz.pop_due(0) == ()
     assert one_ghz.pop_due(1) == (1,)
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    (
+        True,
+        False,
+        0,
+        -0.05,
+        Fraction(11, 100),
+        math.nan,
+        math.inf,
+        -math.inf,
+        "0.05",
+        Decimal("0.05"),
+    ),
+)
+def test_scheduler_rejects_first_deadline_outside_one_period(invalid):
+    with pytest.raises(ValueError, match="first_deadline_sec"):
+        PeriodicScheduler(10, first_deadline_sec=invalid)
+
+
+@pytest.mark.parametrize(
+    ("first_deadline_sec", "now_ns", "expected"),
+    (
+        (Fraction(5, 2_000_000_000), 3, (2,)),
+        (Fraction(7, 2_000_000_000), 4, (4,)),
+    ),
+)
+def test_scheduler_first_deadline_uses_exact_ties_to_even_rounding(
+    first_deadline_sec,
+    now_ns,
+    expected,
+):
+    scheduler = PeriodicScheduler(
+        100_000_000,
+        first_deadline_sec=first_deadline_sec,
+    )
+
+    assert scheduler.pop_due(now_ns) == expected
+
+
+def test_scheduler_rounds_each_absolute_phase_deadline_before_emitting() -> None:
+    scheduler = PeriodicScheduler(
+        1_024,
+        first_deadline_sec=Fraction(1, 1_000_000_000),
+    )
+
+    assert scheduler.pop_due(2_929_689) == (
+        1,
+        976_564,
+        1_953_126,
+        2_929_688,
+    )
+
+
+def test_scheduler_fractional_first_deadline_stays_phase_locked_without_drift():
+    scheduler = PeriodicScheduler(10, first_deadline_sec=Fraction(1, 20))
+
+    stamps = scheduler.pop_due(10_000_000_000)
+
+    assert stamps == tuple(
+        50_000_000 + index * 100_000_000
+        for index in range(100)
+    )
 
 
 @pytest.mark.parametrize(

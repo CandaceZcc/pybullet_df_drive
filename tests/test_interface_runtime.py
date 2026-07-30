@@ -5,6 +5,7 @@ from collections import deque
 from dataclasses import replace
 import json
 from threading import Event, Lock, Thread
+import time
 
 import pytest
 
@@ -224,6 +225,40 @@ class LegacyOnlyLidar:
         self.scan_calls += 1
         point = LidarPoint(0, 1.0, 0.0, 0.0, 100, 1, 0)
         return LidarPointCloud(timestamp_ns, "lidar_front", 1, 1, (point,))
+
+
+class MessageOnlyLidar:
+    """记录 headless runtime 是否只调用企业点云入口。"""
+
+    def __init__(self, frame_id: str, lidar_id: int) -> None:
+        self.frame_id = frame_id
+        self.lidar_id = lidar_id
+        self.scan_timestamps: list[int] = []
+        self.top_view_timestamps: list[int] = []
+
+    def scan(self, timestamp_ns: int) -> LidarPointCloud:
+        self.scan_timestamps.append(timestamp_ns)
+        point = LidarPoint(0, 1.0, 0.0, 0.0, 100, 1, 0)
+        return LidarPointCloud(
+            timestamp_ns,
+            self.frame_id,
+            1,
+            self.lidar_id,
+            (point,),
+        )
+
+    def scan_with_top_view(self, timestamp_ns: int) -> LidarScanResult:
+        self.top_view_timestamps.append(timestamp_ns)
+        raise AssertionError("headless runtime must not build a LiDAR top view")
+
+
+class AtomicPreferredLidar(MessageOnlyLidar):
+    """即使旧增量入口仍存在，生产 runtime 也必须选择原子整帧扫描。"""
+
+    def begin_incremental_scan(self, _timestamp_ns: int, *, capture_top_view: bool):
+        raise AssertionError(
+            f"runtime must not split one lidar frame across physics steps: {capture_top_view}"
+        )
 
 
 class DashboardTruthSensors:
@@ -567,6 +602,100 @@ def test_runtime_applies_each_ecal_peer_state_only_to_its_own_topic():
         runtime.close()
 
 
+@pytest.mark.parametrize(
+    ("target_name", "quality_state", "error_count", "dropped_count", "detail"),
+    (
+        (
+            "wheel_command",
+            "error",
+            1,
+            0,
+            "eCAL command delivery failed",
+        ),
+        (
+            "lidar_front",
+            "error",
+            1,
+            0,
+            "eCAL ProtoPublisher.send returned False",
+        ),
+        (
+            "lidar_front",
+            "degraded",
+            0,
+            1,
+            "eCAL publisher queue replaced an older frame",
+        ),
+    ),
+)
+def test_runtime_active_transport_fault_outweighs_disconnected_topic_peer(
+    target_name,
+    quality_state,
+    error_count,
+    dropped_count,
+    detail,
+):
+    """活动发送错误或队列降级必须优先于同话题的对端缺失提示。"""
+    config = InterfaceConfig.default(transport_mode="ecal")
+    target_topic = getattr(config, target_name).topic
+
+    class DisconnectedErrorTransport(FakeTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.current_snapshot = TransportSnapshot(
+                mode="ecal",
+                ecal_connected=False,
+                published_count=0,
+                received_count=0,
+                error_count=error_count,
+                dropped_count=dropped_count,
+                topic_quality=tuple(
+                    TransportTopicQuality(
+                        channel.topic,
+                        error_count=error_count if channel.topic == target_topic else 0,
+                        dropped_count=(
+                            dropped_count if channel.topic == target_topic else 0
+                        ),
+                        state=quality_state if channel.topic == target_topic else "active",
+                        detail=detail if channel.topic == target_topic else "",
+                        revision=1,
+                        peer_connected=channel.topic != target_topic,
+                    )
+                    for channel in config.channels
+                ),
+            )
+
+        def snapshot(self) -> TransportSnapshot:
+            return self.current_snapshot
+
+        def poll_peer_state(self) -> str:
+            return "active"
+
+    clock = FakeMonotonic(initial=1.0)
+    runtime = _runtime_type()(
+        FakeRobot(),
+        config=config,
+        transport=DisconnectedErrorTransport(),
+        monotonic=clock,
+    )
+    try:
+        runtime.initialize_peer_lifecycle(
+            "ecal",
+            "disconnected",
+            ecal_connected=False,
+        )
+        runtime.poll_transport()
+
+        topic = runtime.status_snapshot().topics[target_topic]
+
+        assert topic.state == quality_state
+        assert topic.error_count == error_count
+        assert topic.dropped_count == dropped_count
+        assert topic.detail == detail
+    finally:
+        runtime.close()
+
+
 def test_runtime_command_frequency_uses_interface_status_window() -> None:
     clock = FakeMonotonic()
     robot = FakeRobot()
@@ -672,6 +801,133 @@ def test_rebind_construction_or_old_parking_failure_never_commits_mixed_robot_st
         assert old_robot.command_calls[-1][0] == (3.0, 4.0)
     finally:
         runtime.close()
+
+
+def test_rebind_post_stop_commit_failure_faults_without_mixed_ingress():
+    """停车后的意外提交异常必须 fail-closed，不能重新激活旧 token。"""
+
+    class InjectedRebindFailure(BaseException):
+        pass
+
+    clock = FakeMonotonic()
+    old_robot = FakeRobot("df_mid")
+    new_robot = FakeRobot("active_steering_4wd")
+    transport = FakeTransport()
+    runtime = _make_runtime(old_robot, clock, transport)
+    old_mailbox, old_generation = runtime.capture_command_ingress()
+    old_subscription = transport.subscriptions[0]
+    original_clear = runtime._clear_dashboard_payloads_locked
+
+    def fail_after_dashboard_clear() -> None:
+        original_clear()
+        raise InjectedRebindFailure("injected post-stop commit failure")
+
+    runtime._clear_dashboard_payloads_locked = fail_after_dashboard_clear
+    try:
+        with pytest.raises(InjectedRebindFailure, match="post-stop commit failure"):
+            runtime.rebind_robot(new_robot)
+    finally:
+        runtime.__dict__.pop("_clear_dashboard_payloads_locked", None)
+
+    candidate_subscription = transport.subscriptions[1]
+    try:
+        assert runtime._state == "faulted"
+        assert runtime.robot_model is old_robot.model_spec
+        assert runtime._robot is old_robot
+        assert runtime._mailbox is old_mailbox
+        assert runtime._command_subscription is old_subscription
+        assert runtime._active_subscription_token is None
+        assert not runtime._accepting_commands
+        assert not runtime._world_ready
+        assert old_mailbox.capture_generation() > old_generation
+        assert old_subscription.close_count == 0
+        assert candidate_subscription.close_count == 1
+
+        payload = runtime._codec.encode(WheelCommand(2, (3.0, 4.0), ()))
+        assert old_subscription.callback(payload, clock()) is None
+        assert candidate_subscription.callback(payload, clock()) is None
+        with pytest.raises(RuntimeError, match="faulted"):
+            runtime.accept_local_command(
+                WheelCommand(3, (1.0, 2.0), ()),
+                received_at=clock(),
+            )
+    finally:
+        runtime.close()
+
+    assert old_subscription.close_count == 1
+    assert candidate_subscription.close_count == 1
+
+
+def test_rebind_partial_subscription_commit_faults_without_mixed_ingress(
+    monkeypatch,
+) -> None:
+    """候选句柄已写但 token 未写时，任意异常也必须关闭两代准入。"""
+
+    class InjectedPartialSubscriptionFailure(BaseException):
+        pass
+
+    class FailOnceAfterCandidateWrite:
+        """精确在候选 subscription 落盘后注入一次提交异常。"""
+
+        failed = False
+
+        def __get__(self, instance, owner=None):
+            if instance is None:
+                return self
+            return instance.__dict__["_command_subscription"]
+
+        def __set__(self, instance, value) -> None:
+            instance.__dict__["_command_subscription"] = value
+            if not self.failed:
+                self.failed = True
+                raise InjectedPartialSubscriptionFailure(
+                    "injected partial subscription commit failure"
+                )
+
+    clock = FakeMonotonic()
+    old_robot = FakeRobot("df_mid")
+    new_robot = FakeRobot("active_steering_4wd")
+    transport = FakeTransport()
+    runtime = _make_runtime(old_robot, clock, transport)
+    old_mailbox, old_generation = runtime.capture_command_ingress()
+    old_subscription = transport.subscriptions[0]
+    descriptor = FailOnceAfterCandidateWrite()
+    monkeypatch.setattr(
+        type(runtime),
+        "_command_subscription",
+        descriptor,
+        raising=False,
+    )
+
+    with pytest.raises(
+        InjectedPartialSubscriptionFailure,
+        match="partial subscription commit failure",
+    ):
+        runtime.rebind_robot(new_robot)
+
+    candidate_subscription = transport.subscriptions[1]
+    try:
+        assert descriptor.failed is True
+        assert runtime._state == "faulted"
+        assert runtime._robot is old_robot
+        assert runtime.robot_model is old_robot.model_spec
+        assert runtime._mailbox is old_mailbox
+        assert runtime._command_subscription is old_subscription
+        assert runtime._active_subscription_token is None
+        assert runtime._accepting_commands is False
+        assert runtime._world_ready is False
+        assert old_mailbox.capture_generation() > old_generation
+        assert old_subscription.close_count == 0
+        assert candidate_subscription.close_count == 1
+
+        payload = runtime._codec.encode(WheelCommand(2, (3.0, 4.0), ()))
+        assert old_subscription.callback(payload, clock()) is None
+        assert candidate_subscription.callback(payload, clock()) is None
+    finally:
+        runtime.close()
+
+    assert old_subscription.close_count == 1
+    assert candidate_subscription.close_count == 1
 
 
 def test_two_concurrent_closes_share_one_blocking_transport_barrier():
@@ -1042,6 +1298,294 @@ def test_wheel_state_callback_close_skips_stale_publish_log_after_logger_close(t
         runtime.close()
 
 
+def test_publish_callback_close_rejects_when_prepare_owns_lifecycle_transition():
+    """prepare 等同步发布退出时，回调 close 必须失败而不能形成互等。"""
+    clock = FakeMonotonic(0.01)
+    robot = FakeRobot(actual_drive=(1.0, 2.0))
+    transport = LocalTransport(monotonic=clock)
+    runtime = _runtime_type()(
+        robot,
+        config=InterfaceConfig.default(transport_mode="local"),
+        transport=transport,
+        monotonic=clock,
+    )
+    callback_entered = Event()
+    invoke_close = Event()
+    callback_returned = Event()
+    prepare_returned = Event()
+    close_errors: list[BaseException] = []
+    after_errors: list[BaseException] = []
+    prepare_errors: list[BaseException] = []
+
+    def callback(_payload: bytes, _received_at: float) -> None:
+        callback_entered.set()
+        assert invoke_close.wait(timeout=3.0)
+        try:
+            runtime.close()
+        except BaseException as exc:
+            close_errors.append(exc)
+        finally:
+            callback_returned.set()
+
+    transport.subscribe(
+        runtime.config.wheel_state.topic,
+        "slope_sim.interfaces.v1.WheelState",
+        callback,
+    )
+
+    def run_after() -> None:
+        try:
+            runtime.after_physics_step(0.01)
+        except BaseException as exc:  # pragma: no cover - 汇合后断言
+            after_errors.append(exc)
+
+    def run_prepare() -> None:
+        try:
+            runtime.prepare_world_rebuild()
+        except BaseException as exc:  # pragma: no cover - 汇合后断言
+            prepare_errors.append(exc)
+        finally:
+            prepare_returned.set()
+
+    after_thread = Thread(target=run_after, daemon=True)
+    prepare_thread = Thread(target=run_prepare, daemon=True)
+    try:
+        after_thread.start()
+        assert callback_entered.wait(timeout=2.0)
+        prepare_thread.start()
+        deadline = time.monotonic() + 2.0
+        while True:
+            with runtime._condition:
+                transition_owned = (
+                    runtime._prepare_in_progress and not runtime._world_ready
+                )
+                state_during_prepare = runtime._state
+            if transition_owned:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                pytest.fail("prepare did not acquire the lifecycle transition")
+            time.sleep(min(0.005, remaining))
+        assert state_during_prepare == "open"
+
+        invoke_close.set()
+        returned_without_deadlock = callback_returned.wait(timeout=0.3)
+        state_after_callback = runtime._state
+
+        # 仅帮助旧 RED 实现退出互等，避免守护线程污染后续测试。
+        if not returned_without_deadlock:
+            with runtime._condition:
+                runtime._prepare_in_progress = False
+                runtime._condition.notify_all()
+
+        if after_thread.ident is not None:
+            after_thread.join(timeout=2.0)
+        if prepare_thread.ident is not None:
+            prepare_thread.join(timeout=2.0)
+
+        assert returned_without_deadlock
+        assert state_after_callback == "open"
+        assert len(close_errors) == 1
+        assert isinstance(close_errors[0], RuntimeError)
+        assert "lifecycle transition" in str(close_errors[0])
+        assert not after_thread.is_alive() and not prepare_thread.is_alive()
+        assert after_errors == prepare_errors == []
+        assert prepare_returned.is_set()
+        assert runtime.close_trace == ()
+    finally:
+        invoke_close.set()
+        with runtime._condition:
+            if runtime._prepare_in_progress:
+                runtime._prepare_in_progress = False
+                runtime._condition.notify_all()
+        after_thread.join(timeout=2.0)
+        prepare_thread.join(timeout=2.0)
+        runtime.close()
+
+
+def test_publish_callback_close_rejects_when_external_close_already_owns_transition():
+    """外部 close 等同步回调时，回调内嵌套 close 不能反向等待外部 owner。"""
+
+    class ObservableLocalTransport(LocalTransport):
+        def __init__(self) -> None:
+            super().__init__(monotonic=clock)
+            self.quiesce_entered = Event()
+
+        def quiesce(self) -> TransportSnapshot:
+            self.quiesce_entered.set()
+            return super().quiesce()
+
+    clock = FakeMonotonic(0.01)
+    robot = FakeRobot(actual_drive=(1.0, 2.0))
+    transport = ObservableLocalTransport()
+    runtime = _runtime_type()(
+        robot,
+        config=InterfaceConfig.default(transport_mode="local"),
+        transport=transport,
+        monotonic=clock,
+    )
+    callback_entered = Event()
+    invoke_nested_close = Event()
+    callback_returned = Event()
+    external_close_returned = Event()
+    nested_close_errors: list[BaseException] = []
+    after_errors: list[BaseException] = []
+    external_close_errors: list[BaseException] = []
+
+    def callback(_payload: bytes, _received_at: float) -> None:
+        callback_entered.set()
+        assert invoke_nested_close.wait(timeout=3.0)
+        try:
+            runtime.close()
+        except BaseException as exc:
+            nested_close_errors.append(exc)
+        finally:
+            callback_returned.set()
+
+    transport.subscribe(
+        runtime.config.wheel_state.topic,
+        "slope_sim.interfaces.v1.WheelState",
+        callback,
+    )
+
+    def run_after() -> None:
+        try:
+            runtime.after_physics_step(0.01)
+        except BaseException as exc:  # pragma: no cover - 汇合后断言
+            after_errors.append(exc)
+
+    def run_external_close() -> None:
+        try:
+            runtime.close()
+        except BaseException as exc:  # pragma: no cover - 汇合后断言
+            external_close_errors.append(exc)
+        finally:
+            external_close_returned.set()
+
+    after_thread = Thread(target=run_after, daemon=True)
+    close_thread = Thread(target=run_external_close, daemon=True)
+    try:
+        after_thread.start()
+        assert callback_entered.wait(timeout=2.0)
+        close_thread.start()
+        assert transport.quiesce_entered.wait(timeout=2.0)
+
+        invoke_nested_close.set()
+        returned_without_deadlock = callback_returned.wait(timeout=0.3)
+
+        # 仅帮助旧 RED 实现退出互等，真正实现必须由 nested close 自行 fail-fast。
+        if not returned_without_deadlock:
+            with runtime._condition:
+                runtime._state = "closed"
+                runtime._condition.notify_all()
+
+        after_thread.join(timeout=2.0)
+        close_thread.join(timeout=2.0)
+
+        assert returned_without_deadlock
+        assert len(nested_close_errors) == 1
+        assert isinstance(nested_close_errors[0], RuntimeError)
+        assert "lifecycle transition" in str(nested_close_errors[0])
+        assert not after_thread.is_alive() and not close_thread.is_alive()
+        assert after_errors == external_close_errors == []
+        assert external_close_returned.is_set()
+        assert runtime._in_flight_publishes == 0
+        assert runtime.close_trace == (
+            "stop_commands",
+            "safe_stop",
+            "stop_sensors",
+            "quiesce_transport",
+            "close_log",
+            "close_transport",
+            "close_sensors",
+        )
+    finally:
+        invoke_nested_close.set()
+        with runtime._condition:
+            if runtime._state == "closing":
+                runtime._state = "closed"
+                runtime._condition.notify_all()
+        if after_thread.ident is not None:
+            after_thread.join(timeout=2.0)
+        if close_thread.ident is not None:
+            close_thread.join(timeout=2.0)
+        runtime.close()
+
+
+@pytest.mark.parametrize("operation", ("prepare", "rebind", "close"))
+def test_safe_stop_rejects_reentrant_close_from_lifecycle_owner(operation: str):
+    """外部停车端口不得让当前生命周期 owner 同线程等待自己。"""
+
+    class ReentrantSafeStopRobot(FakeRobot):
+        def __init__(self) -> None:
+            super().__init__("df_mid")
+            self.runtime = None
+            self.reentry_started = Event()
+            self.reentry_errors: list[BaseException] = []
+            self._reentry_attempted = False
+
+        def hold_current_steering_and_stop_drive(self, dt: float) -> None:
+            super().hold_current_steering_and_stop_drive(dt)
+            if self._reentry_attempted:
+                return
+            self._reentry_attempted = True
+            self.reentry_started.set()
+            try:
+                self.runtime.close()
+            except BaseException as exc:
+                self.reentry_errors.append(exc)
+
+    clock = FakeMonotonic()
+    robot = ReentrantSafeStopRobot()
+    runtime = _make_runtime(robot, clock)
+    robot.runtime = runtime
+    operation_errors: list[BaseException] = []
+    operation_returned = Event()
+
+    def run_operation() -> None:
+        try:
+            if operation == "prepare":
+                runtime.prepare_world_rebuild()
+            elif operation == "rebind":
+                runtime.rebind_robot(FakeRobot("df_mid"))
+            else:
+                runtime.close()
+        except BaseException as exc:  # pragma: no cover - 汇合后断言
+            operation_errors.append(exc)
+        finally:
+            operation_returned.set()
+
+    worker = Thread(target=run_operation, daemon=True)
+    returned_without_deadlock = False
+    try:
+        worker.start()
+        assert robot.reentry_started.wait(timeout=2.0)
+        returned_without_deadlock = operation_returned.wait(timeout=0.3)
+
+        # 仅帮助旧 RED 实现退出同线程自等待，避免守护线程污染后续测试。
+        if not returned_without_deadlock:
+            with runtime._condition:
+                runtime._state = "closed"
+                runtime._prepare_in_progress = False
+                runtime._rebind_in_progress = False
+                runtime._condition.notify_all()
+        worker.join(timeout=2.0)
+
+        assert returned_without_deadlock
+        assert not worker.is_alive()
+        assert operation_errors == []
+        assert len(robot.reentry_errors) == 1
+        assert isinstance(robot.reentry_errors[0], RuntimeError)
+        assert "lifecycle transition" in str(robot.reentry_errors[0])
+    finally:
+        with runtime._condition:
+            forced_closed = runtime._state == "closed" and not returned_without_deadlock
+        if operation == "prepare" and not forced_closed:
+            runtime.abort_world_rebuild()
+        worker.join(timeout=2.0)
+        runtime.close()
+
+
 def _release_self_waiting_publish_for_test(runtime, worker: Thread) -> None:
     """仅用于让旧 RED 实现退出自等待，避免守护线程残留到后续测试。"""
     if not worker.is_alive():
@@ -1050,6 +1594,89 @@ def _release_self_waiting_publish_for_test(runtime, worker: Thread) -> None:
         runtime._in_flight_publishes = 0
         runtime._condition.notify_all()
     worker.join(timeout=2.0)
+
+
+def test_command_receive_logger_close_is_rejected_without_self_deadlock():
+    """命令接收日志持有非重入锁时，嵌套 close 必须立即失败。"""
+
+    class ReentrantCloseLogger:
+        def __init__(self) -> None:
+            self.runtime = None
+            self.close_started = Event()
+            self.close_errors: list[BaseException] = []
+
+        def record_message(self, record) -> bool:
+            if record.topic == "/sim/wheel/command" and record.direction == "receive":
+                self.close_started.set()
+                try:
+                    self.runtime.close()
+                except BaseException as exc:
+                    self.close_errors.append(exc)
+            return True
+
+        def record_event(self, _event: str, **_fields: object) -> bool:
+            return True
+
+        def close(self) -> None:
+            return None
+
+    clock = FakeMonotonic(0.01)
+    robot = FakeRobot(actual_drive=(1.0, 2.0))
+    transport = LocalTransport(monotonic=clock)
+    logger = ReentrantCloseLogger()
+    runtime = _runtime_type()(
+        robot,
+        config=InterfaceConfig.default(transport_mode="local"),
+        transport=transport,
+        monotonic=clock,
+        logger=logger,
+    )
+    logger.runtime = runtime
+    command = WheelCommand(1, (2.0, 3.0), ())
+    publish_errors: list[BaseException] = []
+    publish_returned = Event()
+
+    def publish_command() -> None:
+        try:
+            transport.publish(
+                runtime.config.wheel_command.topic,
+                runtime._codec.encode(command),
+                runtime._codec.type_name(command),
+                command.timestamp_ns,
+                wall_time=clock(),
+            )
+        except BaseException as exc:  # pragma: no cover - 汇合后断言
+            publish_errors.append(exc)
+        finally:
+            publish_returned.set()
+
+    worker = Thread(target=publish_command, daemon=True)
+    returned_without_deadlock = False
+    try:
+        worker.start()
+        assert logger.close_started.wait(timeout=2.0)
+        returned_without_deadlock = publish_returned.wait(timeout=0.3)
+
+        # 旧 RED 会在同一线程重取 _log_lock；测试线程只负责释放该死锁。
+        if not returned_without_deadlock and runtime._log_lock.locked():
+            runtime._log_lock.release()
+        worker.join(timeout=2.0)
+
+        assert returned_without_deadlock
+        assert not worker.is_alive()
+        assert publish_errors == []
+        assert len(logger.close_errors) == 1
+        assert isinstance(logger.close_errors[0], RuntimeError)
+        assert "interface callback" in str(logger.close_errors[0])
+        assert runtime.accept_local_command(
+            WheelCommand(2, (3.0, 4.0), ()),
+            received_at=clock(),
+        )
+    finally:
+        if worker.is_alive() and runtime._log_lock.locked():
+            runtime._log_lock.release()
+        worker.join(timeout=2.0)
+        runtime.close()
 
 
 def test_prepare_from_local_transport_callback_is_rejected_without_partial_rebuild():
@@ -1095,7 +1722,7 @@ def test_prepare_from_local_transport_callback_is_rejected_without_partial_rebui
         assert after_errors == []
         assert len(prepare_errors) == 1
         assert isinstance(prepare_errors[0], RuntimeError)
-        assert "in-flight publish" in str(prepare_errors[0])
+        assert "in-flight interface callback" in str(prepare_errors[0])
         assert robot.safe_stop_count == 0
         assert runtime.accept_local_command(
             WheelCommand(1, (2.0, 3.0), ()), received_at=clock()
@@ -1159,13 +1786,59 @@ def test_prepare_from_logger_callback_uses_same_reentrant_publish_guard():
         assert after_errors == []
         assert len(logger.prepare_errors) == 1
         assert isinstance(logger.prepare_errors[0], RuntimeError)
-        assert "in-flight publish" in str(logger.prepare_errors[0])
+        assert "in-flight interface callback" in str(logger.prepare_errors[0])
         assert robot.safe_stop_count == 0
         assert runtime.accept_local_command(
             WheelCommand(1, (2.0, 3.0), ()), received_at=clock()
         )
     finally:
         _release_self_waiting_publish_for_test(runtime, worker)
+        runtime.close()
+
+
+@pytest.mark.parametrize("operation", ("commit", "abort", "fault"))
+def test_publish_callback_rejects_remaining_world_lifecycle_operations(operation: str):
+    """其余世界事务入口也不得从同步接口回调内启动或等待。"""
+    clock = FakeMonotonic(0.01)
+    robot = FakeRobot(actual_drive=(1.0, 2.0))
+    transport = LocalTransport(monotonic=clock)
+    runtime = _runtime_type()(
+        robot,
+        config=InterfaceConfig.default(transport_mode="local"),
+        transport=transport,
+        monotonic=clock,
+    )
+    lifecycle_errors: list[BaseException] = []
+
+    def callback(_payload: bytes, _received_at: float) -> None:
+        try:
+            if operation == "commit":
+                runtime.commit_world_rebuild(FakeRobot(), None, None)
+            elif operation == "abort":
+                runtime.abort_world_rebuild()
+            else:
+                runtime.fault_world_rebuild()
+        except BaseException as exc:
+            lifecycle_errors.append(exc)
+
+    transport.subscribe(
+        runtime.config.wheel_state.topic,
+        "slope_sim.interfaces.v1.WheelState",
+        callback,
+    )
+    try:
+        states = runtime.after_physics_step(0.01)
+
+        assert len(states) == 1
+        assert len(lifecycle_errors) == 1
+        assert isinstance(lifecycle_errors[0], RuntimeError)
+        assert "in-flight interface callback" in str(lifecycle_errors[0])
+        assert robot.safe_stop_count == 0
+        assert runtime.accept_local_command(
+            WheelCommand(1, (2.0, 3.0), ()),
+            received_at=clock(),
+        )
+    finally:
         runtime.close()
 
 
@@ -1658,6 +2331,7 @@ def test_dashboard_payloads_update_only_after_successful_current_publish_per_top
         assert first.lidar_rear is not None and first.lidar_rear_view is not None
         assert first.rtk is not None and first.imu is not None
         assert first.lidar_front.timebase_ns == first.lidar_front_view.timestamp_ns == 100_000_000
+        assert first.lidar_rear.timebase_ns == first.lidar_rear_view.timestamp_ns == 50_000_000
 
         transport.topic_publish_outcomes[front_topic] = deque((False,))
         runtime.after_physics_step(0.1)
@@ -1666,14 +2340,154 @@ def test_dashboard_payloads_update_only_after_successful_current_publish_per_top
         assert second.lidar_front is first.lidar_front
         assert second.lidar_front_view is first.lidar_front_view
         assert second.lidar_rear is not first.lidar_rear
-        assert second.lidar_rear.timebase_ns == 200_000_000
-        assert second.lidar_rear_view.timestamp_ns == 200_000_000
+        assert second.lidar_rear.timebase_ns == 150_000_000
+        assert second.lidar_rear_view.timestamp_ns == 150_000_000
         assert second.rtk.timestamp_ns == 200_000_000
         assert second.imu.timestamp_ns == 200_000_000
         assert second.wheel_state.timestamp_ns == 200_000_000
         # 旧快照继续持有构造时的冻结 payload，不受后续发布影响。
         assert first.sim_time_ns == 100_000_000
-        assert first.lidar_rear.timebase_ns == 100_000_000
+        assert first.lidar_rear.timebase_ns == 50_000_000
+    finally:
+        runtime.close()
+
+
+def test_headless_runtime_publishes_message_only_lidar_without_dashboard_payloads() -> None:
+    """关闭俯视捕获后仍发布双点云，但不生成或保存 Dashboard 点云对。"""
+    clock = FakeMonotonic()
+    transport = FakeTransport()
+    runtime = _runtime_type()(
+        FakeRobot(),
+        config=InterfaceConfig.default(transport_mode="local"),
+        transport=transport,
+        monotonic=clock,
+        capture_lidar_top_view=False,
+    )
+    front = MessageOnlyLidar("lidar_front", 1)
+    rear = MessageOnlyLidar("lidar_rear", 2)
+    runtime._front_lidar = front
+    runtime._rear_lidar = rear
+    runtime._truth_sensor_suite = DashboardTruthSensors()
+    try:
+        runtime.after_physics_step(0.1)
+        snapshot = runtime.dashboard_snapshot(wall_time=clock())
+
+        assert front.scan_timestamps == [100_000_000]
+        assert rear.scan_timestamps == [50_000_000]
+        assert front.top_view_timestamps == rear.top_view_timestamps == []
+        assert snapshot.lidar_front is snapshot.lidar_front_view is None
+        assert snapshot.lidar_rear is snapshot.lidar_rear_view is None
+        published_topics = tuple(item[0] for item in transport.published)
+        assert runtime.config.lidar_front.topic in published_topics
+        assert runtime.config.lidar_rear.topic in published_topics
+        assert snapshot.status.topics[runtime.config.lidar_front.topic].message_count == 1
+        assert snapshot.status.topics[runtime.config.lidar_rear.topic].message_count == 1
+    finally:
+        runtime.close()
+
+
+def test_runtime_prefers_atomic_lidar_scan_over_legacy_incremental_entrypoint() -> None:
+    """每个 deadline 在同一物理时刻完成整批射线，不能拼接跨帧世界状态。"""
+    transport = FakeTransport()
+    runtime = _runtime_type()(
+        FakeRobot(),
+        config=InterfaceConfig.default(transport_mode="local"),
+        transport=transport,
+        capture_lidar_top_view=False,
+    )
+    front = AtomicPreferredLidar("lidar_front", 1)
+    rear = AtomicPreferredLidar("lidar_rear", 2)
+    runtime._front_lidar = front
+    runtime._rear_lidar = rear
+    runtime._truth_sensor_suite = DashboardTruthSensors()
+    try:
+        runtime.after_physics_step(0.1)
+
+        assert front.scan_timestamps == [100_000_000]
+        assert rear.scan_timestamps == [50_000_000]
+        assert {
+            topic
+            for topic, _payload, _type_name, _timestamp_ns, _wall_time in transport.published
+        } >= {runtime.config.lidar_front.topic, runtime.config.lidar_rear.topic}
+    finally:
+        runtime.close()
+
+
+def test_runtime_phase_shifts_lidars_while_each_remains_exactly_ten_hz() -> None:
+    """前后雷达错开半周期，长期仍分别服从统一仿真时钟。"""
+    runtime = _runtime_type()(
+        FakeRobot(),
+        config=InterfaceConfig.default(transport_mode="local"),
+        transport=FakeTransport(),
+        capture_lidar_top_view=False,
+    )
+    front = MessageOnlyLidar("lidar_front", 1)
+    rear = MessageOnlyLidar("lidar_rear", 2)
+    runtime._front_lidar = front
+    runtime._rear_lidar = rear
+    runtime._truth_sensor_suite = DashboardTruthSensors()
+    try:
+        for _ in range(2_400):
+            runtime.after_physics_step(1.0 / 240.0)
+
+        assert front.scan_timestamps == [
+            index * 100_000_000
+            for index in range(1, 101)
+        ]
+        assert rear.scan_timestamps == [
+            50_000_000 + index * 100_000_000
+            for index in range(100)
+        ]
+    finally:
+        runtime.close()
+
+
+def test_lidar_phase_is_stable_across_pause_and_world_rebuild() -> None:
+    """暂停和世界重建不推进仿真时钟，也不重置双雷达相位。"""
+    clock = FakeMonotonic()
+    runtime = _runtime_type()(
+        FakeRobot(),
+        config=InterfaceConfig.default(transport_mode="local"),
+        transport=FakeTransport(),
+        monotonic=clock,
+        capture_lidar_top_view=False,
+    )
+    first_front = MessageOnlyLidar("lidar_front", 1)
+    first_rear = MessageOnlyLidar("lidar_rear", 2)
+    runtime._front_lidar = first_front
+    runtime._rear_lidar = first_rear
+    runtime._truth_sensor_suite = DashboardTruthSensors()
+    try:
+        runtime.after_physics_step(0.05)
+        assert first_front.scan_timestamps == []
+        assert first_rear.scan_timestamps == [50_000_000]
+
+        runtime.pause()
+        assert runtime.after_physics_step(1.0) == ()
+        runtime.resume(wall_time=clock())
+        runtime.after_physics_step(0.05)
+        assert first_front.scan_timestamps == [100_000_000]
+        assert first_rear.scan_timestamps == [50_000_000]
+
+        runtime.prepare_world_rebuild()
+        runtime.commit_world_rebuild(
+            FakeRobot(),
+            DashboardBackend(),
+            _dashboard_scene_document(),
+        )
+        rebuilt_front = MessageOnlyLidar("lidar_front", 1)
+        rebuilt_rear = MessageOnlyLidar("lidar_rear", 2)
+        runtime._front_lidar = rebuilt_front
+        runtime._rear_lidar = rebuilt_rear
+        runtime._truth_sensor_suite = DashboardTruthSensors()
+
+        runtime.after_physics_step(0.05)
+        assert rebuilt_front.scan_timestamps == []
+        assert rebuilt_rear.scan_timestamps == [150_000_000]
+
+        runtime.after_physics_step(0.05)
+        assert rebuilt_front.scan_timestamps == [200_000_000]
+        assert rebuilt_rear.scan_timestamps == [150_000_000]
     finally:
         runtime.close()
 

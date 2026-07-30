@@ -6,7 +6,7 @@ import math
 import os
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, fields, replace
 from functools import lru_cache
 from pathlib import Path
@@ -44,6 +44,7 @@ from slope_sim.scene import terrain_model_names
 from slope_sim.telemetry import RobotTelemetry
 from slope_sim.window_layout import (
     DisplayMetrics,
+    DASHBOARD_WIDTH_RATIO,
     FrameExtents,
     Rect,
     WindowLayoutError,
@@ -102,25 +103,59 @@ SMOOTHED_TELEMETRY_FIELDS = frozenset(
 
 DASHBOARD_WINDOW_TITLE = "3D仿真Dashboard"
 DASHBOARD_LAYOUT_REPORT_ENV = "SLOPE_SIM_DASHBOARD_LAYOUT_REPORT_PATH"
-DASHBOARD_DEFAULT_WIDTH_RATIO = 0.2
-DASHBOARD_TOP_AREA_STRETCH = 45
-DASHBOARD_CONTROL_AREA_STRETCH = 55
+DASHBOARD_LAYOUT_REPORT_VERSION = 4
+DASHBOARD_CONTENT_TAB_LABELS = frozenset({"接口状态", "障碍物"})
+DASHBOARD_REQUIRED_CRITICAL_CONTROLS = (
+    "暂停",
+    "复位车辆",
+    "线速度",
+    "角速度",
+    "退出",
+    "车型",
+    "应用车型",
+    "场地",
+    "坡度",
+    "场地随机种子",
+    "起伏",
+    "应用场地",
+    "障碍模式",
+    "障碍形状",
+    "障碍数量",
+    "障碍随机种子",
+    "障碍速度",
+    "障碍移动占比",
+    "添加障碍",
+    "删除选中",
+    "清空障碍",
+    "结构状态",
+)
+DASHBOARD_DEFAULT_WIDTH_RATIO = DASHBOARD_WIDTH_RATIO
+DASHBOARD_TOP_AREA_STRETCH = 50
+DASHBOARD_CONTROL_AREA_STRETCH = 50
 DASHBOARD_TOP_TABS_MIN_HEIGHT = 320
-DASHBOARD_DIRECTION_BUTTON_SIZE = 36
 DASHBOARD_CONTROL_SPINBOX_WIDTH = 104
 DASHBOARD_PLOT_FIGURE_SIZE = (4.0, 3.2)
-DASHBOARD_PLOT_MARGINS = {"left": 0.24, "right": 0.96, "bottom": 0.20, "top": 0.86}
+DASHBOARD_PLOT_MARGINS = {"left": 0.26, "right": 0.96, "bottom": 0.20, "top": 0.86}
 DASHBOARD_COMPACT_HEIGHT_PLOT_MARGINS = {"left": 0.24, "right": 0.96, "bottom": 0.35, "top": 0.69}
 DASHBOARD_VERY_COMPACT_PLOT_MARGINS = {"left": 0.24, "right": 0.96, "bottom": 0.33, "top": 0.68}
 DASHBOARD_COMPACT_CONTROL_SCROLL_HEIGHT = 20
 DASHBOARD_VERY_COMPACT_SCROLL_HEIGHT = 10
 DASHBOARD_VERY_COMPACT_PLOT_BUTTON_HEIGHT = 22
-DASHBOARD_BUTTON_PULSE_SEC = 0.75
 DASHBOARD_MAX_PLOT_DRAW_HZ = 2.0
 DASHBOARD_MIN_PLOT_DRAW_COOLDOWN_SEC = 0.5
 DASHBOARD_PLOT_DRAW_COOLDOWN_FACTOR = 2.0
-DASHBOARD_RENDERED_PLOT_LEFT_MARGIN = 0.46
-DASHBOARD_LIDAR_DEFAULT_LIMITS = (-5.0, 5.0)
+DASHBOARD_LIDAR_X_LIMITS = (-48.0, 48.0)
+DASHBOARD_LIDAR_Y_LIMITS = (-30.0, 30.0)
+DASHBOARD_LIDAR_TAG_COLORS = ("#7a7f85", "#2f8f46", "#2878b5", "#d1495b")
+DASHBOARD_LIDAR_TAG_LABELS = (
+    "unknown",
+    "terrain",
+    "static obstacle",
+    "moving obstacle",
+)
+DASHBOARD_CRITICAL_CONTROL_SCROLL_MARGIN = 8
+DASHBOARD_MIN_FULL_WIDTH_PLOT = 300
+DASHBOARD_NARROW_PLOT_LEFT_MARGIN = 0.28
 
 INTERFACE_STATE_TEXT = {
     "active": "活动",
@@ -185,8 +220,12 @@ def _fmt_abs_slip(value: float, valid: bool) -> str:
 
 
 def dashboard_window_size(available_width: int, available_height: int) -> tuple[int, int]:
-    """返回屏幕可用区域右侧 20% 的默认 Dashboard 尺寸。"""
-    return max(1, int(available_width * DASHBOARD_DEFAULT_WIDTH_RATIO)), max(1, int(available_height))
+    """返回屏幕可用区域右侧 33% 的默认 Dashboard 尺寸。"""
+    width = (
+        int(available_width) * DASHBOARD_DEFAULT_WIDTH_RATIO.numerator
+        + DASHBOARD_DEFAULT_WIDTH_RATIO.denominator // 2
+    ) // DASHBOARD_DEFAULT_WIDTH_RATIO.denominator
+    return max(1, width), max(1, int(available_height))
 
 
 def _interface_state_text(state: str) -> str:
@@ -213,21 +252,6 @@ def _format_timestamp(value: int | None) -> str:
 
 def _format_array(values: tuple[float, ...], unit: str) -> str:
     return f"[{', '.join(f'{value:.2f}' for value in values)}] {unit}"
-
-
-class _FixedNumericValue:
-    """默认企业页不创建内部调参控件时，保留旧入口所需的 value API。"""
-
-    def __init__(self, value: float) -> None:
-        self._value = float(value)
-
-    def value(self) -> float:
-        return self._value
-
-
-def dashboard_top_tabs_min_height(window_height: int, reserved_height: int) -> int:
-    """优先保留 320px 顶部区域，小窗口则缩至布局实际可用高度。"""
-    return min(DASHBOARD_TOP_TABS_MIN_HEIGHT, max(0, int(window_height) - int(reserved_height)))
 
 
 def should_refresh_dashboard(last_update_time: float | None, now: float, update_hz: float) -> bool:
@@ -277,6 +301,8 @@ def smooth_telemetry(previous: RobotTelemetry | None, current: RobotTelemetry, a
 
 
 DASHBOARD_VERY_COMPACT_LEGEND_FONT_SIZE = 6
+DASHBOARD_VERY_COMPACT_AXIS_LABEL_FONT_SIZE = 6
+DASHBOARD_VERY_COMPACT_TICK_FONT_SIZE = 6
 
 
 def wait_for_dashboard_frame_extents(
@@ -553,8 +579,6 @@ class TelemetryDashboard:
         self._camera_follow_enabled = bool(camera_follow_enabled)
         self._camera_follow_view = str(camera_follow_view)
         self._pressed_keys: set[int] = set()
-        self._button_keys: set[int] = set()
-        self._button_pulses: dict[int, float] = {}
         self._should_exit = False
         self._pending_actions: deque[RuntimeAction] = deque()
         self._structure_busy = False
@@ -578,7 +602,10 @@ class TelemetryDashboard:
         report_path = os.environ.get(DASHBOARD_LAYOUT_REPORT_ENV)
         self._layout_report_path = Path(report_path) if report_path else None
         self._last_layout_report_tab_index: int | None = None
+        self._last_layout_report_revisions: dict[int, int] = {}
         self._plot_dirty_tabs: set[str] = set()
+        self._plot_data_revisions: dict[str, int] = {}
+        self._plot_rendered_revisions: dict[str, int] = {}
         self._plot_next_draw_time: dict[str, float] = {}
         self._plot_draw_started_at: dict[str, float] = {}
         self.labels: dict[str, object] = {}
@@ -595,6 +622,8 @@ class TelemetryDashboard:
         self.interface_plot_specs = interface_chart_specs(get_robot_model(robot_model))
         self._interface_line_keys: set[str] = set()
         self.lidar_collection = None
+        self.lidar_vehicle_marker = None
+        self.lidar_range_ring = None
         self.lidar_front_time_text = None
         self.lidar_rear_time_text = None
         self.developer_layout = None
@@ -603,9 +632,8 @@ class TelemetryDashboard:
         self.diagnostic_control_scroll = None
         self.diagnostic_control_content = None
         self.diagnostic_control_groups: list[object] = []
-        # manual_demo 仍通过 value() 读取驾驶上限；默认企业页不创建可见调参控件。
-        self.linear_spin: object = _FixedNumericValue(max_linear_speed)
-        self.angular_spin: object = _FixedNumericValue(max_angular_speed)
+        self.linear_spin = None
+        self.angular_spin = None
         self.camera_follow_checkbox = None
         self.camera_view_combo = None
         self.direction_buttons: list[object] = []
@@ -692,8 +720,6 @@ class TelemetryDashboard:
         if developer_diagnostics_enabled:
             self._add_developer_diagnostics_tab(
                 self.tabs,
-                max_linear_speed=max_linear_speed,
-                max_angular_speed=max_angular_speed,
                 camera_follow_enabled=camera_follow_enabled,
                 camera_follow_view=camera_follow_view,
             )
@@ -718,7 +744,7 @@ class TelemetryDashboard:
         else:
             width, height = dashboard_window_size(1366, 768)
         self.window.resize(width, height)
-        self._update_layout_for_height(height)
+        self._update_layout_for_size(width, height)
 
         self.window.keyPressEvent = self._key_press_event
         self.window.keyReleaseEvent = self._key_release_event
@@ -849,7 +875,6 @@ class TelemetryDashboard:
         golf_relief: str,
     ) -> None:
         """创建企业允许的仿真、机器人、场地和障碍物控制。"""
-        del max_linear_speed, max_angular_speed
         self.control_scroll = self.QtWidgets.QScrollArea()
         self.control_scroll.setWidgetResizable(True)
         self.control_scroll.setHorizontalScrollBarPolicy(self.QtCore.Qt.ScrollBarAlwaysOff)
@@ -864,7 +889,10 @@ class TelemetryDashboard:
         self.control_layout.setContentsMargins(4, 4, 4, 4)
         self.control_layout.setSpacing(6)
 
-        simulation_group = self._create_simulation_group()
+        simulation_group = self._create_simulation_group(
+            max_linear_speed=max_linear_speed,
+            max_angular_speed=max_angular_speed,
+        )
         robot_group = self._create_robot_group(robot_model)
         terrain_group = self._create_terrain_group(terrain_model, slope_deg, golf_seed, golf_relief)
         obstacle_group = self._create_obstacle_group()
@@ -874,13 +902,19 @@ class TelemetryDashboard:
         self.control_layout.addStretch(1)
         self.control_scroll.setWidget(self.control_content)
 
-    def _create_simulation_group(self) -> object:
-        """创建持续暂停、复位、退出和手动驾驶控制。"""
+    def _create_simulation_group(
+        self,
+        *,
+        max_linear_speed: float,
+        max_angular_speed: float,
+    ) -> object:
+        """创建暂停、速度上限、复位、退出和键盘驾驶控制。"""
         group = self.QtWidgets.QGroupBox("仿真控制")
         grid = self.QtWidgets.QGridLayout(group)
         grid.setContentsMargins(8, 7, 8, 7)
         grid.setHorizontalSpacing(4)
         grid.setVerticalSpacing(4)
+        grid.setColumnStretch(1, 1)
 
         grid.addWidget(self.QtWidgets.QLabel("运行状态"), 0, 0)
         self.pause_status_label = self.QtWidgets.QLabel("运行中")
@@ -904,11 +938,22 @@ class TelemetryDashboard:
         self.reset_button.clicked.connect(self.request_reset)
         grid.addWidget(self.reset_button, 2, 0, 1, 3)
 
-        self._add_button(grid, "↑", 3, 1, self.QtCore.Qt.Key_Up)
-        self._add_button(grid, "←", 4, 0, self.QtCore.Qt.Key_Left)
-        self._add_button(grid, "■", 4, 1, self.QtCore.Qt.Key_Space)
-        self._add_button(grid, "→", 4, 2, self.QtCore.Qt.Key_Right)
-        self._add_button(grid, "↓", 5, 1, self.QtCore.Qt.Key_Down)
+        self.linear_spin = self.QtWidgets.QDoubleSpinBox()
+        self.linear_spin.setRange(0.0, 2.0)
+        self.linear_spin.setSingleStep(0.05)
+        self.linear_spin.setSuffix(" m/s")
+        self.linear_spin.setValue(max_linear_speed)
+        self.linear_spin.setMinimumWidth(DASHBOARD_CONTROL_SPINBOX_WIDTH)
+        self.angular_spin = self.QtWidgets.QDoubleSpinBox()
+        self.angular_spin.setRange(0.0, 4.0)
+        self.angular_spin.setSingleStep(0.05)
+        self.angular_spin.setSuffix(" rad/s")
+        self.angular_spin.setValue(max_angular_speed)
+        self.angular_spin.setMinimumWidth(DASHBOARD_CONTROL_SPINBOX_WIDTH)
+        grid.addWidget(self.QtWidgets.QLabel("线速度"), 3, 0)
+        grid.addWidget(self.linear_spin, 3, 1, 1, 2)
+        grid.addWidget(self.QtWidgets.QLabel("角速度"), 4, 0)
+        grid.addWidget(self.angular_spin, 4, 1, 1, 2)
 
         self.quit_button = self.QtWidgets.QPushButton("退出")
         self._configure_button(
@@ -917,7 +962,7 @@ class TelemetryDashboard:
             self.QtWidgets.QStyle.StandardPixmap.SP_DialogCloseButton,
         )
         self.quit_button.clicked.connect(self.request_exit)
-        grid.addWidget(self.quit_button, 6, 0, 1, 3)
+        grid.addWidget(self.quit_button, 5, 0, 1, 3)
         return group
 
     def _create_robot_group(self, robot_model: str) -> object:
@@ -1088,12 +1133,10 @@ class TelemetryDashboard:
         self,
         tabs: object,
         *,
-        max_linear_speed: float,
-        max_angular_speed: float,
         camera_follow_enabled: bool,
         camera_follow_view: str,
     ) -> None:
-        """创建仅含内部遥测、速度上限和相机参数的开发者页。"""
+        """创建仅含内部遥测和相机参数的开发者页。"""
         developer_tab = self.QtWidgets.QWidget()
         developer_layout = self.QtWidgets.QVBoxLayout(developer_tab)
         self.developer_layout = developer_layout
@@ -1148,22 +1191,6 @@ class TelemetryDashboard:
         diagnostic_layout.setContentsMargins(4, 4, 4, 4)
         diagnostic_layout.setSpacing(6)
 
-        parameter_group = self.QtWidgets.QGroupBox("参数")
-        parameter_layout = self.QtWidgets.QGridLayout(parameter_group)
-        parameter_layout.setColumnStretch(1, 1)
-        self.linear_spin = self.QtWidgets.QDoubleSpinBox()
-        self.linear_spin.setRange(0.0, 2.0)
-        self.linear_spin.setSingleStep(0.05)
-        self.linear_spin.setValue(max_linear_speed)
-        self.angular_spin = self.QtWidgets.QDoubleSpinBox()
-        self.angular_spin.setRange(0.0, 4.0)
-        self.angular_spin.setSingleStep(0.05)
-        self.angular_spin.setValue(max_angular_speed)
-        parameter_layout.addWidget(self.QtWidgets.QLabel("最大线速度"), 0, 0)
-        parameter_layout.addWidget(self.linear_spin, 0, 1)
-        parameter_layout.addWidget(self.QtWidgets.QLabel("最大角速度"), 1, 0)
-        parameter_layout.addWidget(self.angular_spin, 1, 1)
-
         camera_group = self.QtWidgets.QGroupBox("相机")
         camera_layout = self.QtWidgets.QGridLayout(camera_group)
         camera_layout.setColumnStretch(1, 1)
@@ -1181,7 +1208,7 @@ class TelemetryDashboard:
         self.camera_follow_checkbox.toggled.connect(self._update_camera_follow_state)
         self._update_camera_follow_state()
 
-        self.diagnostic_control_groups = [parameter_group, camera_group]
+        self.diagnostic_control_groups = [camera_group]
         for group in self.diagnostic_control_groups:
             diagnostic_layout.addWidget(group)
         diagnostic_layout.addStretch(1)
@@ -1193,41 +1220,6 @@ class TelemetryDashboard:
         """统一使用 Qt 标准图标，并为命令按钮提供可访问提示。"""
         button.setToolTip(tooltip)
         button.setIcon(self.window.style().standardIcon(standard_pixmap))
-
-    def _add_button(self, grid: object, text: str, row: int, col: int, key: int) -> object:
-        normalized_key = self._normalize_key(key)
-        icon_and_tooltip = {
-            self._normalize_key(self.QtCore.Qt.Key_Up): (
-                self.QtWidgets.QStyle.StandardPixmap.SP_ArrowUp,
-                "向前驾驶",
-            ),
-            self._normalize_key(self.QtCore.Qt.Key_Down): (
-                self.QtWidgets.QStyle.StandardPixmap.SP_ArrowDown,
-                "向后驾驶",
-            ),
-            self._normalize_key(self.QtCore.Qt.Key_Left): (
-                self.QtWidgets.QStyle.StandardPixmap.SP_ArrowLeft,
-                "向左转向",
-            ),
-            self._normalize_key(self.QtCore.Qt.Key_Right): (
-                self.QtWidgets.QStyle.StandardPixmap.SP_ArrowRight,
-                "向右转向",
-            ),
-            self._normalize_key(self.QtCore.Qt.Key_Space): (
-                self.QtWidgets.QStyle.StandardPixmap.SP_MediaStop,
-                "按住暂停仿真",
-            ),
-        }
-        button = self.QtWidgets.QPushButton(text)
-        button.setFixedSize(DASHBOARD_DIRECTION_BUTTON_SIZE, DASHBOARD_DIRECTION_BUTTON_SIZE)
-        standard_pixmap, tooltip = icon_and_tooltip[normalized_key]
-        self._configure_button(button, tooltip, standard_pixmap)
-        button.pressed.connect(lambda key=key: self._button_keys.add(self._normalize_key(key)))
-        button.released.connect(lambda key=key: self._button_keys.discard(self._normalize_key(key)))
-        button.clicked.connect(lambda _checked=False, key=key: self._pulse_button_key(key))
-        self.direction_buttons.append(button)
-        grid.addWidget(button, row, col)
-        return button
 
     def _add_obstacle_tab(self, tabs: object) -> None:
         """创建障碍物快照表；表格只保存逻辑字段，不接触 PyBullet body。"""
@@ -1249,7 +1241,7 @@ class TelemetryDashboard:
         tabs.addTab(obstacle_tab, "障碍物")
 
     def _add_plot_tabs(self, tabs: object) -> None:
-        """按冻结顺序把十四个折线页和 LiDAR 页直接加入顶层标签栏。"""
+        """按冻结顺序把十二个折线页和 LiDAR 页直接加入顶层标签栏。"""
         from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
         from matplotlib.figure import Figure
 
@@ -1291,14 +1283,19 @@ class TelemetryDashboard:
         axis.set_title(title, fontsize=7)
         axis.set_xlabel(x_label, fontsize=9)
         axis.set_ylabel(y_label, fontsize=9)
+        if tab_label == "轨迹":
+            # 大坐标轨迹直接显示完整刻度，避免科学计数 offset 挤占 xlabel 空间。
+            axis.ticklabel_format(axis="both", style="plain", useOffset=False)
+        else:
+            # 时间轴标签靠左、科学计数 offset 靠右，窄画布也不会互相遮挡。
+            axis.xaxis.set_label_coords(0.0, -0.17)
+            axis.xaxis.label.set_horizontalalignment("left")
+        # 窄侧栏不显示轴端最外层刻度，避免完整文字落到 Figure 边界之外。
+        axis.xaxis.get_major_locator().set_params(prune="both")
+        axis.yaxis.get_major_locator().set_params(prune="both")
         axis.tick_params(axis="both", labelsize=8)
         axis.grid(True, alpha=0.3)
-        figure.subplots_adjust(
-            **{
-                **DASHBOARD_PLOT_MARGINS,
-                "left": max(DASHBOARD_PLOT_MARGINS["left"], DASHBOARD_RENDERED_PLOT_LEFT_MARGIN),
-            }
-        )
+        figure.subplots_adjust(**DASHBOARD_PLOT_MARGINS)
         event_name = "draw_event"
         callback_id = canvas.mpl_connect(
             event_name,
@@ -1307,6 +1304,8 @@ class TelemetryDashboard:
         self._mpl_connections.append((canvas, event_name, callback_id))
         self.plot_layouts[tab_label] = plot_layout
         self.plot_axes[tab_label] = axis
+        self._plot_data_revisions[tab_label] = 0
+        self._plot_rendered_revisions[tab_label] = -1
         self._plot_next_draw_time[tab_label] = 0.0
         plot_layout.addWidget(canvas, stretch=1)
         return plot_tab, plot_layout, figure, canvas, axis
@@ -1379,15 +1378,27 @@ class TelemetryDashboard:
     @staticmethod
     def _create_plot_legend(axis: object, handles: list[object], labels: list[str]) -> object:
         """空转向页也创建稳定 Legend，且不制造虚假零值 Line2D。"""
+        legend_columns = max(1, min(2, len(labels)))
         if handles:
             return axis.legend(
                 handles=handles,
                 labels=labels,
+                ncols=legend_columns,
+                columnspacing=1.0,
+                handletextpad=0.6,
                 **DASHBOARD_PLOT_LEGEND_STYLE,
             )
         from matplotlib.legend import Legend
 
-        legend = Legend(axis, [], [], **DASHBOARD_PLOT_LEGEND_STYLE)
+        legend = Legend(
+            axis,
+            [],
+            [],
+            ncols=legend_columns,
+            columnspacing=1.0,
+            handletextpad=0.6,
+            **DASHBOARD_PLOT_LEGEND_STYLE,
+        )
         axis.add_artist(legend)
         return legend
 
@@ -1403,16 +1414,58 @@ class TelemetryDashboard:
 
         plot_tab, plot_layout, _figure, _canvas, axis = self._register_plot_canvas(
             "LiDAR点云",
-            "LiDAR top view",
-            "x [m]",
-            "y [m]",
+            "LiDAR obstacles (base_link)",
+            "forward x [m]",
+            "left y [m]",
             Figure=Figure,
             FigureCanvas=FigureCanvas,
         )
         axis.set_aspect("equal", adjustable="box")
-        self.lidar_collection = axis.scatter([], [], s=4)
+        self.lidar_collection = axis.scatter([], [], s=4, zorder=3)
         self.lidar_collection.set_offsets(np.empty((0, 2)))
         self._set_lidar_limits(np.empty((0, 2)))
+        axis.axhline(0.0, color="#687078", linewidth=0.6, alpha=0.35, zorder=1)
+        axis.axvline(0.0, color="#687078", linewidth=0.6, alpha=0.35, zorder=1)
+        from matplotlib.lines import Line2D
+        from matplotlib.patches import Circle
+
+        self.lidar_range_ring = Circle(
+            (0.0, 0.0),
+            radius=30.0,
+            fill=False,
+            edgecolor="#687078",
+            linewidth=0.7,
+            linestyle="--",
+            alpha=0.45,
+            zorder=1,
+        )
+        axis.add_patch(self.lidar_range_ring)
+        self.lidar_vehicle_marker = axis.plot(
+            [0.0],
+            [0.0],
+            marker=">",
+            markersize=8,
+            color="#111827",
+            linestyle="None",
+            zorder=4,
+        )[0]
+        legend_handles = [
+            Line2D(
+                [],
+                [],
+                marker="o",
+                markersize=4,
+                markerfacecolor=color,
+                markeredgecolor="none",
+                linestyle="None",
+            )
+            for color in DASHBOARD_LIDAR_TAG_COLORS
+        ] + [self.lidar_vehicle_marker]
+        self.plot_legends["LiDAR点云"] = self._create_plot_legend(
+            axis,
+            legend_handles,
+            [*DASHBOARD_LIDAR_TAG_LABELS, "vehicle forward"],
+        )
         self.lidar_front_time_text = axis.text(
             0.02,
             0.98,
@@ -1508,10 +1561,6 @@ class TelemetryDashboard:
         self._pressed_keys.discard(key_code)
         return True
 
-    def _pulse_button_key(self, key: object) -> None:
-        """让一次短点击也至少持续几个仿真帧，避免 press/release 同轮被吃掉。"""
-        self._button_pulses[self._normalize_key(key)] = time.monotonic() + DASHBOARD_BUTTON_PULSE_SEC
-
     @property
     def paused(self) -> bool:
         """返回持续暂停状态；调用方只能通过界面命令切换。"""
@@ -1532,16 +1581,23 @@ class TelemetryDashboard:
             icon = self.QtWidgets.QStyle.StandardPixmap.SP_MediaPause
         self.pause_button.setIcon(self.window.style().standardIcon(icon))
 
-    def _update_layout_for_height(self, height: int) -> None:
-        """按固定窗口高度分配上下区域，不改变字号或宽高比例。"""
+    def _update_layout_for_size(self, width: int, height: int) -> None:
+        """按固定窗口尺寸分配区域，并仅为异常超窄画布补足文字边距。"""
         compact_height = height < 600
         very_compact_height = height <= 320
-        tabs_ratio = 0.72 if compact_height else 0.55
-        tabs_min_height = max(80, min(DASHBOARD_TOP_TABS_MIN_HEIGHT, int(height * tabs_ratio)))
-        self.tabs.setMinimumHeight(tabs_min_height)
-        self.control_scroll.setMaximumHeight(
-            DASHBOARD_COMPACT_CONTROL_SCROLL_HEIGHT if very_compact_height else 16_777_215
+        margins = self.window_layout.contentsMargins()
+        reserved_height = (
+            margins.top()
+            + margins.bottom()
+            + self.title_label.sizeHint().height()
+            + 2 * self.window_layout.spacing()
         )
+        # 最小高度不能超过 pane 可用预算的一半，否则会覆盖上下 1:1 stretch。
+        half_pane_budget = max(0, (int(height) - reserved_height) // 2)
+        tabs_min_height = min(DASHBOARD_TOP_TABS_MIN_HEIGHT, half_pane_budget)
+        self.tabs.setMinimumHeight(tabs_min_height)
+        # 企业控制区始终参与 1:1 stretch，小窗口依靠自身滚动条保留全部控件。
+        self.control_scroll.setMaximumHeight(16_777_215)
         if self.diagnostic_control_scroll is not None:
             if very_compact_height:
                 self.diagnostic_control_scroll.setMaximumHeight(DASHBOARD_VERY_COMPACT_SCROLL_HEIGHT)
@@ -1579,33 +1635,36 @@ class TelemetryDashboard:
             if very_compact_height
             else DASHBOARD_PLOT_LEGEND_STYLE["fontsize"]
         )
+        axis_label_font_size = DASHBOARD_VERY_COMPACT_AXIS_LABEL_FONT_SIZE if very_compact_height else 9
+        tick_font_size = DASHBOARD_VERY_COMPACT_TICK_FONT_SIZE if very_compact_height else 8
         for axis in self.plot_axes.values():
             legend = axis.get_legend()
             if legend is not None:
                 for text in legend.get_texts():
                     text.set_fontsize(legend_font_size)
+            # 极矮画布只压缩外围文字，不侵占数据 axes 的相对高度。
+            axis.xaxis.label.set_fontsize(axis_label_font_size)
+            axis.yaxis.label.set_fontsize(axis_label_font_size)
+            axis.xaxis.labelpad = 0.0 if very_compact_height else 4.0
+            axis.tick_params(
+                axis="x",
+                labelsize=tick_font_size,
+                pad=0.0 if very_compact_height else 3.5,
+            )
+            axis.tick_params(axis="y", labelsize=tick_font_size)
         if height <= 320:
-            for figure in self.plot_figures.values():
-                figure.subplots_adjust(
-                    **{
-                        **DASHBOARD_VERY_COMPACT_PLOT_MARGINS,
-                        "left": max(
-                            DASHBOARD_VERY_COMPACT_PLOT_MARGINS["left"],
-                            DASHBOARD_RENDERED_PLOT_LEFT_MARGIN,
-                        ),
-                    }
-                )
+            plot_margins = DASHBOARD_VERY_COMPACT_PLOT_MARGINS
         elif compact_height:
-            for figure in self.plot_figures.values():
-                figure.subplots_adjust(
-                    **{
-                        **DASHBOARD_COMPACT_HEIGHT_PLOT_MARGINS,
-                        "left": max(
-                            DASHBOARD_COMPACT_HEIGHT_PLOT_MARGINS["left"],
-                            DASHBOARD_RENDERED_PLOT_LEFT_MARGIN,
-                        ),
-                    }
-                )
+            plot_margins = DASHBOARD_COMPACT_HEIGHT_PLOT_MARGINS
+        else:
+            plot_margins = DASHBOARD_PLOT_MARGINS
+        if width < DASHBOARD_MIN_FULL_WIDTH_PLOT:
+            plot_margins = {
+                **plot_margins,
+                "left": max(plot_margins["left"], DASHBOARD_NARROW_PLOT_LEFT_MARGIN),
+            }
+        for figure in self.plot_figures.values():
+            figure.subplots_adjust(**plot_margins)
 
     @staticmethod
     def _rect_attribute(rect: object, name: str) -> int:
@@ -1701,7 +1760,7 @@ class TelemetryDashboard:
                 str(int(self.window.winId())),
                 Rect(x, y, width, height),
             )
-        self._update_layout_for_height(target.height)
+        self._update_layout_for_size(target.width, target.height)
 
     def request_exit(self) -> None:
         self._should_exit = True
@@ -1848,6 +1907,8 @@ class TelemetryDashboard:
                     item.setData(self.QtCore.Qt.UserRole, snapshot.logical_id)
             if snapshot.logical_id == selected_logical_id:
                 selected_row = row
+        # 位置列允许换行，刷新后必须按当前列宽重算每行高度。
+        self.obstacle_table.resizeRowsToContents()
         self.obstacle_table.clearSelection()
         if selected_row is not None:
             self.obstacle_table.selectRow(selected_row)
@@ -1909,6 +1970,15 @@ class TelemetryDashboard:
         self._plot_dirty_tabs.add(label)
         self._request_current_plot_draw(time.monotonic())
 
+    def _mark_plot_data_changed(self, tab_labels: Iterable[str]) -> None:
+        """推进受影响页的数据修订，并把它们加入下一次绘制集合。"""
+        labels = tuple(tab_labels)
+        for label in labels:
+            if label not in self._plot_data_revisions:
+                continue
+            self._plot_data_revisions[label] += 1
+        self._plot_dirty_tabs.update(labels)
+
     def _record_plot_draw(self, tab_label: str) -> None:
         """记录一次实际绘制耗时，并为慢速绘图增加冷却时间。"""
         started_at = self._plot_draw_started_at.pop(tab_label, None)
@@ -1924,7 +1994,7 @@ class TelemetryDashboard:
         self.plot_buffer.clear()
         self.interface_plot_buffer.clear()
         line_tabs = {spec.tab_label for spec in self.plot_specs}
-        self._plot_dirty_tabs.update(line_tabs)
+        self._mark_plot_data_changed(line_tabs)
         self._request_current_plot_draw(time.monotonic())
 
     def reset_feedback_history(self) -> None:
@@ -1947,7 +2017,7 @@ class TelemetryDashboard:
         self._set_lidar_limits(np.empty((0, 2)))
         self.lidar_front_time_text.set_text("前: --")
         self.lidar_rear_time_text.set_text("后: --")
-        self._plot_dirty_tabs.add("LiDAR点云")
+        self._mark_plot_data_changed(("LiDAR点云",))
 
     def save_plot_snapshot(self, tab_label: str | None = None) -> Path:
         """保存当前曲线页截图到配置的图像目录。"""
@@ -1976,6 +2046,19 @@ class TelemetryDashboard:
         point = widget.mapToGlobal(self.QtCore.QPoint(0, 0))
         return [point.x(), point.y(), widget.width(), widget.height()]
 
+    @staticmethod
+    def _matplotlib_bounds_logical_rect(
+        canvas: object,
+        bounds: object,
+        scale: float,
+    ) -> tuple[int, int, int, int]:
+        """向外包围 Matplotlib 物理 bbox，保留亚像素越界和重叠证据。"""
+        left = math.floor(bounds.x0 / scale)
+        right = math.ceil(bounds.x1 / scale)
+        top = math.floor(canvas.height() - bounds.y1 / scale)
+        bottom = math.ceil(canvas.height() - bounds.y0 / scale)
+        return left, top, max(1, right - left), max(1, bottom - top)
+
     def _legend_global_rect(self, tab_label: str) -> list[int] | None:
         """读取现有 renderer 的图例边界，不主动触发 Matplotlib 绘制。"""
         canvas = self.plot_canvases.get(tab_label)
@@ -1990,14 +2073,217 @@ class TelemetryDashboard:
             scale = float(getattr(canvas, "device_pixel_ratio", 1.0))
             if scale <= 0.0:
                 return None
-            left = round(bounds.x0 / scale)
-            top = round(canvas.height() - bounds.y1 / scale)
-            width = max(1, round(bounds.width / scale))
-            height = max(1, round(bounds.height / scale))
+            left, top, width, height = self._matplotlib_bounds_logical_rect(
+                canvas,
+                bounds,
+                scale,
+            )
             point = canvas.mapToGlobal(self.QtCore.QPoint(left, top))
             return [point.x(), point.y(), width, height]
         except Exception:
             return None
+
+    def _axis_global_rect(self, tab_label: str) -> list[int] | None:
+        """读取 active axes 的全局逻辑矩形，供外部门禁检查画布覆盖率。"""
+        canvas = self.plot_canvases.get(tab_label)
+        axis = self.plot_axes.get(tab_label)
+        if canvas is None or axis is None:
+            return None
+        try:
+            bounds = axis.get_window_extent(renderer=canvas.get_renderer())
+            scale = float(getattr(canvas, "device_pixel_ratio", 1.0))
+            if scale <= 0.0:
+                return None
+            left, top, width, height = self._matplotlib_bounds_logical_rect(
+                canvas,
+                bounds,
+                scale,
+            )
+            point = canvas.mapToGlobal(self.QtCore.QPoint(left, top))
+            return [point.x(), point.y(), width, height]
+        except Exception:
+            return None
+
+    def _plot_artist_global_rect(
+        self,
+        tab_label: str,
+        artist: object,
+    ) -> dict[str, object] | None:
+        """把非空 Matplotlib 文本 artist 转成 Qt 全局逻辑矩形。"""
+        canvas = self.plot_canvases.get(tab_label)
+        if canvas is None or not artist.get_visible():
+            return None
+        text = str(artist.get_text())
+        if not text.strip():
+            return None
+        try:
+            renderer = canvas.get_renderer()
+            bounds = artist.get_window_extent(renderer=renderer)
+            scale = float(getattr(canvas, "device_pixel_ratio", 1.0))
+            if scale <= 0.0:
+                return None
+            left, top, width, height = self._matplotlib_bounds_logical_rect(
+                canvas,
+                bounds,
+                scale,
+            )
+            point = canvas.mapToGlobal(self.QtCore.QPoint(left, top))
+            return {
+                "text": text,
+                "rect": [point.x(), point.y(), width, height],
+            }
+        except Exception:
+            return None
+
+    def _plot_artist_rects(self, tab_label: str) -> dict[str, object] | None:
+        """报告坐标轴标题、标签与 offset，供外部门禁独立检查包含和重叠。"""
+        axis = self.plot_axes.get(tab_label)
+        if axis is None:
+            return None
+        artists = {
+            "title": axis.title,
+            "x_label": axis.xaxis.label,
+            "y_label": axis.yaxis.label,
+            "x_offset": axis.xaxis.get_offset_text(),
+            "y_offset": axis.yaxis.get_offset_text(),
+        }
+        return {
+            name: self._plot_artist_global_rect(tab_label, artist)
+            for name, artist in artists.items()
+        }
+
+    def _plot_tick_rects(self, tab_label: str) -> dict[str, list[object]] | None:
+        """报告当前实际可见的横纵轴 tick 文本，禁止窄画布静默遮挡。"""
+        axis = self.plot_axes.get(tab_label)
+        if axis is None:
+            return None
+        result: dict[str, list[object]] = {"x": [], "y": []}
+        for axis_name, artists in (
+            ("x", axis.get_xticklabels()),
+            ("y", axis.get_yticklabels()),
+        ):
+            for artist in artists:
+                value = self._plot_artist_global_rect(tab_label, artist)
+                if value is not None:
+                    result[axis_name].append(value)
+        return result
+
+    def _legend_text_rects(self, tab_label: str) -> list[object] | None:
+        """报告图例内部文字，供 verifier 检查图例自身包含和互斥。"""
+        legend = self.plot_legends.get(tab_label)
+        if legend is None:
+            return None
+        return [
+            value
+            for artist in legend.get_texts()
+            if (value := self._plot_artist_global_rect(tab_label, artist)) is not None
+        ]
+
+    def _qt_text_global_rect(self, widget: object) -> dict[str, object] | None:
+        """按控件真实字体计算其显示文字所需矩形和可用内容矩形。"""
+        QtCore = self.QtCore
+        QtWidgets = self.QtWidgets
+        if isinstance(widget, QtWidgets.QComboBox):
+            text = widget.currentText()
+        elif isinstance(widget, QtWidgets.QAbstractSpinBox):
+            text = widget.text()
+        elif isinstance(widget, (QtWidgets.QAbstractButton, QtWidgets.QLabel)):
+            text = widget.text()
+        else:
+            return None
+        text = str(text)
+        if not text.strip():
+            return None
+
+        container = widget.contentsRect()
+        if isinstance(widget, (QtWidgets.QComboBox, QtWidgets.QAbstractSpinBox)):
+            # 为下拉箭头或步进按钮预留原生样式区域，避免数字被覆盖。
+            container = container.adjusted(4, 1, -24, -1)
+            alignment = QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter
+        elif isinstance(widget, QtWidgets.QAbstractButton):
+            icon_width = 0 if widget.icon().isNull() else widget.iconSize().width() + 6
+            container = container.adjusted(icon_width + 4, 1, -4, -1)
+            alignment = QtCore.Qt.AlignCenter
+        else:
+            # QLabel 的字体 bbox 可触及 contentsRect 上下边，不能把合法像素误报为裁切。
+            container = container.adjusted(2, 0, -2, 0)
+            alignment = widget.alignment()
+        if container.width() <= 0 or container.height() <= 0:
+            return None
+
+        flags = int(alignment | QtCore.Qt.TextSingleLine)
+        bounds = widget.fontMetrics().boundingRect(container, flags, text)
+        text_point = widget.mapToGlobal(bounds.topLeft())
+        container_point = widget.mapToGlobal(container.topLeft())
+        return {
+            "text": text,
+            "rect": [text_point.x(), text_point.y(), bounds.width(), bounds.height()],
+            "container_rect": [
+                container_point.x(),
+                container_point.y(),
+                container.width(),
+                container.height(),
+            ],
+        }
+
+    def _tab_qt_text_rect(self, tab_index: int) -> dict[str, object] | None:
+        """计算当前页签完整文字所需矩形，不能依赖 Qt 自动裁切。"""
+        tab_bar = self.tabs.tabBar()
+        text = self.tabs.tabText(tab_index)
+        container = tab_bar.tabRect(tab_index).adjusted(6, 2, -6, -2)
+        if not text.strip() or container.width() <= 0 or container.height() <= 0:
+            return None
+        flags = int(self.QtCore.Qt.AlignCenter | self.QtCore.Qt.TextSingleLine)
+        bounds = tab_bar.fontMetrics().boundingRect(container, flags, text)
+        text_point = tab_bar.mapToGlobal(bounds.topLeft())
+        container_point = tab_bar.mapToGlobal(container.topLeft())
+        return {
+            "text": text,
+            "rect": [text_point.x(), text_point.y(), bounds.width(), bounds.height()],
+            "container_rect": [
+                container_point.x(),
+                container_point.y(),
+                container.width(),
+                container.height(),
+            ],
+        }
+
+    def _tab_scroll_button_rects(self) -> dict[str, list[int]]:
+        """读取 Qt 标签栏真实左右滚动按钮，禁止验收脚本猜测固定坐标。"""
+        tab_bar = self.tabs.tabBar()
+        result: dict[str, list[int]] = {}
+        directions = {
+            self.QtCore.Qt.LeftArrow: "left",
+            self.QtCore.Qt.RightArrow: "right",
+        }
+        for button in tab_bar.findChildren(self.QtWidgets.QToolButton):
+            name = directions.get(button.arrowType())
+            if name is not None and button.isVisibleTo(tab_bar):
+                result[name] = self._widget_global_rect(button)
+        return result
+
+    def _ensure_control_fully_visible(self, widget: object) -> None:
+        """按控件真实外框补偿 Qt 滚动结果，保证 QRect 完整落入 viewport。"""
+        margin = DASHBOARD_CRITICAL_CONTROL_SCROLL_MARGIN
+        scrollbar = self.control_scroll.verticalScrollBar()
+        viewport = self.control_scroll.viewport()
+        self.control_scroll.ensureWidgetVisible(widget, margin, margin)
+        for _attempt in range(3):
+            top_left = widget.mapTo(viewport, self.QtCore.QPoint(0, 0))
+            top = top_left.y()
+            bottom = top + widget.height()
+            if top < margin:
+                delta = top - margin
+            elif bottom > viewport.height() - margin:
+                delta = bottom - (viewport.height() - margin)
+            else:
+                return
+            previous = scrollbar.value()
+            scrollbar.setValue(
+                max(scrollbar.minimum(), min(scrollbar.maximum(), previous + delta))
+            )
+            if scrollbar.value() == previous:
+                return
 
     def _layout_report(self) -> dict[str, object] | None:
         """构造当前页只读布局快照；绘图未完成时等待下一次事件循环。"""
@@ -2012,16 +2298,121 @@ class TelemetryDashboard:
             or getattr(canvas, "_is_drawing", False)
         ):
             return None
-        plot_buttons = [
-            self._widget_global_rect(button)
+        page_kind = "content" if tab_label in DASHBOARD_CONTENT_TAB_LABELS else "plot"
+        if page_kind == "content":
+            required_plot_buttons: list[str] = []
+            rendered_data_revision: int | None = None
+        elif tab_label == "LiDAR点云":
+            required_plot_buttons = ["保存当前图"]
+            rendered_data_revision = self._plot_rendered_revisions.get(tab_label, -1)
+        else:
+            required_plot_buttons = ["清空曲线", "保存当前图"]
+            rendered_data_revision = self._plot_rendered_revisions.get(tab_label, -1)
+        if page_kind == "plot":
+            current_data_revision = self._plot_data_revisions.get(tab_label, -1)
+            if (
+                rendered_data_revision < 0
+                or rendered_data_revision != current_data_revision
+            ):
+                return None
+        plot_button_widgets = {
+            button.text(): button
             for button in page.findChildren(self.QtWidgets.QPushButton)
             if button.isVisibleTo(page)
-        ]
-        critical_controls = {
-            "暂停": self._widget_global_rect(self.pause_button),
-            "复位车辆": self._widget_global_rect(self.reset_button),
-            "退出": self._widget_global_rect(self.quit_button),
         }
+        plot_buttons = {
+            name: self._widget_global_rect(button)
+            for name, button in plot_button_widgets.items()
+        }
+        legend_rect = self._legend_global_rect(tab_label)
+        if page_kind == "plot" and legend_rect is None:
+            return None
+        plot_artist_rects = self._plot_artist_rects(tab_label)
+        plot_tick_rects = self._plot_tick_rects(tab_label)
+        axes_rect = self._axis_global_rect(tab_label)
+        legend_text_rects = (
+            self._legend_text_rects(tab_label) if legend_rect is not None else None
+        )
+        if page_kind == "plot" and (
+            plot_artist_rects is None
+            or axes_rect is None
+            or any(plot_artist_rects[name] is None for name in ("title", "x_label", "y_label"))
+            or plot_tick_rects is None
+            or any(not plot_tick_rects[axis_name] for axis_name in ("x", "y"))
+        ):
+            return None
+        if tab_label == "接口状态":
+            content_widget_rects = {
+                "接口状态滚动区": self._widget_global_rect(self.interface_scroll)
+            }
+        elif tab_label == "障碍物":
+            content_widget_rects = {
+                "障碍物表格": self._widget_global_rect(self.obstacle_table)
+            }
+        else:
+            content_widget_rects = {}
+
+        tab_scroll_button_rects = self._tab_scroll_button_rects()
+        if set(tab_scroll_button_rects) != {"left", "right"}:
+            return None
+        tab_qt_text = self._tab_qt_text_rect(tab_index)
+        plot_button_qt_texts = {
+            name: self._qt_text_global_rect(button)
+            for name, button in plot_button_widgets.items()
+        }
+        if tab_qt_text is None or any(
+            value is None for value in plot_button_qt_texts.values()
+        ):
+            return None
+
+        # 验收模式逐个滚动关键控件，记录其真正完全进入视口时的几何。
+        scrollbar = self.control_scroll.verticalScrollBar()
+        original_scroll_value = scrollbar.value()
+        viewport_rect = self._widget_global_rect(self.control_scroll.viewport())
+        critical_widgets = {
+            "暂停": self.pause_button,
+            "复位车辆": self.reset_button,
+            "线速度": self.linear_spin,
+            "角速度": self.angular_spin,
+            "退出": self.quit_button,
+            "车型": self.robot_combo,
+            "应用车型": self.apply_robot_button,
+            "场地": self.terrain_combo,
+            "坡度": self.slope_spin,
+            "场地随机种子": self.golf_seed_spin,
+            "起伏": self.golf_relief_combo,
+            "应用场地": self.apply_terrain_button,
+            "障碍模式": self.obstacle_mode_combo,
+            "障碍形状": self.obstacle_shape_combo,
+            "障碍数量": self.obstacle_count_spin,
+            "障碍随机种子": self.obstacle_seed_spin,
+            "障碍速度": self.obstacle_speed_spin,
+            "障碍移动占比": self.obstacle_ratio_spin,
+            "添加障碍": self.add_obstacles_button,
+            "删除选中": self.delete_obstacle_button,
+            "清空障碍": self.clear_obstacles_button,
+            "结构状态": self.structure_status_label,
+        }
+        critical_controls: dict[str, object] = {}
+        critical_control_qt_texts: dict[str, object] = {}
+        try:
+            for name in DASHBOARD_REQUIRED_CRITICAL_CONTROLS:
+                widget = critical_widgets[name]
+                self._ensure_control_fully_visible(widget)
+                qt_text = self._qt_text_global_rect(widget)
+                if qt_text is None:
+                    return None
+                critical_controls[name] = {
+                    "rect": self._widget_global_rect(widget),
+                    "viewport_rect": self._widget_global_rect(
+                        self.control_scroll.viewport()
+                    ),
+                    "scroll_value": scrollbar.value(),
+                }
+                critical_control_qt_texts[name] = qt_text
+        finally:
+            scrollbar.setValue(original_scroll_value)
+
         screen = self.window.screen()
         screen_rect = None
         if screen is not None:
@@ -2033,45 +2424,68 @@ class TelemetryDashboard:
                 geometry.height(),
             ]
         return {
-            "report_version": 1,
+            "report_version": DASHBOARD_LAYOUT_REPORT_VERSION,
             "tab_index": tab_index,
             "tab_count": self.tabs.count(),
             "tab_label": tab_label,
             "tab_order": [
                 self.tabs.tabText(index) for index in range(self.tabs.count())
             ],
+            "page_kind": page_kind,
+            "required_plot_buttons": required_plot_buttons,
+            "rendered_data_revision": rendered_data_revision,
             "device_pixel_ratio": float(self.window.devicePixelRatioF()),
             "screen_rect": screen_rect,
             "window_rect": self._widget_global_rect(self.window),
+            "title_rect": self._widget_global_rect(self.title_label),
             "tabs_rect": self._widget_global_rect(self.tabs),
+            "tab_bar_rect": self._widget_global_rect(self.tabs.tabBar()),
+            "tab_scroll_button_rects": tab_scroll_button_rects,
             "controls_rect": self._widget_global_rect(self.control_scroll),
             "page_rect": self._widget_global_rect(page),
             "canvas_rect": None if canvas is None else self._widget_global_rect(canvas),
-            "legend_rect": self._legend_global_rect(tab_label),
+            "axes_rect": axes_rect,
+            "legend_rect": legend_rect,
+            "legend_text_rects": legend_text_rects,
             "plot_button_rects": plot_buttons,
+            "content_widget_rects": content_widget_rects,
+            "plot_artist_rects": plot_artist_rects,
+            "plot_tick_rects": plot_tick_rects,
+            "qt_text_rects": {
+                "tab": tab_qt_text,
+                "plot_buttons": plot_button_qt_texts,
+                "critical_controls": critical_control_qt_texts,
+            },
+            "control_viewport_rect": viewport_rect,
+            "control_content_rect": self._widget_global_rect(self.control_content),
+            "control_scroll_range": [scrollbar.minimum(), scrollbar.maximum()],
             "critical_control_rects": critical_controls,
         }
 
     def _emit_layout_report_if_requested(self) -> None:
-        """验收模式下每个页签只追加一次 JSONL 布局报告。"""
+        """验收模式只追加新访问的内容页或完成新数据绘制的图表页。"""
         if self._layout_report_path is None:
             return
         tab_index = self.tabs.currentIndex()
-        if tab_index == self._last_layout_report_tab_index:
-            return
         report = self._layout_report()
         if report is None:
+            return
+        revision = report["rendered_data_revision"]
+        if revision is None:
+            if tab_index == self._last_layout_report_tab_index:
+                return
+        elif self._last_layout_report_revisions.get(tab_index, -1) >= revision:
             return
         self._layout_report_path.parent.mkdir(parents=True, exist_ok=True)
         with self._layout_report_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(report, ensure_ascii=False, sort_keys=True))
             handle.write("\n")
         self._last_layout_report_tab_index = tab_index
+        if revision is not None:
+            self._last_layout_report_revisions[tab_index] = revision
 
     def current_command(self) -> DashboardCommand:
-        now = time.monotonic()
-        self._button_pulses = {key: expires_at for key, expires_at in self._button_pulses.items() if expires_at >= now}
-        keys = self._pressed_keys | self._button_keys | set(self._button_pulses)
+        keys = self._pressed_keys
         structural_action = self._pending_actions.popleft() if self._pending_actions else None
         if self.camera_follow_checkbox is None or self.camera_view_combo is None:
             camera_follow_enabled = self._camera_follow_enabled
@@ -2230,7 +2644,7 @@ class TelemetryDashboard:
         if snapshot.robot_model != self._interface_robot_model:
             self._rebuild_interface_line_artists(snapshot.robot_model)
         self._interface_generation = snapshot.generation
-        self._plot_dirty_tabs.update(
+        self._mark_plot_data_changed(
             {spec.tab_label for spec in self.interface_plot_specs} | {"LiDAR点云"}
         )
 
@@ -2269,11 +2683,11 @@ class TelemetryDashboard:
             self.update_interface_status(snapshot.status)
             self._last_interface_status_update_time = now
         space = self._normalize_key(self.QtCore.Qt.Key_Space)
-        paused = self._paused or space in (self._pressed_keys | self._button_keys | set(self._button_pulses))
+        paused = self._paused or space in self._pressed_keys
         changed = self.interface_plot_buffer.append(snapshot, paused=paused)
-        self._plot_dirty_tabs.update(changed)
+        self._mark_plot_data_changed(changed)
         if not paused and self._capture_latest_lidar_views(snapshot):
-            self._plot_dirty_tabs.add("LiDAR点云")
+            self._mark_plot_data_changed(("LiDAR点云",))
         self._request_current_plot_draw(now)
 
     def _maybe_update_plots(self, telemetry: RobotTelemetry, now: float) -> bool:
@@ -2282,7 +2696,9 @@ class TelemetryDashboard:
             return self._request_current_plot_draw(now)
         self.plot_buffer.append(telemetry)
         self._last_plot_update_time = now
-        self._plot_dirty_tabs.update(spec.tab_label for spec in dashboard_plot_specs())
+        self._mark_plot_data_changed(
+            spec.tab_label for spec in dashboard_plot_specs()
+        )
         self._request_current_plot_draw(now)
         return True
 
@@ -2311,6 +2727,9 @@ class TelemetryDashboard:
             return
         if tab_label == "LiDAR点云":
             self._apply_lidar_series()
+            self._plot_rendered_revisions[tab_label] = self._plot_data_revisions[
+                tab_label
+            ]
             return
         spec = next(spec for spec in self.plot_specs if spec.tab_label == tab_label)
         if spec in self.interface_plot_specs:
@@ -2332,12 +2751,14 @@ class TelemetryDashboard:
         axis = self.plot_axes[spec.tab_label]
         axis.relim()
         axis.autoscale_view()
+        self._plot_rendered_revisions[tab_label] = self._plot_data_revisions[
+            tab_label
+        ]
 
     def _apply_lidar_series(self) -> None:
         """把前后最后成功帧合并为一个 base_link 俯视散点集。"""
         import numpy as np
 
-        tag_colors = ("#7a7f85", "#2f8f46", "#2878b5", "#d1495b")
         points = []
         colors = []
         for side in ("front", "rear"):
@@ -2346,7 +2767,7 @@ class TelemetryDashboard:
                 continue
             for point in view.points:
                 points.append((point.x, point.y))
-                colors.append(tag_colors[point.tag])
+                colors.append(DASHBOARD_LIDAR_TAG_COLORS[point.tag])
         offsets = np.asarray(points, dtype=float) if points else np.empty((0, 2))
         self.lidar_collection.set_offsets(offsets)
         self.lidar_collection.set_facecolors(colors)
@@ -2361,25 +2782,11 @@ class TelemetryDashboard:
         self._set_lidar_limits(offsets)
 
     def _set_lidar_limits(self, offsets: object) -> None:
-        """仅按当前合并点云重建 dataLim，空点云恢复固定默认视野。"""
-        import numpy as np
-
+        """保持固定 base_link 视野；点云更新不能改变物理比例或 axes 几何。"""
+        del offsets
         axis = self.plot_axes["LiDAR点云"]
-        if len(offsets) == 0:
-            axis.dataLim.set_points(
-                np.array([[np.inf, np.inf], [-np.inf, -np.inf]], dtype=float)
-            )
-            axis.set_xlim(*DASHBOARD_LIDAR_DEFAULT_LIMITS)
-            axis.set_ylim(*DASHBOARD_LIDAR_DEFAULT_LIMITS)
-            return
-
-        minimum = np.min(offsets, axis=0)
-        maximum = np.max(offsets, axis=0)
-        axis.dataLim.set_points(np.array([minimum, maximum], dtype=float))
-        span = maximum - minimum
-        padding = np.maximum(span * 0.05, 0.5)
-        axis.set_xlim(minimum[0] - padding[0], maximum[0] + padding[0])
-        axis.set_ylim(minimum[1] - padding[1], maximum[1] + padding[1])
+        axis.set_xlim(*DASHBOARD_LIDAR_X_LIMITS)
+        axis.set_ylim(*DASHBOARD_LIDAR_Y_LIMITS)
 
     def _dispose(self) -> None:
         """幂等释放 Qt 全局钩子、Matplotlib 回调和全部窗口资源。"""
@@ -2458,6 +2865,8 @@ class TelemetryDashboard:
         self._latest_interface_snapshot = None
         self._interface_status = None
         self.lidar_collection = None
+        self.lidar_vehicle_marker = None
+        self.lidar_range_ring = None
         self.lidar_front_time_text = None
         self.lidar_rear_time_text = None
 
