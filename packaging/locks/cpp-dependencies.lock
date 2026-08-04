@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "dependencies": [
+    {
+      "name": "ecal",
+      "url": "https://github.com/eclipse-ecal/ecal/archive/refs/tags/v6.1.1.tar.gz",
+      "ref_kind": "tag",
+      "ref": "v6.1.1",
+      "commit": "bf0bc5734dd31c6315ebad907c92c2bb1edc1851",
+      "license": "Apache-2.0",
+      "license_files": ["LICENSE.txt"],
+      "consumers": ["cpp_dependency"],
+      "archive": {
+        "format": "tar.gz",
+        "size": 10856958,
+        "sha256": "fe084727ce0189f94454c7b57a86141b4ab4c311782c79cdee8996bfd73dc0ca"
+      }
+    },
+    {
+      "name": "protobuf",
+      "url": "https://github.com/protocolbuffers/protobuf/archive/refs/tags/v33.6.tar.gz",
+      "ref_kind": "tag",
+      "ref": "v33.6",
+      "commit": "6e1998413a5bca7c058b85999667893f167434bc",
+      "license": "BSD-3-Clause",
+      "license_files": ["LICENSE"],
+      "consumers": ["cpp_dependency"],
+      "archive": {
+        "format": "tar.gz",
+        "size": 6890866,
+        "sha256": "e825cac584256f88840ab6cf37add69ba0c6145811329d75642698a622d13498"
+      }
+    },
+    {
+      "name": "mcap",
+      "url": "https://github.com/foxglove/mcap/archive/refs/tags/releases/cpp/v1.4.0.tar.gz",
+      "ref_kind": "tag",
+      "ref": "releases/cpp/v1.4.0",
+      "commit": "9e7838c3ea51336d84141a80e2ffb15c589d2f54",
+      "license": "MIT",
+      "license_files": ["LICENSE"],
+      "consumers": ["cpp_dependency"],
+      "archive": {
+        "format": "tar.gz",
+        "size": 938333,
+        "sha256": "64ff3e51119f37ffcfaf9deecbd987a7cb4d4d9035d74a3fd3773395a470fda1"
+      }
+    },
+    {
+      "name": "zstd",
+      "url": "https://github.com/facebook/zstd/archive/refs/tags/v1.5.7.tar.gz",
+      "ref_kind": "tag",
+      "ref": "v1.5.7",
+      "commit": "f8745da6ff1ad1e7bab384bd1f9d742439278e99",
+      "license": "BSD-3-Clause OR GPL-2.0-only",
+      "license_files": ["LICENSE", "COPYING"],
+      "consumers": ["cpp_dependency"],
+      "archive": {
+        "format": "tar.gz",
+        "size": 2451884,
+        "sha256": "37d7284556b20954e56e1ca85b80226768902e2edabd3b649e9e72c0c9012ee3"
+      }
+    },
+    {
+      "name": "pcl",
+      "url": "https://github.com/PointCloudLibrary/pcl/archive/refs/tags/pcl-1.14.0.tar.gz",
+      "ref_kind": "tag",
+      "ref": "pcl-1.14.0",
+      "commit": "f62c018b4fc7df3dc2c096918a8462a190f28bb8",
+      "license": "BSD-3-Clause",
+      "license_files": ["LICENSE.txt"],
+      "consumers": ["validation"],
+      "archive": {
+        "format": "tar.gz",
+        "size": 68662907,
+        "sha256": "de297b929eafcb93747f12f98a196efddf3d55e4edf1b6729018b436d5be594d"
+      }
+    }
+  ]
+}

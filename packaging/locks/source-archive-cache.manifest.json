@@ -1,0 +1,166 @@
+{
+  "archives": [
+    {
+      "archive": {
+        "format": "tar.gz",
+        "sha256": "714030981c4bcc9d6dfcf03e34a982d7bdea30c77d47e4f1d090ea49dbabce59",
+        "size": 342723
+      },
+      "commit": "68ae1e1dc77f61f03c95d7c2809831e198d0aedd",
+      "consumers": [
+        "ros_overlay"
+      ],
+      "materialized_member_count": 221,
+      "materialized_regular_bytes": 1820175,
+      "materialized_tree_sha256": "13cea5d180e11b0c721376aad7005616486c29fd4c14145f6632a22cb6904f08",
+      "member_count": 259,
+      "name": "Livox-SDK2",
+      "ref": "68ae1e1dc77f61f03c95d7c2809831e198d0aedd",
+      "ref_kind": "commit",
+      "regular_bytes": 1820175,
+      "relative_path": "archives/714030981c4bcc9d6dfcf03e34a982d7bdea30c77d47e4f1d090ea49dbabce59/68ae1e1dc77f61f03c95d7c2809831e198d0aedd.tar.gz",
+      "symlink_count": 0,
+      "top_level_root": "Livox-SDK2-68ae1e1dc77f61f03c95d7c2809831e198d0aedd",
+      "url": "https://github.com/Livox-SDK/Livox-SDK2/archive/68ae1e1dc77f61f03c95d7c2809831e198d0aedd.tar.gz"
+    },
+    {
+      "archive": {
+        "format": "tar.gz",
+        "sha256": "fe084727ce0189f94454c7b57a86141b4ab4c311782c79cdee8996bfd73dc0ca",
+        "size": 10856958
+      },
+      "commit": "bf0bc5734dd31c6315ebad907c92c2bb1edc1851",
+      "consumers": [
+        "cpp_dependency"
+      ],
+      "materialized_member_count": 2918,
+      "materialized_regular_bytes": 23797541,
+      "materialized_tree_sha256": "5ed162add4ba4129537180ff40b42d7045469e2fc7104dcdced3f87fade1397f",
+      "member_count": 3902,
+      "name": "ecal",
+      "ref": "v6.1.1",
+      "ref_kind": "tag",
+      "regular_bytes": 23797541,
+      "relative_path": "archives/fe084727ce0189f94454c7b57a86141b4ab4c311782c79cdee8996bfd73dc0ca/v6.1.1.tar.gz",
+      "symlink_count": 0,
+      "top_level_root": "ecal-6.1.1",
+      "url": "https://github.com/eclipse-ecal/ecal/archive/refs/tags/v6.1.1.tar.gz"
+    },
+    {
+      "archive": {
+        "format": "tar.gz",
+        "sha256": "185e2fec89c06bec1abf2e2ededc4be23fc6d5347cc88b992f84074bc3795c76",
+        "size": 166453
+      },
+      "commit": "13eb05e4e6dd7a765b934d0c5fd6236676a57b49",
+      "consumers": [
+        "ros_overlay"
+      ],
+      "materialized_member_count": 103,
+      "materialized_regular_bytes": 899302,
+      "materialized_tree_sha256": "2586418240091e785f586b71f64a16e3572f41b9e03edbbd9991db3610d03d1d",
+      "member_count": 119,
+      "name": "livox_ros_driver2",
+      "ref": "1.2.6",
+      "ref_kind": "tag",
+      "regular_bytes": 899302,
+      "relative_path": "archives/185e2fec89c06bec1abf2e2ededc4be23fc6d5347cc88b992f84074bc3795c76/1.2.6.tar.gz",
+      "symlink_count": 0,
+      "top_level_root": "livox_ros_driver2-1.2.6",
+      "url": "https://github.com/Livox-SDK/livox_ros_driver2/archive/refs/tags/1.2.6.tar.gz"
+    },
+    {
+      "archive": {
+        "format": "tar.gz",
+        "sha256": "64ff3e51119f37ffcfaf9deecbd987a7cb4d4d9035d74a3fd3773395a470fda1",
+        "size": 938333
+      },
+      "commit": "9e7838c3ea51336d84141a80e2ffb15c589d2f54",
+      "consumers": [
+        "cpp_dependency"
+      ],
+      "materialized_member_count": 1516,
+      "materialized_regular_bytes": 4291143,
+      "materialized_tree_sha256": "5b99519cf8cab49f03c649781f4bad4f4ea4bc83bf49b21590f42d1e7a014445",
+      "member_count": 1700,
+      "name": "mcap",
+      "ref": "releases/cpp/v1.4.0",
+      "ref_kind": "tag",
+      "regular_bytes": 4291143,
+      "relative_path": "archives/64ff3e51119f37ffcfaf9deecbd987a7cb4d4d9035d74a3fd3773395a470fda1/v1.4.0.tar.gz",
+      "symlink_count": 0,
+      "top_level_root": "mcap-releases-cpp-v1.4.0",
+      "url": "https://github.com/foxglove/mcap/archive/refs/tags/releases/cpp/v1.4.0.tar.gz"
+    },
+    {
+      "archive": {
+        "format": "tar.gz",
+        "sha256": "de297b929eafcb93747f12f98a196efddf3d55e4edf1b6729018b436d5be594d",
+        "size": 68662907
+      },
+      "commit": "f62c018b4fc7df3dc2c096918a8462a190f28bb8",
+      "consumers": [
+        "validation"
+      ],
+      "materialized_member_count": 3514,
+      "materialized_regular_bytes": 138451231,
+      "materialized_tree_sha256": "a2f579fe614f3e52ecbb018130012b474502a7a041793e800110b4e792f1825a",
+      "member_count": 4082,
+      "name": "pcl",
+      "ref": "pcl-1.14.0",
+      "ref_kind": "tag",
+      "regular_bytes": 138451231,
+      "relative_path": "archives/de297b929eafcb93747f12f98a196efddf3d55e4edf1b6729018b436d5be594d/pcl-1.14.0.tar.gz",
+      "symlink_count": 0,
+      "top_level_root": "pcl-pcl-1.14.0",
+      "url": "https://github.com/PointCloudLibrary/pcl/archive/refs/tags/pcl-1.14.0.tar.gz"
+    },
+    {
+      "archive": {
+        "format": "tar.gz",
+        "sha256": "e825cac584256f88840ab6cf37add69ba0c6145811329d75642698a622d13498",
+        "size": 6890866
+      },
+      "commit": "6e1998413a5bca7c058b85999667893f167434bc",
+      "consumers": [
+        "cpp_dependency"
+      ],
+      "materialized_member_count": 3255,
+      "materialized_regular_bytes": 45196064,
+      "materialized_tree_sha256": "2484743eac7fe27c553b5be4e409684b540ac084f2575d4a056b0989d324cf19",
+      "member_count": 3640,
+      "name": "protobuf",
+      "ref": "v33.6",
+      "ref_kind": "tag",
+      "regular_bytes": 45196064,
+      "relative_path": "archives/e825cac584256f88840ab6cf37add69ba0c6145811329d75642698a622d13498/v33.6.tar.gz",
+      "symlink_count": 0,
+      "top_level_root": "protobuf-33.6",
+      "url": "https://github.com/protocolbuffers/protobuf/archive/refs/tags/v33.6.tar.gz"
+    },
+    {
+      "archive": {
+        "format": "tar.gz",
+        "sha256": "37d7284556b20954e56e1ca85b80226768902e2edabd3b649e9e72c0c9012ee3",
+        "size": 2451884
+      },
+      "commit": "f8745da6ff1ad1e7bab384bd1f9d742439278e99",
+      "consumers": [
+        "cpp_dependency"
+      ],
+      "materialized_member_count": 639,
+      "materialized_regular_bytes": 8355130,
+      "materialized_tree_sha256": "ee2468e57e1eafe4086f857724fbec311122d4251d4e73ced0ff696322375a20",
+      "member_count": 743,
+      "name": "zstd",
+      "ref": "v1.5.7",
+      "ref_kind": "tag",
+      "regular_bytes": 8354806,
+      "relative_path": "archives/37d7284556b20954e56e1ca85b80226768902e2edabd3b649e9e72c0c9012ee3/v1.5.7.tar.gz",
+      "symlink_count": 2,
+      "top_level_root": "zstd-1.5.7",
+      "url": "https://github.com/facebook/zstd/archive/refs/tags/v1.5.7.tar.gz"
+    }
+  ],
+  "schema_version": 1
+}

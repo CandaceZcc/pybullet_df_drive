@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "dependencies": [
+    {
+      "name": "livox_ros_driver2",
+      "url": "https://github.com/Livox-SDK/livox_ros_driver2/archive/refs/tags/1.2.6.tar.gz",
+      "ref_kind": "tag",
+      "ref": "1.2.6",
+      "commit": "13eb05e4e6dd7a765b934d0c5fd6236676a57b49",
+      "license": "MIT",
+      "license_files": ["LICENSE.txt"],
+      "third_party_license_files": ["3rdparty/rapidjson/license.txt"],
+      "consumers": ["ros_overlay"],
+      "archive": {
+        "format": "tar.gz",
+        "size": 166453,
+        "sha256": "185e2fec89c06bec1abf2e2ededc4be23fc6d5347cc88b992f84074bc3795c76"
+      }
+    },
+    {
+      "name": "Livox-SDK2",
+      "url": "https://github.com/Livox-SDK/Livox-SDK2/archive/68ae1e1dc77f61f03c95d7c2809831e198d0aedd.tar.gz",
+      "ref_kind": "commit",
+      "ref": "68ae1e1dc77f61f03c95d7c2809831e198d0aedd",
+      "commit": "68ae1e1dc77f61f03c95d7c2809831e198d0aedd",
+      "license": "MIT",
+      "license_files": ["LICENSE.txt"],
+      "third_party_license_files": [
+        "3rdparty/rapidjson/license.txt",
+        "3rdparty/FastCRC/LICENSE.md",
+        "3rdparty/spdlog/LICENSE",
+        "3rdparty/spdlog/spdlog/fmt/bundled/LICENSE.rst"
+      ],
+      "consumers": ["ros_overlay"],
+      "archive": {
+        "format": "tar.gz",
+        "size": 342723,
+        "sha256": "714030981c4bcc9d6dfcf03e34a982d7bdea30c77d47e4f1d090ea49dbabce59"
+      }
+    }
+  ]
+}
