@@ -4,18 +4,21 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .ipynb_checkpoints/
+.codegraph/
 .superpowers/
 
 .env
 .venv/
 venv/
 
-results/logs/*.csv
-results/logs/*.summary.json
-results/logs/*.jsonl
-results/logs/*.interfaces.bin
-results/figures/*.png
-results/figures/*.pdf
+build/
+
+results/logs/*
+!results/logs/.gitkeep
+results/figures/*
+!results/figures/.gitkeep
+results/stage4/*
+!results/stage4/.gitkeep
 
 references/repos/*
 !references/repos/.gitkeep
