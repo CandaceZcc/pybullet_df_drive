@@ -53,3 +53,131 @@ repositories:
       - scripts/06_navigate_environment.py
       - scripts/10_advanced_navigation.py
       - scripts/pybullet_nav_env.py
+  - name: ecal
+    stage: 4
+    url: https://github.com/eclipse-ecal/ecal.git
+    branch: master
+    commit: e9ca7cf7f3e39696f79c6506eb116f61f8948bc7
+    license: Apache-2.0
+    license_scope: first_party
+    license_files:
+      - LICENSE.txt
+    stars: 1033
+    stars_observed_at: "2026-07-31T07:03:51Z"
+    purpose: Official raw C++ publisher/subscriber, datatype metadata, peer-count, recorder, and CMake reference for stage four.
+    focus:
+      - ecal/core/include/ecal/types.h
+      - ecal/core/include/ecal/pubsub/publisher.h
+      - ecal/core/include/ecal/pubsub/subscriber.h
+      - ecal/samples/cpp/pubsub/binary/blob_send
+      - ecal/samples/cpp/pubsub/binary/blob_receive
+  - name: protobuf
+    stage: 4
+    url: https://github.com/protocolbuffers/protobuf.git
+    branch: main
+    commit: ea6ec8d5b1601c6d4b43c512d36901856ff378e1
+    license: BSD-3-Clause
+    license_scope: first_party
+    license_files:
+      - LICENSE
+    stars: 71666
+    stars_observed_at: "2026-07-31T07:03:51Z"
+    purpose: Official deterministic serialization, descriptor-set generation, and Python/C++ interoperability reference.
+    focus:
+      - src/google/protobuf/io/coded_stream.h
+      - src/google/protobuf/compiler/command_line_interface.cc
+      - src/google/protobuf/descriptor.h
+  - name: mcap
+    stage: 4
+    url: https://github.com/foxglove/mcap.git
+    branch: main
+    commit: 58db4435c68e92c58713d22938639ebe8c0ed2fd
+    license: MIT
+    license_scope: first_party
+    license_files:
+      - LICENSE
+    stars: 1022
+    stars_observed_at: "2026-07-31T07:03:51Z"
+    purpose: Official C++ MCAP writer/reader, raw Protobuf channel, indexing, CRC, and file-rotation reference.
+    focus:
+      - cpp/mcap/include/mcap/writer.hpp
+      - cpp/mcap/include/mcap/reader.hpp
+      - cpp/examples/protobuf/writer.cpp
+      - cpp/examples/rotatemcap.cpp
+  - name: zstd
+    stage: 4
+    url: https://github.com/facebook/zstd.git
+    branch: dev
+    commit: 5c7b7bad26808e6b40ac3b3d0075466e27738a9d
+    license: BSD-3-Clause OR GPL-2.0-only
+    license_scope: first_party
+    license_files:
+      - LICENSE
+      - COPYING
+    stars: 27491
+    stars_observed_at: "2026-07-31T07:03:51Z"
+    purpose: Official deterministic compression, CMake source-build, CLI, and library ABI reference.
+    focus:
+      - build/cmake/CMakeLists.txt
+      - lib/zstd.h
+      - tests/cli-tests/determinism/basic.sh
+  - name: livox_ros_driver2
+    stage: 4
+    url: https://github.com/Livox-SDK/livox_ros_driver2.git
+    branch: master
+    commit: 13eb05e4e6dd7a765b934d0c5fd6236676a57b49
+    license: MIT
+    license_scope: first_party
+    license_files:
+      - LICENSE.txt
+    third_party_license_files:
+      - 3rdparty/rapidjson/license.txt
+    stars: 821
+    stars_observed_at: "2026-07-31T07:03:51Z"
+    purpose: Official MID-360 CustomMsg/CustomPoint, ROS 2 Jazzy conversion, and RViz configuration reference.
+    focus:
+      - msg/CustomPoint.msg
+      - msg/CustomMsg.msg
+      - src/lddc.cpp
+      - package_ROS2.xml
+      - config/display_point_cloud_ROS2.rviz
+  - name: Livox-SDK2
+    stage: 4
+    url: https://github.com/Livox-SDK/Livox-SDK2.git
+    branch: master
+    commit: 68ae1e1dc77f61f03c95d7c2809831e198d0aedd
+    license: MIT
+    license_scope: first_party
+    license_files:
+      - LICENSE.txt
+    third_party_license_files:
+      - 3rdparty/rapidjson/license.txt
+      - 3rdparty/FastCRC/LICENSE.md
+      - 3rdparty/spdlog/LICENSE
+      - 3rdparty/spdlog/spdlog/fmt/bundled/LICENSE.rst
+    stars: 490
+    stars_observed_at: "2026-07-31T07:03:51Z"
+    purpose: Official MID-360 packet, device, SDK build-chain, and configuration semantics reference.
+    focus:
+      - include/livox_lidar_def.h
+      - include/livox_lidar_api.h
+      - CMakeLists.txt
+      - samples/livox_lidar_quick_start/mid360_config.json
+  - name: pcl
+    stage: 4
+    url: https://github.com/PointCloudLibrary/pcl.git
+    branch: master
+    commit: 6a4f535faad59bb22afdcb4becafc2e35e99c711
+    license: BSD-3-Clause
+    license_scope: first_party
+    license_files:
+      - LICENSE.txt
+    stars: 11078
+    stars_observed_at: "2026-07-31T07:03:51Z"
+    purpose: Official independent PCD/PLY reader, writer, and conversion interoperability reference.
+    focus:
+      - io/include/pcl/io/pcd_io.h
+      - io/include/pcl/io/ply_io.h
+      - tools/pcd2ply.cpp
+      - tools/ply2pcd.cpp
+      - test/io/test_ply_io.cpp
