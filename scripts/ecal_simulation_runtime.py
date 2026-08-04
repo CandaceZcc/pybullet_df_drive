@@ -31,6 +31,7 @@ from slope_sim.interfaces.logging import (
     read_interface_log,
 )
 from slope_sim.interfaces.wheel import WheelDecision
+from slope_sim.lidar_worker import LidarServiceSnapshot
 from slope_sim.model_registry import get_robot_model, robot_model_names
 from slope_sim.obstacles import ObstacleGenerationRequest
 from slope_sim.realtime import RuntimeObservationCadence
@@ -51,6 +52,19 @@ _LOGGER_IDLE_TIMEOUT_SEC = 2.0
 _LOGGER_SAMPLE_PERIOD_SEC = 0.100
 _ACTIVE_DRIVE_THRESHOLD_RAD_S = 0.1
 _ACTIVE_FEEDBACK_THRESHOLD_RAD_S = 0.5
+_COMMAND_CALLBACK_SWITCH_INTERVAL_SEC = 0.001
+
+
+def _install_command_callback_scheduling() -> float:
+    """实时窗口收紧 GIL 轮转，避免 LiDAR 后处理饿死命令回调。"""
+    previous = sys.getswitchinterval()
+    sys.setswitchinterval(min(previous, _COMMAND_CALLBACK_SWITCH_INTERVAL_SEC))
+    return previous
+
+
+def _restore_command_callback_scheduling(previous: float) -> None:
+    """恢复调用方线程切换策略，保证同进程重复运行不泄漏全局状态。"""
+    sys.setswitchinterval(previous)
 
 
 def _horizontal_distance(
@@ -273,6 +287,14 @@ class _NormalLoadMotionTracker:
 
 
 @dataclass(frozen=True)
+class _NormalLoadStartCapture:
+    """把正式窗口起点 ACK 前的日志与传输快照绑定。"""
+
+    log_snapshot: InterfaceLogSnapshot
+    transport_snapshot: EcalTransportSnapshot
+
+
+@dataclass(frozen=True)
 class _NormalLoadEndCapture:
     """把正式窗口终点与同一屏障内的日志、传输快照绑定。"""
 
@@ -379,6 +401,26 @@ def _write_ack(path: Path, payload: object = None) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
 
+def _write_final_protocol_ack(
+    runtime: object,
+    transport: EcalTransport,
+    logger: InterfaceEventLogger,
+    path: Path,
+) -> None:
+    """排空传感器、日志和发送 lane 后保持冻结并写最终 ACK。"""
+    fence = runtime.begin_sensor_fence()
+    _wait_for_logger_idle(logger, timeout_sec=_LOGGER_IDLE_TIMEOUT_SEC)
+    transport.wait_idle(timeout_sec=_TRANSPORT_IDLE_TIMEOUT_SEC)
+    snapshot = transport.snapshot()
+    if any(
+        quality.state != "active" or quality.peer_connected is not True
+        for quality in snapshot.topic_quality
+    ):
+        raise RuntimeError("final protocol transport snapshot is not active")
+    _write_ack(path, {"active": True})
+    runtime.complete_sensor_fence(fence, resume_capture=False)
+
+
 def _drive_is_stopped(values: tuple[float, ...]) -> bool:
     return bool(values) and max(abs(value) for value in values) <= _STOP_SPEED_TOLERANCE_RAD_S
 
@@ -432,6 +474,11 @@ def _normal_load_physics_step_due(
     if not math.isfinite(observed_at):
         raise ValueError("normal-load wall time must be finite")
     return observed_at < tracker.start_wall_time + duration
+
+
+def _final_protocol_physics_step_due(final_ack: Path) -> bool:
+    """最终协议 ACK 完整落盘后停步，给 peer 留出静默关闭窗口。"""
+    return _read_marker(final_ack) is None
 
 
 def _wait_for_normal_load_completion_marker(
@@ -566,6 +613,27 @@ def _run_scheduled_physics_frame(
     )
 
 
+def _finish_gated_physics_iteration(
+    frame: _ScheduledPhysicsFrame,
+    *,
+    allow_physics_step: bool,
+    pacer: _DeadlinePacer,
+) -> None:
+    """observation 处理完成后，为关闭的外部门消费本轮墙钟期限。"""
+    if not frame.advanced and not allow_physics_step:
+        pacer.wait_for_next_deadline()
+
+
+def _transport_allows_physics_step(
+    runtime: object,
+    transport: EcalTransport,
+    time_step_sec: float,
+) -> bool:
+    """发送 lane 忙时只挡住会跨发布期限的下一物理步。"""
+    due_topics = runtime.next_physics_step_publish_topics(time_step_sec)
+    return all(transport.is_topic_idle(topic) for topic in due_topics)
+
+
 def _capture_runtime_observation(
     runtime: object,
     transport: EcalTransport,
@@ -596,6 +664,34 @@ def _transport_snapshot_payload(
             }
             for quality in snapshot.topic_quality
         },
+    }
+
+
+def _lidar_service_snapshot_result(runtime: object) -> dict[str, object] | None:
+    """把当前 worker 的固定诊断合同复制进 P0 JSON 结果。"""
+    capture = getattr(runtime, "lidar_service_snapshot", None)
+    if not callable(capture):
+        raise TypeError("runtime must expose lidar_service_snapshot()")
+    snapshot = capture()
+    if snapshot is None:
+        return None
+    if type(snapshot) is not LidarServiceSnapshot:
+        raise TypeError("runtime returned an invalid LiDAR service snapshot")
+    return {
+        "state": snapshot.state,
+        "child_pid": snapshot.child_pid,
+        "lifecycle_generation": snapshot.lifecycle_generation,
+        "pause_epoch": snapshot.pause_epoch,
+        "next_job_id": snapshot.next_job_id,
+        "in_flight_identity": snapshot.in_flight_identity,
+        "pending_capture_identity": snapshot.pending_capture_identity,
+        "completed_count": snapshot.completed_count,
+        "failed_count": snapshot.failed_count,
+        "overrun_count": snapshot.overrun_count,
+        "stale_count": snapshot.stale_count,
+        "max_capture_to_response_ns": snapshot.max_capture_to_response_ns,
+        "last_error_code": snapshot.last_error_code,
+        "last_error_detail": snapshot.last_error_detail,
     }
 
 
@@ -693,6 +789,8 @@ def _wait_for_logger_idle(
         snapshot = logger.snapshot()
         if snapshot.writer_failed:
             raise RuntimeError("interface logger writer failed during normal load")
+        if snapshot.closed:
+            raise RuntimeError("interface logger is closed at marker boundary")
         if snapshot.pending_count == 0:
             return snapshot
         if time.monotonic() >= deadline:
@@ -862,6 +960,38 @@ def _capture_marked_transport_snapshot(
     return snapshot
 
 
+def _capture_normal_load_start(
+    runtime: object,
+    transport: EcalTransport,
+    logger: InterfaceEventLogger,
+    marker: Path,
+    ack: Path,
+    *,
+    before_ack: Callable[[], None] | None = None,
+    ack_fields: Mapping[str, object] | None = None,
+) -> _NormalLoadStartCapture | None:
+    """先收敛传感器和日志，再捕获 start transport 快照并恢复 capture。"""
+    if not marker.exists():
+        return None
+    fence = runtime.begin_sensor_fence()
+    log_snapshot = _wait_for_logger_idle(
+        logger,
+        timeout_sec=_LOGGER_IDLE_TIMEOUT_SEC,
+    )
+    transport_snapshot = _capture_marked_transport_snapshot(
+        transport,
+        marker,
+        ack,
+        before_ack=before_ack,
+        ack_fields=ack_fields,
+    )
+    if transport_snapshot is None:
+        raise RuntimeError("normal-load start transport snapshot is not active")
+    # 只有成功 ACK 后才解除可恢复 fence；异常路径保持停止。
+    runtime.complete_sensor_fence(fence, resume_capture=True)
+    return _NormalLoadStartCapture(log_snapshot, transport_snapshot)
+
+
 def _capture_normal_load_end(
     transport: EcalTransport,
     logger: InterfaceEventLogger,
@@ -872,8 +1002,10 @@ def _capture_normal_load_end(
     end_sim_time_ns: int,
     end_wall_time: float,
     end_position_m: Sequence[float],
+    runtime: object | None = None,
 ) -> _NormalLoadEndCapture:
     """在单一结束屏障内冻结仿真边界、日志和 active transport 快照。"""
+    fence = None if runtime is None else runtime.begin_sensor_fence()
     window_log_snapshot = logger.snapshot()
     accepted = (
         window_log_snapshot.accepted_messages
@@ -894,6 +1026,9 @@ def _capture_normal_load_end(
     )
     if transport_snapshot is None:
         raise RuntimeError("normal-load end transport snapshot is not active")
+    if runtime is not None:
+        # transport helper 已成功写 ACK，随后才允许后测协议继续 capture。
+        runtime.complete_sensor_fence(fence, resume_capture=True)
     return _NormalLoadEndCapture(
         step_count=end_step_count,
         sim_time_ns=end_sim_time_ns,
@@ -902,6 +1037,49 @@ def _capture_normal_load_end(
         log_queue_sample=(window_log_snapshot.pending_count, completed),
         log_snapshot=log_snapshot,
         transport_snapshot=transport_snapshot,
+    )
+
+
+def _bootstrap_normal_load_scene(
+    client_id: int,
+    config: ExperimentConfig,
+    document: object,
+) -> tuple[object, object, object, int, frozenset[int]]:
+    """在 session/worker 启动前完成 P0 20 障碍事务，并冻结完整逻辑文档。"""
+    world, obstacle_manager = build_world_from_scene_document(client_id, config, document)
+    bootstrap_coordinator = SimulationCoordinator(
+        client_id,
+        config,
+        world,
+        obstacle_manager,
+        sensor_document=document.sensors,
+    )
+    add_result = bootstrap_coordinator.apply_action(
+        AddObstaclesAction(ObstacleGenerationRequest("mixed", 20, seed=7301))
+    )
+    obstacle_count = len(obstacle_manager.snapshot())
+    if (
+        add_result.obstacle_result is None
+        or not add_result.obstacle_result.succeeded
+        or obstacle_count != 20
+    ):
+        raise RuntimeError("failed to install exactly twenty normal-load obstacles")
+    obstacle_body_ids = frozenset(
+        snapshot.body_id
+        for snapshot in obstacle_manager.snapshot(include_body_id=True)
+        if snapshot.body_id is not None
+    )
+    if len(obstacle_body_ids) != obstacle_count:
+        raise RuntimeError("normal-load obstacle body IDs are incomplete")
+    runtime_document = bootstrap_coordinator.logical_scene_document()
+    if len(runtime_document.obstacles) != obstacle_count:
+        raise RuntimeError("normal-load logical scene does not match installed obstacles")
+    return (
+        world,
+        obstacle_manager,
+        runtime_document,
+        obstacle_count,
+        obstacle_body_ids,
     )
 
 
@@ -952,10 +1130,19 @@ def run_simulation_runtime(
     log_paths = None
     result: dict[str, object] = {}
     cyclic_gc_was_enabled: bool | None = None
+    previous_thread_switch_interval_sec: float | None = None
     try:
         document = initial_scene_document(config)
-        world, obstacle_manager = build_world_from_scene_document(
-            client_id, config, document
+        (
+            world,
+            obstacle_manager,
+            document,
+            obstacle_count,
+            obstacle_body_ids,
+        ) = _bootstrap_normal_load_scene(
+            client_id,
+            config,
+            document,
         )
         session = create_interface_session(
             config,
@@ -986,25 +1173,6 @@ def run_simulation_runtime(
             sensor_document=document.sensors,
         )
         robot = coordinator.world.active_robot.robot
-        add_result = coordinator.apply_action(
-            AddObstaclesAction(
-                ObstacleGenerationRequest("mixed", 20, seed=7301)
-            )
-        )
-        obstacle_count = len(obstacle_manager.snapshot())
-        if (
-            add_result.obstacle_result is None
-            or not add_result.obstacle_result.succeeded
-            or obstacle_count != 20
-        ):
-            raise RuntimeError("failed to install exactly twenty normal-load obstacles")
-        obstacle_body_ids = frozenset(
-            snapshot.body_id
-            for snapshot in obstacle_manager.snapshot(include_body_id=True)
-            if snapshot.body_id is not None
-        )
-        if len(obstacle_body_ids) != obstacle_count:
-            raise RuntimeError("normal-load obstacle body IDs are incomplete")
 
         scenario_dir.mkdir(parents=True, exist_ok=True)
         ready_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1074,6 +1242,7 @@ def run_simulation_runtime(
         pacer = _DeadlinePacer(config.time_step)
         pacer.start()
         cyclic_gc_was_enabled = _suspend_cyclic_gc()
+        previous_thread_switch_interval_sec = _install_command_callback_scheduling()
         while not stop_file.exists():
             loop_wall_time = time.monotonic()
             if loop_wall_time - started_at >= max_runtime:
@@ -1142,6 +1311,7 @@ def run_simulation_runtime(
                     end_sim_time_ns=runtime.clock.now_ns,
                     end_wall_time=end_barrier_wall_time,
                     end_position_m=end_position,
+                    runtime=runtime,
                 )
                 normal_load_motion_evidence = normal_load_motion_tracker.finish(
                     end_step_count=end_capture.step_count,
@@ -1177,6 +1347,17 @@ def run_simulation_runtime(
                     marker=scenario_dir / "invalid.active",
                     pacer=pacer,
                 )
+            physics_step_due = (
+                fence_step_due
+                and _final_protocol_physics_step_due(
+                    scenario_dir / "new_command.ack"
+                )
+                and _transport_allows_physics_step(
+                    runtime,
+                    transport,
+                    config.time_step,
+                )
+            )
 
             active_tracker = (
                 normal_load_motion_tracker
@@ -1193,7 +1374,7 @@ def run_simulation_runtime(
                 coordinator,
                 config.time_step,
                 observation_cadence=observation_cadence,
-                allow_physics_step=fence_step_due,
+                allow_physics_step=physics_step_due,
                 normal_load_tracker=active_tracker,
                 normal_load_duration_sec=active_duration,
             )
@@ -1224,9 +1405,12 @@ def run_simulation_runtime(
                             }
                         )
                         last_states[topic] = topic_status.state
+            _finish_gated_physics_iteration(
+                frame,
+                allow_physics_step=physics_step_due,
+                pacer=pacer,
+            )
             if not frame.advanced:
-                if not fence_step_due:
-                    pacer.wait_for_next_deadline()
                 continue
             if status is None or dashboard is None or transport_status is None:
                 raise RuntimeError("runtime observation was not initialized")
@@ -1356,10 +1540,6 @@ def run_simulation_runtime(
                     measurement_start_payload,
                     "measurement start marker",
                 )
-                log_start = _wait_for_logger_idle(
-                    logger,
-                    timeout_sec=_LOGGER_IDLE_TIMEOUT_SEC,
-                )
                 start_step_count = physics_steps
                 start_sim_time_ns = runtime.clock.now_ns
                 tracker_holder: list[_NormalLoadMotionTracker] = []
@@ -1382,21 +1562,23 @@ def run_simulation_runtime(
                         )
                     )
 
-                transport_start = _capture_marked_transport_snapshot(
+                start_capture = _capture_normal_load_start(
+                    runtime,
                     transport,
+                    logger,
                     scenario_dir / "measurement_start.active",
                     scenario_dir / "measurement_start.ack",
                     before_ack=begin_motion_window,
                     ack_fields={"window_start_sim_time_ns": start_sim_time_ns},
                 )
-                if transport_start is not None:
+                if start_capture is not None:
                     if len(tracker_holder) != 1:
                         raise RuntimeError("normal-load motion window did not start once")
                     normal_load_motion_tracker = tracker_holder[0]
                     normal_load_requested_duration_sec = requested_duration_sec
                     warmup_requested_sec = requested_warmup_sec
-                    normal_load_start_snapshot = transport_start
-                    normal_load_log_start_snapshot = log_start
+                    normal_load_start_snapshot = start_capture.transport_snapshot
+                    normal_load_log_start_snapshot = start_capture.log_snapshot
                     normal_load_started_at = normal_load_motion_tracker.start_wall_time
                     next_log_sample_at = normal_load_started_at
                     normal_load_sim_started_ns = normal_load_motion_tracker.start_sim_time_ns
@@ -1407,7 +1589,8 @@ def run_simulation_runtime(
                     ) / 1_000_000_000.0
                     warmup_physics_steps = physics_steps
                     warmup_log_accepted_messages = (
-                        log_start.accepted_messages - warmup_started_log.accepted_messages
+                        start_capture.log_snapshot.accepted_messages
+                        - warmup_started_log.accepted_messages
                     )
                     warmup_topic_counts = {
                         topic: topic_status.message_count
@@ -1420,13 +1603,15 @@ def run_simulation_runtime(
                     )
                     normal_load_base_last = normal_load_base_start
                     baseline_accepted = (
-                        log_start.accepted_messages + log_start.accepted_events
+                        start_capture.log_snapshot.accepted_messages
+                        + start_capture.log_snapshot.accepted_events
                     )
                     normal_load_log_samples.append(
                         (
                             0.0,
-                            log_start.pending_count,
-                            baseline_accepted - log_start.pending_count,
+                            start_capture.log_snapshot.pending_count,
+                            baseline_accepted
+                            - start_capture.log_snapshot.pending_count,
                         )
                     )
 
@@ -1600,9 +1785,11 @@ def run_simulation_runtime(
                         disconnected_stopped and reconnect_generation_advanced
                     )
                     accepted_peer_states = topic_states
-                    _write_ack(
+                    _write_final_protocol_ack(
+                        runtime,
+                        transport,
+                        logger,
                         scenario_dir / "new_command.ack",
-                        {"active": True},
                     )
 
             pacer.wait_for_next_deadline()
@@ -1660,6 +1847,7 @@ def run_simulation_runtime(
             if len(normal_load_steering_peaks) >= 2
             else 0.0
         )
+        lidar_service_snapshot_result = _lidar_service_snapshot_result(runtime)
         result = {
             **normal_load_motion_evidence,
             "transport": "ecal",
@@ -1675,6 +1863,7 @@ def run_simulation_runtime(
             "reconnect_generation_advanced": reconnect_generation_advanced,
             "mailbox_generation_before_disconnect": mailbox_generation_before_disconnect,
             "mailbox_generation_after_disconnect": mailbox_generation_after_disconnect,
+            "lidar_service_snapshot": lidar_service_snapshot_result,
             "normal_load_obstacle_count": obstacle_count,
             "normal_load_log_sample_count": len(normal_load_log_samples),
             "normal_load_log_samples": normal_load_log_samples,
@@ -1744,6 +1933,10 @@ def run_simulation_runtime(
             ),
         }
     finally:
+        if previous_thread_switch_interval_sec is not None:
+            _restore_command_callback_scheduling(
+                previous_thread_switch_interval_sec,
+            )
         if cyclic_gc_was_enabled is not None:
             _restore_cyclic_gc(cyclic_gc_was_enabled)
         close_error: BaseException | None = None

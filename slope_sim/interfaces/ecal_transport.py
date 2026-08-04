@@ -25,6 +25,7 @@ from slope_sim.interfaces.transport import (
 )
 
 
+_UINT32_MAX = (1 << 32) - 1
 _UINT64_MAX = (1 << 64) - 1
 _ROLES = frozenset({"simulation", "peer"})
 _STOPPING_STATES = frozenset({"quiescing", "quiesced", "closing", "closed"})
@@ -193,6 +194,11 @@ class EcalBindings:
         required = (
             (core, "initialize", "eCAL core.initialize"),
             (core, "finalize", "eCAL core.finalize"),
+            (
+                core,
+                "get_publisher_configuration",
+                "eCAL core.get_publisher_configuration",
+            ),
             (proto_core, "Publisher", "eCAL proto Publisher"),
             (proto_core, "Subscriber", "eCAL proto Subscriber"),
             (common_core, "ReceiveCallbackData", "eCAL ReceiveCallbackData"),
@@ -212,11 +218,27 @@ class EcalBindings:
         self,
         topic: str,
         message_type: type[Message],
+        *,
+        shm_buffer_count: int,
+        acknowledge_timeout_ms: int,
     ) -> _ProtoResource:
-        """创建绑定到固定 Protobuf 类的真实 publisher。"""
+        """创建使用有界 SHM ring 与 subscriber ACK 的真实 publisher。"""
+        buffer_count = _require_queue_size(shm_buffer_count)
+        ack_timeout_ms = _require_uint32(
+            "acknowledge_timeout_ms",
+            acknowledge_timeout_ms,
+        )
+        publisher_config = self.core.get_publisher_configuration()
+        try:
+            publisher_config.layer.shm.acknowledge_timeout_ms = ack_timeout_ms
+            publisher_config.layer.shm.memfile_buffer_count = buffer_count
+        except AttributeError as error:
+            raise RuntimeError(
+                "eCAL publisher SHM configuration is unavailable"
+            ) from error
         publisher_type = self.proto_core.Publisher
         return _ProtoResource(
-            publisher_type(message_type, topic),
+            publisher_type(message_type, topic, publisher_config),
             direction="publisher",
         )
 
@@ -367,9 +389,39 @@ def _require_wall_time(name: str, value: object) -> float:
 
 
 def _require_queue_size(value: object) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        raise ValueError("queue_size must be a positive integer")
+    return _require_positive_uint32("queue_size", value)
+
+
+def _require_positive_uint32(name: str, value: object) -> int:
+    """校验写入 eCAL 原生 unsigned int 配置的正整数。"""
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 0 < value <= _UINT32_MAX
+    ):
+        raise ValueError(f"{name} must be a positive uint32 integer")
     return value
+
+
+def _require_uint32(name: str, value: object) -> int:
+    """校验允许零值关闭功能的 eCAL unsigned int 配置。"""
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 0 <= value <= _UINT32_MAX
+    ):
+        raise ValueError(f"{name} must be a uint32 integer")
+    return value
+
+
+def publisher_acknowledge_timeout_ms(config: InterfaceConfig) -> int:
+    """以命令 watchdog 为 ACK 等待上限，并向上取整到原生毫秒。"""
+    if not isinstance(config, InterfaceConfig):
+        raise ValueError("config must be an InterfaceConfig")
+    return _require_positive_uint32(
+        "acknowledge_timeout_ms",
+        math.ceil(config.command_timeout_sec * 1_000.0),
+    )
 
 
 def _error_detail(error: BaseException) -> str:
@@ -459,6 +511,11 @@ class EcalTransport:
         self._bindings = load_ecal_bindings() if bindings is None else bindings
         self._monotonic = monotonic
         self._queue_size = _require_queue_size(selected_queue_size)
+        self._acknowledge_timeout_ms = (
+            publisher_acknowledge_timeout_ms(selected_config)
+            if role == "peer"
+            else 0
+        )
         self._role = role
         self._peer_state_callback = peer_state_callback
         self._condition = Condition()
@@ -535,6 +592,8 @@ class EcalTransport:
                 resource = self._bindings.create_publisher(
                     channel.topic,
                     channel.message_type,
+                    shm_buffer_count=self._queue_size,
+                    acknowledge_timeout_ms=self._acknowledge_timeout_ms,
                 )
                 self._publisher_resources.append((channel, resource))
                 self._publisher_by_topic[channel.topic] = (channel, resource)
@@ -771,6 +830,26 @@ class EcalTransport:
         with self._condition:
             pending = self._pending.get(normalized_topic)
             return None if pending is None else bytes(pending.payload)
+
+    def is_idle(self) -> bool:
+        """只读判断所有 publisher lane 是否没有 ready、latest 或 native in-flight。"""
+        with self._condition:
+            self._require_open_locked()
+            return not self._pending and not self._claimed_pending
+
+    def is_topic_idle(self, topic: str) -> bool:
+        """只读判断指定 publisher lane 是否没有 pending 或 native in-flight。"""
+        normalized_topic = _require_nonempty_text("topic", topic)
+        with self._condition:
+            self._require_open_locked()
+            if normalized_topic not in self._publisher_by_topic:
+                raise ValueError(
+                    f"topic {normalized_topic!r} is not configured for publish"
+                )
+            return (
+                normalized_topic not in self._pending
+                and normalized_topic not in self._claimed_pending
+            )
 
     def wait_idle(self, *, timeout_sec: float) -> None:
         """有界等待 pending 与 worker 已认领帧全部发送完成。"""

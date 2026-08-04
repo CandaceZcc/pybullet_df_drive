@@ -548,18 +548,26 @@ class MultiLineLidar:
             () if accepted_world_points is None else tuple(accepted_world_points)
         )
 
-    def scan_with_top_view(self, timebase_ns: int) -> LidarScanResult:
-        """用一次射线批次同步生成雷达局部点云和 base_link 俯视帧。"""
+    def _scan_frozen(
+        self,
+        timebase_ns: int,
+        world_mount_pose: Pose,
+        base_pose: Pose | None = None,
+    ) -> LidarPointCloud | LidarScanResult:
+        """使用调用方冻结的世界位姿扫描，避免读取后端当前姿态。"""
         scan_time = _require_uint64("timebase_ns", timebase_ns)
-        mount = self._world_mount()
-        base_pose = self._backend.world_pose("base_link")
-        if not isinstance(base_pose, Pose):
-            raise RuntimeError("sensor backend world_pose must return Pose")
+        if type(world_mount_pose) is not Pose:
+            raise ValueError("world_mount_pose must be an exact Pose")
+        if base_pose is not None and type(base_pose) is not Pose:
+            raise ValueError("base_pose must be an exact Pose when provided")
         message, accepted_world_points = self._scan_message_at_mount(
             scan_time,
-            mount,
-            capture_world_points=True,
+            world_mount_pose,
+            capture_world_points=base_pose is not None,
         )
+        if base_pose is None:
+            return message
+
         # 只转换企业点云已接受的同一批 world hit，天然保持 message 严格同序。
         raw_base_points = self._backend.inverse_transform_points(
             base_pose,
@@ -584,12 +592,22 @@ class MultiLineLidar:
         )
         return LidarScanResult(message, top_view)
 
+    def scan_with_top_view(self, timebase_ns: int) -> LidarScanResult:
+        """用一次射线批次同步生成雷达局部点云和 base_link 俯视帧。"""
+        scan_time = _require_uint64("timebase_ns", timebase_ns)
+        mount = self._world_mount()
+        base_pose = self._backend.world_pose("base_link")
+        if not isinstance(base_pose, Pose):
+            raise RuntimeError("sensor backend world_pose must return Pose")
+        result = self._scan_frozen(scan_time, mount, base_pose)
+        if type(result) is not LidarScanResult:
+            raise RuntimeError("frozen lidar dashboard scan returned an unexpected result")
+        return result
+
     def scan(self, timebase_ns: int) -> LidarPointCloud:
         """生成企业点云，不构造仅供 Dashboard 使用的 base_link 俯视帧。"""
         scan_time = _require_uint64("timebase_ns", timebase_ns)
-        message, _world_points = self._scan_message_at_mount(
-            scan_time,
-            self._world_mount(),
-            capture_world_points=False,
-        )
-        return message
+        result = self._scan_frozen(scan_time, self._world_mount())
+        if type(result) is not LidarPointCloud:
+            raise RuntimeError("frozen lidar message scan returned an unexpected result")
+        return result

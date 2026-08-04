@@ -30,6 +30,7 @@ from slope_sim.interfaces.transport import (
 from slope_sim.lidar_pointcloud import LidarScanResult
 from slope_sim.model_registry import RobotModelSpec, get_robot_model
 from slope_sim.scene_config import SceneDocument, SensorDocument, TerrainDocument
+from slope_sim.sensor_backend import Pose
 
 
 class FakeMonotonic:
@@ -103,7 +104,13 @@ class FakeRobot:
 class FakeTransport:
     """可注入发布和关闭结果的线程安全窄传输。"""
 
-    def __init__(self, publish_outcomes: tuple[object, ...] = ()) -> None:
+    def __init__(
+        self,
+        publish_outcomes: tuple[object, ...] = (),
+        *,
+        mode: str = "local",
+    ) -> None:
+        self.mode = mode
         self.publish_outcomes = deque(publish_outcomes)
         self.topic_publish_outcomes: dict[str, deque[object]] = {}
         self.published: list[tuple[str, bytes, str, int, float | None]] = []
@@ -151,8 +158,8 @@ class FakeTransport:
 
     def snapshot(self) -> TransportSnapshot:
         return TransportSnapshot(
-            mode="local",
-            ecal_connected=False,
+            mode=self.mode,
+            ecal_connected=self.mode == "ecal",
             published_count=len(self.published),
             received_count=0,
             error_count=0,
@@ -281,6 +288,39 @@ class DashboardBackend:
         pass
 
 
+class HeldLidarService:
+    """用事件控制 prepared 结果可见性，模拟仍在扫描的异步 worker。"""
+
+    def __init__(self) -> None:
+        self.capture_entered = Event()
+        self.result_release = Event()
+        self.captures: list[dict[str, object]] = []
+        self.poll_count = 0
+        self.close_count = 0
+
+    def capture(self, **capture: object) -> bool:
+        self.captures.append(capture)
+        self.capture_entered.set()
+        return True
+
+    def poll(self) -> None:
+        self.poll_count += 1
+        return None
+
+    def close(self) -> None:
+        self.close_count += 1
+
+
+class FrozenMountLidar:
+    """process-mode 测试只暴露冻结安装位姿，不允许父进程执行扫描。"""
+
+    def __init__(self, pose: Pose) -> None:
+        self.pose = pose
+
+    def _world_mount(self) -> Pose:
+        return self.pose
+
+
 def _dashboard_scene_document() -> SceneDocument:
     return SceneDocument(
         1,
@@ -389,6 +429,185 @@ def test_three_240_hz_steps_apply_command_and_publish_first_actual_state_at_10_m
             ((3.0, -2.0), (), 1.0 / 240.0),
             ((3.0, -2.0), (), 1.0 / 240.0),
         ]
+    finally:
+        runtime.close()
+
+
+def test_next_physics_step_publish_topics_preview_is_non_mutating() -> None:
+    """预览只报告下一步的到期话题，不得提前推进时钟或 scheduler。"""
+    clock = FakeMonotonic()
+    robot = FakeRobot(actual_drive=(2.7, -1.8))
+    transport = FakeTransport()
+    runtime = _make_runtime(robot, clock, transport)
+    time_step_sec = 1.0 / 240.0
+    try:
+        assert runtime.next_physics_step_publish_topics(time_step_sec) == ()
+        assert runtime.next_physics_step_publish_topics(time_step_sec) == ()
+        assert runtime.clock.now_ns == 0
+
+        assert runtime.after_physics_step(time_step_sec) == ()
+        assert runtime.next_physics_step_publish_topics(time_step_sec) == ()
+        assert runtime.after_physics_step(time_step_sec) == ()
+
+        expected_wheel_topic = (runtime.config.wheel_state.topic,)
+        assert runtime.next_physics_step_publish_topics(time_step_sec) == (
+            expected_wheel_topic
+        )
+        assert runtime.next_physics_step_publish_topics(time_step_sec) == (
+            expected_wheel_topic
+        )
+        assert runtime.clock.now_ns == 8_333_333
+        assert robot.read_timestamps == []
+        assert transport.published == []
+
+        states = runtime.after_physics_step(time_step_sec)
+        assert [state.timestamp_ns for state in states] == [10_000_000]
+        assert runtime.clock.now_ns == 12_500_000
+
+        assert runtime.next_physics_step_publish_topics(0.1) == expected_wheel_topic
+        _attach_dashboard_sensors(runtime)
+        expected_output_topics = tuple(
+            channel.topic
+            for channel in runtime.config.channels
+            if channel.direction == "publish"
+        )
+        predicted_topics = runtime.next_physics_step_publish_topics(0.1)
+        assert predicted_topics == expected_output_topics
+        assert runtime.clock.now_ns == 12_500_000
+
+        published_before = len(transport.published)
+        runtime.after_physics_step(0.1)
+        actual_topics = tuple(
+            dict.fromkeys(
+                event[0] for event in transport.published[published_before:]
+            )
+        )
+        assert actual_topics == predicted_topics
+    finally:
+        runtime.close()
+
+
+def test_async_lidar_capture_does_not_wait_before_next_wheel_deadline() -> None:
+    """worker 结果未就绪时，下一次 100 Hz 轮子期限仍必须按帧返回。"""
+    clock = FakeMonotonic()
+    service = HeldLidarService()
+    transport = FakeTransport(mode="ecal")
+    runtime = _runtime_type()(
+        FakeRobot(actual_drive=(1.0, 2.0)),
+        config=InterfaceConfig.default(transport_mode="ecal"),
+        transport=transport,
+        monotonic=clock,
+        sensor_backend=DashboardBackend(),
+        scene_document=_dashboard_scene_document(),
+        capture_lidar_top_view=False,
+        lidar_scan_service=service,
+    )
+    runtime._front_lidar = FrozenMountLidar(
+        Pose((1.0, 0.0, 0.8), (0.0, 0.0, 0.0, 1.0))
+    )
+    runtime._rear_lidar = FrozenMountLidar(
+        Pose((-1.0, 0.0, 0.8), (0.0, 0.0, 1.0, 0.0))
+    )
+    frame_returned = Event()
+    emitted: list[WheelState] = []
+    errors: list[BaseException] = []
+
+    def run_through_next_wheel_deadline() -> None:
+        try:
+            runtime.after_physics_step(0.05)
+            emitted.extend(runtime.after_physics_step(0.01))
+        except BaseException as exc:  # pragma: no cover - 汇合后断言
+            errors.append(exc)
+        finally:
+            frame_returned.set()
+
+    frame_thread = Thread(target=run_through_next_wheel_deadline, daemon=True)
+    try:
+        frame_thread.start()
+        assert service.capture_entered.wait(timeout=2.0)
+        assert not service.result_release.is_set()
+        assert frame_returned.wait(timeout=0.5)
+        assert errors == []
+        assert emitted[-1].timestamp_ns == 60_000_000
+        assert service.result_release.is_set() is False
+    finally:
+        service.result_release.set()
+        frame_thread.join(timeout=2.0)
+        runtime.close()
+
+
+@pytest.mark.parametrize("requested_mode", ("local", "auto"))
+def test_actual_local_transport_rejects_async_lidar_service_without_using_it(
+    requested_mode: str,
+) -> None:
+    """异步 LiDAR 只属于实际 eCAL transport，构造失败前 service 仍归入口所有。"""
+    service = HeldLidarService()
+    transport = FakeTransport(mode="local")
+    runtime = None
+    try:
+        with pytest.raises(
+            ValueError,
+            match="lidar_scan_service requires actual transport mode 'ecal'",
+        ):
+            runtime = _runtime_type()(
+                FakeRobot(),
+                config=InterfaceConfig.default(transport_mode=requested_mode),
+                transport=transport,
+                sensor_backend=DashboardBackend(),
+                scene_document=_dashboard_scene_document(),
+                lidar_scan_service=service,
+            )
+    finally:
+        if runtime is not None:
+            runtime.close()
+
+    assert service.poll_count == 0
+    assert service.captures == []
+    assert service.close_count == 0
+    assert transport.close_count == 1
+
+
+def test_process_mode_preview_excludes_unprepared_lidar_topic() -> None:
+    """process 模式预览只报告本帧能同步发布的 wheel/RTK/IMU。"""
+    service = HeldLidarService()
+    runtime = _runtime_type()(
+        FakeRobot(),
+        config=InterfaceConfig.default(transport_mode="ecal"),
+        transport=FakeTransport(mode="ecal"),
+        sensor_backend=DashboardBackend(),
+        scene_document=_dashboard_scene_document(),
+        lidar_scan_service=service,
+    )
+    try:
+        assert runtime.next_physics_step_publish_topics(0.1) == (
+            runtime.config.wheel_state.topic,
+            runtime.config.rtk.topic,
+            runtime.config.imu.topic,
+        )
+        assert service.poll_count == 0
+    finally:
+        runtime.close()
+
+
+def test_async_lidar_polls_once_at_frame_head_and_tail() -> None:
+    """一帧只在 before 开头和 after 结尾各执行一次非阻塞 poll。"""
+    service = HeldLidarService()
+    clock = FakeMonotonic()
+    runtime = _runtime_type()(
+        FakeRobot(),
+        config=InterfaceConfig.default(transport_mode="ecal"),
+        transport=FakeTransport(mode="ecal"),
+        monotonic=clock,
+        sensor_backend=DashboardBackend(),
+        scene_document=_dashboard_scene_document(),
+        lidar_scan_service=service,
+    )
+    try:
+        runtime.before_physics_step(0.001, wall_time=clock())
+        assert service.poll_count == 1
+
+        runtime.after_physics_step(0.001)
+        assert service.poll_count == 2
     finally:
         runtime.close()
 

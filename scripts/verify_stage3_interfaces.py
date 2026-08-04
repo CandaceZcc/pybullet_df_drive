@@ -85,7 +85,7 @@ from slope_sim.scene_config import (
 )
 from slope_sim.sensor_backend import Pose, PyBulletSensorBackend, RayHit
 from slope_sim.simulation import initial_scene_document, run_interface_physics_frame
-from slope_sim.realtime import RuntimeObservationCadence
+from slope_sim.realtime import DeadlinePacer, RuntimeObservationCadence
 from slope_sim.truth_sensors import MountPose, SensorMounts, TruthSensorSuite, wrap_angle
 
 
@@ -1805,7 +1805,12 @@ def run_twenty_obstacle_queue_performance_check(
                     log_baseline: InterfaceLogSnapshot | None = None,
                 ):
                     started_at = time.perf_counter()
-                    deadline = started_at
+                    pacer = DeadlinePacer(
+                        TIME_STEP,
+                        monotonic=time.perf_counter,
+                        sleep=time.sleep,
+                    )
+                    pacer.start()
                     ended_at = started_at + duration_sec
                     next_sample = started_at
                     last_dashboard = started_at
@@ -1858,10 +1863,7 @@ def run_twenty_obstacle_queue_performance_check(
                                 next_sample = (
                                     event_at + PERFORMANCE_LOG_SAMPLE_PERIOD_SEC
                                 )
-                        deadline += TIME_STEP
-                        delay = deadline - time.perf_counter()
-                        if delay > 0.0:
-                            time.sleep(delay)
+                        pacer.wait_for_next_deadline()
                     if collect:
                         # 排空前保留窗口终点，避免漏掉最后恰满一秒的停滞。
                         capture_log_sample(time.perf_counter())

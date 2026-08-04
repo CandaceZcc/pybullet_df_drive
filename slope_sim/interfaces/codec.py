@@ -122,6 +122,9 @@ _TYPE_NAMES = {
     ImuAttitude: "slope_sim.interfaces.v1.ImuAttitude",
 }
 
+# 已编码 LiDAR bytes 的无解码发布路径使用同一权威 type name，避免各 runtime 重写字面量。
+LIDAR_POINT_CLOUD_TYPE_NAME = _TYPE_NAMES[LidarPointCloud]
+
 
 class ProtoCodec:
     """显式编解码五种可独立传输的企业接口消息。"""

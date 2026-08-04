@@ -31,6 +31,7 @@ from slope_sim.interfaces.models import (
     WheelCommand,
     WheelState,
 )
+from slope_sim.lidar_worker import LidarServiceSnapshot
 
 
 CONFIG = InterfaceConfig.default(transport_mode="ecal")
@@ -211,6 +212,115 @@ def test_simulation_peer_builds_commands_for_the_selected_robot_model(
     assert len(command.drive_wheel_speed_rad_s) == drive_count
     assert len(command.steering_wheel_speed_rad_s) == steering_count
     assert all(value > 0.0 for value in command.drive_wheel_speed_rad_s)
+
+
+def test_simulation_peer_marks_ready_only_after_all_resources_are_discovered(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """共同 start 门闩打开前，peer ready 必须已经代表完整六话题发现。"""
+
+    class StopAtStart(RuntimeError):
+        pass
+
+    class Bindings:
+        def __init__(self) -> None:
+            self.discovery_calls = 0
+            self.closed: list[object] = []
+
+        @staticmethod
+        def create_participant(_name: str) -> object:
+            return object()
+
+        @staticmethod
+        def create_subscriber(
+            _topic: str,
+            _message_type: type,
+            _callback,
+        ) -> object:
+            return object()
+
+        def is_peer_connected(self, _resource: object) -> bool:
+            self.discovery_calls += 1
+            return True
+
+        def close(self, resource: object) -> None:
+            self.closed.append(resource)
+
+    bindings = Bindings()
+    ready_file = tmp_path / "peer.ready"
+
+    monkeypatch.setattr(peer_script, "load_ecal_bindings", lambda: bindings)
+    monkeypatch.setattr(
+        peer_script,
+        "_create_command_publisher",
+        lambda _bindings, _config: object(),
+    )
+    monkeypatch.setattr(
+        peer_script,
+        "_official_output_message_types",
+        lambda: {"/sim/test/output": object},
+    )
+
+    def stop_after_ready(_start_file, _timeout_sec: float) -> None:
+        assert ready_file.read_text(encoding="utf-8") == "ready\n"
+        assert bindings.discovery_calls == 2
+        raise StopAtStart("stop after readiness assertion")
+
+    monkeypatch.setattr(peer_script, "_wait_for_start", stop_after_ready)
+
+    with pytest.raises(StopAtStart, match="stop after readiness assertion"):
+        peer_script.run_simulation_peer(
+            result_json=tmp_path / "peer-result.json",
+            scenario_dir=tmp_path / "scenario",
+            duration_sec=1.0,
+            warmup_sec=1.0,
+            participant_name="ready-after-discovery",
+            ready_file=ready_file,
+            start_file=tmp_path / "start.signal",
+            start_timeout_sec=1.0,
+        )
+
+    assert len(bindings.closed) == 3
+
+
+def test_simulation_peer_waits_for_output_data_plane_before_warmup() -> None:
+    """控制面发现后，warmup 前仍须看到五话题的真实 output 回调。"""
+    wait_for_output_delivery = getattr(
+        peer_script,
+        "_wait_for_output_delivery",
+        None,
+    )
+    assert callable(
+        wait_for_output_delivery
+    ), "simulation peer needs an output data-plane preflight"
+
+    first_topic = CONFIG.wheel_state.topic
+    second_topic = CONFIG.lidar_front.topic
+    received = {first_topic: [], second_topic: []}
+    clock = {"now": 0.0}
+    deliveries = iter((first_topic, second_topic))
+
+    def sleep(duration: float) -> None:
+        clock["now"] += duration
+        try:
+            received[next(deliveries)].append({"timestamp_ns": 1})
+        except StopIteration:
+            pass
+
+    wait_for_output_delivery(
+        received,
+        Lock(),
+        (first_topic, second_topic),
+        timeout_sec=1.0,
+        monotonic=lambda: clock["now"],
+        sleep=sleep,
+    )
+
+    source = inspect.getsource(peer_script.run_simulation_peer)
+    assert source.index("_wait_for_output_delivery(") < source.index(
+        "warmup_events, _warmup_start, _warmup_end = _run_v61_command_schedule("
+    )
 
 
 def test_simulation_children_receive_the_same_differential_robot_model(
@@ -593,6 +703,123 @@ def test_fence_pause_keeps_discovery_observation_without_physics_step() -> None:
     assert frame.advanced is False
 
 
+def test_transport_busy_iterations_keep_safety_checks_and_consume_deadlines() -> None:
+    """发送 lane 忙时逐轮停物理并推进 deadline，空闲后只恢复一帧。"""
+    calls: list[str] = []
+
+    class Runtime:
+        def poll_transport(self) -> None:
+            calls.append("poll")
+
+        def before_physics_step(self, _dt: float, *, wall_time: float):
+            calls.append(f"before:{wall_time:.3f}")
+            return object()
+
+        def after_physics_step(self, _dt: float):
+            calls.append("publish")
+            return (object(),)
+
+    class Coordinator:
+        def step(self, _dt: float) -> None:
+            calls.append("step")
+
+    class Pacer:
+        def wait_for_next_deadline(self) -> None:
+            calls.append("wait")
+
+    run_frame = getattr(
+        runtime_script,
+        "_run_scheduled_physics_frame",
+        None,
+    )
+    finish_iteration = getattr(
+        runtime_script,
+        "_finish_gated_physics_iteration",
+        None,
+    )
+    assert callable(run_frame), "runtime needs one testable scheduled frame"
+    assert callable(finish_iteration), "runtime needs one testable gated frame tail"
+
+    cadence = runtime_script.RuntimeObservationCadence(monotonic=lambda: 20.0)
+    runtime = Runtime()
+    coordinator = Coordinator()
+    pacer = Pacer()
+    frames = []
+    for allow_physics_step in (False, False, True):
+        frame = run_frame(
+            runtime,
+            coordinator,
+            1.0 / 240.0,
+            observation_cadence=cadence,
+            allow_physics_step=allow_physics_step,
+        )
+        finish_iteration(
+            frame,
+            allow_physics_step=allow_physics_step,
+            pacer=pacer,
+        )
+        frames.append(frame)
+
+    assert [frame.advanced for frame in frames] == [False, False, True]
+    assert calls == [
+        "poll",
+        "before:20.000",
+        "wait",
+        "before:20.000",
+        "wait",
+        "before:20.000",
+        "step",
+        "publish",
+    ]
+
+
+def test_busy_transport_blocks_only_due_topics_with_busy_lanes() -> None:
+    """LiDAR lane 忙不能阻断 wheel-only 帧，只阻断同话题再次到期的帧。"""
+    calls: list[str] = []
+
+    class Runtime:
+        def __init__(self, topics: tuple[str, ...]) -> None:
+            self.topics = topics
+
+        def next_physics_step_publish_topics(
+            self,
+            time_step_sec: float,
+        ) -> tuple[str, ...]:
+            assert time_step_sec == pytest.approx(1.0 / 240.0)
+            calls.append(f"preview:{','.join(self.topics)}")
+            return self.topics
+
+    class Transport:
+        def __init__(self, busy_topics: set[str]) -> None:
+            self.busy_topics = busy_topics
+
+        def is_topic_idle(self, topic: str) -> bool:
+            calls.append(f"idle:{topic}")
+            return topic not in self.busy_topics
+
+        def is_idle(self) -> bool:
+            raise AssertionError("cadence gate must not consult global transport state")
+
+    allows_step = getattr(
+        runtime_script,
+        "_transport_allows_physics_step",
+        None,
+    )
+    assert callable(allows_step), "runtime needs a cadence-aware transport gate"
+
+    busy_lidar = Transport({"lidar"})
+    assert allows_step(Runtime(()), busy_lidar, 1.0 / 240.0) is True
+    assert allows_step(Runtime(("wheel",)), busy_lidar, 1.0 / 240.0) is True
+    assert allows_step(Runtime(("lidar",)), busy_lidar, 1.0 / 240.0) is False
+    assert calls == [
+        "preview:",
+        "preview:wheel",
+        "idle:wheel",
+        "preview:lidar",
+        "idle:lidar",
+    ]
+
+
 def test_runtime_observation_reuses_dashboard_status_without_duplicate_snapshot() -> None:
     """headless 门禁只构造一次组合 status，并保留逐话题 peer 原始快照。"""
     calls: list[str] = []
@@ -629,25 +856,126 @@ def test_runtime_observation_reuses_dashboard_status_without_duplicate_snapshot(
     assert calls == ["dashboard", "transport"]
 
 
+def test_runtime_result_serializes_current_lidar_service_snapshot() -> None:
+    """P0 result 固定保存当前 worker 的全部生命周期诊断字段。"""
+    snapshot = LidarServiceSnapshot(
+        "draining",
+        42,
+        3,
+        2,
+        8,
+        (7, 3, 2, "lidar_front", 900_000_000),
+        (3, 2, "lidar_rear", 950_000_000),
+        4,
+        1,
+        2,
+        3,
+        80_000_000,
+        "worker_protocol_failed",
+        "response mismatch",
+    )
+
+    class Runtime:
+        def lidar_service_snapshot(self) -> LidarServiceSnapshot:
+            return snapshot
+
+    serialize = getattr(runtime_script, "_lidar_service_snapshot_result", None)
+    assert callable(serialize), "runtime result needs LiDAR service diagnostics"
+    assert serialize(Runtime()) == {
+        "state": "draining",
+        "child_pid": 42,
+        "lifecycle_generation": 3,
+        "pause_epoch": 2,
+        "next_job_id": 8,
+        "in_flight_identity": (7, 3, 2, "lidar_front", 900_000_000),
+        "pending_capture_identity": (3, 2, "lidar_rear", 950_000_000),
+        "completed_count": 4,
+        "failed_count": 1,
+        "overrun_count": 2,
+        "stale_count": 3,
+        "max_capture_to_response_ns": 80_000_000,
+        "last_error_code": "worker_protocol_failed",
+        "last_error_detail": "response mismatch",
+    }
+
+    class RuntimeWithoutService:
+        def lidar_service_snapshot(self) -> None:
+            return None
+
+    assert serialize(RuntimeWithoutService()) is None
+
+
+@pytest.mark.parametrize(
+    ("previous_interval", "installed_interval"),
+    (
+        (0.005, runtime_script._COMMAND_CALLBACK_SWITCH_INTERVAL_SEC),
+        (0.0005, 0.0005),
+    ),
+)
+def test_command_callback_scheduling_restores_exact_previous_interval(
+    monkeypatch,
+    previous_interval: float,
+    installed_interval: float,
+) -> None:
+    """实时窗口只收紧调度，并在退出时精确恢复调用方原值。"""
+    set_calls: list[float] = []
+    monkeypatch.setattr(
+        runtime_script.sys,
+        "getswitchinterval",
+        lambda: previous_interval,
+    )
+    monkeypatch.setattr(runtime_script.sys, "setswitchinterval", set_calls.append)
+
+    saved_interval = runtime_script._install_command_callback_scheduling()
+    runtime_script._restore_command_callback_scheduling(saved_interval)
+
+    assert saved_interval == previous_interval
+    assert set_calls == [installed_interval, previous_interval]
+
+
 def test_simulation_runtime_main_loop_uses_scheduled_observation_and_boundaries() -> None:
     """真实入口必须接入低频观测和成对仿真时钟屏障，不能只留下孤立 helper。"""
     source = inspect.getsource(runtime_script.run_simulation_runtime)
     frame_source = inspect.getsource(runtime_script._run_scheduled_physics_frame)
+    frame_tail_source = inspect.getsource(
+        runtime_script._finish_gated_physics_iteration
+    )
 
     assert "_prepare_scheduled_physics_step(" in frame_source
     assert "observation_cadence.poll_if_due(" in inspect.getsource(
         runtime_script._prepare_physics_step
     )
     assert "_run_scheduled_physics_frame(" in source
+    scheduling_install = (
+        "previous_thread_switch_interval_sec = "
+        "_install_command_callback_scheduling()"
+    )
+    assert scheduling_install in source
+    assert source.index(scheduling_install) < source.index(
+        "while not stop_file.exists():"
+    )
+    assert "if previous_thread_switch_interval_sec is not None:" in source
+    assert source.rindex("finally:") < source.rindex(
+        "_restore_command_callback_scheduling("
+    )
+    assert "pacer.wait_for_next_deadline()" in frame_tail_source
     assert "RuntimeObservationCadence()" in source
     assert "_capture_runtime_observation(" in source
     assert "_begin_normal_load_motion_window(" in source
     assert "_capture_normal_load_end(" in source
     assert "_WheelDrainFenceGate(" in source
     assert "_wheel_drain_physics_step_due(" in source
+    assert "_write_final_protocol_ack(" in source
+    assert "_final_protocol_physics_step_due(" in source
+    assert "_transport_allows_physics_step(" in source
+    assert "and transport.is_idle()" not in source
+    assert "allow_physics_step=physics_step_due" in source
     assert "_wait_for_normal_load_completion_marker(" in source
     assert source.index("_wait_for_normal_load_completion_marker(") < source.index(
         "_run_scheduled_physics_frame("
+    )
+    assert source.index("if observation_due:") < source.index(
+        "_finish_gated_physics_iteration("
     )
     assert "frame.published_wheel_states" in source
     assert 'before_ack=begin_motion_window' in source
@@ -657,10 +985,380 @@ def test_simulation_runtime_main_loop_uses_scheduled_observation_and_boundaries(
     assert "runtime.poll_transport()" not in source
 
 
+def test_normal_load_scene_contains_twenty_obstacles_before_interface_session(
+    monkeypatch,
+) -> None:
+    """P0 worker 输入必须由未绑定 runtime 的 bootstrap coordinator 先完整生成。"""
+    bootstrap = getattr(runtime_script, "_bootstrap_normal_load_scene", None)
+    assert callable(bootstrap), "runtime needs a normal-load bootstrap helper"
+    initial_document = SimpleNamespace(sensors=SimpleNamespace())
+    prepared_document = SimpleNamespace(obstacles=tuple(range(20)))
+    world = object()
+    coordinator_calls: list[dict[str, object]] = []
+
+    class Manager:
+        def snapshot(self, *, include_body_id=False):
+            if include_body_id:
+                return tuple(
+                    SimpleNamespace(body_id=index + 1) for index in range(20)
+                )
+            return tuple(range(20))
+
+    class BootstrapCoordinator:
+        def __init__(
+            self,
+            client_id,
+            config,
+            selected_world,
+            obstacle_manager,
+            *,
+            interface_runtime=None,
+            sensor_document=None,
+        ):
+            coordinator_calls.append(
+                {
+                    "client_id": client_id,
+                    "config": config,
+                    "world": selected_world,
+                    "manager": obstacle_manager,
+                    "interface_runtime": interface_runtime,
+                    "sensor_document": sensor_document,
+                }
+            )
+
+        def apply_action(self, action):
+            assert action.request.count == 20
+            return SimpleNamespace(
+                obstacle_result=SimpleNamespace(succeeded=True),
+            )
+
+        def logical_scene_document(self):
+            return prepared_document
+
+    manager = Manager()
+    config = SimpleNamespace(time_step=1.0 / 240.0)
+    monkeypatch.setattr(
+        runtime_script,
+        "build_world_from_scene_document",
+        lambda *_args: (world, manager),
+    )
+    monkeypatch.setattr(runtime_script, "SimulationCoordinator", BootstrapCoordinator)
+
+    (
+        actual_world,
+        actual_manager,
+        runtime_document,
+        obstacle_count,
+        obstacle_body_ids,
+    ) = bootstrap(3, config, initial_document)
+
+    assert actual_world is world
+    assert actual_manager is manager
+    assert runtime_document is prepared_document
+    assert obstacle_count == 20
+    assert obstacle_body_ids == frozenset(range(1, 21))
+    assert coordinator_calls[0]["interface_runtime"] is None
+    assert coordinator_calls[0]["sensor_document"] is initial_document.sensors
+
+
+def test_runtime_ready_file_follows_worker_preflight_for_twenty_obstacles() -> None:
+    """ready 文件只能在 20 障碍 bootstrap 与 session worker ready 之后写入。"""
+    source = inspect.getsource(runtime_script.run_simulation_runtime)
+
+    bootstrap_index = source.index("_bootstrap_normal_load_scene(")
+    session_index = source.index("create_interface_session(")
+    ready_index = source.index("ready_file.write_text(")
+
+    assert bootstrap_index < session_index < ready_index
+
+
+def test_runtime_passes_bootstrap_document_to_session_before_writing_ready_file(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """ready 闩必须可观察到 session 已以完整 20 障碍文档完成 worker preflight。"""
+    initial_document = SimpleNamespace(sensors=SimpleNamespace())
+    prepared_document = SimpleNamespace(obstacles=tuple(range(20)), sensors=SimpleNamespace())
+    robot = object()
+    world = SimpleNamespace(active_robot=SimpleNamespace(robot=robot))
+    manager = object()
+    session_documents: list[object] = []
+    session_created = False
+
+    class StopAfterReady(RuntimeError):
+        pass
+
+    class FakeTransport:
+        pass
+
+    class FakeRuntime:
+        config = SimpleNamespace(channels=())
+        close_trace = ()
+
+    class FakeSession:
+        actual_transport_mode = "ecal"
+        transport = FakeTransport()
+        logger = object()
+        runtime = FakeRuntime()
+
+        def close(self):
+            return None
+
+    class FinalCoordinator:
+        def __init__(self, _client_id, _config, selected_world, _manager, **kwargs):
+            assert kwargs["interface_runtime"] is FakeSession.runtime
+            assert kwargs["sensor_document"] is prepared_document.sensors
+            self.world = selected_world
+
+    def create_session(_config, *, document, **_kwargs):
+        nonlocal session_created
+        session_documents.append(document)
+        assert len(document.obstacles) == 20
+        session_created = True
+        return FakeSession()
+
+    def stop_after_ready(_start_file, _stop_file, *, timeout_sec):
+        assert timeout_sec > 0.0
+        assert session_created
+        assert ready_file.exists()
+        raise StopAfterReady("stop after ready gate")
+
+    ready_file = tmp_path / "runtime.ready"
+    monkeypatch.setattr(runtime_script, "initial_scene_document", lambda _config: initial_document)
+    monkeypatch.setattr(
+        runtime_script,
+        "_bootstrap_normal_load_scene",
+        lambda *_args: (world, manager, prepared_document, 20, frozenset(range(1, 21))),
+    )
+    monkeypatch.setattr(runtime_script, "create_interface_session", create_session)
+    monkeypatch.setattr(runtime_script, "SimulationCoordinator", FinalCoordinator)
+    monkeypatch.setattr(runtime_script, "EcalTransport", FakeTransport)
+    monkeypatch.setattr(runtime_script, "_wait_for_start_signal", stop_after_ready)
+    monkeypatch.setattr(runtime_script.p, "connect", lambda _mode: 17)
+    monkeypatch.setattr(runtime_script.p, "disconnect", lambda _client_id: None)
+
+    with pytest.raises(StopAfterReady, match="stop after ready gate"):
+        runtime_script.run_simulation_runtime(
+            result_json=tmp_path / "result.json",
+            scenario_dir=tmp_path / "scenario",
+            ready_file=ready_file,
+            start_file=tmp_path / "start",
+            stop_file=tmp_path / "stop",
+            participant_name="task11-bootstrap-test",
+            max_runtime_sec=1.0,
+        )
+
+    assert session_documents == [prepared_document]
+
+
+def test_final_protocol_ack_pauses_physics_before_peer_shutdown(tmp_path) -> None:
+    """最终 ACK 后必须停止发布，让 peer 在静默 transport 上完成资源关闭。"""
+    final_ack = tmp_path / "new_command.ack"
+    should_step = getattr(
+        runtime_script,
+        "_final_protocol_physics_step_due",
+        None,
+    )
+    assert callable(should_step), "runtime needs a final protocol shutdown fence"
+
+    assert should_step(final_ack) is True
+    final_ack.write_text('{"active": true}', encoding="utf-8")
+    assert should_step(final_ack) is False
+
+
+def test_final_protocol_ack_drains_sensor_and_io_before_staying_frozen(
+    tmp_path,
+) -> None:
+    """最终 ACK 前排空 sensor/logger/transport，ACK 后保持 capture 冻结。"""
+    final_ack = tmp_path / "new_command.ack"
+    order: list[str] = []
+    fence = object()
+
+    class Runtime:
+        def begin_sensor_fence(self) -> object:
+            order.append("sensor")
+            return fence
+
+        def complete_sensor_fence(
+            self,
+            received_fence: object,
+            *,
+            resume_capture: bool,
+        ) -> None:
+            assert received_fence is fence
+            assert resume_capture is False
+            assert final_ack.exists()
+            order.append("frozen")
+
+    class Logger:
+        def snapshot(self) -> InterfaceLogSnapshot:
+            order.append("logger")
+            return InterfaceLogSnapshot(1, 0, 0, 0, False, False, 0)
+
+    class Transport:
+        def wait_idle(self, *, timeout_sec: float) -> None:
+            assert not final_ack.exists()
+            assert timeout_sec == runtime_script._TRANSPORT_IDLE_TIMEOUT_SEC
+            order.append("transport_idle")
+
+        def snapshot(self) -> object:
+            order.append("snapshot")
+            return SimpleNamespace(topic_quality=())
+
+    write_ack = getattr(runtime_script, "_write_final_protocol_ack", None)
+    assert callable(write_ack), "runtime needs a final sensor and I/O boundary"
+
+    write_ack(Runtime(), Transport(), Logger(), final_ack)
+
+    assert order == [
+        "sensor",
+        "logger",
+        "transport_idle",
+        "snapshot",
+        "frozen",
+    ]
+    assert json.loads(final_ack.read_text(encoding="utf-8")) == {"active": True}
+
+
+def test_final_protocol_ack_rejects_inactive_snapshot_without_unfreezing(
+    tmp_path,
+) -> None:
+    """final transport 非 active 时不得写成功 ACK 或解除 sensor fence。"""
+    final_ack = tmp_path / "new_command.ack"
+    completed = False
+
+    class Runtime:
+        def begin_sensor_fence(self) -> object:
+            return object()
+
+        def complete_sensor_fence(self, *_args, **_kwargs) -> None:
+            nonlocal completed
+            completed = True
+
+    class Logger:
+        def snapshot(self) -> InterfaceLogSnapshot:
+            return InterfaceLogSnapshot(1, 0, 0, 0, False, False, 0)
+
+    class Transport:
+        def wait_idle(self, *, timeout_sec: float) -> None:
+            assert timeout_sec == runtime_script._TRANSPORT_IDLE_TIMEOUT_SEC
+
+        def snapshot(self) -> object:
+            return SimpleNamespace(
+                topic_quality=(
+                    SimpleNamespace(state="waiting_peer", peer_connected=False),
+                )
+            )
+
+    with pytest.raises(RuntimeError, match="final protocol transport snapshot"):
+        runtime_script._write_final_protocol_ack(
+            Runtime(),
+            Transport(),
+            Logger(),
+            final_ack,
+        )
+
+    assert not final_ack.exists()
+    assert completed is False
+
+
+def test_final_protocol_ack_rejects_closed_logger_before_transport(
+    tmp_path,
+) -> None:
+    """logger 已关闭时不得继续 transport 边界或写 final ACK。"""
+    final_ack = tmp_path / "new_command.ack"
+    order: list[str] = []
+
+    class Runtime:
+        def begin_sensor_fence(self) -> object:
+            order.append("sensor")
+            return object()
+
+        def complete_sensor_fence(self, *_args, **_kwargs) -> None:
+            order.append("complete")
+
+    class Logger:
+        def snapshot(self) -> InterfaceLogSnapshot:
+            order.append("logger")
+            return InterfaceLogSnapshot(1, 0, 0, 0, True, False, 0)
+
+    class Transport:
+        def wait_idle(self, *, timeout_sec: float) -> None:
+            order.append("transport_idle")
+
+        def snapshot(self) -> object:
+            order.append("snapshot")
+            return SimpleNamespace(topic_quality=())
+
+    with pytest.raises(RuntimeError, match="logger is closed"):
+        runtime_script._write_final_protocol_ack(
+            Runtime(),
+            Transport(),
+            Logger(),
+            final_ack,
+        )
+
+    assert order == ["sensor", "logger"]
+    assert not final_ack.exists()
+
+
+def test_simulation_peer_recreates_command_publisher_with_same_shm_ring() -> None:
+    """初始连接和重连都必须创建独立、同配置的 command publisher。"""
+    calls: list[tuple[str, type, int, int]] = []
+
+    class Bindings:
+        def create_publisher(
+            self,
+            topic: str,
+            message_type: type,
+            *,
+            shm_buffer_count: int,
+            acknowledge_timeout_ms: int,
+        ) -> object:
+            calls.append(
+                (
+                    topic,
+                    message_type,
+                    shm_buffer_count,
+                    acknowledge_timeout_ms,
+                )
+            )
+            return object()
+
+    create_publisher = getattr(
+        peer_script,
+        "_create_command_publisher",
+        None,
+    )
+    assert callable(create_publisher), "peer needs one command publisher factory"
+
+    config = peer_script.InterfaceConfig.default(transport_mode="ecal")
+    bindings = Bindings()
+    initial = create_publisher(bindings, config)
+    reconnected = create_publisher(bindings, config)
+
+    assert initial is not reconnected
+    assert calls == [
+        (
+            config.wheel_command.topic,
+            peer_script.pb.WheelCommand,
+            config.outgoing_queue_size,
+            100,
+        ),
+        (
+            config.wheel_command.topic,
+            peer_script.pb.WheelCommand,
+            config.outgoing_queue_size,
+            100,
+        ),
+    ]
+
+
 def test_simulation_peer_main_flow_uses_sim_window_and_delivery_fence() -> None:
     """peer 入口必须消费完整 ACK，并按 runtime 仿真边界等待、筛选输出。"""
     source = inspect.getsource(peer_script.run_simulation_peer)
 
+    assert source.count("_create_command_publisher(") == 2
     assert "_wait_for_json_object(" in source
     assert "_complete_measurement_window(" in source
     assert "_wait_for_output_fence(" in source
@@ -919,6 +1617,188 @@ def test_marked_transport_snapshot_starts_window_before_ack(
     assert payload["window_start_sim_time_ns"] == 1_000_000_000
 
 
+def test_measurement_start_fence_prevents_warmup_lidar_from_crossing_snapshot(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """warmup prepared 帧必须先进入日志，再捕获 start 快照并写 ACK。"""
+    marker = tmp_path / "measurement_start.active"
+    ack = tmp_path / "measurement_start.ack"
+    marker.write_text("{}", encoding="utf-8")
+    order: list[str] = []
+    prepared_visible = False
+    log_snapshot = InterfaceLogSnapshot(1, 0, 0, 0, False, False, 0)
+    transport_snapshot = SimpleNamespace(
+        published_count=1,
+        received_count=0,
+        dropped_count=0,
+        error_count=0,
+        topic_quality=(
+            SimpleNamespace(
+                topic=CONFIG.lidar_front.topic,
+                dropped_count=0,
+                error_count=0,
+                state="active",
+                detail="",
+                peer_connected=True,
+            ),
+        ),
+    )
+
+    class Runtime:
+        def begin_sensor_fence(self) -> object:
+            nonlocal prepared_visible
+            order.extend(("sensor", "prepared_publish"))
+            prepared_visible = True
+            return object()
+
+        def complete_sensor_fence(self, _fence: object, *, resume_capture: bool) -> None:
+            assert resume_capture is True
+            assert ack.exists()
+            order.append("resume")
+
+    class Logger:
+        def snapshot(self) -> InterfaceLogSnapshot:
+            assert prepared_visible
+            order.append("logger_idle")
+            return log_snapshot
+
+    class Transport:
+        def wait_idle(self, *, timeout_sec: float) -> None:
+            assert timeout_sec == runtime_script._TRANSPORT_IDLE_TIMEOUT_SEC
+            order.append("transport_idle")
+
+        def snapshot(self) -> object:
+            assert order[-1] == "transport_idle"
+            order.append("snapshot")
+            return transport_snapshot
+
+    def write_ack(path: Path, payload: object = None) -> None:
+        order.append("ack")
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+    capture_start = getattr(runtime_script, "_capture_normal_load_start", None)
+    assert callable(capture_start), "runtime needs one measurement-start sensor fence"
+    monkeypatch.setattr(runtime_script, "_write_ack", write_ack)
+
+    captured = capture_start(
+        Runtime(),
+        Transport(),
+        Logger(),
+        marker,
+        ack,
+        before_ack=lambda: order.append("window_start"),
+        ack_fields={"window_start_sim_time_ns": 1_000_000_000},
+    )
+
+    assert captured.log_snapshot is log_snapshot
+    assert captured.transport_snapshot is transport_snapshot
+    assert order == [
+        "sensor",
+        "prepared_publish",
+        "logger_idle",
+        "transport_idle",
+        "snapshot",
+        "window_start",
+        "ack",
+        "resume",
+    ]
+
+
+def test_sensor_fence_timeout_prevents_success_ack(tmp_path) -> None:
+    """sensor drain 超时后不得继续 logger/transport 或写成功 ACK。"""
+    marker = tmp_path / "measurement_start.active"
+    ack = tmp_path / "measurement_start.ack"
+    marker.write_text("{}", encoding="utf-8")
+    order: list[str] = []
+
+    class Runtime:
+        def begin_sensor_fence(self) -> object:
+            order.append("sensor")
+            raise TimeoutError("sensor fence did not become idle within 250 ms")
+
+        def complete_sensor_fence(self, *_args, **_kwargs) -> None:
+            raise AssertionError("timed-out fence must not resume")
+
+    class Logger:
+        def snapshot(self) -> object:
+            raise AssertionError("logger must not run after sensor timeout")
+
+    class Transport:
+        def wait_idle(self, **_kwargs) -> None:
+            raise AssertionError("transport must not run after sensor timeout")
+
+        def snapshot(self) -> object:
+            raise AssertionError("snapshot must not run after sensor timeout")
+
+    with pytest.raises(TimeoutError, match="250 ms"):
+        runtime_script._capture_normal_load_start(
+            Runtime(),
+            Transport(),
+            Logger(),
+            marker,
+            ack,
+        )
+
+    assert order == ["sensor"]
+    assert not ack.exists()
+
+
+def test_fence_does_not_resume_previously_suspended_service(tmp_path) -> None:
+    """脚本只回传 opaque token，由 runtime 保留进入前 suspended 状态。"""
+    marker = tmp_path / "measurement_start.active"
+    ack = tmp_path / "measurement_start.ack"
+    marker.write_text("{}", encoding="utf-8")
+    token = object()
+    log_snapshot = InterfaceLogSnapshot(0, 0, 0, 0, False, False, 0)
+    transport_snapshot = SimpleNamespace(
+        published_count=0,
+        received_count=0,
+        dropped_count=0,
+        error_count=0,
+        topic_quality=(),
+    )
+
+    class Runtime:
+        capture_enabled = False
+
+        def begin_sensor_fence(self) -> object:
+            return token
+
+        def complete_sensor_fence(self, fence: object, *, resume_capture: bool) -> None:
+            assert ack.exists()
+            assert fence is token
+            assert resume_capture is True
+            # fake token 表示进入前 suspended，runtime 因此不实际解门。
+            self.capture_enabled = False
+
+        def resume(self) -> None:
+            raise AssertionError("marker helper must not bypass the fence token")
+
+    class Logger:
+        def snapshot(self) -> InterfaceLogSnapshot:
+            return log_snapshot
+
+    class Transport:
+        def wait_idle(self, *, timeout_sec: float) -> None:
+            assert timeout_sec == runtime_script._TRANSPORT_IDLE_TIMEOUT_SEC
+
+        def snapshot(self) -> object:
+            return transport_snapshot
+
+    runtime = Runtime()
+    runtime_script._capture_normal_load_start(
+        runtime,
+        Transport(),
+        Logger(),
+        marker,
+        ack,
+    )
+
+    assert ack.exists()
+    assert runtime.capture_enabled is False
+
+
 def test_measurement_start_rebases_pacer_before_capturing_wall_time() -> None:
     """正式窗口不能继承 transport/logger 屏障积累的墙钟欠债。"""
     order: list[str] = []
@@ -941,6 +1821,16 @@ def test_measurement_start_rebases_pacer_before_capturing_wall_time() -> None:
 
     assert order == ["reset", "capture"]
     assert tracker.start_wall_time == 20.0
+
+
+def test_measurement_start_log_sample_uses_capture_snapshot() -> None:
+    """正式窗口首个日志样本必须使用同一 start capture 的 logger 快照。"""
+    source = inspect.getsource(runtime_script.run_simulation_runtime)
+
+    assert "start_capture.log_snapshot.pending_count" in source
+    assert "start_capture.log_snapshot.accepted_messages" in source
+    assert "start_capture.log_snapshot.accepted_events" in source
+    assert "log_start." not in source
 
 
 def test_simulation_runtime_does_not_ack_measurement_until_every_peer_is_active(
@@ -1047,6 +1937,96 @@ def test_capture_normal_load_end_freezes_log_transport_and_sim_boundary(tmp_path
     assert json.loads(ack.read_text(encoding="utf-8"))[
         "window_end_sim_time_ns"
     ] == 5_000_000_000
+
+
+def test_measurement_end_ack_resumes_post_window_protocol(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """end fence 先收敛传感器，且只能在边界 ACK 后恢复 capture。"""
+    marker = tmp_path / "measurement_complete.active"
+    ack = tmp_path / "measurement_complete.ack"
+    marker.write_text("{}", encoding="utf-8")
+    order: list[str] = []
+    prepared_visible = False
+    snapshots = iter(
+        (
+            InterfaceLogSnapshot(2, 0, 0, 0, False, False, 1),
+            InterfaceLogSnapshot(2, 0, 0, 0, False, False, 0),
+        )
+    )
+    transport_snapshot = SimpleNamespace(
+        published_count=2,
+        received_count=0,
+        dropped_count=0,
+        error_count=0,
+        topic_quality=(
+            SimpleNamespace(
+                topic=CONFIG.lidar_front.topic,
+                dropped_count=0,
+                error_count=0,
+                state="active",
+                detail="",
+                peer_connected=True,
+            ),
+        ),
+    )
+
+    class Runtime:
+        def begin_sensor_fence(self) -> object:
+            nonlocal prepared_visible
+            order.extend(("sensor", "prepared_publish"))
+            prepared_visible = True
+            return object()
+
+        def complete_sensor_fence(self, _fence: object, *, resume_capture: bool) -> None:
+            assert resume_capture is True
+            assert ack.exists()
+            order.append("resume")
+
+    class Logger:
+        def snapshot(self) -> InterfaceLogSnapshot:
+            assert prepared_visible
+            order.append("logger")
+            return next(snapshots)
+
+    class Transport:
+        def wait_idle(self, *, timeout_sec: float) -> None:
+            assert timeout_sec == runtime_script._TRANSPORT_IDLE_TIMEOUT_SEC
+            order.append("transport_idle")
+
+        def snapshot(self) -> object:
+            order.append("snapshot")
+            return transport_snapshot
+
+    def write_ack(path: Path, payload: object = None) -> None:
+        order.append("ack")
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+    monkeypatch.setattr(runtime_script, "_write_ack", write_ack)
+
+    runtime_script._capture_normal_load_end(
+        Transport(),
+        Logger(),
+        marker,
+        ack,
+        runtime=Runtime(),
+        end_step_count=2,
+        end_sim_time_ns=100_000_000,
+        end_wall_time=1.0,
+        end_position_m=(0.0, 0.0, 0.0),
+    )
+
+    assert order == [
+        "sensor",
+        "prepared_publish",
+        "logger",
+        "logger",
+        "transport_idle",
+        "snapshot",
+        "ack",
+        "resume",
+    ]
 
 
 def test_measurement_end_rejects_inactive_snapshot_before_committing_boundary(

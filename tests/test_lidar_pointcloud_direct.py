@@ -1,7 +1,7 @@
 # 多线点云 DIRECT 门禁：验证三地形、自身过滤、前后障碍标签和连续移动扫描。
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import itertools
 import math
 import statistics
@@ -12,8 +12,17 @@ import pytest
 
 from slope_sim.lidar_pointcloud import LidarConfig, MultiLineLidar
 from slope_sim.model_registry import get_robot_model
-from slope_sim.obstacles import ObstacleSnapshot, create_box_obstacle, update_kinematic_obstacle
+from slope_sim.obstacles import (
+    ObstacleGeometry,
+    ObstaclePath,
+    ObstacleSnapshot,
+    ObstacleSpec,
+    create_box_obstacle,
+    update_kinematic_obstacle,
+)
 from slope_sim.robot import create_robot
+from slope_sim.runtime_actions import TerrainSelection
+from slope_sim.scene_config import SceneDocument, SensorDocument
 from slope_sim.scene import create_slope_scene
 from slope_sim.sensor_backend import Pose, PyBulletSensorBackend, RayHit
 from slope_sim.truth_sensors import MountPose, SensorMounts
@@ -305,3 +314,161 @@ def test_moving_obstacle_changes_cloud_continuously_across_five_scans():
     assert len(result.closest_ranges_m) == 5
     assert all(left != right for left, right in adjacent)
     assert max(abs(right - left) for left, right in adjacent) < 0.10
+
+
+@pytest.mark.parametrize(
+    ("terrain_model", "obstacle_mode", "topic", "capture_top_view"),
+    (
+        ("flat", "none", "lidar_front", False),
+        ("slope", "static", "lidar_front", True),
+        ("golf_heightfield", "moving", "lidar_rear", True),
+        ("flat", "miss", "lidar_rear", False),
+    ),
+)
+def test_worker_payload_bytes_match_sync_across_direct_scene_matrix(
+    terrain_model: str,
+    obstacle_mode: str,
+    topic: str,
+    capture_top_view: bool,
+) -> None:
+    """不同真实场景的 worker payload 必须逐字节等于同步生产扫描。"""
+    from slope_sim.config import ExperimentConfig
+    from slope_sim.coordinator import build_world_from_scene_document
+    from slope_sim.interfaces.codec import ProtoCodec
+    from slope_sim.interfaces.models import LidarPointCloud
+    from slope_sim.lidar_pointcloud import LidarScanResult
+    from slope_sim.lidar_worker import (
+        LidarScanRequest,
+        LidarWorkerWorldSpec,
+        PreparedLidarFrame,
+        PreparedLidarPayload,
+        start_lidar_worker,
+        world_digest_for_document,
+    )
+
+    terrain = TerrainSelection(
+        terrain_model,
+        slope_deg=8.0 if terrain_model == "slope" else 0.0,
+        golf_seed=31 if terrain_model == "golf_heightfield" else 0,
+        golf_relief="medium",
+    )
+    obstacles: tuple[ObstacleSpec, ...]
+    if obstacle_mode == "static":
+        obstacles = (
+            ObstacleSpec(
+                1,
+                "static",
+                ObstacleGeometry("box", (0.25, 0.25, 0.40)),
+                (2.0, 0.35, 0.40),
+                IDENTITY_QUATERNION,
+            ),
+        )
+    elif obstacle_mode == "moving":
+        obstacles = (
+            ObstacleSpec(
+                1,
+                "moving",
+                ObstacleGeometry("box", (0.25, 0.25, 0.40)),
+                (2.25, -0.35, 0.40),
+                IDENTITY_QUATERNION,
+                ObstaclePath((1.5, -0.35), (3.0, -0.35), 0.40, 0.5, 1),
+            ),
+        )
+    else:
+        obstacles = ()
+    config = ExperimentConfig(
+        mode="direct",
+        robot_model=ROBOT_MODEL,
+        terrain_model=terrain_model,
+        slope_deg=terrain.slope_deg,
+        golf_seed=terrain.golf_seed,
+        golf_relief=terrain.golf_relief,
+    )
+    document = SceneDocument.from_runtime(
+        ROBOT_MODEL,
+        terrain,
+        obstacles,
+        SensorDocument.default().mounts,
+    )
+    world_spec = LidarWorkerWorldSpec(
+        1,
+        config,
+        document,
+        world_digest_for_document(document),
+    )
+    client_id = p.connect(p.DIRECT)
+    handle = None
+    try:
+        world, manager = build_world_from_scene_document(client_id, config, document)
+        backend = PyBulletSensorBackend(client_id, world.active_robot.robot.robot_id)
+        records = manager.snapshot(include_body_id=True)
+        backend.bind_scene(world.scene.body_ids, records)
+        mount = (
+            document.sensors.mounts.lidar_front
+            if topic == "lidar_front"
+            else document.sensors.mounts.lidar_rear
+        )
+        lidar_id = 1 if topic == "lidar_front" else 2
+        world_mount = (
+            Pose((0.0, 0.0, 100.0), IDENTITY_QUATERNION)
+            if obstacle_mode == "miss"
+            else _world_mount(backend, mount)
+        )
+        base_pose = backend.world_pose("base_link") if capture_top_view else None
+        snapshots = tuple(replace(record, body_id=None) for record in records)
+        request = LidarScanRequest(
+            1,
+            1,
+            123_000_001,
+            0,
+            0,
+            topic,
+            topic,
+            lidar_id,
+            900_000_000,
+            world_mount,
+            base_pose,
+            snapshots,
+        )
+        scanner = MultiLineLidar(
+            backend,
+            document.sensors.lidar,
+            mount,
+            frame_id=topic,
+            lidar_id=lidar_id,
+        )
+        direct_result = scanner._scan_frozen(
+            request.timestamp_ns,
+            request.world_mount_pose,
+            request.optional_base_pose,
+        )
+        if capture_top_view:
+            assert type(direct_result) is LidarScanResult
+            direct_message = direct_result.message
+        else:
+            assert type(direct_result) is not LidarScanResult
+            direct_message = direct_result
+        assert type(direct_message) is LidarPointCloud
+        if obstacle_mode == "miss":
+            assert direct_message.point_num == 0
+        direct_payload = ProtoCodec().encode(direct_message)
+
+        handle = start_lidar_worker(world_spec, startup_timeout_sec=15.0)
+        handle.request_sender.send(request)
+        assert handle.response_receiver.poll(15.0)
+        response = handle.response_receiver.recv()
+
+        expected_type = PreparedLidarFrame if capture_top_view else PreparedLidarPayload
+        assert type(response) is expected_type
+        assert response.protobuf_payload == direct_payload
+        if capture_top_view:
+            assert ProtoCodec().encode(response.message) == direct_payload
+            assert response.optional_top_view is not None
+            assert len(response.optional_top_view.points) == len(response.message.points)
+            assert tuple(point.tag for point in response.optional_top_view.points) == tuple(
+                point.tag for point in response.message.points
+            )
+    finally:
+        if handle is not None:
+            handle.close()
+        p.disconnect(client_id)

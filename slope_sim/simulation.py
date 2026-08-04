@@ -26,6 +26,12 @@ from slope_sim.interfaces.config import InterfaceConfig
 from slope_sim.interfaces.ecal_transport import create_transport
 from slope_sim.interfaces.logging import InterfaceEventLogger, InterfaceLogPaths
 from slope_sim.interfaces.runtime import InterfaceRuntime
+from slope_sim.lidar_worker import (
+    LidarScanService,
+    LidarWorkerWorldSpec,
+    start_lidar_worker,
+    world_digest_for_document,
+)
 from slope_sim.logger import CsvSimulationLogger
 from slope_sim.metrics import compute_tracking_metrics
 from slope_sim.model_registry import get_robot_model
@@ -44,6 +50,10 @@ from slope_sim.scene_config import (
 )
 from slope_sim.sensor_backend import PyBulletSensorBackend
 from slope_sim.sensors import LidarSummary, read_lidar
+
+
+_LIDAR_WORKER_PROTOCOL_VERSION = 1
+_LIDAR_WORKER_STARTUP_TIMEOUT_SEC = 15.0
 
 
 def _suspend_cyclic_gc() -> bool:
@@ -138,14 +148,28 @@ class _PeerStateRelay:
                 )
                 self._runtime.consume_transport_snapshot(snapshot)
 
-    def attach(self, runtime: InterfaceRuntime, transport: object) -> object:
-        """先推进 discovery，再锁住 callback 读取用于初始化的最新快照。"""
+    def initial_snapshot(self, transport: object) -> object:
+        """在 runtime 初始化和 worker 启动前推进 discovery 并冻结一次快照。"""
         # poll 可能同步触发 relay callback，必须在进入非重入锁之前完成。
         poll = getattr(transport, "poll_peer_state", None)
         if callable(poll):
             poll()
+        return transport.snapshot()
+
+    def attach(
+        self,
+        runtime: InterfaceRuntime,
+        transport: object,
+        *,
+        initial_snapshot: object | None = None,
+    ) -> object:
+        """把已确认的初始快照交给 runtime，并在随后转发 peer 生命周期边沿。"""
+        snapshot = (
+            self.initial_snapshot(transport)
+            if initial_snapshot is None
+            else initial_snapshot
+        )
         with self._lock:
-            snapshot = transport.snapshot()
             state = getattr(
                 snapshot,
                 "state",
@@ -194,6 +218,53 @@ def _close_resource_quietly(resource: object | None) -> None:
             pass
 
 
+def _close_lidar_service_quietly(service: object | None) -> None:
+    """runtime 接管前发生初始化失败时，只回收本次创建的 service 及 owned child。"""
+    if service is None:
+        return
+    close_idle = getattr(service, "close_idle", None)
+    force_close = getattr(service, "force_close", None)
+    try:
+        if not callable(close_idle):
+            raise RuntimeError("lidar service does not provide close_idle")
+        close_idle(timeout_sec=_LIDAR_WORKER_STARTUP_TIMEOUT_SEC)
+        return
+    except BaseException:
+        pass
+    if callable(force_close):
+        try:
+            force_close()
+        except BaseException:
+            pass
+
+
+def _start_lidar_scan_service(
+    config: ExperimentConfig,
+    document: SceneDocument,
+    *,
+    lifecycle_generation: int,
+    expected_world_digest: str | None = None,
+) -> LidarScanService:
+    """以无 body-id 的完整文档启动 worker，并构造拥有该 handle 的父端 service。"""
+    digest = world_digest_for_document(document)
+    if expected_world_digest is not None and digest != expected_world_digest:
+        raise RuntimeError("lidar worker world digest differs from runtime document")
+    world_spec = LidarWorkerWorldSpec(
+        _LIDAR_WORKER_PROTOCOL_VERSION,
+        config,
+        document,
+        digest,
+    )
+    handle = start_lidar_worker(
+        world_spec,
+        startup_timeout_sec=_LIDAR_WORKER_STARTUP_TIMEOUT_SEC,
+    )
+    return LidarScanService.from_worker_handle(
+        handle,
+        lifecycle_generation=lifecycle_generation,
+    )
+
+
 def create_interface_session(
     config: ExperimentConfig,
     *,
@@ -213,6 +284,7 @@ def create_interface_session(
     transport = None
     interface_logger = None
     runtime = None
+    lidar_scan_service = None
     peer_state_relay = _PeerStateRelay()
     try:
         runtime_document = SceneDocument.from_runtime(
@@ -239,11 +311,36 @@ def create_interface_session(
         if participant_name is not None:
             transport_kwargs["participant_name"] = participant_name
         transport = create_transport(config.interface_mode, **transport_kwargs)
+        initial_transport_snapshot = peer_state_relay.initial_snapshot(transport)
+        actual_transport_mode = initial_transport_snapshot.mode
+        lidar_scan_service_factory = None
         if config.interface_log_enabled:
             interface_logger = InterfaceEventLogger(
                 config.log_dir,
                 queue_size=interface_config.log_queue_size,
             )
+        if actual_transport_mode == "ecal":
+            lidar_scan_service = _start_lidar_scan_service(
+                config,
+                runtime_document,
+                lifecycle_generation=0,
+            )
+
+            def lidar_scan_service_factory(
+                candidate_document: SceneDocument,
+                lifecycle_generation: int,
+                expected_world_digest: str,
+            ) -> LidarScanService:
+                """重建候选沿用本 session 配置，并重新核对 parent 提供的 digest。"""
+                return _start_lidar_scan_service(
+                    config,
+                    candidate_document,
+                    lifecycle_generation=lifecycle_generation,
+                    expected_world_digest=expected_world_digest,
+                )
+
+        elif actual_transport_mode != "local":
+            raise RuntimeError("transport returned an unsupported actual mode")
         runtime = InterfaceRuntime(
             coordinator_world.active_robot.robot,
             config=interface_config,
@@ -255,14 +352,23 @@ def create_interface_session(
             capture_lidar_top_view=(
                 config.mode == "gui" and config.dashboard_enabled
             ),
+            lidar_scan_service=lidar_scan_service,
+            lidar_scan_service_factory=lidar_scan_service_factory,
         )
-        actual_transport_mode = peer_state_relay.attach(runtime, transport).mode
+        # runtime 构造成功即取得 service 所有权；后续失败只能经 runtime.close 回收。
+        lidar_scan_service = None
+        actual_transport_mode = peer_state_relay.attach(
+            runtime,
+            transport,
+            initial_snapshot=initial_transport_snapshot,
+        ).mode
     except BaseException:
         if runtime is not None:
             # runtime 构造成功后已经取得完整所有权，后续失败不能绕过其关闭顺序。
             _close_resource_quietly(runtime)
         else:
             # 构造失败自身也会清理；幂等关闭同时覆盖 transport/logger 的更早失败点。
+            _close_lidar_service_quietly(lidar_scan_service)
             _close_resource_quietly(interface_logger)
             _close_resource_quietly(transport)
             _close_resource_quietly(backend)

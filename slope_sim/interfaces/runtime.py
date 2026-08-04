@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Collection, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from fractions import Fraction
 import math
@@ -11,7 +12,7 @@ import time
 from typing import Protocol, runtime_checkable
 
 from slope_sim.interfaces.clock import PeriodicScheduler, SimulationClock
-from slope_sim.interfaces.codec import ProtoCodec
+from slope_sim.interfaces.codec import LIDAR_POINT_CLOUD_TYPE_NAME, ProtoCodec
 from slope_sim.interfaces.config import ChannelConfig, InterfaceConfig
 from slope_sim.interfaces.dashboard_snapshot import (
     InterfaceDashboardSnapshot,
@@ -43,7 +44,16 @@ from slope_sim.interfaces.transport import (
 )
 from slope_sim.interfaces.wheel import WheelCommandMailbox, WheelDecision
 from slope_sim.lidar_pointcloud import LidarScanResult, MultiLineLidar
+from slope_sim.lidar_worker import (
+    LidarScanService,
+    LidarServiceEvent,
+    LidarServiceSnapshot,
+    PreparedLidarFrame,
+    PreparedLidarPayload,
+    world_digest_for_document,
+)
 from slope_sim.model_registry import RobotModelSpec
+from slope_sim.obstacles import ObstacleSnapshot, ObstacleSpec
 from slope_sim.scene_config import SceneDocument
 from slope_sim.sensor_backend import SensorBackend
 from slope_sim.truth_sensors import TruthSensorSuite
@@ -51,6 +61,8 @@ from slope_sim.truth_sensors import TruthSensorSuite
 
 _SAFE_STOP_DT = 1.0 / 240.0
 _TERMINAL_LOG_TIMEOUT_SEC = 1.0
+_SENSOR_FENCE_TIMEOUT_SEC = 0.250
+_LIDAR_CLOSE_JOIN_TIMEOUT_SEC = 2.0
 _UINT64_MAX = (1 << 64) - 1
 
 
@@ -112,6 +124,15 @@ class _LocalTwist:
     dt: float
 
 
+@dataclass(frozen=True, slots=True)
+class SensorFence:
+    """记录可恢复 sensor fence 的原 service 与进入前状态。"""
+
+    _runtime: object
+    _service: object | None
+    _service_was_ready: bool
+
+
 def _robot_model(robot: object) -> RobotModelSpec:
     """确认机器人来自注册表并实现运行时所需的轮子端口。"""
     model = getattr(robot, "model_spec", None)
@@ -131,6 +152,17 @@ def _error_detail(error: BaseException) -> str:
     """生成稳定且非空的状态错误说明。"""
     message = str(error)
     return f"{type(error).__name__}: {message}" if message else type(error).__name__
+
+
+def _bounded_failure_detail(stage: str, error: BaseException) -> str:
+    """生成不携带任意异常文本的单行有界生命周期诊断。"""
+    detail = f"{stage} failed: {type(error).__name__}".replace("\r", " ").replace(
+        "\n", " "
+    )
+    encoded = detail.encode("utf-8", errors="replace")
+    if len(encoded) <= 512:
+        return encoded.decode("utf-8")
+    return encoded[:512].decode("utf-8", errors="ignore")
 
 
 def _wheel_counts(model: RobotModelSpec) -> tuple[int, int]:
@@ -200,6 +232,11 @@ class InterfaceRuntime:
         scene_document: SceneDocument | None = None,
         logger: InterfaceEventLogger | None = None,
         capture_lidar_top_view: bool = True,
+        lidar_scan_service: LidarScanService | None = None,
+        lidar_scan_service_factory: Callable[
+            [SceneDocument, int, str], LidarScanService
+        ]
+        | None = None,
     ) -> None:
         if not isinstance(config, InterfaceConfig):
             raise ValueError("config must be an InterfaceConfig")
@@ -211,12 +248,27 @@ class InterfaceRuntime:
             raise ValueError("scene_document must be a SceneDocument")
         if not isinstance(capture_lidar_top_view, bool):
             raise ValueError("capture_lidar_top_view must be a bool")
+        if lidar_scan_service_factory is not None and not callable(
+            lidar_scan_service_factory
+        ):
+            raise ValueError("lidar_scan_service_factory must be callable")
         model = _robot_model(robot)
 
         self._config = config
         self._transport = transport
         self._monotonic = monotonic
         self._capture_lidar_top_view = capture_lidar_top_view
+        self._lidar_scan_service: LidarScanService | None = None
+        self._lidar_capture_fenced = False
+        self._active_sensor_fence: SensorFence | None = None
+        self._lidar_service_paused_by_runtime: LidarScanService | None = None
+        self._lidar_scan_service_factory = lidar_scan_service_factory
+        self._prepared_lidar_service: LidarScanService | None = None
+        self._prepared_scene_document: SceneDocument | None = None
+        self._prepared_lidar_world_digest: str | None = None
+        self._retired_lidar_services: list[LidarScanService] = []
+        self._retired_lidar_cleanup_claims: set[int] = set()
+        self._retired_lidar_diagnostic_ids: set[int] = set()
         self._condition = Condition()
         self._state = "open"
         self._lifecycle_generation = 0
@@ -227,8 +279,11 @@ class InterfaceRuntime:
         self._in_flight_world_operations = 0
         self._world_operation_context = local()
         self._lifecycle_owner_ident: int | None = None
+        self._rebuild_candidate_owner_ident: int | None = None
         self._prepare_in_progress = False
         self._rebind_in_progress = False
+        self._rebuild_candidate_in_progress = False
+        self._rebuild_lidar_candidate_in_progress = False
         self._rebuild_prepared = False
         self._prepared_robot_parked = False
         self._accepting_commands = True
@@ -248,6 +303,12 @@ class InterfaceRuntime:
         self._robot = robot
         self._robot_model = model
         try:
+            if lidar_scan_service is not None:
+                actual_transport_mode = transport.snapshot().mode
+                if type(actual_transport_mode) is not str or actual_transport_mode != "ecal":
+                    raise ValueError(
+                        "lidar_scan_service requires actual transport mode 'ecal'"
+                    )
             self._mailbox = WheelCommandMailbox(
                 model,
                 timeout_sec=config.command_timeout_sec,
@@ -324,6 +385,7 @@ class InterfaceRuntime:
             subscription, subscription_token = self._subscribe_wheel_command()
             self._command_subscription = subscription
             self._active_subscription_token = subscription_token
+            self._lidar_scan_service = lidar_scan_service
         except BaseException:
             # 构造尚未成功，不伪造正常 close_trace，也不能触碰机器人控制端口。
             _close_initialization_resources(logger, transport, sensor_backend)
@@ -455,7 +517,11 @@ class InterfaceRuntime:
 
     def _reject_lifecycle_owner_reentry_locked(self, operation: str) -> None:
         """生命周期 owner 调用外部端口时，同线程嵌套入口必须立即失败。"""
-        if self._lifecycle_owner_ident == get_ident():
+        current_ident = get_ident()
+        if (
+            self._lifecycle_owner_ident == current_ident
+            or self._rebuild_candidate_owner_ident == current_ident
+        ):
             raise RuntimeError(
                 f"{operation} cannot reenter an active lifecycle transition"
             )
@@ -957,6 +1023,10 @@ class InterfaceRuntime:
             if peer_state == "disconnected":
                 if previous != "disconnected" or initial:
                     self._lifecycle_generation += 1
+                    if self._lidar_scan_service is not None:
+                        self._lidar_scan_service.invalidate_generation(
+                            self._lifecycle_generation
+                        )
                     self._mailbox.clear()
                     self._clear_dashboard_payloads_locked()
                     self._local_twist = None
@@ -1027,6 +1097,7 @@ class InterfaceRuntime:
         wall_time: float | None = None,
     ) -> WheelDecision | None:
         """先按 100 Hz 回环本地目标，再消费邮箱并下发本帧轮子控制。"""
+        self._poll_lidar_service()
         timeout_event = False
         with self._condition:
             self._require_open_locked()
@@ -1079,6 +1150,37 @@ class InterfaceRuntime:
             )
         return decision
 
+    def next_physics_step_publish_topics(self, dt: float) -> tuple[str, ...]:
+        """只读预览下一物理步跨过期限的可发布输出话题。"""
+        with self._condition:
+            self._require_open_locked()
+            if self._paused or not self._world_ready:
+                return ()
+            candidate_ns = self._clock.preview_advance(dt)
+            topics: list[str] = []
+            if self._wheel_scheduler.preview_due(candidate_ns):
+                topics.append(self._config.wheel_state.topic)
+            sensors_available = (
+                self._front_lidar is not None
+                and self._rear_lidar is not None
+                and self._truth_sensor_suite is not None
+            )
+            if sensors_available:
+                topics.extend(
+                    topic
+                    for topic, scheduler in self._sensor_schedulers.items()
+                    if scheduler.preview_due(candidate_ns)
+                    and (
+                        self._lidar_scan_service is None
+                        or topic
+                        not in {
+                            self._config.lidar_front.topic,
+                            self._config.lidar_rear.topic,
+                        }
+                    )
+                )
+            return tuple(topics)
+
     def after_physics_step(self, dt: float) -> tuple[WheelState, ...]:
         """仅在 Bullet 步进后读取物理反馈，并按独立期限发布五路状态。"""
         with self._condition:
@@ -1114,29 +1216,57 @@ class InterfaceRuntime:
             rear_lidar = self._rear_lidar
             truth_sensor_suite = self._truth_sensor_suite
             capture_lidar_top_view = self._capture_lidar_top_view
+            lidar_scan_service = self._lidar_scan_service
         if sensors_available:
             if front_lidar is None or rear_lidar is None or truth_sensor_suite is None:
                 raise RuntimeError("sensor availability snapshot is inconsistent")
-            routes = (
-                (
-                    self._config.lidar_front.topic,
-                    lambda timestamp_ns: (
-                        self._scan_lidar_for_dashboard(front_lidar, timestamp_ns)
-                        if capture_lidar_top_view
-                        else self._scan_lidar_message(front_lidar, timestamp_ns)
+            if lidar_scan_service is None:
+                routes = (
+                    (
+                        self._config.lidar_front.topic,
+                        lambda timestamp_ns: (
+                            self._scan_lidar_for_dashboard(front_lidar, timestamp_ns)
+                            if capture_lidar_top_view
+                            else self._scan_lidar_message(front_lidar, timestamp_ns)
+                        ),
                     ),
-                ),
-                (
-                    self._config.lidar_rear.topic,
-                    lambda timestamp_ns: (
-                        self._scan_lidar_for_dashboard(rear_lidar, timestamp_ns)
-                        if capture_lidar_top_view
-                        else self._scan_lidar_message(rear_lidar, timestamp_ns)
+                    (
+                        self._config.lidar_rear.topic,
+                        lambda timestamp_ns: (
+                            self._scan_lidar_for_dashboard(rear_lidar, timestamp_ns)
+                            if capture_lidar_top_view
+                            else self._scan_lidar_message(rear_lidar, timestamp_ns)
+                        ),
                     ),
-                ),
-                (self._config.rtk.topic, truth_sensor_suite.read_rtk),
-                (self._config.imu.topic, truth_sensor_suite.read_imu),
-            )
+                    (self._config.rtk.topic, truth_sensor_suite.read_rtk),
+                    (self._config.imu.topic, truth_sensor_suite.read_imu),
+                )
+            else:
+                capture_routes = (
+                    (
+                        self._config.lidar_front.topic,
+                        front_lidar,
+                    ),
+                    (
+                        self._config.lidar_rear.topic,
+                        rear_lidar,
+                    ),
+                )
+                captures_current = True
+                for topic, lidar in capture_routes:
+                    if not self._capture_lidar_deadlines(
+                        topic,
+                        sensor_due[topic],
+                        lidar,
+                        lidar_scan_service,
+                        generation,
+                    ):
+                        captures_current = False
+                        break
+                routes = (
+                    (self._config.rtk.topic, truth_sensor_suite.read_rtk),
+                    (self._config.imu.topic, truth_sensor_suite.read_imu),
+                ) if captures_current else ()
             for topic, reader in routes:
                 if not self._publish_sensor_deadlines(
                     topic,
@@ -1145,6 +1275,7 @@ class InterfaceRuntime:
                     generation,
                 ):
                     break
+        self._poll_lidar_service()
         return states
 
     @staticmethod
@@ -1168,6 +1299,359 @@ class InterfaceRuntime:
         if type(message) is not LidarPointCloud:
             raise TypeError("lidar scan must return an exact LidarPointCloud")
         return message
+
+    @staticmethod
+    def _snapshot_bodyless_obstacle(obstacle: ObstacleSpec) -> ObstacleSnapshot:
+        """把稳定逻辑障碍物复制成 worker 只接受的无物理 ID 快照。"""
+        return ObstacleSnapshot(
+            logical_id=obstacle.logical_id,
+            body_id=None,
+            mode=obstacle.mode,
+            shape=obstacle.geometry.shape,
+            position=obstacle.position,
+            orientation=obstacle.orientation,
+            path=obstacle.path,
+            geometry=obstacle.geometry,
+        )
+
+    def _capture_lidar_deadlines(
+        self,
+        topic: str,
+        deadlines: tuple[int, ...],
+        lidar: object,
+        service: LidarScanService,
+        generation: int,
+    ) -> bool:
+        """在单个 world 屏障内冻结每帧输入，释放屏障后再提交 IPC。"""
+        if topic == self._config.lidar_front.topic:
+            service_topic = "lidar_front"
+        elif topic == self._config.lidar_rear.topic:
+            service_topic = "lidar_rear"
+        else:
+            raise ValueError("async lidar capture requires a configured lidar topic")
+
+        for timestamp_ns in deadlines:
+            with self._condition:
+                if self._lidar_capture_fenced:
+                    return self._generation_is_publishable_locked(generation)
+                if not self._begin_world_operation_locked(generation):
+                    return False
+                backend = self._sensor_backend
+                scene_document = self._scene_document
+                capture_top_view = self._capture_lidar_top_view
+            capture: dict[str, object] | None = None
+            capture_error: Exception | None = None
+            try:
+                world_mount_reader = getattr(lidar, "_world_mount", None)
+                if not callable(world_mount_reader):
+                    raise TypeError("lidar must provide a frozen world mount")
+                world_mount_pose = world_mount_reader()
+                optional_base_pose = None
+                if capture_top_view:
+                    if backend is None:
+                        raise RuntimeError("sensor backend is not configured")
+                    optional_base_pose = backend.world_pose("base_link")
+                if scene_document is None:
+                    raise RuntimeError("scene document is not configured")
+                snapshots = tuple(
+                    self._snapshot_bodyless_obstacle(obstacle)
+                    for obstacle in scene_document.obstacles
+                )
+                capture = {
+                    "topic": service_topic,
+                    "timestamp_ns": timestamp_ns,
+                    "world_mount_pose": world_mount_pose,
+                    "optional_base_pose": optional_base_pose,
+                    "complete_obstacle_snapshots_without_body_ids": snapshots,
+                }
+            except Exception as exc:
+                capture_error = exc
+            finally:
+                self._finish_world_operation()
+
+            if capture_error is not None:
+                with self._condition:
+                    if self._lifecycle_generation != generation:
+                        return False
+                    self._record_topic_error_locked(topic, capture_error)
+                self._record_event(
+                    "sensor_failed",
+                    topic,
+                    tracker_generation=generation,
+                    topic=topic,
+                    reason=_error_detail(capture_error),
+                    sim_time_ns=timestamp_ns,
+                )
+                continue
+            if capture is None:
+                raise RuntimeError("lidar capture completed without a snapshot")
+            with self._condition:
+                if not self._generation_is_publishable_locked(generation):
+                    return False
+                if self._lidar_capture_fenced:
+                    return True
+            try:
+                service.capture(**capture)
+            except Exception as exc:
+                with self._condition:
+                    if self._lifecycle_generation != generation:
+                        return False
+                    self._record_topic_error_locked(topic, exc)
+                continue
+        return True
+
+    def _consume_lidar_service_events(
+        self,
+        service: LidarScanService,
+        events: tuple[LidarServiceEvent, ...],
+        *,
+        allow_closing: bool = False,
+    ) -> None:
+        """只按一次性 typed event 更新当前 service 对应的话题质量。"""
+        for event in events:
+            if type(event) is not LidarServiceEvent:
+                raise TypeError("lidar service returned an invalid event")
+            if event.scope == "topic":
+                if event.optional_topic == "lidar_front":
+                    topics = (self._config.lidar_front.topic,)
+                elif event.optional_topic == "lidar_rear":
+                    topics = (self._config.lidar_rear.topic,)
+                else:  # pragma: no cover - LidarServiceEvent 构造器已冻结该合同
+                    raise ValueError("lidar service event used an unknown topic")
+            else:
+                topics = (
+                    self._config.lidar_front.topic,
+                    self._config.lidar_rear.topic,
+                )
+            with self._condition:
+                state_is_publishable = self._state == "open" or (
+                    allow_closing and self._state == "closing"
+                )
+                if not state_is_publishable or self._lidar_scan_service is not service:
+                    return
+                generation = self._lifecycle_generation
+                for topic in topics:
+                    tracker = self._topics[topic]
+                    tracker.error_count += 1
+                    tracker.dropped_count += 1
+                    tracker.state = "error"
+                    tracker.detail = event.bounded_detail
+                sim_time_ns = (
+                    self._clock.now_ns
+                    if event.optional_job_identity is None
+                    else event.optional_job_identity[4]
+                )
+            event_fields: dict[str, object] = {
+                "scope": event.scope,
+                "stable_error_code": event.stable_error_code,
+                "service_event_kind": event.kind,
+                "service_event_sequence": event.sequence,
+                "reason": event.bounded_detail,
+                "sim_time_ns": sim_time_ns,
+            }
+            if event.scope == "topic":
+                event_fields["topic"] = topics[0]
+            else:
+                event_fields["topics"] = topics
+            self._record_event(
+                "sensor_failed",
+                topics[0],
+                tracker_generation=generation,
+                **event_fields,
+            )
+
+    def _poll_lidar_service(self, *, allow_closing: bool = False) -> None:
+        """非阻塞收取一帧及其 typed outcomes，并立即走既有发布通道。"""
+        with self._condition:
+            service = self._lidar_scan_service
+            state_is_publishable = self._state == "open" or (
+                allow_closing and self._state == "closing"
+            )
+            if service is None or not state_is_publishable:
+                return
+        prepared = service.poll()
+        drain_events = getattr(service, "drain_events", None)
+        events = () if not callable(drain_events) else drain_events()
+        if type(events) is not tuple:
+            raise TypeError("lidar service drain_events must return an exact tuple")
+        self._consume_lidar_service_events(
+            service,
+            events,
+            allow_closing=allow_closing,
+        )
+        if prepared is not None:
+            if type(prepared) is PreparedLidarPayload:
+                self._publish_prepared_lidar_payload(
+                    prepared,
+                    allow_closing=allow_closing,
+                )
+            else:
+                self._publish_prepared_lidar_frame(
+                    prepared,
+                    allow_closing=allow_closing,
+                )
+
+    def begin_sensor_fence(self) -> SensorFence:
+        """停止新 capture，并在 250 ms 总预算内排空已捕获帧。"""
+        with self._condition:
+            self._require_open_locked()
+            if self._active_sensor_fence is not None:
+                raise RuntimeError("sensor fence is already active")
+            service = self._lidar_scan_service
+            if service is not None:
+                self._lidar_capture_fenced = True
+            provisional = SensorFence(self, service, False)
+            self._active_sensor_fence = provisional
+
+        if service is None:
+            return provisional
+
+        deadline = self._monotonic() + _SENSOR_FENCE_TIMEOUT_SEC
+        # snapshot/poll 都可能进入 IPC，不能持有 runtime 生命周期锁。
+        snapshot = service.snapshot()
+        if self._monotonic() >= deadline:
+            raise TimeoutError("sensor fence did not become idle within 250 ms")
+        fence = SensorFence(self, service, snapshot.state == "ready")
+        with self._condition:
+            self._require_open_locked()
+            if self._active_sensor_fence is not provisional:
+                raise RuntimeError("sensor fence ownership changed during startup")
+            self._active_sensor_fence = fence
+
+        while (
+            snapshot.in_flight_identity is not None
+            or snapshot.pending_capture_identity is not None
+        ):
+            self._poll_lidar_service()
+            snapshot = service.snapshot()
+            if self._monotonic() >= deadline:
+                raise TimeoutError("sensor fence did not become idle within 250 ms")
+            if (
+                snapshot.in_flight_identity is None
+                and snapshot.pending_capture_identity is None
+            ):
+                break
+        return fence
+
+    def complete_sensor_fence(
+        self,
+        fence: SensorFence,
+        *,
+        resume_capture: bool,
+    ) -> None:
+        """ACK 成功后只为进入前 ready 的同一 service 恢复 capture。"""
+        if not isinstance(resume_capture, bool):
+            raise ValueError("resume_capture must be a bool")
+        with self._condition:
+            self._require_open_locked()
+            if fence is not self._active_sensor_fence or fence._runtime is not self:
+                raise ValueError("sensor fence does not belong to this runtime")
+            if (
+                resume_capture
+                and fence._service_was_ready
+                and self._lidar_scan_service is fence._service
+            ):
+                self._lidar_capture_fenced = False
+            self._active_sensor_fence = None
+
+    def _publish_prepared_lidar_frame(
+        self,
+        frame: object,
+        *,
+        allow_closing: bool = False,
+    ) -> bool:
+        """校验 worker 帧身份后直接发布预编码 bytes，不在父进程重新编码。"""
+        if type(frame) is not PreparedLidarFrame:
+            return False
+        if frame.topic == "lidar_front":
+            topic = self._config.lidar_front.topic
+            expected_lidar_id = 1
+        elif frame.topic == "lidar_rear":
+            topic = self._config.lidar_rear.topic
+            expected_lidar_id = 2
+        else:
+            return False
+        message = frame.message
+        top_view = frame.optional_top_view
+        if (
+            type(message) is not LidarPointCloud
+            or message.frame_id != frame.topic
+            or message.lidar_id != expected_lidar_id
+            or message.timebase_ns != frame.timestamp_ns
+            or type(frame.protobuf_payload) is not bytes
+            or not frame.protobuf_payload
+        ):
+            return False
+        with self._condition:
+            if not self._generation_is_publishable_locked(
+                frame.lifecycle_generation,
+                allow_closing=allow_closing,
+            ):
+                return False
+            capture_top_view = self._capture_lidar_top_view
+        if capture_top_view:
+            if type(top_view) is not LidarTopViewFrame:
+                return False
+            try:
+                LidarScanResult(message, top_view)
+            except (TypeError, ValueError):
+                return False
+        elif top_view is not None:
+            return False
+        try:
+            type_name = self._codec.type_name(message)
+        except Exception as exc:
+            with self._condition:
+                if self._lifecycle_generation == frame.lifecycle_generation:
+                    self._record_topic_error_locked(topic, exc)
+            return False
+        return self._publish_encoded_message(
+            topic,
+            message,
+            frame.timestamp_ns,
+            frame.lifecycle_generation,
+            payload=frame.protobuf_payload,
+            type_name=type_name,
+            top_view=top_view,
+            allow_closing=allow_closing,
+        )
+
+    def _publish_prepared_lidar_payload(
+        self,
+        payload_frame: object,
+        *,
+        allow_closing: bool = False,
+    ) -> bool:
+        """headless worker payload 不解码点云，直接复用 encoded publish 内核。"""
+        if type(payload_frame) is not PreparedLidarPayload:
+            return False
+        if payload_frame.topic == "lidar_front":
+            topic = self._config.lidar_front.topic
+        elif payload_frame.topic == "lidar_rear":
+            topic = self._config.lidar_rear.topic
+        else:  # pragma: no cover - compact 合同构造器已冻结 topic
+            return False
+        if type(payload_frame.protobuf_payload) is not bytes or not payload_frame.protobuf_payload:
+            return False
+        with self._condition:
+            if (
+                self._capture_lidar_top_view
+                or not self._generation_is_publishable_locked(
+                    payload_frame.lifecycle_generation,
+                    allow_closing=allow_closing,
+                )
+            ):
+                return False
+        return self._publish_encoded_message(
+            topic,
+            None,
+            payload_frame.timestamp_ns,
+            payload_frame.lifecycle_generation,
+            payload=payload_frame.protobuf_payload,
+            type_name=LIDAR_POINT_CLOUD_TYPE_NAME,
+            store_dashboard_output=False,
+            allow_closing=allow_closing,
+        )
 
     def _publish_wheel_deadlines(
         self,
@@ -1274,11 +1758,40 @@ class InterfaceRuntime:
                     return False
         return True
 
-    def _generation_is_publishable_locked(self, generation: int) -> bool:
+    def _generation_is_publishable_locked(
+        self,
+        generation: int,
+        *,
+        allow_closing: bool = False,
+    ) -> bool:
+        if allow_closing:
+            return (
+                self._state == "closing"
+                and not self._paused
+                and self._lifecycle_generation == generation
+            )
         return (
             self._state == "open"
             and self._world_ready
             and not self._paused
+            and self._lifecycle_generation == generation
+        )
+
+    def _generation_can_commit_publish_locked(
+        self,
+        generation: int,
+        *,
+        allow_closing: bool = False,
+    ) -> bool:
+        """允许已完成的 transport 调用提交当前代结果，不受回调内 pause 影响。"""
+        if allow_closing:
+            return (
+                self._state == "closing"
+                and self._lifecycle_generation == generation
+            )
+        return (
+            self._state == "open"
+            and self._world_ready
             and self._lifecycle_generation == generation
         )
 
@@ -1337,16 +1850,52 @@ class InterfaceRuntime:
         try:
             payload = self._codec.encode(message)
             type_name = self._codec.type_name(message)
+        except Exception as exc:
+            with self._condition:
+                if self._lifecycle_generation == generation:
+                    self._record_topic_error_locked(topic, exc)
+            return False
+        return self._publish_encoded_message(
+            topic,
+            message,
+            timestamp_ns,
+            generation,
+            payload=payload,
+            type_name=type_name,
+            count_topic=count_topic,
+            log_publish=log_publish,
+            top_view=top_view,
+        )
+
+    def _publish_encoded_message(
+        self,
+        topic: str,
+        message: object | None,
+        timestamp_ns: int,
+        generation: int,
+        *,
+        payload: bytes,
+        type_name: str,
+        count_topic: bool = True,
+        log_publish: bool = True,
+        top_view: LidarTopViewFrame | None = None,
+        store_dashboard_output: bool = True,
+        allow_closing: bool = False,
+    ) -> bool:
+        """复用同一发布线性化内核提交已编码消息及其 Dashboard 副本。"""
+        try:
             publish_time = self._monotonic()
         except Exception as exc:
             with self._condition:
                 if self._lifecycle_generation == generation:
                     self._record_topic_error_locked(topic, exc)
             return False
-
         # 第二次检查与登记必须原子；transport 调用本身始终在 lifecycle 锁外。
         with self._condition:
-            if not self._generation_is_publishable_locked(generation):
+            if not self._generation_is_publishable_locked(
+                generation,
+                allow_closing=allow_closing,
+            ):
                 return False
             self._in_flight_publishes += 1
         previous_publish_depth = self._enter_interface_callback("publish")
@@ -1368,10 +1917,9 @@ class InterfaceRuntime:
 
             if publish_error is not None:
                 with self._condition:
-                    publish_still_current = (
-                        self._lifecycle_generation == generation
-                        and self._state == "open"
-                        and self._world_ready
+                    publish_still_current = self._generation_can_commit_publish_locked(
+                        generation,
+                        allow_closing=allow_closing,
                     )
                     if publish_still_current:
                         self._record_topic_error_locked(topic, publish_error)
@@ -1386,16 +1934,16 @@ class InterfaceRuntime:
                 return False
 
             with self._condition:
-                publish_still_current = (
-                    self._state == "open"
-                    and self._lifecycle_generation == generation
-                    and self._world_ready
+                publish_still_current = self._generation_can_commit_publish_locked(
+                    generation,
+                    allow_closing=allow_closing,
                 )
                 if publish_still_current and count_topic:
                     tracker = self._topics[topic]
                     tracker.message_count += 1
                     tracker.latest_timestamp_ns = timestamp_ns
-                    self._store_dashboard_output_locked(topic, message, top_view)
+                    if store_dashboard_output:
+                        self._store_dashboard_output_locked(topic, message, top_view)
                     try:
                         frequency = self._wheel_frequency if topic == self._config.wheel_state.topic else tracker.frequency
                         if frequency is None:
@@ -1416,6 +1964,7 @@ class InterfaceRuntime:
                     payload,
                     publish_time,
                     tracker_generation=generation,
+                    allow_closing=allow_closing,
                 )
             return publish_still_current
         finally:
@@ -1509,6 +2058,7 @@ class InterfaceRuntime:
         wall_time: float,
         *,
         tracker_generation: int | None = None,
+        allow_closing: bool = False,
     ) -> None:
         logger = self._logger
         if logger is None:
@@ -1517,9 +2067,12 @@ class InterfaceRuntime:
         with self._log_lock:
             # 等待日志锁期间 close 可能已完成；旧代消息不得触碰终结后的 logger。
             with self._condition:
+                state_is_loggable = self._state == "open" or (
+                    allow_closing and self._state == "closing"
+                )
                 if tracker_generation is not None and (
                     self._lifecycle_generation != tracker_generation
-                    or self._state != "open"
+                    or not state_is_loggable
                 ):
                     return
             self._flush_pending_logger_drops_locked(logger, terminal=False)
@@ -1748,12 +2301,82 @@ class InterfaceRuntime:
             **fields,
         )
 
+    def _cleanup_retired_lidar_service(
+        self,
+        service: LidarScanService,
+        *,
+        report_failure: bool,
+    ) -> BaseException | None:
+        """串行重试一个 retired worker；成功后才释放 runtime 所有权。"""
+        identity = id(service)
+        with self._condition:
+            while identity in self._retired_lidar_cleanup_claims:
+                self._condition.wait()
+            if not any(item is service for item in self._retired_lidar_services):
+                return None
+            self._retired_lidar_cleanup_claims.add(identity)
+
+        error: BaseException | None = None
+        try:
+            service.close_idle()
+        except BaseException as exc:
+            error = exc
+            should_report = False
+            with self._condition:
+                if report_failure and identity not in self._retired_lidar_diagnostic_ids:
+                    self._retired_lidar_diagnostic_ids.add(identity)
+                    should_report = True
+            if should_report:
+                try:
+                    self._record_event(
+                        "retired_cleanup_failed",
+                        self._config.wheel_command.topic,
+                        scope="service",
+                        stable_error_code="worker_shutdown_failed",
+                        reason=_bounded_failure_detail(
+                            "retired lidar service cleanup",
+                            exc,
+                        ),
+                    )
+                except BaseException:
+                    pass
+        else:
+            with self._condition:
+                self._retired_lidar_services = [
+                    item for item in self._retired_lidar_services if item is not service
+                ]
+                self._retired_lidar_diagnostic_ids.discard(identity)
+        finally:
+            with self._condition:
+                self._retired_lidar_cleanup_claims.discard(identity)
+                self._condition.notify_all()
+        return error
+
+    def _register_retired_lidar_service_locked(
+        self,
+        service: LidarScanService,
+    ) -> None:
+        """在 runtime condition 内登记仍由本 runtime 负责终结的 service。"""
+        if not any(item is service for item in self._retired_lidar_services):
+            self._retired_lidar_services.append(service)
+
     def status_snapshot(self, wall_time: float | None = None) -> InterfaceStatusSnapshot:
         """在单一临界区复制六话题、命令邮箱和实际 transport 状态。"""
         with self._condition:
             captured_at = self._monotonic() if wall_time is None else wall_time
             transport = self._transport.snapshot()
             return self._status_snapshot_locked(captured_at, transport)
+
+    def lidar_service_snapshot(self) -> LidarServiceSnapshot | None:
+        """返回调用线性化时由 runtime 持有的当前 LiDAR service 诊断。"""
+        with self._condition:
+            service = self._lidar_scan_service
+        if service is None:
+            return None
+        snapshot = service.snapshot()
+        if type(snapshot) is not LidarServiceSnapshot:
+            raise TypeError("lidar service snapshot must use the frozen contract")
+        return snapshot
 
     def _status_snapshot_locked(
         self,
@@ -1883,16 +2506,28 @@ class InterfaceRuntime:
         )
 
     def pause(self) -> None:
+        """先挂起本 runtime 拥有的异步 LiDAR，再冻结物理调度。"""
         with self._condition:
             self._require_open_locked()
+            if self._paused:
+                return
+            service = self._lidar_scan_service
+            self._lidar_service_paused_by_runtime = None
+            if service is not None and service.snapshot().state == "ready":
+                service.pause()
+                self._lidar_service_paused_by_runtime = service
             self._paused = True
 
     def resume(self, wall_time: float | None = None) -> WheelDecision:
-        """先按 100 ms 墙钟期限刷新安全决定，再恢复物理发布。"""
+        """先刷新安全决定并恢复本次 pause 的 LiDAR，再恢复物理发布。"""
         with self._condition:
             self._require_open_locked()
             now = self._monotonic() if wall_time is None else wall_time
             decision = self._mailbox.decision(now=now)
+            service = self._lidar_service_paused_by_runtime
+            if service is not None and self._lidar_scan_service is service:
+                service.resume()
+            self._lidar_service_paused_by_runtime = None
             self._last_decision = decision
             self._paused = False
             return decision
@@ -1912,6 +2547,13 @@ class InterfaceRuntime:
             self._require_open_locked()
             if not self._world_ready:
                 raise RuntimeError("world rebuild is already prepared")
+            lidar_service = self._lidar_scan_service
+            previous_document = self._scene_document
+            previous_digest = None
+            if lidar_service is not None:
+                if previous_document is None:
+                    raise RuntimeError("lidar service requires a scene document")
+                previous_digest = world_digest_for_document(previous_document)
             self._prepare_in_progress = True
             self._lifecycle_owner_ident = get_ident()
             self._rebuild_prepared = False
@@ -1922,6 +2564,44 @@ class InterfaceRuntime:
             subscription = self._command_subscription
             self._command_subscription = None
             robot = self._robot
+            if lidar_service is not None:
+                self._lidar_capture_fenced = True
+            self._prepared_lidar_service = lidar_service
+            self._prepared_scene_document = previous_document
+            self._prepared_lidar_world_digest = previous_digest
+
+        first_error: BaseException | None = None
+        if lidar_service is not None:
+            try:
+                deadline = self._monotonic() + _SENSOR_FENCE_TIMEOUT_SEC
+                safety_deadline = time.monotonic() + _SENSOR_FENCE_TIMEOUT_SEC
+
+                def fence_expired() -> bool:
+                    return (
+                        self._monotonic() >= deadline
+                        or time.monotonic() >= safety_deadline
+                    )
+
+                lidar_service.pause()
+                snapshot = lidar_service.snapshot()
+                if fence_expired():
+                    raise TimeoutError(
+                        "rebuild lidar service did not become idle within 250 ms"
+                    )
+                # pause 已撤销 pending；这里只回收不可取消的旧 native 扫描结果。
+                while snapshot.in_flight_identity is not None:
+                    lidar_service.poll()
+                    snapshot = lidar_service.snapshot()
+                    if fence_expired():
+                        raise TimeoutError(
+                            "rebuild lidar service did not become idle within 250 ms"
+                        )
+                    if snapshot.in_flight_identity is not None:
+                        time.sleep(0.001)
+            except BaseException as exc:
+                first_error = exc
+
+        with self._condition:
             # 已登记读/发布先在旧代退出；world_ready=False 已阻止新任务准入。
             while (
                 self._in_flight_world_operations > 0
@@ -1929,6 +2609,13 @@ class InterfaceRuntime:
             ):
                 self._condition.wait()
             self._lifecycle_generation += 1
+            lifecycle_generation = self._lifecycle_generation
+            if lidar_service is not None:
+                try:
+                    lidar_service.invalidate_generation(lifecycle_generation)
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
             self._mailbox.clear()
             self._clear_dashboard_payloads_locked()
             self._begin_new_command_epoch_locked()
@@ -1937,12 +2624,12 @@ class InterfaceRuntime:
             self._safe_stop_latched = False
             self._safe_stop_mode = None
         # 订阅屏障先等已捕获回调离开，再接触可能被重建的 PyBullet 对象。
-        first_error: BaseException | None = None
         if subscription is not None:
             try:
                 subscription.close()
             except BaseException as exc:
-                first_error = exc
+                if first_error is None:
+                    first_error = exc
         robot_parked = False
         try:
             robot.hold_current_steering_and_stop_drive(_SAFE_STOP_DT)
@@ -1965,6 +2652,7 @@ class InterfaceRuntime:
             raise RuntimeError(
                 "abort_world_rebuild cannot run from an in-flight interface callback"
             )
+        lidar_resolution_reserved = False
         with self._condition:
             self._reject_lifecycle_owner_reentry_locked("abort_world_rebuild")
             while self._prepare_in_progress and self._state == "open":
@@ -1976,6 +2664,48 @@ class InterfaceRuntime:
                 raise RuntimeError("world rebuild is not abortable")
             lifecycle_generation = self._lifecycle_generation
             model = self._robot_model
+            prepared_lidar_service = self._prepared_lidar_service
+            if prepared_lidar_service is not None:
+                if self._rebuild_candidate_in_progress:
+                    raise RuntimeError(
+                        "world rebuild candidate is already in progress"
+                    )
+                self._rebuild_candidate_in_progress = True
+                self._rebuild_candidate_owner_ident = get_ident()
+                lidar_resolution_reserved = True
+
+        try:
+            self._abort_world_rebuild_reserved(
+                lifecycle_generation,
+                model,
+                prepared_lidar_service,
+            )
+        finally:
+            if lidar_resolution_reserved:
+                with self._condition:
+                    self._rebuild_candidate_in_progress = False
+                    self._rebuild_candidate_owner_ident = None
+                    self._condition.notify_all()
+
+    def _abort_world_rebuild_reserved(
+        self,
+        lifecycle_generation: int,
+        model: RobotModelSpec,
+        prepared_lidar_service: LidarScanService | None,
+    ) -> None:
+        """在 LiDAR 终结 reservation 下恢复 prepare 保存的旧绑定。"""
+
+        if prepared_lidar_service is not None:
+            prepared_snapshot = prepared_lidar_service.snapshot()
+            if (
+                prepared_snapshot.lifecycle_generation != lifecycle_generation
+                or prepared_snapshot.state != "suspended"
+                or prepared_snapshot.in_flight_identity is not None
+                or prepared_snapshot.pending_capture_identity is not None
+            ):
+                raise RuntimeError(
+                    "prepared lidar service must remain suspended and idle"
+                )
 
         mailbox = WheelCommandMailbox(
             model,
@@ -1994,6 +2724,8 @@ class InterfaceRuntime:
                     or self._world_ready
                 ):
                     raise RuntimeError("world changed while aborting rebuild")
+                if prepared_lidar_service is not None:
+                    prepared_lidar_service.resume()
                 self._mailbox = mailbox
                 self._reset_command_tracker_locked()
                 self._begin_new_command_epoch_locked()
@@ -2005,6 +2737,11 @@ class InterfaceRuntime:
                 self._world_ready = True
                 self._rebuild_prepared = False
                 self._prepared_robot_parked = False
+                self._lidar_capture_fenced = False
+                self._lidar_service_paused_by_runtime = None
+                self._prepared_lidar_service = None
+                self._prepared_scene_document = None
+                self._prepared_lidar_world_digest = None
                 self._safe_stop_latched = False
                 self._safe_stop_mode = None
         except BaseException:
@@ -2022,7 +2759,6 @@ class InterfaceRuntime:
                         and self._rebuild_prepared
                     ):
                         self._state = "faulted"
-                        self._lifecycle_generation += 1
                         self._accepting_commands = False
                         self._world_ready = False
                         self._rebuild_prepared = False
@@ -2050,7 +2786,6 @@ class InterfaceRuntime:
             if self._world_ready or not self._rebuild_prepared:
                 raise RuntimeError("world rebuild is not prepared")
             self._state = "faulted"
-            self._lifecycle_generation += 1
             self._accepting_commands = False
             self._world_ready = False
             self._rebuild_prepared = False
@@ -2064,6 +2799,28 @@ class InterfaceRuntime:
             self._safe_stop_mode = None
             self._condition.notify_all()
 
+    @contextmanager
+    def _reserve_world_rebuild_candidate(self):
+        """只串行化候选所有权，不在锁内执行 factory 或预热。"""
+        with self._condition:
+            self._reject_lifecycle_owner_reentry_locked("commit_world_rebuild")
+            while self._prepare_in_progress and self._state == "open":
+                self._condition.wait()
+            self._require_open_locked()
+            if not self._rebuild_prepared or self._world_ready:
+                raise RuntimeError("prepare_world_rebuild must be called first")
+            if self._rebuild_candidate_in_progress:
+                raise RuntimeError("world rebuild candidate is already in progress")
+            self._rebuild_candidate_in_progress = True
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._rebuild_candidate_in_progress = False
+                self._rebuild_lidar_candidate_in_progress = False
+                self._rebuild_candidate_owner_ident = None
+                self._condition.notify_all()
+
     def commit_world_rebuild(
         self,
         new_robot: WheelRobotPort,
@@ -2075,14 +2832,32 @@ class InterfaceRuntime:
             raise RuntimeError(
                 "commit_world_rebuild cannot run from an in-flight interface callback"
             )
+        with self._reserve_world_rebuild_candidate():
+            self._commit_world_rebuild_reserved(
+                new_robot,
+                new_backend,
+                new_document,
+            )
+
+    def _commit_world_rebuild_reserved(
+        self,
+        new_robot: WheelRobotPort,
+        new_backend: SensorBackend,
+        new_document: SceneDocument,
+    ) -> None:
+        """在唯一 reservation 下构建候选并执行原子世界交换。"""
         with self._condition:
-            self._reject_lifecycle_owner_reentry_locked("commit_world_rebuild")
             while self._prepare_in_progress and self._state == "open":
                 self._condition.wait()
             self._require_open_locked()
             if not self._rebuild_prepared or self._world_ready:
                 raise RuntimeError("prepare_world_rebuild must be called first")
             old_backend = self._sensor_backend
+            old_lidar_service = self._prepared_lidar_service
+            previous_document = self._prepared_scene_document
+            previous_digest = self._prepared_lidar_world_digest
+            lidar_service_factory = self._lidar_scan_service_factory
+            lifecycle_generation = self._lifecycle_generation
         model = _robot_model(new_robot)
         if not isinstance(new_document, SceneDocument):
             raise ValueError("new_document must be a SceneDocument")
@@ -2093,12 +2868,93 @@ class InterfaceRuntime:
         )
         decision = mailbox.decision(now=self._monotonic())
         sensors = self._build_sensor_objects(new_backend, new_document)
-        subscription, subscription_token = self._subscribe_wheel_command()
+        candidate_lidar_service = old_lidar_service
+        reuses_previous = False
+        if old_lidar_service is not None:
+            candidate_digest = world_digest_for_document(new_document)
+            reuses_previous = (
+                previous_document is not None
+                and new_document == previous_document
+                and candidate_digest == previous_digest
+            )
+            if not reuses_previous:
+                if lidar_service_factory is None:
+                    raise RuntimeError(
+                        "lidar worker rebuild requires a service factory"
+                    )
+                with self._condition:
+                    self._require_open_locked()
+                    self._rebuild_lidar_candidate_in_progress = True
+                    self._rebuild_candidate_owner_ident = get_ident()
+                candidate_lidar_service = lidar_service_factory(
+                    new_document,
+                    lifecycle_generation,
+                    candidate_digest,
+                )
+                if not isinstance(candidate_lidar_service, LidarScanService):
+                    raise TypeError(
+                        "lidar_scan_service_factory must return LidarScanService"
+                    )
+                try:
+                    candidate_snapshot = candidate_lidar_service.snapshot()
+                    if candidate_snapshot.lifecycle_generation != lifecycle_generation:
+                        raise RuntimeError(
+                            "candidate lidar service generation does not match rebuild"
+                        )
+                    if (
+                        candidate_snapshot.state != "ready"
+                        or candidate_snapshot.in_flight_identity is not None
+                        or candidate_snapshot.pending_capture_identity is not None
+                    ):
+                        raise RuntimeError(
+                            "candidate lidar service must be ready and idle"
+                        )
+                except BaseException:
+                    with self._condition:
+                        self._register_retired_lidar_service_locked(
+                            candidate_lidar_service
+                        )
+                    self._cleanup_retired_lidar_service(
+                        candidate_lidar_service,
+                        report_failure=True,
+                    )
+                    raise
+            else:
+                previous_snapshot = old_lidar_service.snapshot()
+                if (
+                    previous_snapshot.lifecycle_generation != lifecycle_generation
+                    or previous_snapshot.state != "suspended"
+                    or previous_snapshot.in_flight_identity is not None
+                    or previous_snapshot.pending_capture_identity is not None
+                ):
+                    raise RuntimeError(
+                        "previous lidar service must remain suspended and idle"
+                    )
+        subscription: Subscription | None = None
+        retired_lidar_service: LidarScanService | None = None
+        committed = False
         try:
+            subscription, subscription_token = self._subscribe_wheel_command()
             with self._condition:
                 self._require_open_locked()
-                if self._world_ready:
-                    raise RuntimeError("prepare_world_rebuild must be called first")
+                if (
+                    self._world_ready
+                    or not self._rebuild_prepared
+                    or self._lifecycle_generation != lifecycle_generation
+                    or self._prepared_lidar_service is not old_lidar_service
+                    or self._prepared_scene_document is not previous_document
+                    or self._prepared_lidar_world_digest != previous_digest
+                ):
+                    raise RuntimeError("world changed while committing rebuild")
+                # resume 不触碰 child；失败时必须发生在任何新世界字段发布前。
+                if reuses_previous and candidate_lidar_service is not None:
+                    candidate_lidar_service.resume()
+                if (
+                    old_lidar_service is not None
+                    and candidate_lidar_service is not old_lidar_service
+                ):
+                    retired_lidar_service = old_lidar_service
+                    self._register_retired_lidar_service_locked(old_lidar_service)
                 self._robot = new_robot
                 self._robot_model = model
                 self._mailbox = mailbox
@@ -2109,18 +2965,51 @@ class InterfaceRuntime:
                 self._sensor_backend = new_backend
                 self._scene_document = new_document
                 self._install_sensor_objects(*sensors)
+                self._lidar_scan_service = candidate_lidar_service
+                self._lidar_capture_fenced = False
+                self._lidar_service_paused_by_runtime = None
                 self._command_subscription = subscription
                 self._active_subscription_token = subscription_token
                 self._accepting_commands = True
                 self._world_ready = True
                 self._rebuild_prepared = False
                 self._prepared_robot_parked = False
+                self._prepared_lidar_service = None
+                self._prepared_scene_document = None
+                self._prepared_lidar_world_digest = None
+                committed = True
         except BaseException:
-            try:
-                subscription.close()
-            except BaseException:
-                pass
+            if subscription is not None:
+                try:
+                    subscription.close()
+                except BaseException:
+                    pass
+            if retired_lidar_service is not None and not committed:
+                with self._condition:
+                    self._retired_lidar_services = [
+                        item
+                        for item in self._retired_lidar_services
+                        if item is not retired_lidar_service
+                    ]
+            if (
+                candidate_lidar_service is not None
+                and candidate_lidar_service is not old_lidar_service
+                and not committed
+            ):
+                with self._condition:
+                    self._register_retired_lidar_service_locked(
+                        candidate_lidar_service
+                    )
+                self._cleanup_retired_lidar_service(
+                    candidate_lidar_service,
+                    report_failure=True,
+                )
             raise
+        if retired_lidar_service is not None:
+            self._cleanup_retired_lidar_service(
+                retired_lidar_service,
+                report_failure=True,
+            )
         # 新绑定已发布后，旧 backend 的释放失败不能反转成功 commit。
         if old_backend is not None and old_backend is not new_backend:
             close_old_backend = getattr(old_backend, "close", None)
@@ -2360,7 +3249,11 @@ class InterfaceRuntime:
                     if self._close_error is not None:
                         raise self._close_error
                     return
-                if self._prepare_in_progress or self._rebind_in_progress:
+                if (
+                    self._prepare_in_progress
+                    or self._rebind_in_progress
+                    or self._rebuild_lidar_candidate_in_progress
+                ):
                     if in_publish_callback:
                         raise RuntimeError(
                             "close cannot wait for an active lifecycle transition "
@@ -2371,10 +3264,13 @@ class InterfaceRuntime:
                 break
             self._state = "closing"
             self._lifecycle_owner_ident = get_ident()
-            self._lifecycle_generation += 1
+            closing_lidar_generation = self._lifecycle_generation
             self._accepting_commands = False
             self._active_subscription_token = None
             skip_safe_stop = not self._world_ready and self._prepared_robot_parked
+            active_lidar_service = self._lidar_scan_service
+            if active_lidar_service is not None:
+                self._lidar_capture_fenced = True
             self._world_ready = False
             while self._in_flight_world_operations > 0:
                 self._condition.wait()
@@ -2410,7 +3306,122 @@ class InterfaceRuntime:
             if skip_safe_stop
             else lambda: robot.hold_current_steering_and_stop_drive(_SAFE_STOP_DT),
         )
-        run_step("stop_sensors")
+
+        def drain_active_lidar_service() -> None:
+            """在关闭代仍有效时排空 active worker，并在发布完成后正常 join。"""
+            service = active_lidar_service
+            if service is None:
+                return
+            begin_draining = getattr(service, "begin_draining", None)
+            snapshot_service = getattr(service, "snapshot", None)
+            close_idle = getattr(service, "close_idle", None)
+            force_close = getattr(service, "force_close", None)
+            if not all(
+                callable(method)
+                for method in (
+                    begin_draining,
+                    snapshot_service,
+                    close_idle,
+                    force_close,
+                )
+            ):
+                return
+
+            normal_close_error: BaseException | None = None
+            service_failed_before_close = False
+            try:
+                begin_draining()
+                drain_events = getattr(service, "drain_events", None)
+                if callable(drain_events):
+                    pending_events = drain_events()
+                    if type(pending_events) is not tuple:
+                        raise TypeError(
+                            "lidar service drain_events must return an exact tuple"
+                        )
+                    self._consume_lidar_service_events(
+                        service,
+                        pending_events,
+                        allow_closing=True,
+                    )
+                deadline = self._monotonic() + _SENSOR_FENCE_TIMEOUT_SEC
+                hard_deadline = time.monotonic() + _SENSOR_FENCE_TIMEOUT_SEC
+                snapshot = snapshot_service()
+                service_failed_before_close = snapshot.state == "failed"
+                while (
+                    snapshot.in_flight_identity is not None
+                    or snapshot.pending_capture_identity is not None
+                ):
+                    if snapshot.state == "failed":
+                        raise RuntimeError("lidar service failed while closing")
+                    if (
+                        self._monotonic() >= deadline
+                        or time.monotonic() >= hard_deadline
+                    ):
+                        raise TimeoutError(
+                            "lidar service did not drain within 250 ms during close"
+                        )
+                    self._poll_lidar_service(allow_closing=True)
+                    snapshot = snapshot_service()
+                if snapshot.state == "failed":
+                    raise RuntimeError("lidar service failed while closing")
+                close_idle(timeout_sec=_LIDAR_CLOSE_JOIN_TIMEOUT_SEC)
+            except BaseException as exc:
+                normal_close_error = exc
+
+            if normal_close_error is not None:
+                self._record_event(
+                    "worker_shutdown_failed",
+                    self._config.wheel_command.topic,
+                    tracker_generation=closing_lidar_generation,
+                    scope="service",
+                    stable_error_code="worker_shutdown_failed",
+                    reason=_bounded_failure_detail(
+                        "active lidar service shutdown",
+                        normal_close_error,
+                    ),
+                )
+                force_error: BaseException | None = None
+                try:
+                    force_close()
+                except BaseException as exc:
+                    force_error = exc
+                with self._condition:
+                    if self._lidar_scan_service is service:
+                        self._lidar_scan_service = None
+                if force_error is not None:
+                    raise normal_close_error from force_error
+                if not service_failed_before_close:
+                    raise normal_close_error
+                return
+            with self._condition:
+                if self._lidar_scan_service is service:
+                    self._lidar_scan_service = None
+
+        def cleanup_lidar_services() -> None:
+            first_cleanup_error: BaseException | None = None
+            try:
+                drain_active_lidar_service()
+            except BaseException as exc:
+                first_cleanup_error = exc
+            with self._condition:
+                retired = tuple(self._retired_lidar_services)
+            for service in retired:
+                cleanup_error = self._cleanup_retired_lidar_service(
+                    service,
+                    report_failure=False,
+                )
+                if first_cleanup_error is None and cleanup_error is not None:
+                    first_cleanup_error = cleanup_error
+            if first_cleanup_error is not None:
+                raise first_cleanup_error
+
+        run_step("stop_sensors", cleanup_lidar_services)
+        with self._condition:
+            # 合法 closing generation 已完全排空后，才统一失效其余旧代输出。
+            if self._lifecycle_generation == closing_lidar_generation:
+                self._lifecycle_generation += 1
+            self._world_ready = False
+            self._clear_dashboard_payloads_locked()
         terminal_log_deadline: float | None = None
 
         def quiesce_transport() -> None:

@@ -507,6 +507,58 @@ def test_scan_rejects_backend_result_length_mismatch_and_propagates_errors():
         lidar.scan(2)
 
 
+def test_frozen_lidar_scan_matches_live_scan_without_pose_lookup() -> None:
+    """冻结扫描只使用调用方已捕获的安装位姿。"""
+    backend = FakeLidarBackend()
+    lidar = MultiLineLidar.front(backend, LidarConfig.default())
+    backend.hit_ray(91, local_point=(2.0, 1.0, 0.0), category="static_obstacle")
+    world_mount_pose = lidar._world_mount()
+
+    live = lidar.scan(123)
+    backend.world_pose_calls.clear()
+    backend.ray_batches.clear()
+    frozen_scan = getattr(lidar, "_scan_frozen", None)
+
+    assert callable(frozen_scan), "frozen lidar scan entrypoint must exist"
+    frozen = frozen_scan(123, world_mount_pose)
+
+    assert frozen == live
+    assert backend.world_pose_calls == []
+    assert len(backend.ray_batches) == 1
+
+
+def test_frozen_dashboard_scan_keeps_message_and_top_view_atomic() -> None:
+    """冻结 Dashboard 扫描的点云与俯视帧必须来自同一射线批次。"""
+    backend = FakeLidarBackend()
+    lidar = MultiLineLidar.front(backend, LidarConfig.default())
+    backend.parent_poses["base_link"] = Pose(
+        (8.0, -3.0, 1.2),
+        tuple(p.getQuaternionFromEuler((0.0, 0.0, 0.65))),
+    )
+    backend.parent_poses["lidar_front_mount"] = _world_pose_from_base(
+        backend.parent_poses["base_link"],
+        (0.5, 0.2, 0.1),
+    )
+    backend.hit_ray(91, local_point=(2.0, 1.0, 0.0), category="static_obstacle")
+    backend.hit_ray(183, local_point=(3.0, -1.0, 0.0), category="terrain")
+    world_mount_pose = lidar._world_mount()
+    base_pose = backend.parent_poses["base_link"]
+    backend.world_pose_calls.clear()
+    frozen_scan = getattr(lidar, "_scan_frozen", None)
+
+    assert callable(frozen_scan), "frozen lidar scan entrypoint must exist"
+    result = frozen_scan(456, world_mount_pose, base_pose)
+
+    assert isinstance(result, LidarScanResult)
+    assert result.message.timebase_ns == result.top_view.timestamp_ns == 456
+    assert result.message.point_num == len(result.message.points) == len(result.top_view.points) == 2
+    assert [point.tag for point in result.message.points] == [
+        point.tag for point in result.top_view.points
+    ]
+    assert backend.world_pose_calls == []
+    assert len(backend.ray_batches) == 1
+
+
 def _world_pose_from_base(
     base: Pose,
     local_position: tuple[float, float, float],

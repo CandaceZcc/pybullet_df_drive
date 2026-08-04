@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
+import inspect
 
 import pytest
 
@@ -197,6 +198,13 @@ def test_runtime_world_bundle_exposes_owned_transport(tmp_path) -> None:
 
         assert snapshot.mode == "local"
         assert snapshot.error_count == snapshot.dropped_count == 0
+
+
+def test_performance_gate_reuses_shared_deadline_pacer() -> None:
+    """联合负载超期时必须让出执行权，避免饿死异步日志线程。"""
+    source = inspect.getsource(verifier.run_twenty_obstacle_queue_performance_check)
+
+    assert "DeadlinePacer(" in source
 
 
 def test_sustained_backlog_ignores_constant_depth_when_writer_keeps_completing() -> None:

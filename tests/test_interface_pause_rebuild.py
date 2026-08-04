@@ -1,6 +1,7 @@
 # InterfaceRuntime 生命周期测试：覆盖暂停、重建代际、场景刷新和关闭顺序。
 from __future__ import annotations
 
+from dataclasses import replace
 from threading import Event, Lock, Thread
 import time
 
@@ -12,6 +13,17 @@ from slope_sim.interfaces.dashboard_snapshot import LidarTopViewFrame
 from slope_sim.interfaces.models import LidarPointCloud, WheelCommand
 from slope_sim.interfaces.runtime import InterfaceRuntime
 from slope_sim.lidar_pointcloud import LidarScanResult
+from slope_sim.lidar_worker import (
+    LidarScanRequest,
+    LidarScanService,
+    LidarWorkerHandle,
+    LidarWorkerReady,
+    LidarWorkerStop,
+    LidarWorkerStopped,
+    PreparedLidarFrame,
+    world_digest_for_document,
+)
+from slope_sim.scene_config import TerrainDocument
 
 from test_interface_runtime_integration import (
     Backend,
@@ -21,6 +33,7 @@ from test_interface_runtime_integration import (
     StubLidar,
     StubTruth,
     Transport,
+    install_frozen_async_sensors,
     make_runtime,
     scene_document,
 )
@@ -131,6 +144,1471 @@ class BlockingRejectingLogger(Logger):
         self.entered.set()
         assert self.release.wait(timeout=3.0)
         return False
+
+
+class ControllableLidarChannel:
+    """只控制 IPC 收发时机，其余 pause/epoch 语义由真实 service 执行。"""
+
+    def __init__(self) -> None:
+        self.sent: list[object] = []
+        self.responses: list[object] = []
+        self.auto_respond_to_scans = False
+        self.close_count = 0
+
+    def send(self, value: object) -> None:
+        self.sent.append(value)
+        if type(value) is LidarWorkerStop:
+            self.responses.append(
+                LidarWorkerStopped(value.protocol_version, value.process_id)
+            )
+        elif type(value) is LidarScanRequest and self.auto_respond_to_scans:
+            self.responses.append(_prepared_lidar_response(value))
+
+    def poll(self, timeout: float = 0.0) -> bool:
+        assert timeout >= 0.0
+        return bool(self.responses)
+
+    def recv(self) -> object:
+        if not self.responses:
+            raise EOFError("controllable lidar channel is empty")
+        return self.responses.pop(0)
+
+    def close(self) -> None:
+        self.close_count += 1
+
+
+class IdleOwnedWorkerProcess:
+    """模拟 Stop/ACK 后可正常 join 的 owned child。"""
+
+    def __init__(self) -> None:
+        self.alive = True
+
+    def join(self, _timeout_sec: float) -> None:
+        self.alive = False
+
+    def is_alive(self) -> bool:
+        return self.alive
+
+    def terminate(self) -> None:  # pragma: no cover - 失败即由测试栈暴露
+        raise AssertionError("idle owned worker must not be terminated")
+
+    def kill(self) -> None:  # pragma: no cover - 失败即由测试栈暴露
+        raise AssertionError("idle owned worker must not be killed")
+
+
+def _prepared_lidar_response(request: LidarScanRequest) -> PreparedLidarFrame:
+    """按真实请求的完整身份构造可由 service 严格匹配的 worker 响应。"""
+    message = LidarPointCloud(
+        request.timestamp_ns,
+        request.frame_id,
+        0,
+        request.lidar_id,
+        (),
+    )
+    return PreparedLidarFrame(
+        request.protocol_version,
+        request.job_id,
+        request.lifecycle_generation,
+        request.pause_epoch,
+        request.topic,
+        request.timestamp_ns,
+        message,
+        None,
+        b"prepared-old-epoch",
+        1,
+    )
+
+
+def _owned_lidar_service(
+    channel: ControllableLidarChannel,
+    *,
+    child_pid: int,
+    lifecycle_generation: int,
+) -> LidarScanService:
+    """构造具备 Stop/ACK 所有权合同的候选或 active service。"""
+    ready = LidarWorkerReady(
+        1,
+        child_pid,
+        "1" * 64,
+        ("lidar_front", "lidar_rear"),
+        (("lidar_front", "2" * 64), ("lidar_rear", "3" * 64)),
+        1,
+    )
+    handle = LidarWorkerHandle(
+        IdleOwnedWorkerProcess(),
+        channel,
+        channel,
+        ready,
+    )
+    return LidarScanService.from_worker_handle(
+        handle,
+        lifecycle_generation=lifecycle_generation,
+        monotonic_ns=lambda: 1_000_000_000,
+    )
+
+
+def _prepare_lidar_close(
+    service: LidarScanService,
+    channel: ControllableLidarChannel,
+) -> None:
+    """只为测试清理补齐 fake native job，避免把 finally 变成超时场景。"""
+    channel.auto_respond_to_scans = True
+    identity = service.snapshot().in_flight_identity
+    if identity is None or channel.responses:
+        return
+    for request in reversed(channel.sent):
+        if type(request) is not LidarScanRequest:
+            continue
+        request_identity = (
+            request.job_id,
+            request.lifecycle_generation,
+            request.pause_epoch,
+            request.topic,
+            request.timestamp_ns,
+        )
+        if request_identity == identity:
+            channel.responses.append(_prepared_lidar_response(request))
+            return
+    raise AssertionError("test close could not find the in-flight LiDAR request")
+
+
+def _make_async_pause_runtime(*, logger: Logger | None = None):
+    """把真实父端 LiDAR service 接入不启动 eCAL 的测试 transport。"""
+    channel = ControllableLidarChannel()
+    service = _owned_lidar_service(
+        channel,
+        child_pid=42,
+        lifecycle_generation=0,
+    )
+    runtime, robot, transport, clock = make_runtime(
+        mode="ecal",
+        backend=Backend(),
+        document=scene_document(),
+        logger=logger,
+        lidar_scan_service=service,
+        capture_lidar_top_view=False,
+    )
+    install_frozen_async_sensors(runtime)
+    return runtime, robot, transport, clock, service, channel
+
+
+def test_pause_discards_old_epoch_result_before_resume() -> None:
+    runtime, _robot, transport, clock, service, channel = _make_async_pause_runtime()
+    lidar_topics = {
+        runtime.config.lidar_front.topic,
+        runtime.config.lidar_rear.topic,
+    }
+    try:
+        runtime.after_physics_step(0.1)
+        before = service.snapshot()
+        assert len(channel.sent) == 1
+        assert before.in_flight_identity is not None
+        assert before.pending_capture_identity is not None
+        request = channel.sent[0]
+        assert type(request) is LidarScanRequest
+
+        runtime.pause()
+        channel.responses.append(_prepared_lidar_response(request))
+        assert runtime.before_physics_step(1.0 / 240.0, wall_time=clock()) is None
+
+        paused = service.snapshot()
+        assert paused.state == "suspended"
+        assert paused.pause_epoch == before.pause_epoch + 1
+        assert paused.in_flight_identity is None
+        assert paused.pending_capture_identity is None
+        assert paused.completed_count == 0
+        assert paused.stale_count == 1
+        assert all(topic not in lidar_topics for topic, *_rest in transport.published)
+    finally:
+        runtime.close()
+
+
+def test_pause_cancels_pending_without_topic_drop() -> None:
+    runtime, _robot, _transport, clock, service, channel = _make_async_pause_runtime()
+    lidar_topics = (
+        runtime.config.lidar_front.topic,
+        runtime.config.lidar_rear.topic,
+    )
+    try:
+        runtime.after_physics_step(0.1)
+        before_service = service.snapshot()
+        before_topics = runtime.status_snapshot(wall_time=clock()).topics
+        before_drops = tuple(before_topics[topic].dropped_count for topic in lidar_topics)
+        assert len(channel.sent) == 1
+        assert before_service.in_flight_identity is not None
+        assert before_service.pending_capture_identity is not None
+
+        runtime.pause()
+
+        paused = service.snapshot()
+        after_topics = runtime.status_snapshot(wall_time=clock()).topics
+        assert paused.state == "suspended"
+        assert paused.pause_epoch == before_service.pause_epoch + 1
+        assert paused.pending_capture_identity is None
+        assert tuple(after_topics[topic].dropped_count for topic in lidar_topics) == before_drops
+    finally:
+        _prepare_lidar_close(service, channel)
+        runtime.close()
+
+
+def test_resume_uses_new_scheduler_deadline() -> None:
+    runtime, _robot, _transport, clock, service, channel = _make_async_pause_runtime()
+    try:
+        runtime.after_physics_step(0.05)
+        assert len(channel.sent) == 1
+        old_request = channel.sent[0]
+        assert type(old_request) is LidarScanRequest
+        assert old_request.topic == "lidar_rear"
+        assert old_request.timestamp_ns == 50_000_000
+
+        runtime.pause()
+        channel.responses.append(_prepared_lidar_response(old_request))
+        assert runtime.before_physics_step(1.0 / 240.0, wall_time=clock()) is None
+        paused = service.snapshot()
+        assert paused.state == "suspended"
+        assert paused.in_flight_identity is None
+        assert paused.pending_capture_identity is None
+        assert paused.stale_count == 1
+
+        runtime.resume(wall_time=clock())
+        runtime.after_physics_step(0.05)
+
+        assert runtime.clock.now_ns == 100_000_000
+        assert len(channel.sent) == 2
+        new_request = channel.sent[1]
+        resumed = service.snapshot()
+        assert resumed.state == "ready"
+        assert type(new_request) is LidarScanRequest
+        assert new_request.pause_epoch == old_request.pause_epoch + 1
+        assert new_request.topic == "lidar_front"
+        assert new_request.timestamp_ns == 100_000_000
+    finally:
+        _prepare_lidar_close(service, channel)
+        runtime.close()
+
+
+def test_disconnect_cancels_old_pending_but_accepts_new_generation() -> None:
+    """断线边沿同步 retag service，并让新代 capture 等待旧响应收敛。"""
+    runtime, _robot, _transport, clock, service, channel = _make_async_pause_runtime()
+    try:
+        runtime.initialize_peer_lifecycle(
+            "ecal",
+            "active",
+            ecal_connected=True,
+        )
+        runtime.after_physics_step(0.1)
+        before = service.snapshot()
+        assert len(channel.sent) == 1
+        assert before.lifecycle_generation == runtime._lifecycle_generation == 0
+        assert before.in_flight_identity is not None
+        assert before.pending_capture_identity is not None
+        old_request = channel.sent[0]
+        assert type(old_request) is LidarScanRequest
+
+        runtime.handle_peer_state("disconnected", ecal_connected=False)
+
+        retagged = service.snapshot()
+        assert runtime._lifecycle_generation == 1
+        assert retagged.lifecycle_generation == 1
+        assert retagged.state == before.state == "ready"
+        assert retagged.pause_epoch == before.pause_epoch
+        assert retagged.next_job_id == before.next_job_id
+        assert retagged.in_flight_identity == before.in_flight_identity
+        assert retagged.pending_capture_identity is None
+        assert (
+            retagged.completed_count,
+            retagged.failed_count,
+            retagged.overrun_count,
+            retagged.stale_count,
+        ) == (
+            before.completed_count,
+            before.failed_count,
+            before.overrun_count,
+            before.stale_count,
+        )
+        assert service.drain_events() == ()
+
+        runtime.after_physics_step(0.05)
+        pending = service.snapshot()
+        assert pending.pending_capture_identity is not None
+        assert pending.pending_capture_identity[0] == 1
+        channel.responses.append(_prepared_lidar_response(old_request))
+        runtime.before_physics_step(1.0 / 240.0, wall_time=clock())
+
+        assert len(channel.sent) == 2
+        new_request = channel.sent[1]
+        assert type(new_request) is LidarScanRequest
+        assert new_request.lifecycle_generation == 1
+        assert new_request.timestamp_ns == 150_000_000
+        after = service.snapshot()
+        assert after.stale_count == before.stale_count + 1
+        assert after.failed_count == before.failed_count
+        assert service.drain_events() == ()
+    finally:
+        _prepare_lidar_close(service, channel)
+        runtime.close()
+
+
+def test_repeated_disconnect_preserves_current_generation_pending() -> None:
+    """重复 disconnected 不是新边沿，不得撤销当前 generation 的 pending。"""
+    runtime, _robot, _transport, _clock, service, channel = _make_async_pause_runtime()
+    try:
+        runtime.initialize_peer_lifecycle("ecal", "active", ecal_connected=True)
+        runtime.handle_peer_state("disconnected", ecal_connected=False)
+        runtime.after_physics_step(0.1)
+        before = service.snapshot()
+        assert before.lifecycle_generation == runtime._lifecycle_generation == 1
+        assert before.in_flight_identity is not None
+        assert before.pending_capture_identity is not None
+
+        runtime.handle_peer_state("disconnected", ecal_connected=False)
+
+        after = service.snapshot()
+        assert runtime._lifecycle_generation == 1
+        assert after.lifecycle_generation == 1
+        assert after.in_flight_identity == before.in_flight_identity
+        assert after.pending_capture_identity == before.pending_capture_identity
+        assert after.next_job_id == before.next_job_id
+    finally:
+        _prepare_lidar_close(service, channel)
+        runtime.close()
+
+
+def test_disconnect_while_paused_preserves_service_pause_epoch() -> None:
+    """generation 失效与 pause epoch 独立，断线不得唤醒 suspended service。"""
+    runtime, _robot, _transport, _clock, service, _channel = _make_async_pause_runtime()
+    try:
+        runtime.initialize_peer_lifecycle("ecal", "active", ecal_connected=True)
+        runtime.pause()
+        paused = service.snapshot()
+        assert paused.state == "suspended"
+
+        runtime.handle_peer_state("disconnected", ecal_connected=False)
+
+        disconnected = service.snapshot()
+        assert disconnected.state == "suspended"
+        assert disconnected.pause_epoch == paused.pause_epoch
+        assert disconnected.lifecycle_generation == 1
+        assert runtime.paused is True
+    finally:
+        runtime.close()
+
+
+def test_rebuild_discards_old_generation_result() -> None:
+    """prepare 排空并丢弃旧代 LiDAR 结果，不得归因为话题失败。"""
+    runtime, _robot, transport, clock, service, channel = _make_async_pause_runtime()
+    lidar_topics = (
+        runtime.config.lidar_front.topic,
+        runtime.config.lidar_rear.topic,
+    )
+    try:
+        runtime.after_physics_step(0.1)
+        before_service = service.snapshot()
+        before_generation = runtime._lifecycle_generation
+        before_topics = runtime.status_snapshot(wall_time=clock()).topics
+        before_quality = tuple(
+            (before_topics[topic].error_count, before_topics[topic].dropped_count)
+            for topic in lidar_topics
+        )
+        assert before_service.lifecycle_generation == before_generation
+        assert before_service.in_flight_identity is not None
+        assert before_service.pending_capture_identity is not None
+        assert len(channel.sent) == 1
+        old_request = channel.sent[0]
+        assert type(old_request) is LidarScanRequest
+
+        # response 已 ready，prepare 应在同步预算内收敛，无需真实 sleep。
+        channel.responses.append(_prepared_lidar_response(old_request))
+        runtime.prepare_world_rebuild()
+
+        rebuilt_service = service.snapshot()
+        rebuilt_topics = runtime.status_snapshot(wall_time=clock()).topics
+        assert runtime._lifecycle_generation == before_generation + 1
+        assert rebuilt_service.state == "suspended"
+        assert rebuilt_service.lifecycle_generation == runtime._lifecycle_generation
+        assert rebuilt_service.pause_epoch == before_service.pause_epoch + 1
+        assert rebuilt_service.in_flight_identity is None
+        assert rebuilt_service.pending_capture_identity is None
+        assert rebuilt_service.completed_count == before_service.completed_count
+        assert rebuilt_service.stale_count == before_service.stale_count + 1
+        assert channel.responses == []
+        assert all(topic not in lidar_topics for topic, *_rest in transport.published)
+        assert service.drain_events() == ()
+        assert tuple(
+            (rebuilt_topics[topic].error_count, rebuilt_topics[topic].dropped_count)
+            for topic in lidar_topics
+        ) == before_quality
+    finally:
+        runtime.close()
+
+
+def test_rebuild_prepare_timeout_is_bounded_with_static_monotonic() -> None:
+    """注入时钟不前进时仍须由真实墙钟兜底，禁止无限忙轮询。"""
+    runtime, _robot, _transport, _clock, service, channel = (
+        _make_async_pause_runtime()
+    )
+    runtime.after_physics_step(0.05)
+    request = channel.sent[0]
+    assert type(request) is LidarScanRequest
+    prepare_errors: list[BaseException] = []
+
+    def run_prepare() -> None:
+        try:
+            runtime.prepare_world_rebuild()
+        except BaseException as exc:  # pragma: no cover - 汇合后断言
+            prepare_errors.append(exc)
+
+    prepare_thread = Thread(target=run_prepare, daemon=True)
+    started_at = time.monotonic()
+    returned_within_budget = False
+    try:
+        prepare_thread.start()
+        prepare_thread.join(timeout=1.0)
+        returned_within_budget = not prepare_thread.is_alive()
+        elapsed = time.monotonic() - started_at
+    finally:
+        if prepare_thread.is_alive():
+            channel.responses.append(_prepared_lidar_response(request))
+            prepare_thread.join(timeout=2.0)
+        _prepare_lidar_close(service, channel)
+        runtime.close()
+
+    assert returned_within_budget
+    assert elapsed < 1.0
+    assert len(prepare_errors) == 1
+    assert isinstance(prepare_errors[0], TimeoutError)
+    assert "250 ms" in str(prepare_errors[0])
+
+
+def test_rebuild_prepare_preserves_sensor_timeout_over_subscription_close_error() -> None:
+    """多个 prepare 屏障失败时保留最早的 sensor timeout 作为主错误。"""
+    runtime, _robot, transport, _clock, service, channel = (
+        _make_async_pause_runtime()
+    )
+    runtime.after_physics_step(0.05)
+    request = channel.sent[0]
+    assert type(request) is LidarScanRequest
+    subscription = transport.subscriptions[-1][2]
+    subscription.close_error = RuntimeError("subscription barrier secondary failure")
+    monotonic_calls = 0
+
+    def expiring_monotonic() -> float:
+        nonlocal monotonic_calls
+        monotonic_calls += 1
+        return 0.0 if monotonic_calls == 1 else 1.0
+
+    runtime._monotonic = expiring_monotonic
+    try:
+        with pytest.raises(TimeoutError, match="250 ms"):
+            runtime.prepare_world_rebuild()
+
+        assert subscription.closed
+    finally:
+        channel.responses.append(_prepared_lidar_response(request))
+        service.poll()
+        runtime.close()
+
+
+def test_rebuild_prepare_retags_runtime_and_service_before_disconnect() -> None:
+    """prepare 的 runtime/service retag 必须作为同一 disconnect 临界区完成。"""
+    runtime, _robot, _transport, _clock, service, _channel = (
+        _make_async_pause_runtime()
+    )
+    runtime.initialize_peer_lifecycle("ecal", "active", ecal_connected=True)
+    original_invalidate = service.invalidate_generation
+    prepare_invalidate_entered = Event()
+    release_prepare_invalidate = Event()
+    prepare_errors: list[BaseException] = []
+    disconnect_errors: list[BaseException] = []
+
+    def blocking_invalidate(generation: int) -> None:
+        if generation == 1:
+            prepare_invalidate_entered.set()
+            assert release_prepare_invalidate.wait(timeout=3.0)
+        original_invalidate(generation)
+
+    service.invalidate_generation = blocking_invalidate
+
+    def run_prepare() -> None:
+        try:
+            runtime.prepare_world_rebuild()
+        except BaseException as exc:  # pragma: no cover - 汇合后断言
+            prepare_errors.append(exc)
+
+    def run_disconnect() -> None:
+        try:
+            runtime.handle_peer_state("disconnected", ecal_connected=False)
+        except BaseException as exc:  # pragma: no cover - 汇合后断言
+            disconnect_errors.append(exc)
+
+    prepare_thread = Thread(target=run_prepare, daemon=True)
+    disconnect_thread = Thread(target=run_disconnect, daemon=True)
+    try:
+        prepare_thread.start()
+        assert prepare_invalidate_entered.wait(timeout=2.0)
+        disconnect_thread.start()
+        time.sleep(0.05)
+        release_prepare_invalidate.set()
+        prepare_thread.join(timeout=2.0)
+        disconnect_thread.join(timeout=2.0)
+
+        assert not prepare_thread.is_alive() and not disconnect_thread.is_alive()
+        assert prepare_errors == []
+        assert disconnect_errors == []
+        assert runtime._lifecycle_generation == 2
+        assert service.snapshot().lifecycle_generation == 2
+        assert service.snapshot().state == "suspended"
+    finally:
+        release_prepare_invalidate.set()
+        prepare_thread.join(timeout=2.0)
+        disconnect_thread.join(timeout=2.0)
+        runtime.close()
+
+
+def test_rebuild_waits_for_old_service_idle_before_candidate_start() -> None:
+    """候选 factory 只能在 prepare 收敛旧 native 扫描后启动。"""
+    runtime, _robot, _transport, _clock, old_service, old_channel = (
+        _make_async_pause_runtime()
+    )
+    candidate_document = replace(
+        scene_document(),
+        terrain=TerrainDocument("slope", 5.0, 0, "low"),
+    )
+    candidate_channel = ControllableLidarChannel()
+    factory_calls: list[tuple[object, int, str, object]] = []
+    prepare_errors: list[BaseException] = []
+
+    def factory(document, generation: int, expected_digest: str):
+        factory_calls.append(
+            (document, generation, expected_digest, old_service.snapshot())
+        )
+        return _owned_lidar_service(
+            candidate_channel,
+            child_pid=43,
+            lifecycle_generation=generation,
+        )
+
+    runtime._lidar_scan_service_factory = factory
+    runtime.after_physics_step(0.05)
+    old_request = old_channel.sent[0]
+    assert type(old_request) is LidarScanRequest
+
+    def run_prepare() -> None:
+        try:
+            runtime.prepare_world_rebuild()
+        except BaseException as exc:  # pragma: no cover - 汇合后断言
+            prepare_errors.append(exc)
+
+    prepare_thread = Thread(target=run_prepare, daemon=True)
+    try:
+        prepare_thread.start()
+        deadline = time.monotonic() + 2.0
+        while old_service.snapshot().state != "suspended":
+            if time.monotonic() >= deadline:
+                pytest.fail("prepare did not suspend the old lidar service")
+            time.sleep(0.001)
+
+        assert prepare_thread.is_alive()
+        assert factory_calls == []
+
+        old_channel.responses.append(_prepared_lidar_response(old_request))
+        prepare_thread.join(timeout=2.0)
+        assert not prepare_thread.is_alive()
+        assert prepare_errors == []
+
+        runtime.commit_world_rebuild(Robot(70), Backend(), candidate_document)
+
+        assert len(factory_calls) == 1
+        document, generation, digest, old_at_factory = factory_calls[0]
+        assert document is candidate_document
+        assert generation == runtime._lifecycle_generation
+        assert digest == world_digest_for_document(candidate_document)
+        assert old_at_factory.state == "suspended"
+        assert old_at_factory.in_flight_identity is None
+        assert old_at_factory.pending_capture_identity is None
+        assert runtime._lidar_scan_service is not old_service
+    finally:
+        old_channel.responses.append(_prepared_lidar_response(old_request))
+        prepare_thread.join(timeout=2.0)
+        runtime.close()
+
+
+def test_rebuild_advances_generation_only_in_prepare() -> None:
+    """候选创建和 commit 沿用 prepare generation，不得重复推进。"""
+    runtime, _robot, _transport, _clock, _old_service, _old_channel = (
+        _make_async_pause_runtime()
+    )
+    candidate_document = replace(
+        scene_document(),
+        terrain=TerrainDocument("slope", 6.0, 0, "low"),
+    )
+    candidate_channel = ControllableLidarChannel()
+    factory_generations: list[int] = []
+
+    def factory(_document, generation: int, _expected_digest: str):
+        factory_generations.append(generation)
+        return _owned_lidar_service(
+            candidate_channel,
+            child_pid=44,
+            lifecycle_generation=generation,
+        )
+
+    runtime._lidar_scan_service_factory = factory
+    try:
+        before_generation = runtime._lifecycle_generation
+        runtime.prepare_world_rebuild()
+        prepared_generation = runtime._lifecycle_generation
+        assert prepared_generation == before_generation + 1
+
+        runtime.commit_world_rebuild(Robot(71), Backend(), candidate_document)
+
+        assert runtime._lifecycle_generation == prepared_generation
+        assert factory_generations == [prepared_generation]
+        assert (
+            runtime._lidar_scan_service.snapshot().lifecycle_generation
+            == prepared_generation
+        )
+    finally:
+        runtime.close()
+
+
+def test_rebuild_candidate_failure_preserves_active_service() -> None:
+    """无效候选必须在原子发布前关闭，旧 service 仍可供 rollback。"""
+    runtime, _robot, _transport, _clock, old_service, _old_channel = (
+        _make_async_pause_runtime()
+    )
+    previous_document = runtime.scene_document
+    candidate_document = replace(
+        scene_document(),
+        terrain=TerrainDocument("slope", 7.0, 0, "low"),
+    )
+    candidate_close_calls: list[float] = []
+    candidate_service: LidarScanService | None = None
+
+    def factory(_document, generation: int, _expected_digest: str):
+        nonlocal candidate_service
+        candidate_service = LidarScanService(
+            ControllableLidarChannel(),
+            child_pid=45,
+            lifecycle_generation=generation + 1,
+            monotonic_ns=lambda: 1_000_000_000,
+        )
+
+        def close_candidate(timeout_sec: float = 5.0) -> None:
+            candidate_close_calls.append(timeout_sec)
+
+        candidate_service.close_idle = close_candidate
+        return candidate_service
+
+    runtime._lidar_scan_service_factory = factory
+    try:
+        runtime.prepare_world_rebuild()
+        prepared_generation = runtime._lifecycle_generation
+
+        with pytest.raises(RuntimeError, match="generation"):
+            runtime.commit_world_rebuild(Robot(72), Backend(), candidate_document)
+
+        assert runtime._lifecycle_generation == prepared_generation
+        assert runtime._lidar_scan_service is old_service
+        assert old_service.snapshot().state == "suspended"
+        assert runtime.scene_document is previous_document
+        assert runtime._rebuild_prepared is True
+        assert runtime._world_ready is False
+        assert candidate_service is not None
+        assert candidate_close_calls == [5.0]
+    finally:
+        runtime.close()
+
+
+def test_rebuild_closes_candidate_when_subscription_fails() -> None:
+    """factory 已转移的候选若未提交，任何后续失败都必须立即回收。"""
+    runtime, _robot, transport, _clock, old_service, _old_channel = (
+        _make_async_pause_runtime()
+    )
+    candidate_document = replace(
+        scene_document(),
+        terrain=TerrainDocument("slope", 7.5, 0, "low"),
+    )
+    candidate_service: LidarScanService | None = None
+    candidate_close_calls: list[float] = []
+    subscription_error = RuntimeError("candidate subscription failed")
+
+    def factory(_document, generation: int, _expected_digest: str):
+        nonlocal candidate_service
+        candidate_service = LidarScanService(
+            ControllableLidarChannel(),
+            child_pid=47,
+            lifecycle_generation=generation,
+            monotonic_ns=lambda: 1_000_000_000,
+        )
+
+        def close_candidate(timeout_sec: float = 5.0) -> None:
+            candidate_close_calls.append(timeout_sec)
+
+        candidate_service.close_idle = close_candidate
+        return candidate_service
+
+    def fail_subscribe(*_args, **_kwargs):
+        raise subscription_error
+
+    runtime._lidar_scan_service_factory = factory
+    runtime.prepare_world_rebuild()
+    prepared_generation = runtime._lifecycle_generation
+    transport.subscribe = fail_subscribe
+    try:
+        with pytest.raises(RuntimeError) as captured:
+            runtime.commit_world_rebuild(Robot(76), Backend(), candidate_document)
+
+        assert captured.value is subscription_error
+        assert candidate_service is not None
+        assert candidate_close_calls == [5.0]
+        assert runtime._lidar_scan_service is old_service
+        assert old_service.snapshot().state == "suspended"
+        assert runtime._lifecycle_generation == prepared_generation
+        assert runtime._rebuild_prepared is True
+        assert runtime._world_ready is False
+    finally:
+        runtime.close()
+
+
+def test_rebuild_retains_candidate_when_failure_cleanup_also_fails() -> None:
+    """候选未提交且 close 失败时保留主错误，并把所有权交给最终重试。"""
+    logger = Logger()
+    runtime, _robot, transport, _clock, old_service, _old_channel = (
+        _make_async_pause_runtime(logger=logger)
+    )
+    candidate_document = replace(
+        scene_document(),
+        terrain=TerrainDocument("slope", 7.6, 0, "low"),
+    )
+    candidate_service: LidarScanService | None = None
+    candidate_close_calls: list[float] = []
+    subscription_error = RuntimeError("candidate subscription primary failure")
+    cleanup_error = RuntimeError("candidate cleanup secondary failure")
+
+    def factory(_document, generation: int, _expected_digest: str):
+        nonlocal candidate_service
+        candidate_service = LidarScanService(
+            ControllableLidarChannel(),
+            child_pid=48,
+            lifecycle_generation=generation,
+            monotonic_ns=lambda: 1_000_000_000,
+        )
+
+        def close_candidate(timeout_sec: float = 5.0) -> None:
+            candidate_close_calls.append(timeout_sec)
+            if len(candidate_close_calls) == 1:
+                raise cleanup_error
+
+        candidate_service.close_idle = close_candidate
+        return candidate_service
+
+    def fail_subscribe(*_args, **_kwargs):
+        raise subscription_error
+
+    runtime._lidar_scan_service_factory = factory
+    runtime.prepare_world_rebuild()
+    transport.subscribe = fail_subscribe
+    closed = False
+    try:
+        with pytest.raises(RuntimeError) as captured:
+            runtime.commit_world_rebuild(Robot(79), Backend(), candidate_document)
+
+        assert captured.value is subscription_error
+        assert runtime._lidar_scan_service is old_service
+        assert candidate_service is not None
+        assert candidate_close_calls == [5.0]
+        assert candidate_service in runtime._retired_lidar_services
+        assert sum(
+            event == "retired_cleanup_failed" for event, _fields in logger.events
+        ) == 1
+
+        runtime.close()
+        closed = True
+        assert candidate_close_calls == [5.0, 5.0]
+        assert candidate_service not in runtime._retired_lidar_services
+        assert sum(
+            event == "retired_cleanup_failed" for event, _fields in logger.events
+        ) == 1
+    finally:
+        if not closed:
+            runtime.close()
+
+
+def test_concurrent_rebuild_commits_start_only_one_candidate() -> None:
+    """同一 prepared transaction 只能保留一个锁外 candidate reservation。"""
+    runtime, _robot, _transport, _clock, _old_service, _old_channel = (
+        _make_async_pause_runtime()
+    )
+    candidate_document = replace(
+        scene_document(),
+        terrain=TerrainDocument("slope", 7.75, 0, "low"),
+    )
+    factory_entered = Event()
+    second_factory_entered = Event()
+    release_factory = Event()
+    factory_calls: list[int] = []
+    call_lock = Lock()
+    first_errors: list[BaseException] = []
+    second_errors: list[BaseException] = []
+
+    def factory(_document, generation: int, _expected_digest: str):
+        with call_lock:
+            call_index = len(factory_calls) + 1
+            factory_calls.append(call_index)
+            if call_index == 1:
+                factory_entered.set()
+            else:
+                second_factory_entered.set()
+        assert release_factory.wait(timeout=3.0)
+        service = LidarScanService(
+            ControllableLidarChannel(),
+            child_pid=50 + call_index,
+            lifecycle_generation=generation,
+            monotonic_ns=lambda: 1_000_000_000,
+        )
+        service.close_idle = lambda timeout_sec=5.0: None
+        return service
+
+    runtime._lidar_scan_service_factory = factory
+    runtime.prepare_world_rebuild()
+
+    def run_commit(robot_id: int, errors: list[BaseException]) -> None:
+        try:
+            runtime.commit_world_rebuild(
+                Robot(robot_id),
+                Backend(),
+                candidate_document,
+            )
+        except BaseException as exc:  # pragma: no cover - 汇合后断言
+            errors.append(exc)
+
+    first = Thread(target=run_commit, args=(77, first_errors), daemon=True)
+    second = Thread(target=run_commit, args=(78, second_errors), daemon=True)
+    try:
+        first.start()
+        assert factory_entered.wait(timeout=2.0)
+        second.start()
+        second.join(timeout=0.5)
+
+        assert not second_factory_entered.is_set()
+        assert not second.is_alive()
+        assert len(second_errors) == 1
+        assert "candidate" in str(second_errors[0])
+
+        release_factory.set()
+        first.join(timeout=2.0)
+        assert not first.is_alive()
+        assert first_errors == []
+        assert factory_calls == [1]
+        assert runtime.bound_robot_id == 77
+    finally:
+        release_factory.set()
+        first.join(timeout=2.0)
+        second.join(timeout=2.0)
+        runtime.close()
+
+
+def test_rebuild_rejects_candidate_if_generation_changes_during_factory() -> None:
+    """factory 锁外运行期间的新失效边沿必须阻止旧代候选发布。"""
+    runtime, _robot, _transport, _clock, old_service, _old_channel = (
+        _make_async_pause_runtime()
+    )
+    runtime.initialize_peer_lifecycle("ecal", "active", ecal_connected=True)
+    candidate_document = replace(
+        scene_document(),
+        terrain=TerrainDocument("slope", 7.8, 0, "low"),
+    )
+    factory_entered = Event()
+    release_factory = Event()
+    candidate_close_calls: list[float] = []
+    commit_errors: list[BaseException] = []
+
+    def factory(_document, generation: int, _expected_digest: str):
+        factory_entered.set()
+        assert release_factory.wait(timeout=3.0)
+        candidate = LidarScanService(
+            ControllableLidarChannel(),
+            child_pid=53,
+            lifecycle_generation=generation,
+            monotonic_ns=lambda: 1_000_000_000,
+        )
+
+        def close_candidate(timeout_sec: float = 5.0) -> None:
+            candidate_close_calls.append(timeout_sec)
+
+        candidate.close_idle = close_candidate
+        return candidate
+
+    runtime._lidar_scan_service_factory = factory
+    runtime.prepare_world_rebuild()
+    prepared_generation = runtime._lifecycle_generation
+
+    def run_commit() -> None:
+        try:
+            runtime.commit_world_rebuild(Robot(80), Backend(), candidate_document)
+        except BaseException as exc:  # pragma: no cover - 汇合后断言
+            commit_errors.append(exc)
+
+    commit_thread = Thread(target=run_commit, daemon=True)
+    try:
+        commit_thread.start()
+        assert factory_entered.wait(timeout=2.0)
+
+        runtime.handle_peer_state("disconnected", ecal_connected=False)
+        assert runtime._lifecycle_generation == prepared_generation + 1
+        assert old_service.snapshot().lifecycle_generation == prepared_generation + 1
+
+        release_factory.set()
+        commit_thread.join(timeout=2.0)
+        assert not commit_thread.is_alive()
+        assert len(commit_errors) == 1
+        assert "world changed" in str(commit_errors[0])
+        assert candidate_close_calls == [5.0]
+        assert runtime._lidar_scan_service is old_service
+        assert runtime._rebuild_prepared is True
+        assert runtime._world_ready is False
+    finally:
+        release_factory.set()
+        commit_thread.join(timeout=2.0)
+        runtime.close()
+
+
+def test_close_waits_for_candidate_reservation_and_retries_cleanup() -> None:
+    """close 必须等锁外 factory 交回所有权，再回收首次关闭失败的候选。"""
+    logger = Logger()
+    runtime, _robot, transport, _clock, _old_service, _old_channel = (
+        _make_async_pause_runtime(logger=logger)
+    )
+    candidate_document = replace(
+        scene_document(),
+        terrain=TerrainDocument("slope", 7.9, 0, "low"),
+    )
+    factory_entered = Event()
+    release_factory = Event()
+    candidate_close_calls: list[float] = []
+    commit_errors: list[BaseException] = []
+    close_errors: list[BaseException] = []
+    subscription_error = RuntimeError("candidate subscription failed during close")
+    cleanup_error = RuntimeError("candidate first cleanup failed during close")
+
+    def factory(_document, generation: int, _expected_digest: str):
+        factory_entered.set()
+        assert release_factory.wait(timeout=3.0)
+        candidate = LidarScanService(
+            ControllableLidarChannel(),
+            child_pid=54,
+            lifecycle_generation=generation,
+            monotonic_ns=lambda: 1_000_000_000,
+        )
+
+        def close_candidate(timeout_sec: float = 5.0) -> None:
+            candidate_close_calls.append(timeout_sec)
+            if len(candidate_close_calls) == 1:
+                raise cleanup_error
+
+        candidate.close_idle = close_candidate
+        return candidate
+
+    def fail_subscribe(*_args, **_kwargs):
+        raise subscription_error
+
+    runtime._lidar_scan_service_factory = factory
+    runtime.prepare_world_rebuild()
+    transport.subscribe = fail_subscribe
+
+    def run_commit() -> None:
+        try:
+            runtime.commit_world_rebuild(Robot(81), Backend(), candidate_document)
+        except BaseException as exc:  # pragma: no cover - 汇合后断言
+            commit_errors.append(exc)
+
+    def run_close() -> None:
+        try:
+            runtime.close()
+        except BaseException as exc:  # pragma: no cover - 汇合后断言
+            close_errors.append(exc)
+
+    commit_thread = Thread(target=run_commit, daemon=True)
+    close_thread = Thread(target=run_close, daemon=True)
+    try:
+        commit_thread.start()
+        assert factory_entered.wait(timeout=2.0)
+        close_thread.start()
+        close_thread.join(timeout=0.2)
+        close_waited_for_candidate = close_thread.is_alive()
+
+        release_factory.set()
+        commit_thread.join(timeout=2.0)
+        close_thread.join(timeout=2.0)
+
+        assert close_waited_for_candidate
+        assert not commit_thread.is_alive() and not close_thread.is_alive()
+        assert len(commit_errors) == 1
+        assert commit_errors[0] is subscription_error
+        assert close_errors == []
+        assert candidate_close_calls == [5.0, 5.0]
+        assert runtime._retired_lidar_services == []
+        assert sum(
+            event == "retired_cleanup_failed" for event, _fields in logger.events
+        ) == 1
+    finally:
+        release_factory.set()
+        commit_thread.join(timeout=2.0)
+        close_thread.join(timeout=2.0)
+        runtime.close()
+
+
+def test_close_before_lidar_candidate_ownership_prevents_factory_start() -> None:
+    """close 已完成后不得从通用 reservation 的前半窗口再创建 worker。"""
+    runtime, _robot, _transport, _clock, _old_service, _old_channel = (
+        _make_async_pause_runtime()
+    )
+    candidate_document = replace(
+        scene_document(),
+        terrain=TerrainDocument("slope", 8.1, 0, "low"),
+    )
+    build_entered = Event()
+    release_build = Event()
+    factory_calls: list[tuple[int, str]] = []
+    commit_errors: list[BaseException] = []
+    original_build = runtime._build_sensor_objects
+
+    def blocking_build(backend, document):
+        build_entered.set()
+        assert release_build.wait(timeout=3.0)
+        return original_build(backend, document)
+
+    def factory(_document, generation: int, expected_digest: str):
+        factory_calls.append((generation, expected_digest))
+        return LidarScanService(
+            ControllableLidarChannel(),
+            child_pid=55,
+            lifecycle_generation=generation,
+            monotonic_ns=lambda: 1_000_000_000,
+        )
+
+    runtime._build_sensor_objects = blocking_build
+    runtime._lidar_scan_service_factory = factory
+    runtime.prepare_world_rebuild()
+
+    def run_commit() -> None:
+        try:
+            runtime.commit_world_rebuild(Robot(83), Backend(), candidate_document)
+        except BaseException as exc:  # pragma: no cover - 汇合后断言
+            commit_errors.append(exc)
+
+    commit_thread = Thread(target=run_commit, daemon=True)
+    try:
+        commit_thread.start()
+        assert build_entered.wait(timeout=2.0)
+        assert runtime._rebuild_candidate_in_progress is True
+        assert runtime._rebuild_lidar_candidate_in_progress is False
+
+        runtime.close()
+        release_build.set()
+        commit_thread.join(timeout=2.0)
+
+        assert not commit_thread.is_alive()
+        assert len(commit_errors) == 1
+        assert str(commit_errors[0]) == "interface runtime is closed"
+        assert factory_calls == []
+        assert runtime._retired_lidar_services == []
+    finally:
+        release_build.set()
+        commit_thread.join(timeout=2.0)
+        runtime.close()
+
+
+def test_abort_rebuild_rejects_active_lidar_candidate_without_resuming_old() -> None:
+    """candidate prewarm 期间 abort 不得恢复旧 worker 形成双扫描。"""
+    runtime, _robot, _transport, _clock, old_service, old_channel = (
+        _make_async_pause_runtime()
+    )
+    candidate_document = replace(
+        scene_document(),
+        terrain=TerrainDocument("slope", 8.2, 0, "low"),
+    )
+    factory_entered = Event()
+    release_factory = Event()
+    commit_errors: list[BaseException] = []
+    candidate_service: LidarScanService | None = None
+
+    def factory(_document, generation: int, _expected_digest: str):
+        nonlocal candidate_service
+        factory_entered.set()
+        assert release_factory.wait(timeout=3.0)
+        candidate_service = LidarScanService(
+            ControllableLidarChannel(),
+            child_pid=56,
+            lifecycle_generation=generation,
+            monotonic_ns=lambda: 1_000_000_000,
+        )
+        candidate_service.close_idle = lambda timeout_sec=5.0: None
+        return candidate_service
+
+    runtime._lidar_scan_service_factory = factory
+    runtime.prepare_world_rebuild()
+
+    def run_commit() -> None:
+        try:
+            runtime.commit_world_rebuild(Robot(84), Backend(), candidate_document)
+        except BaseException as exc:  # pragma: no cover - 汇合后断言
+            commit_errors.append(exc)
+
+    commit_thread = Thread(target=run_commit, daemon=True)
+    try:
+        commit_thread.start()
+        assert factory_entered.wait(timeout=2.0)
+
+        with pytest.raises(RuntimeError, match="candidate is already in progress"):
+            runtime.abort_world_rebuild()
+
+        assert old_service.snapshot().state == "suspended"
+        assert runtime._rebuild_prepared is True
+        assert runtime._world_ready is False
+        runtime.after_physics_step(0.05)
+        assert old_channel.sent == []
+
+        release_factory.set()
+        commit_thread.join(timeout=2.0)
+        assert not commit_thread.is_alive()
+        assert commit_errors == []
+        assert candidate_service is not None
+        assert runtime._lidar_scan_service is candidate_service
+    finally:
+        release_factory.set()
+        commit_thread.join(timeout=2.0)
+        runtime.close()
+
+
+def test_lidar_abort_reservation_prevents_candidate_factory_start() -> None:
+    """旧 worker 恢复事务开始后，commit 不得从反向竞态启动 candidate。"""
+    runtime, _robot, transport, _clock, old_service, _old_channel = (
+        _make_async_pause_runtime()
+    )
+    candidate_document = replace(
+        scene_document(),
+        terrain=TerrainDocument("slope", 8.3, 0, "low"),
+    )
+    abort_subscribe_entered = Event()
+    release_abort_subscribe = Event()
+    abort_errors: list[BaseException] = []
+    factory_calls: list[tuple[int, str]] = []
+    subscribe_calls = 0
+    original_subscribe = transport.subscribe
+
+    def blocking_first_subscribe(*args, **kwargs):
+        nonlocal subscribe_calls
+        subscription = original_subscribe(*args, **kwargs)
+        subscribe_calls += 1
+        if subscribe_calls == 1:
+            abort_subscribe_entered.set()
+            assert release_abort_subscribe.wait(timeout=3.0)
+        return subscription
+
+    def factory(_document, generation: int, expected_digest: str):
+        factory_calls.append((generation, expected_digest))
+        return LidarScanService(
+            ControllableLidarChannel(),
+            child_pid=57,
+            lifecycle_generation=generation,
+            monotonic_ns=lambda: 1_000_000_000,
+        )
+
+    runtime._lidar_scan_service_factory = factory
+    runtime.prepare_world_rebuild()
+    transport.subscribe = blocking_first_subscribe
+
+    def run_abort() -> None:
+        try:
+            runtime.abort_world_rebuild()
+        except BaseException as exc:  # pragma: no cover - 汇合后断言
+            abort_errors.append(exc)
+
+    abort_thread = Thread(target=run_abort, daemon=True)
+    try:
+        abort_thread.start()
+        assert abort_subscribe_entered.wait(timeout=2.0)
+
+        with pytest.raises(RuntimeError, match="candidate is already in progress"):
+            runtime.commit_world_rebuild(Robot(85), Backend(), candidate_document)
+        assert factory_calls == []
+        assert old_service.snapshot().state == "suspended"
+
+        release_abort_subscribe.set()
+        abort_thread.join(timeout=2.0)
+        assert not abort_thread.is_alive()
+        assert abort_errors == []
+        assert old_service.snapshot().state == "ready"
+        assert runtime._lidar_scan_service is old_service
+        assert runtime._world_ready is True
+    finally:
+        release_abort_subscribe.set()
+        abort_thread.join(timeout=2.0)
+        runtime.close()
+
+
+def test_rebuild_rollback_retags_and_reuses_old_service() -> None:
+    """same-document rollback 复用旧 worker，并保留累计计数和 job 序号。"""
+    runtime, _robot, _transport, clock, old_service, old_channel = (
+        _make_async_pause_runtime()
+    )
+    previous_document = runtime.scene_document
+    assert previous_document is not None
+    rollback_document = replace(previous_document)
+    assert rollback_document == previous_document
+    assert rollback_document is not previous_document
+    target_document = replace(
+        previous_document,
+        terrain=TerrainDocument("slope", 8.0, 0, "low"),
+    )
+    factory_calls: list[tuple[object, int, str]] = []
+
+    def fail_candidate(document, generation: int, expected_digest: str):
+        factory_calls.append((document, generation, expected_digest))
+        raise RuntimeError("candidate prewarm failed")
+
+    runtime._lidar_scan_service_factory = fail_candidate
+    runtime.after_physics_step(0.05)
+    completed_request = old_channel.sent[0]
+    assert type(completed_request) is LidarScanRequest
+    old_channel.responses.append(_prepared_lidar_response(completed_request))
+    runtime.before_physics_step(1.0 / 240.0, wall_time=clock())
+    before_prepare = old_service.snapshot()
+    assert before_prepare.completed_count == 1
+    assert before_prepare.next_job_id == 2
+
+    try:
+        runtime.prepare_world_rebuild()
+        prepared_generation = runtime._lifecycle_generation
+        prepared_snapshot = old_service.snapshot()
+        assert prepared_snapshot.state == "suspended"
+
+        with pytest.raises(RuntimeError, match="candidate prewarm failed"):
+            runtime.commit_world_rebuild(Robot(73), Backend(), target_document)
+
+        runtime.commit_world_rebuild(Robot(74), Backend(), rollback_document)
+
+        assert len(factory_calls) == 1
+        assert factory_calls[0][0] is target_document
+        assert factory_calls[0][1] == prepared_generation
+        assert factory_calls[0][2] == world_digest_for_document(target_document)
+        assert runtime._lifecycle_generation == prepared_generation
+        assert runtime._lidar_scan_service is old_service
+        reused = old_service.snapshot()
+        assert reused.state == "ready"
+        assert reused.lifecycle_generation == prepared_generation
+        assert reused.next_job_id == prepared_snapshot.next_job_id
+        assert reused.completed_count == prepared_snapshot.completed_count
+        assert reused.failed_count == prepared_snapshot.failed_count
+        assert reused.overrun_count == prepared_snapshot.overrun_count
+        assert reused.stale_count == prepared_snapshot.stale_count
+    finally:
+        runtime.close()
+
+
+def test_rebuild_commit_ignores_retired_service_cleanup_failure() -> None:
+    """新世界发布后旧 worker 清理失败只能诊断并留待 close 重试。"""
+    logger = Logger()
+    runtime, _robot, _transport, clock, old_service, _old_channel = (
+        _make_async_pause_runtime(logger=logger)
+    )
+    candidate_document = replace(
+        scene_document(),
+        terrain=TerrainDocument("slope", 9.0, 0, "low"),
+    )
+    candidate_channel = ControllableLidarChannel()
+    candidate_ready = LidarWorkerReady(
+        1,
+        46,
+        "4" * 64,
+        ("lidar_front", "lidar_rear"),
+        (("lidar_front", "5" * 64), ("lidar_rear", "6" * 64)),
+        1,
+    )
+    candidate_handle = LidarWorkerHandle(
+        IdleOwnedWorkerProcess(),
+        candidate_channel,
+        candidate_channel,
+        candidate_ready,
+    )
+    candidate_service = LidarScanService.from_worker_handle(
+        candidate_handle,
+        lifecycle_generation=1,
+        monotonic_ns=lambda: 1_000_000_000,
+    )
+    cleanup_error = RuntimeError("retired worker close failed")
+    old_close_calls: list[float] = []
+
+    def close_old(timeout_sec: float = 5.0) -> None:
+        old_close_calls.append(timeout_sec)
+        if len(old_close_calls) == 1:
+            raise cleanup_error
+
+    old_service.close_idle = close_old
+
+    def factory(_document, generation: int, _expected_digest: str):
+        assert generation == candidate_service.snapshot().lifecycle_generation
+        return candidate_service
+
+    runtime._lidar_scan_service_factory = factory
+    lidar_topics = (
+        runtime.config.lidar_front.topic,
+        runtime.config.lidar_rear.topic,
+    )
+    before_topics = runtime.status_snapshot(wall_time=clock()).topics
+    before_quality = tuple(
+        (
+            before_topics[topic].state,
+            before_topics[topic].error_count,
+            before_topics[topic].dropped_count,
+        )
+        for topic in lidar_topics
+    )
+    closed = False
+    try:
+        runtime.prepare_world_rebuild()
+        runtime.commit_world_rebuild(Robot(75), Backend(), candidate_document)
+
+        assert runtime._lidar_scan_service is candidate_service
+        assert runtime.scene_document is candidate_document
+        assert runtime.bound_robot_id == 75
+        assert old_close_calls == [5.0]
+        assert old_service in runtime._retired_lidar_services
+        assert id(old_service) in runtime._retired_lidar_diagnostic_ids
+        cleanup_events = [
+            fields
+            for event, fields in logger.events
+            if event == "retired_cleanup_failed"
+        ]
+        assert len(cleanup_events) == 1
+        assert cleanup_events[0]["scope"] == "service"
+        assert cleanup_events[0]["stable_error_code"] == "worker_shutdown_failed"
+        assert cleanup_events[0]["reason"] == (
+            "retired lidar service cleanup failed: RuntimeError"
+        )
+        assert "\n" not in cleanup_events[0]["reason"]
+        assert len(cleanup_events[0]["reason"].encode("utf-8")) <= 512
+        after_topics = runtime.status_snapshot(wall_time=clock()).topics
+        assert tuple(
+            (
+                after_topics[topic].state,
+                after_topics[topic].error_count,
+                after_topics[topic].dropped_count,
+            )
+            for topic in lidar_topics
+        ) == before_quality
+
+        runtime.close()
+        closed = True
+        assert old_close_calls == [5.0, 5.0]
+        assert old_service not in runtime._retired_lidar_services
+        assert id(old_service) not in runtime._retired_lidar_diagnostic_ids
+        assert sum(
+            event == "retired_cleanup_failed" for event, _fields in logger.events
+        ) == 1
+    finally:
+        if not closed:
+            runtime.close()
+
+
+def test_abort_rebuild_retags_and_resumes_old_service() -> None:
+    """物理世界未删除时 abort 恢复 prepare 保存的同一异步 service。"""
+    runtime, _robot, _transport, _clock, old_service, _old_channel = (
+        _make_async_pause_runtime()
+    )
+    try:
+        before = old_service.snapshot()
+        runtime.prepare_world_rebuild()
+        prepared = old_service.snapshot()
+        assert prepared.state == "suspended"
+        assert prepared.lifecycle_generation == runtime._lifecycle_generation
+
+        runtime.abort_world_rebuild()
+
+        assert runtime._lidar_scan_service is old_service
+        restored = old_service.snapshot()
+        assert restored.state == "ready"
+        assert restored.lifecycle_generation == runtime._lifecycle_generation
+        assert restored.next_job_id == before.next_job_id
+        assert restored.completed_count == before.completed_count
+        assert restored.failed_count == before.failed_count
+        assert restored.overrun_count == before.overrun_count
+        assert restored.stale_count == before.stale_count
+        assert runtime._lidar_capture_fenced is False
+        assert runtime._prepared_lidar_service is None
+    finally:
+        runtime.close()
+
+
+def test_fault_rebuild_keeps_prepare_generation() -> None:
+    """世界不可恢复只终结 prepared 状态，不重复推进 generation。"""
+    runtime, _robot, _transport, _clock, old_service, _old_channel = (
+        _make_async_pause_runtime()
+    )
+    try:
+        runtime.prepare_world_rebuild()
+        prepared_generation = runtime._lifecycle_generation
+
+        runtime.fault_world_rebuild()
+
+        assert runtime._lifecycle_generation == prepared_generation
+        assert old_service.snapshot().lifecycle_generation == prepared_generation
+        assert old_service.snapshot().state == "suspended"
+    finally:
+        runtime.close()
+
+
+def test_abort_failure_keeps_prepare_generation() -> None:
+    """abort 恢复失败可以 fault runtime，但不能再次失效同一旧世界。"""
+    runtime, _robot, transport, _clock, old_service, _old_channel = (
+        _make_async_pause_runtime()
+    )
+    abort_error = RuntimeError("abort subscription failed")
+
+    def fail_subscribe(*_args, **_kwargs):
+        raise abort_error
+
+    try:
+        runtime.prepare_world_rebuild()
+        prepared_generation = runtime._lifecycle_generation
+        transport.subscribe = fail_subscribe
+
+        with pytest.raises(RuntimeError) as captured:
+            runtime.abort_world_rebuild()
+
+        assert captured.value is abort_error
+        assert runtime._state == "faulted"
+        assert runtime._lifecycle_generation == prepared_generation
+        assert old_service.snapshot().lifecycle_generation == prepared_generation
+        assert old_service.snapshot().state == "suspended"
+    finally:
+        runtime.close()
+
+
+def test_resume_service_failure_keeps_runtime_paused_and_decision_unchanged(
+    monkeypatch,
+) -> None:
+    """service 恢复失败时不得先发布 runtime 已恢复的可见状态。"""
+    runtime, _robot, _transport, clock, service, _channel = _make_async_pause_runtime()
+    try:
+        runtime.pause()
+        previous = runtime.last_decision
+
+        def fail_resume() -> None:
+            raise RuntimeError("injected lidar resume failure")
+
+        monkeypatch.setattr(service, "resume", fail_resume)
+        with pytest.raises(RuntimeError, match="injected lidar resume failure"):
+            runtime.resume(wall_time=clock())
+
+        assert runtime.paused is True
+        assert runtime.last_decision is previous
+        assert service.snapshot().state == "suspended"
+    finally:
+        runtime.close()
+
 
 def test_pause_freezes_clock_local_scheduler_and_physical_topics_but_poll_continues() -> None:
     backend = Backend()

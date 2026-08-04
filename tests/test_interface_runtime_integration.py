@@ -27,9 +27,23 @@ from slope_sim.interfaces.models import (
 )
 from slope_sim.interfaces.transport import TransportSnapshot, TransportTopicQuality
 from slope_sim.lidar_pointcloud import LidarScanResult, MultiLineLidar
+from slope_sim.lidar_worker import (
+    LidarScanService,
+    LidarServiceEvent,
+    LidarServiceSnapshot,
+    LidarWorkerHandle,
+    LidarWorkerReady,
+    LidarWorkerStop,
+    LidarWorkerStopped,
+    LidarWorkerWorldSpec,
+    PreparedLidarFrame,
+    PreparedLidarPayload,
+    world_digest_for_document,
+)
 from slope_sim.model_registry import get_robot_model
 from slope_sim.obstacles import ObstacleGeometry, ObstacleSnapshot, ObstacleSpec
 from slope_sim.scene_config import SceneDocument, SensorDocument, TerrainDocument
+from slope_sim.sensor_backend import Pose
 from slope_sim.truth_sensors import SensorMounts, TruthSensorSuite
 
 
@@ -437,6 +451,239 @@ class StubTruth:
         return ImuAttitude(timestamp_ns, 0.1, -0.2)
 
 
+class AsyncLidarService:
+    """确定性返回 prepared 帧并记录非阻塞 capture/poll 边界。"""
+
+    def __init__(
+        self,
+        results: tuple[PreparedLidarFrame, ...] = (),
+        events: tuple[LidarServiceEvent, ...] = (),
+    ) -> None:
+        self.results = deque(results)
+        self.events = deque(events)
+        self.captures: list[dict[str, object]] = []
+        self.poll_count = 0
+        self.runtime = None
+        self.capture_world_operation_counts: list[int] = []
+        self.capture_generations: list[int] = []
+
+    def capture(self, **capture: object) -> bool:
+        self.captures.append(capture)
+        if self.runtime is not None:
+            self.capture_world_operation_counts.append(
+                self.runtime._in_flight_world_operations
+            )
+            self.capture_generations.append(self.runtime._lifecycle_generation)
+        return True
+
+    def poll(self) -> PreparedLidarFrame | None:
+        self.poll_count += 1
+        return self.results.popleft() if self.results else None
+
+    def drain_events(self) -> tuple[LidarServiceEvent, ...]:
+        events = tuple(self.events)
+        self.events.clear()
+        return events
+
+
+class SessionLidarService(AsyncLidarService):
+    """模拟 session 交给 runtime 后由其唯一关闭的 idle worker service。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.state = "ready"
+        self.close_idle_count = 0
+        self.force_close_count = 0
+
+    def begin_draining(self) -> None:
+        self.state = "draining"
+
+    def snapshot(self) -> object:
+        return SimpleNamespace(
+            state=self.state,
+            in_flight_identity=None,
+            pending_capture_identity=None,
+        )
+
+    def close_idle(self, *, timeout_sec: float) -> None:
+        assert timeout_sec > 0.0
+        self.close_idle_count += 1
+        self.state = "closed"
+
+    def force_close(self) -> None:
+        self.force_close_count += 1
+        self.state = "closed"
+
+
+class RuntimeLidarChannel:
+    """为 runtime 集成测试提供真实 service 使用的可控 IPC 边界。"""
+
+    def __init__(self) -> None:
+        self.sent: list[object] = []
+        self.responses: deque[object] = deque()
+        self.poll_count = 0
+        self.recv_count = 0
+        self.close_count = 0
+
+    def send(self, value: object) -> None:
+        self.sent.append(value)
+        if type(value) is LidarWorkerStop:
+            self.responses.append(
+                LidarWorkerStopped(value.protocol_version, value.process_id)
+            )
+
+    def poll(self, timeout: float = 0.0) -> bool:
+        assert timeout >= 0.0
+        self.poll_count += 1
+        return bool(self.responses)
+
+    def recv(self) -> object:
+        self.recv_count += 1
+        return self.responses.popleft()
+
+    def close(self) -> None:
+        self.close_count += 1
+
+
+class IdleOwnedLidarProcess:
+    """模拟 Stop/ACK 后可正常 join 的 exact owned child。"""
+
+    def __init__(self) -> None:
+        self.alive = True
+
+    def join(self, _timeout_sec: float) -> None:
+        self.alive = False
+
+    def is_alive(self) -> bool:
+        return self.alive
+
+    def terminate(self) -> None:  # pragma: no cover - 调用即测试失败
+        raise AssertionError("idle owned lidar process must not be terminated")
+
+    def kill(self) -> None:  # pragma: no cover - 调用即测试失败
+        raise AssertionError("idle owned lidar process must not be killed")
+
+
+def make_owned_lidar_service(
+    *,
+    channel: RuntimeLidarChannel | None = None,
+    process: object | None = None,
+) -> tuple[LidarScanService, RuntimeLidarChannel]:
+    """构造可由后续 runtime close 精确回收的真实父端 service。"""
+    selected_channel = RuntimeLidarChannel() if channel is None else channel
+    selected_process = IdleOwnedLidarProcess() if process is None else process
+    ready = LidarWorkerReady(
+        1,
+        42,
+        "1" * 64,
+        ("lidar_front", "lidar_rear"),
+        (("lidar_front", "2" * 64), ("lidar_rear", "3" * 64)),
+        1,
+    )
+    handle = LidarWorkerHandle(
+        selected_process,
+        selected_channel,
+        selected_channel,
+        ready,
+    )
+    service = LidarScanService.from_worker_handle(
+        handle,
+        lifecycle_generation=0,
+        monotonic_ns=lambda: 1_000_000_000,
+    )
+    return service, selected_channel
+
+
+class FenceLidarService(AsyncLidarService):
+    """用逐次 poll 状态驱动可恢复 sensor fence，不进行真实等待。"""
+
+    def __init__(
+        self,
+        *,
+        state: str = "ready",
+        in_flight_identity: object | None = None,
+        pending_capture_identity: object | None = None,
+        poll_steps: tuple[
+            tuple[PreparedLidarFrame | None, object | None, object | None],
+            ...,
+        ] = (),
+    ) -> None:
+        super().__init__()
+        self.state = state
+        self.in_flight_identity = in_flight_identity
+        self.pending_capture_identity = pending_capture_identity
+        self.poll_steps = deque(poll_steps)
+
+    def poll(self) -> PreparedLidarFrame | None:
+        self.poll_count += 1
+        if not self.poll_steps:
+            return None
+        result, in_flight, pending = self.poll_steps.popleft()
+        self.in_flight_identity = in_flight
+        self.pending_capture_identity = pending
+        return result
+
+    def snapshot(self) -> object:
+        return SimpleNamespace(
+            state=self.state,
+            in_flight_identity=self.in_flight_identity,
+            pending_capture_identity=self.pending_capture_identity,
+        )
+
+
+class FrozenCaptureLidar:
+    """异步路径只允许读取安装位姿，不允许父进程执行 raycast。"""
+
+    def __init__(self, pose: Pose) -> None:
+        self.pose = pose
+
+    def _world_mount(self) -> Pose:
+        return self.pose
+
+
+class ObservedCaptureLidar(FrozenCaptureLidar):
+    """记录安装位姿读取是否位于单个 world-operation 屏障内。"""
+
+    def __init__(self, pose: Pose) -> None:
+        super().__init__(pose)
+        self.runtime = None
+        self.world_operation_counts: list[int] = []
+
+    def _world_mount(self) -> Pose:
+        assert self.runtime is not None
+        self.world_operation_counts.append(self.runtime._in_flight_world_operations)
+        return super()._world_mount()
+
+
+class ObservedBaseBackend(Backend):
+    """记录 Dashboard base 位姿读取所在的 lifecycle 屏障。"""
+
+    def __init__(self, base_pose: Pose) -> None:
+        super().__init__()
+        self.base_pose = base_pose
+        self.runtime = None
+        self.world_operation_counts: list[int] = []
+
+    def world_pose(self, parent_link: str) -> Pose:
+        assert parent_link == "base_link"
+        assert self.runtime is not None
+        self.world_operation_counts.append(self.runtime._in_flight_world_operations)
+        return self.base_pose
+
+
+class RejectParentEncodeCodec:
+    """保留类型名查询，但让 prepared 路径的任何父端重编码立即失败。"""
+
+    def __init__(self, delegate: ProtoCodec) -> None:
+        self.delegate = delegate
+
+    def encode(self, _message: object) -> bytes:
+        raise AssertionError("prepared lidar payload must not be encoded in the parent")
+
+    def type_name(self, message: object) -> str:
+        return self.delegate.type_name(message)
+
+
 def scene_document() -> SceneDocument:
     """构造不含动态 body id 的绑定配置。"""
     return SceneDocument(
@@ -455,12 +702,17 @@ def make_runtime(
     document: SceneDocument | None = None,
     logger: Logger | None = None,
     transport: Transport | None = None,
+    lidar_scan_service: object | None = None,
+    capture_lidar_top_view: bool = True,
 ):
     from slope_sim.interfaces.runtime import InterfaceRuntime
 
     clock = Clock()
     robot = Robot()
     selected_transport = Transport(mode=mode) if transport is None else transport
+    runtime_kwargs = {}
+    if lidar_scan_service is not None:
+        runtime_kwargs["lidar_scan_service"] = lidar_scan_service
     runtime = InterfaceRuntime(
         robot,
         config=InterfaceConfig.default(transport_mode=mode),
@@ -469,8 +721,38 @@ def make_runtime(
         sensor_backend=backend,
         scene_document=document,
         logger=logger,
+        capture_lidar_top_view=capture_lidar_top_view,
+        **runtime_kwargs,
     )
     return runtime, robot, selected_transport, clock
+
+
+def prepared_lidar_frame(job_id: int, timestamp_ns: int) -> PreparedLidarFrame:
+    """构造 fence 测试使用的最小合法 worker prepared 帧。"""
+    message = LidarPointCloud(timestamp_ns, "lidar_front", 0, 1, ())
+    return PreparedLidarFrame(
+        1,
+        job_id,
+        0,
+        0,
+        "lidar_front",
+        timestamp_ns,
+        message,
+        None,
+        f"prepared-{job_id}".encode("ascii"),
+        1,
+    )
+
+
+def install_frozen_async_sensors(runtime: object) -> None:
+    """为 fence 测试安装不会执行父端 raycast 的确定性传感器。"""
+    runtime._front_lidar = FrozenCaptureLidar(
+        Pose((1.0, 0.0, 0.8), (0.0, 0.0, 0.0, 1.0))
+    )
+    runtime._rear_lidar = FrozenCaptureLidar(
+        Pose((-1.0, 0.0, 0.8), (0.0, 0.0, 1.0, 0.0))
+    )
+    runtime._truth_sensor_suite = StubTruth()
 
 
 @pytest.mark.parametrize("failure_stage", ("sensor_build", "subscribe"))
@@ -508,11 +790,11 @@ def test_constructor_failure_closes_all_owned_resources_and_preserves_original_e
     assert robot.safe_stops == 0
 
 
-def test_entrypoint_actual_mode_snapshot_failure_closes_constructed_runtime(
+def test_entrypoint_actual_mode_snapshot_failure_closes_pre_runtime_resources(
     monkeypatch,
     tmp_path,
 ) -> None:
-    """runtime 成功后读取实际模式失败，也必须只经 runtime 所有权链完成清理。"""
+    """actual mode 必须早于 runtime；snapshot 失败时回收已创建的入口资源。"""
     trace: list[str] = []
     robot = Robot()
     world = SimpleNamespace(
@@ -582,12 +864,9 @@ def test_entrypoint_actual_mode_snapshot_failure_closes_constructed_runtime(
             document=scene_document(),
         )
 
-    assert trace[-4:] == [
-        "runtime.close",
-        "logger.close",
-        "transport.close",
-        "backend.close",
-    ]
+    assert trace[-2:] == ["transport.close", "backend.close"]
+    assert "runtime" not in trace
+    assert "logger" not in trace
 
 
 def test_entrypoint_backend_bind_failure_closes_backend_and_preserves_primary_error(
@@ -762,6 +1041,8 @@ def test_production_session_polls_transport_before_initial_lifecycle_snapshot(
     """session attach 必须先推进 discovery，再读取用于初始化的最新状态。"""
     transport = Transport(mode="ecal")
     trace: list[str] = []
+    snapshots: list[TransportSnapshot] = []
+    attached_snapshots: list[object | None] = []
     discovery_polled = False
 
     def poll_peer_state() -> str:
@@ -774,7 +1055,7 @@ def test_production_session_polls_transport_before_initial_lifecycle_snapshot(
         trace.append("snapshot")
         if not discovery_polled:
             raise AssertionError("snapshot read before poll_peer_state")
-        return TransportSnapshot(
+        value = TransportSnapshot(
             mode="ecal",
             ecal_connected=True,
             published_count=0,
@@ -782,6 +1063,8 @@ def test_production_session_polls_transport_before_initial_lifecycle_snapshot(
             error_count=0,
             dropped_count=0,
         )
+        snapshots.append(value)
+        return value
 
     transport.poll_peer_state = poll_peer_state
     transport.snapshot = snapshot
@@ -804,6 +1087,18 @@ def test_production_session_polls_transport_before_initial_lifecycle_snapshot(
         "create_transport",
         lambda *_args, **_kwargs: transport,
     )
+    original_attach = simulation_module._PeerStateRelay.attach
+
+    def capture_attach(self, runtime, selected_transport, *, initial_snapshot=None):
+        attached_snapshots.append(initial_snapshot)
+        return original_attach(
+            self,
+            runtime,
+            selected_transport,
+            initial_snapshot=initial_snapshot,
+        )
+
+    monkeypatch.setattr(simulation_module._PeerStateRelay, "attach", capture_attach)
 
     session = simulation_module.create_interface_session(
         ExperimentConfig(
@@ -819,6 +1114,8 @@ def test_production_session_polls_transport_before_initial_lifecycle_snapshot(
     assert session is not None
     try:
         assert trace[:2] == ["poll", "snapshot"]
+        assert len(attached_snapshots) == 1
+        assert attached_snapshots[0] is snapshots[0]
     finally:
         session.close()
 
@@ -1024,6 +1321,233 @@ def test_production_auto_fallback_logs_unavailable_once_but_explicit_local_does_
         assert local_logger.events == []
     finally:
         local_session.close()
+
+
+@pytest.mark.parametrize("requested_mode", ("ecal", "auto"))
+def test_production_session_creates_worker_only_for_actual_ecal_mode(
+    monkeypatch,
+    requested_mode: str,
+) -> None:
+    """实际 eCAL session 必须把 ready worker 的唯一所有权转交给 runtime。"""
+    worker_calls: list[tuple[object, float]] = []
+    services: list[SessionLidarService] = []
+    handle = object()
+    transport = Transport(mode="ecal")
+    world = SimpleNamespace(
+        scene=SimpleNamespace(body_ids=(10,)),
+        active_robot=SimpleNamespace(robot=Robot()),
+    )
+
+    class Manager:
+        def snapshot(self, *, include_body_id=False):
+            return ()
+
+    class ServiceFactory:
+        @staticmethod
+        def from_worker_handle(worker_handle, **kwargs):
+            assert worker_handle is handle
+            service = SessionLidarService()
+            services.append(service)
+            return service
+
+    def start_worker(world_spec, *, startup_timeout_sec):
+        worker_calls.append((world_spec, startup_timeout_sec))
+        return handle
+
+    monkeypatch.setattr(simulation_module, "PyBulletSensorBackend", lambda *_args: Backend())
+    monkeypatch.setattr(simulation_module, "create_transport", lambda *_args, **_kwargs: transport)
+    monkeypatch.setattr(simulation_module, "start_lidar_worker", start_worker, raising=False)
+    monkeypatch.setattr(simulation_module, "LidarScanService", ServiceFactory, raising=False)
+
+    session = simulation_module.create_interface_session(
+        ExperimentConfig(
+            interface_mode=requested_mode,
+            interface_enabled=True,
+            interface_log_enabled=False,
+        ),
+        client_id=3,
+        coordinator_world=world,
+        obstacle_manager=Manager(),
+        document=scene_document(),
+    )
+
+    assert session is not None
+    service = services[0]
+    try:
+        assert len(worker_calls) == 1
+        world_spec, startup_timeout_sec = worker_calls[0]
+        assert type(world_spec) is LidarWorkerWorldSpec
+        assert world_spec.experiment_config.interface_mode == requested_mode
+        assert world_spec.scene_document == scene_document()
+        assert world_spec.world_digest == world_digest_for_document(scene_document())
+        assert startup_timeout_sec > 0.0
+        assert session.runtime._lidar_scan_service is service
+        factory = session.runtime._lidar_scan_service_factory
+        assert callable(factory)
+        candidate = factory(
+            scene_document(),
+            7,
+            world_digest_for_document(scene_document()),
+        )
+        assert candidate is services[1]
+        assert len(worker_calls) == 2
+        candidate.close_idle(timeout_sec=1.0)
+        assert candidate.close_idle_count == 1
+    finally:
+        session.close()
+    assert service.close_idle_count == 1
+    assert service.force_close_count == 0
+
+
+def test_auto_local_fallback_does_not_create_worker(monkeypatch) -> None:
+    """auto 实际降级 local 后必须保留同步 LiDAR 路径，不能启动 child。"""
+    worker_calls: list[object] = []
+    transport = Transport(mode="local")
+    world = SimpleNamespace(
+        scene=SimpleNamespace(body_ids=(10,)),
+        active_robot=SimpleNamespace(robot=Robot()),
+    )
+
+    class Manager:
+        def snapshot(self, *, include_body_id=False):
+            return ()
+
+    def unexpected_worker(*_args, **_kwargs):
+        worker_calls.append(object())
+        raise AssertionError("actual local mode must not start a lidar worker")
+
+    monkeypatch.setattr(simulation_module, "PyBulletSensorBackend", lambda *_args: Backend())
+    monkeypatch.setattr(simulation_module, "create_transport", lambda *_args, **_kwargs: transport)
+    monkeypatch.setattr(
+        simulation_module,
+        "start_lidar_worker",
+        unexpected_worker,
+        raising=False,
+    )
+
+    session = simulation_module.create_interface_session(
+        ExperimentConfig(
+            interface_mode="auto",
+            interface_enabled=True,
+            interface_log_enabled=False,
+        ),
+        client_id=3,
+        coordinator_world=world,
+        obstacle_manager=Manager(),
+        document=scene_document(),
+    )
+
+    assert session is not None
+    try:
+        assert worker_calls == []
+        assert session.runtime._lidar_scan_service is None
+    finally:
+        session.close()
+
+
+@pytest.mark.parametrize("requested_mode", ("ecal", "auto"))
+def test_worker_start_failure_closes_all_session_resources(
+    monkeypatch,
+    requested_mode: str,
+) -> None:
+    """实际 eCAL worker 启动失败必须回滚 logger、transport 与 backend。"""
+    trace: list[str] = []
+    transport = Transport(mode="ecal")
+    transport.trace = trace
+    backend = Backend(trace)
+    logger = Logger(trace=trace)
+    worker_specs: list[object] = []
+    world = SimpleNamespace(
+        scene=SimpleNamespace(body_ids=(10,)),
+        active_robot=SimpleNamespace(robot=Robot()),
+    )
+
+    class Manager:
+        def snapshot(self, *, include_body_id=False):
+            return ()
+
+    def reject_start(world_spec, **_kwargs):
+        worker_specs.append(world_spec)
+        raise RuntimeError("injected worker startup failure")
+
+    monkeypatch.setattr(simulation_module, "PyBulletSensorBackend", lambda *_args: backend)
+    monkeypatch.setattr(simulation_module, "create_transport", lambda *_args, **_kwargs: transport)
+    monkeypatch.setattr(simulation_module, "InterfaceEventLogger", lambda *_args, **_kwargs: logger)
+    monkeypatch.setattr(simulation_module, "start_lidar_worker", reject_start, raising=False)
+
+    with pytest.raises(RuntimeError, match="injected worker startup failure"):
+        simulation_module.create_interface_session(
+            ExperimentConfig(
+                interface_mode=requested_mode,
+                interface_enabled=True,
+                interface_log_enabled=True,
+            ),
+            client_id=3,
+            coordinator_world=world,
+            obstacle_manager=Manager(),
+            document=scene_document(),
+        )
+
+    assert trace == ["logger.close", "transport.close", "backend.close"]
+    assert worker_specs[0].experiment_config.interface_mode == requested_mode
+
+
+@pytest.mark.parametrize("failure_stage", ("runtime", "relay"))
+def test_runtime_or_relay_failure_after_worker_ready_closes_child_once(
+    monkeypatch,
+    failure_stage: str,
+) -> None:
+    """worker ready 后，入口或 runtime 失败都只能由当时的所有者关闭一次。"""
+    service = SessionLidarService()
+    handle = object()
+    transport = Transport(mode="ecal")
+    world = SimpleNamespace(
+        scene=SimpleNamespace(body_ids=(10,)),
+        active_robot=SimpleNamespace(robot=Robot()),
+    )
+
+    class Manager:
+        def snapshot(self, *, include_body_id=False):
+            return ()
+
+    class ServiceFactory:
+        @staticmethod
+        def from_worker_handle(worker_handle, **_kwargs):
+            assert worker_handle is handle
+            return service
+
+    monkeypatch.setattr(simulation_module, "PyBulletSensorBackend", lambda *_args: Backend())
+    monkeypatch.setattr(simulation_module, "create_transport", lambda *_args, **_kwargs: transport)
+    monkeypatch.setattr(simulation_module, "start_lidar_worker", lambda *_args, **_kwargs: handle, raising=False)
+    monkeypatch.setattr(simulation_module, "LidarScanService", ServiceFactory, raising=False)
+    if failure_stage == "runtime":
+        def reject_runtime(*_args, **_kwargs):
+            raise RuntimeError("injected runtime construction failure")
+
+        monkeypatch.setattr(simulation_module, "InterfaceRuntime", reject_runtime)
+        expected_error = "injected runtime construction failure"
+    else:
+        def reject_attach(self, _runtime, _transport, **_kwargs):
+            raise RuntimeError("injected relay attach failure")
+
+        monkeypatch.setattr(simulation_module._PeerStateRelay, "attach", reject_attach)
+        expected_error = "injected relay attach failure"
+
+    with pytest.raises(RuntimeError, match=expected_error):
+        simulation_module.create_interface_session(
+            ExperimentConfig(
+                interface_mode="ecal",
+                interface_enabled=True,
+                interface_log_enabled=False,
+            ),
+            client_id=3,
+            coordinator_world=world,
+            obstacle_manager=Manager(),
+            document=scene_document(),
+        )
+
+    assert service.close_idle_count == 1
+    assert service.force_close_count == 0
 
 
 @pytest.mark.parametrize("failure_stage", ("scheduler", "initial_monotonic"))
@@ -1440,6 +1964,927 @@ def test_ecal_interface_frame_never_submits_dashboard_twist() -> None:
         assert transport.poll_count == 1
         assert robot.twists == []
         assert runtime.status_snapshot(wall_time=clock()).command.state == "waiting_command"
+    finally:
+        runtime.close()
+
+
+def test_async_lidar_capture_freezes_bodyless_scene_atomically() -> None:
+    """mount、base 和完整逻辑障碍物必须来自同一 world-operation 捕获。"""
+    obstacles = (
+        ObstacleSpec(
+            logical_id=2,
+            mode="static",
+            geometry=ObstacleGeometry("box", (0.2, 0.3, 0.4)),
+            position=(2.0, 2.5, 0.4),
+            orientation=(0.0, 0.0, 0.0, 1.0),
+        ),
+        ObstacleSpec(
+            logical_id=1,
+            mode="static",
+            geometry=ObstacleGeometry("box", (0.5, 0.6, 0.7)),
+            position=(1.0, 1.5, 0.7),
+            orientation=(0.0, 0.0, 0.0, 1.0),
+        ),
+    )
+    document = replace(scene_document(), obstacles=obstacles)
+    mount_pose = Pose((-3.0, 0.5, 1.2), (0.0, 0.0, 1.0, 0.0))
+    base_pose = Pose((3.0, -0.5, 0.2), (0.0, 0.0, 0.0, 1.0))
+    backend = ObservedBaseBackend(base_pose)
+    service = AsyncLidarService()
+    runtime, _robot, transport, _clock = make_runtime(
+        mode="ecal",
+        backend=backend,
+        document=document,
+        lidar_scan_service=service,
+    )
+    rear = ObservedCaptureLidar(mount_pose)
+    rear.runtime = runtime
+    runtime._rear_lidar = rear
+    service.runtime = runtime
+    backend.runtime = runtime
+    expected_snapshots = tuple(
+        ObstacleSnapshot(
+            logical_id=obstacle.logical_id,
+            body_id=None,
+            mode=obstacle.mode,
+            shape=obstacle.geometry.shape,
+            position=obstacle.position,
+            orientation=obstacle.orientation,
+            path=obstacle.path,
+            geometry=obstacle.geometry,
+        )
+        for obstacle in document.obstacles
+    )
+    try:
+        runtime.after_physics_step(0.05)
+
+        assert rear.world_operation_counts == [1]
+        assert backend.world_operation_counts == [1]
+        assert service.capture_world_operation_counts == [0]
+        assert service.capture_generations == [0]
+        assert len(service.captures) == 1
+        capture = service.captures[0]
+        assert capture == {
+            "topic": "lidar_rear",
+            "timestamp_ns": 50_000_000,
+            "world_mount_pose": mount_pose,
+            "optional_base_pose": base_pose,
+            "complete_obstacle_snapshots_without_body_ids": expected_snapshots,
+        }
+        assert all(snapshot.body_id is None for snapshot in expected_snapshots)
+    finally:
+        runtime.close()
+
+
+def test_async_lidar_result_uses_worker_payload_without_parent_reencode() -> None:
+    """prepared 帧必须把 worker 原字节交给 transport 和 logger。"""
+    payload = b"worker-preencoded-lidar-payload"
+    timestamp_ns = 100_000_000
+    frame = PreparedLidarFrame(
+        1,
+        1,
+        0,
+        0,
+        "lidar_front",
+        timestamp_ns,
+        LidarPointCloud(timestamp_ns, "lidar_front", 0, 1, ()),
+        None,
+        payload,
+        1,
+    )
+    service = AsyncLidarService((frame,))
+    logger = Logger()
+    runtime, _robot, transport, clock = make_runtime(
+        mode="ecal",
+        backend=Backend(),
+        document=scene_document(),
+        logger=logger,
+        lidar_scan_service=service,
+        capture_lidar_top_view=False,
+    )
+    runtime._codec = RejectParentEncodeCodec(runtime._codec)
+    try:
+        runtime.before_physics_step(0.01, wall_time=clock())
+
+        lidar_publishes = [
+            item for item in transport.published if item[0] == runtime.config.lidar_front.topic
+        ]
+        assert len(lidar_publishes) == 1
+        assert lidar_publishes[0][1] == payload
+        assert lidar_publishes[0][3] == timestamp_ns
+        assert len(logger.messages) == 1
+        assert logger.messages[0].payload == payload
+        assert logger.messages[0].sim_time_ns == timestamp_ns
+    finally:
+        runtime.close()
+
+
+def test_async_headless_lidar_payload_publishes_without_parent_pointcloud() -> None:
+    """headless compact 响应直接发布 worker bytes，不解码点云或写入 Dashboard。"""
+    payload = b"worker-headless-compact-lidar-payload"
+    timestamp_ns = 150_000_000
+    compact = PreparedLidarPayload(
+        1,
+        2,
+        0,
+        0,
+        "lidar_front",
+        timestamp_ns,
+        payload,
+        1,
+    )
+    service = AsyncLidarService((compact,))
+    logger = Logger()
+    runtime, _robot, transport, clock = make_runtime(
+        mode="ecal",
+        backend=Backend(),
+        document=scene_document(),
+        logger=logger,
+        lidar_scan_service=service,
+        capture_lidar_top_view=False,
+    )
+    runtime._codec = RejectParentEncodeCodec(runtime._codec)
+    try:
+        runtime.before_physics_step(0.01, wall_time=clock())
+
+        lidar_publishes = [
+            item for item in transport.published if item[0] == runtime.config.lidar_front.topic
+        ]
+        assert len(lidar_publishes) == 1
+        assert lidar_publishes[0][1] == payload
+        assert lidar_publishes[0][2] == "slope_sim.interfaces.v1.LidarPointCloud"
+        assert lidar_publishes[0][3] == timestamp_ns
+        assert len(logger.messages) == 1
+        dashboard = runtime.dashboard_snapshot(wall_time=clock())
+        assert dashboard.lidar_front is None
+        assert dashboard.lidar_front_view is None
+    finally:
+        runtime.close()
+
+
+def test_single_scan_failure_degrades_only_requested_topic_once() -> None:
+    """单帧 worker 失败只给请求话题累计一次 error/drop 和一个事件。"""
+    service = AsyncLidarService(
+        events=(
+            LidarServiceEvent(
+                1,
+                "frame_failed",
+                "topic",
+                "lidar_front",
+                (1, 0, 0, "lidar_front", 100_000_000),
+                "codec_failed",
+                "codec failed",
+            ),
+        )
+    )
+    logger = Logger()
+    runtime, _robot, _transport, clock = make_runtime(
+        mode="ecal",
+        backend=Backend(),
+        document=scene_document(),
+        logger=logger,
+        lidar_scan_service=service,
+        capture_lidar_top_view=False,
+    )
+    front_topic = runtime.config.lidar_front.topic
+    rear_topic = runtime.config.lidar_rear.topic
+    before = runtime.status_snapshot(wall_time=clock()).topics
+    try:
+        runtime.before_physics_step(0.01, wall_time=clock())
+        first = runtime.status_snapshot(wall_time=clock()).topics
+        runtime.before_physics_step(0.01, wall_time=clock())
+        second = runtime.status_snapshot(wall_time=clock()).topics
+
+        assert first[front_topic].error_count == before[front_topic].error_count + 1
+        assert first[front_topic].dropped_count == before[front_topic].dropped_count + 1
+        assert first[front_topic].state == "error"
+        assert first[front_topic].detail == "codec failed"
+        assert (
+            first[rear_topic].error_count,
+            first[rear_topic].dropped_count,
+        ) == (
+            before[rear_topic].error_count,
+            before[rear_topic].dropped_count,
+        )
+        assert (
+            second[front_topic].error_count,
+            second[front_topic].dropped_count,
+        ) == (
+            first[front_topic].error_count,
+            first[front_topic].dropped_count,
+        )
+        sensor_events = [
+            fields for event, fields in logger.events if event == "sensor_failed"
+        ]
+        assert len(sensor_events) == 1
+        assert sensor_events[0]["topic"] == front_topic
+        assert sensor_events[0]["scope"] == "topic"
+        assert sensor_events[0]["stable_error_code"] == "codec_failed"
+        assert sensor_events[0]["reason"] == "codec failed"
+        assert sensor_events[0]["sim_time_ns"] == 100_000_000
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize(
+    ("kind", "job_identity"),
+    (
+        ("capture_rejected", None),
+        ("job_overrun", (1, 0, 0, "lidar_rear", 50_000_000)),
+    ),
+)
+def test_async_lidar_topic_outcome_adds_one_error_and_drop(
+    kind: str,
+    job_identity: tuple[int, int, int, str, int] | None,
+) -> None:
+    """容量拒绝和超时都只按 typed event 精确污染对应话题一次。"""
+    service = AsyncLidarService(
+        events=(
+            LidarServiceEvent(
+                1,
+                kind,
+                "topic",
+                "lidar_rear",
+                job_identity,
+                "sensor_overrun",
+                "lidar scheduling overrun",
+            ),
+        )
+    )
+    runtime, _robot, _transport, clock = make_runtime(
+        mode="ecal",
+        backend=Backend(),
+        document=scene_document(),
+        lidar_scan_service=service,
+        capture_lidar_top_view=False,
+    )
+    rear_topic = runtime.config.lidar_rear.topic
+    before = runtime.status_snapshot(wall_time=clock()).topics[rear_topic]
+    try:
+        runtime.before_physics_step(0.01, wall_time=clock())
+        after = runtime.status_snapshot(wall_time=clock()).topics[rear_topic]
+
+        assert after.error_count == before.error_count + 1
+        assert after.dropped_count == before.dropped_count + 1
+        assert after.state == "error"
+        assert after.detail == "lidar scheduling overrun"
+    finally:
+        runtime.close()
+
+
+def test_unknown_scene_state_faults_both_lidar_topics_once() -> None:
+    """不可恢复的镜像错误只归因一次到双 LiDAR，轮控继续运行。"""
+    job_identity = (1, 0, 0, "lidar_front", 100_000_000)
+    service = AsyncLidarService(
+        events=(
+            LidarServiceEvent(
+                1,
+                "service_failed",
+                "service",
+                None,
+                job_identity,
+                "scene_state_unknown",
+                "scene rollback could not be proven",
+            ),
+        )
+    )
+    logger = Logger()
+    runtime, robot, transport, clock = make_runtime(
+        mode="ecal",
+        backend=Backend(),
+        document=scene_document(),
+        logger=logger,
+        lidar_scan_service=service,
+        capture_lidar_top_view=False,
+    )
+    lidar_topics = (
+        runtime.config.lidar_front.topic,
+        runtime.config.lidar_rear.topic,
+    )
+    before = runtime.status_snapshot(wall_time=clock()).topics
+    payload = ProtoCodec().encode(WheelCommand(1, (1.0, 2.0), ()))
+    try:
+        assert transport.emit(runtime.config.wheel_command.topic, payload, clock()) is True
+        decision = runtime.before_physics_step(0.01, wall_time=clock())
+        first = runtime.status_snapshot(wall_time=clock()).topics
+        runtime.before_physics_step(0.01, wall_time=clock())
+        second = runtime.status_snapshot(wall_time=clock()).topics
+
+        assert decision is not None and decision.waiting is False
+        assert robot.commands == [((1.0, 2.0), (), 0.01), ((1.0, 2.0), (), 0.01)]
+        for topic in lidar_topics:
+            assert first[topic].error_count == before[topic].error_count + 1
+            assert first[topic].dropped_count == before[topic].dropped_count + 1
+            assert first[topic].state == "error"
+            assert first[topic].detail == "scene rollback could not be proven"
+            assert second[topic].error_count == first[topic].error_count
+            assert second[topic].dropped_count == first[topic].dropped_count
+        sensor_events = [
+            fields for event, fields in logger.events if event == "sensor_failed"
+        ]
+        assert len(sensor_events) == 1
+        assert sensor_events[0]["scope"] == "service"
+        assert sensor_events[0]["topics"] == lidar_topics
+        assert sensor_events[0]["stable_error_code"] == "scene_state_unknown"
+        assert sensor_events[0]["reason"] == "scene rollback could not be proven"
+        assert sensor_events[0]["sim_time_ns"] == job_identity[4]
+    finally:
+        runtime.close()
+
+
+def test_worker_protocol_failure_faults_both_lidar_topics_only_once() -> None:
+    """真实 service 协议 fault 只生成一次双话题归因，重复 poll 不累计。"""
+    service, channel = make_owned_lidar_service()
+    assert service.capture(
+        topic="lidar_front",
+        timestamp_ns=100_000_000,
+        world_mount_pose=Pose((0.0, 0.0, 0.8), (0.0, 0.0, 0.0, 1.0)),
+        optional_base_pose=None,
+        complete_obstacle_snapshots_without_body_ids=(),
+    )
+    channel.responses.append(object())
+    logger = Logger()
+    runtime, _robot, _transport, clock = make_runtime(
+        mode="ecal",
+        backend=Backend(),
+        document=scene_document(),
+        logger=logger,
+        lidar_scan_service=service,
+        capture_lidar_top_view=False,
+    )
+    lidar_topics = (
+        runtime.config.lidar_front.topic,
+        runtime.config.lidar_rear.topic,
+    )
+    before = runtime.status_snapshot(wall_time=clock()).topics
+    try:
+        runtime.before_physics_step(0.01, wall_time=clock())
+        first = runtime.status_snapshot(wall_time=clock()).topics
+        runtime.before_physics_step(0.01, wall_time=clock())
+        second = runtime.status_snapshot(wall_time=clock()).topics
+
+        assert service.snapshot().state == "failed"
+        for topic in lidar_topics:
+            assert first[topic].error_count == before[topic].error_count + 1
+            assert first[topic].dropped_count == before[topic].dropped_count + 1
+            assert second[topic].error_count == first[topic].error_count
+            assert second[topic].dropped_count == first[topic].dropped_count
+        sensor_events = [
+            fields for event, fields in logger.events if event == "sensor_failed"
+        ]
+        assert len(sensor_events) == 1
+        assert sensor_events[0]["scope"] == "service"
+        assert sensor_events[0]["stable_error_code"] == "worker_protocol_failed"
+    finally:
+        runtime.close()
+
+
+def test_prepared_identity_failure_never_publishes_payload() -> None:
+    """畸形 prepared 身份在 service 边界 fault，原 payload 绝不进入 transport。"""
+    service, channel = make_owned_lidar_service()
+    assert service.capture(
+        topic="lidar_front",
+        timestamp_ns=100_000_000,
+        world_mount_pose=Pose((0.0, 0.0, 0.8), (0.0, 0.0, 0.0, 1.0)),
+        optional_base_pose=None,
+        complete_obstacle_snapshots_without_body_ids=(),
+    )
+    request = channel.sent[0]
+    payload = b"invalid-identity-payload-must-not-publish"
+    frame = PreparedLidarFrame(
+        request.protocol_version,
+        request.job_id,
+        request.lifecycle_generation,
+        request.pause_epoch,
+        request.topic,
+        request.timestamp_ns,
+        LidarPointCloud(request.timestamp_ns, "lidar_front", 0, 1, ()),
+        None,
+        payload,
+        1,
+    )
+    object.__setattr__(frame, "job_id", request.job_id + 1)
+    channel.responses.append(frame)
+    runtime, _robot, transport, clock = make_runtime(
+        mode="ecal",
+        backend=Backend(),
+        document=scene_document(),
+        lidar_scan_service=service,
+        capture_lidar_top_view=False,
+    )
+    try:
+        runtime.before_physics_step(0.01, wall_time=clock())
+
+        assert service.snapshot().state == "failed"
+        assert all(published_payload != payload for _topic, published_payload, *_rest in transport.published)
+    finally:
+        runtime.close()
+
+
+def test_runtime_exposes_current_lidar_service_snapshot() -> None:
+    """runtime 诊断返回当前 service 的完整只读生命周期快照。"""
+    service, channel = make_owned_lidar_service()
+    assert service.capture(
+        topic="lidar_front",
+        timestamp_ns=100_000_000,
+        world_mount_pose=Pose((0.0, 0.0, 0.8), (0.0, 0.0, 0.0, 1.0)),
+        optional_base_pose=None,
+        complete_obstacle_snapshots_without_body_ids=(),
+    )
+    request = channel.sent[0]
+    channel.responses.append(prepared_lidar_frame(request.job_id, request.timestamp_ns))
+    assert service.poll() is not None
+    runtime, _robot, _transport, _clock = make_runtime(
+        mode="ecal",
+        backend=Backend(),
+        document=scene_document(),
+        lidar_scan_service=service,
+        capture_lidar_top_view=False,
+    )
+    try:
+        snapshot = runtime.lidar_service_snapshot()
+
+        assert type(snapshot) is LidarServiceSnapshot
+        assert snapshot == service.snapshot()
+        assert snapshot.completed_count == 1
+        assert snapshot.in_flight_identity is None
+        assert snapshot.pending_capture_identity is None
+    finally:
+        runtime.close()
+
+
+def test_normal_close_drains_pending_before_transport_and_logger() -> None:
+    """正常关闭先发布已捕获双帧，再终结 worker、transport 与 logger。"""
+    trace: list[str] = []
+
+    def response_for(request: object, payload: bytes) -> PreparedLidarFrame:
+        lidar_id = 1 if request.topic == "lidar_front" else 2
+        return PreparedLidarFrame(
+            request.protocol_version,
+            request.job_id,
+            request.lifecycle_generation,
+            request.pause_epoch,
+            request.topic,
+            request.timestamp_ns,
+            LidarPointCloud(
+                request.timestamp_ns,
+                request.topic,
+                0,
+                lidar_id,
+                (),
+            ),
+            None,
+            payload,
+            1,
+        )
+
+    class DrainChannel(RuntimeLidarChannel):
+        """首帧收取后立即为刚提升的 pending 帧准备响应。"""
+
+        def send(self, value: object) -> None:
+            super().send(value)
+            if len(self.sent) == 2:
+                self.responses.append(response_for(value, b"close-rear"))
+
+        def close(self) -> None:
+            trace.append("worker.close")
+            super().close()
+
+    class OrderedTransport(Transport):
+        def publish(self, topic, payload, type_name, sim_time_ns, *, wall_time=None):
+            trace.append(f"transport.publish:{bytes(payload).decode('ascii')}")
+            return super().publish(
+                topic,
+                payload,
+                type_name,
+                sim_time_ns,
+                wall_time=wall_time,
+            )
+
+        def quiesce(self) -> TransportSnapshot:
+            trace.append("transport.quiesce")
+            return super().quiesce()
+
+        def close(self) -> None:
+            trace.append("transport.close")
+            super().close()
+
+    class OrderedLogger(Logger):
+        def record_message(self, record: InterfaceLogRecord) -> bool:
+            trace.append(f"logger.message:{record.payload.decode('ascii')}")
+            return super().record_message(record)
+
+        def close(self) -> None:
+            trace.append("logger.close")
+            super().close()
+
+    channel = DrainChannel()
+    service, _selected_channel = make_owned_lidar_service(channel=channel)
+    mount = Pose((0.0, 0.0, 0.8), (0.0, 0.0, 0.0, 1.0))
+    assert service.capture(
+        topic="lidar_front",
+        timestamp_ns=100_000_000,
+        world_mount_pose=mount,
+        optional_base_pose=None,
+        complete_obstacle_snapshots_without_body_ids=(),
+    )
+    first_request = channel.sent[0]
+    channel.responses.append(response_for(first_request, b"close-front"))
+    assert service.capture(
+        topic="lidar_rear",
+        timestamp_ns=150_000_000,
+        world_mount_pose=mount,
+        optional_base_pose=None,
+        complete_obstacle_snapshots_without_body_ids=(),
+    )
+    transport = OrderedTransport(mode="ecal")
+    logger = OrderedLogger()
+    runtime, _robot, _transport, _clock = make_runtime(
+        mode="ecal",
+        backend=Backend(),
+        document=scene_document(),
+        logger=logger,
+        transport=transport,
+        lidar_scan_service=service,
+        capture_lidar_top_view=False,
+    )
+
+    runtime.close()
+
+    assert service.snapshot().state == "closed"
+    assert [published[1] for published in transport.published] == [
+        b"close-front",
+        b"close-rear",
+    ]
+    assert [record.payload for record in logger.messages] == [
+        b"close-front",
+        b"close-rear",
+    ]
+    assert trace.index("worker.close") < trace.index("transport.quiesce")
+    assert trace.index("worker.close") < trace.index("logger.close")
+
+
+def test_force_close_cancels_pending_and_never_reports_success_fence() -> None:
+    """drain 超时只走强制终结，不发送正常 stop 或消费成功 ACK。"""
+
+    class AdvancingCloseClock:
+        def __init__(self) -> None:
+            self.value = 0.0
+
+        def __call__(self) -> float:
+            current = self.value
+            self.value += 0.251
+            return current
+
+    class ForceOwnedProcess:
+        def __init__(self) -> None:
+            self.alive = True
+            self.join_timeouts: list[float] = []
+            self.terminate_count = 0
+            self.kill_count = 0
+
+        def join(self, timeout_sec: float) -> None:
+            self.join_timeouts.append(timeout_sec)
+
+        def is_alive(self) -> bool:
+            return self.alive
+
+        def terminate(self) -> None:
+            self.terminate_count += 1
+            self.alive = False
+
+        def kill(self) -> None:
+            self.kill_count += 1
+            self.alive = False
+
+    channel = RuntimeLidarChannel()
+    process = ForceOwnedProcess()
+    service, _selected_channel = make_owned_lidar_service(
+        channel=channel,
+        process=process,
+    )
+    mount = Pose((0.0, 0.0, 0.8), (0.0, 0.0, 0.0, 1.0))
+    assert service.capture(
+        topic="lidar_front",
+        timestamp_ns=100_000_000,
+        world_mount_pose=mount,
+        optional_base_pose=None,
+        complete_obstacle_snapshots_without_body_ids=(),
+    )
+    assert service.capture(
+        topic="lidar_rear",
+        timestamp_ns=150_000_000,
+        world_mount_pose=mount,
+        optional_base_pose=None,
+        complete_obstacle_snapshots_without_body_ids=(),
+    )
+    logger = Logger()
+    runtime, _robot, _transport, _clock = make_runtime(
+        mode="ecal",
+        backend=Backend(),
+        document=scene_document(),
+        logger=logger,
+        lidar_scan_service=service,
+        capture_lidar_top_view=False,
+    )
+    runtime._monotonic = AdvancingCloseClock()
+
+    with pytest.raises(
+        TimeoutError,
+        match="did not drain within 250 ms during close",
+    ):
+        runtime.close()
+
+    snapshot = service.snapshot()
+    assert snapshot.state == "closed"
+    assert snapshot.in_flight_identity is None
+    assert snapshot.pending_capture_identity is None
+    assert process.is_alive() is False
+    assert process.terminate_count == 1
+    assert process.kill_count == 0
+    assert len(channel.sent) == 1
+    assert channel.recv_count == 0
+    shutdown_events = [
+        fields for event, fields in logger.events if event == "worker_shutdown_failed"
+    ]
+    assert len(shutdown_events) == 1
+    assert shutdown_events[0]["scope"] == "service"
+    assert shutdown_events[0]["stable_error_code"] == "worker_shutdown_failed"
+
+
+def test_close_consumes_preexisting_service_failure_once_before_force() -> None:
+    """关闭前已锁存的 service event 仍须精确污染双 LiDAR 一次。"""
+    service, channel = make_owned_lidar_service()
+    assert service.capture(
+        topic="lidar_front",
+        timestamp_ns=100_000_000,
+        world_mount_pose=Pose((0.0, 0.0, 0.8), (0.0, 0.0, 0.0, 1.0)),
+        optional_base_pose=None,
+        complete_obstacle_snapshots_without_body_ids=(),
+    )
+    channel.responses.append(object())
+    assert service.poll() is None
+    assert service.snapshot().state == "failed"
+    logger = Logger()
+    runtime, _robot, _transport, _clock = make_runtime(
+        mode="ecal",
+        backend=Backend(),
+        document=scene_document(),
+        logger=logger,
+        lidar_scan_service=service,
+        capture_lidar_top_view=False,
+    )
+
+    runtime.close()
+
+    sensor_events = [
+        fields for event, fields in logger.events if event == "sensor_failed"
+    ]
+    assert len(sensor_events) == 1
+    assert sensor_events[0]["scope"] == "service"
+    assert sensor_events[0]["stable_error_code"] == "worker_protocol_failed"
+    assert sensor_events[0]["topics"] == (
+        runtime.config.lidar_front.topic,
+        runtime.config.lidar_rear.topic,
+    )
+    assert service.drain_events() == ()
+
+
+def test_async_lidar_allows_rtk_and_imu_at_same_timestamp_to_publish_immediately() -> None:
+    """LiDAR 尚无 prepared 结果时，同期限真值传感器仍在当前帧发布。"""
+    service = AsyncLidarService()
+    runtime, _robot, transport, _clock = make_runtime(
+        mode="ecal",
+        backend=Backend(),
+        document=scene_document(),
+        lidar_scan_service=service,
+        capture_lidar_top_view=False,
+    )
+    runtime._front_lidar = FrozenCaptureLidar(
+        Pose((1.0, 0.0, 0.8), (0.0, 0.0, 0.0, 1.0))
+    )
+    runtime._rear_lidar = FrozenCaptureLidar(
+        Pose((-1.0, 0.0, 0.8), (0.0, 0.0, 1.0, 0.0))
+    )
+    runtime._truth_sensor_suite = StubTruth()
+    try:
+        runtime.after_physics_step(0.1)
+
+        published = {(topic, timestamp_ns) for topic, _payload, _name, timestamp_ns, _wall in transport.published}
+        assert (runtime.config.rtk.topic, 100_000_000) in published
+        assert (runtime.config.imu.topic, 100_000_000) in published
+        assert all(
+            topic not in {runtime.config.lidar_front.topic, runtime.config.lidar_rear.topic}
+            for topic, _timestamp_ns in published
+        )
+        assert [capture["timestamp_ns"] for capture in service.captures] == [
+            100_000_000,
+            50_000_000,
+        ]
+    finally:
+        runtime.close()
+
+
+def test_measurement_fence_drains_captured_lidar_before_transport_and_logger_snapshot() -> None:
+    """fence 返回前必须发布已捕获的 in-flight 与 pending prepared 帧。"""
+    first = prepared_lidar_frame(1, 50_000_000)
+    second = prepared_lidar_frame(2, 100_000_000)
+    service = FenceLidarService(
+        in_flight_identity=(1, 0, 0, "lidar_front", 50_000_000),
+        pending_capture_identity=(0, 0, "lidar_front", 100_000_000),
+        poll_steps=(
+            (first, (2, 0, 0, "lidar_front", 100_000_000), None),
+            (second, None, None),
+        ),
+    )
+    logger = Logger()
+    runtime, _robot, transport, _clock = make_runtime(
+        mode="ecal",
+        backend=Backend(),
+        document=scene_document(),
+        logger=logger,
+        lidar_scan_service=service,
+        capture_lidar_top_view=False,
+    )
+    try:
+        fence = runtime.begin_sensor_fence()
+
+        assert service.poll_count == 2
+        assert [item[1] for item in transport.published] == [
+            first.protobuf_payload,
+            second.protobuf_payload,
+        ]
+        assert [record.payload for record in logger.messages] == [
+            first.protobuf_payload,
+            second.protobuf_payload,
+        ]
+        runtime.complete_sensor_fence(fence, resume_capture=False)
+    finally:
+        runtime.close()
+
+
+def test_measurement_start_ack_resumes_previously_ready_lidar_service() -> None:
+    """可恢复 fence 只在 ACK 后重新允许 ready service 接收 capture。"""
+    service = FenceLidarService(state="ready")
+    runtime, _robot, _transport, _clock = make_runtime(
+        mode="ecal",
+        backend=Backend(),
+        document=scene_document(),
+        lidar_scan_service=service,
+        capture_lidar_top_view=False,
+    )
+    install_frozen_async_sensors(runtime)
+    try:
+        fence = runtime.begin_sensor_fence()
+        runtime.after_physics_step(0.1)
+        assert service.captures == []
+
+        runtime.complete_sensor_fence(fence, resume_capture=True)
+        runtime.after_physics_step(0.1)
+
+        assert service.captures
+    finally:
+        runtime.close()
+
+
+def test_fence_does_not_resume_previously_suspended_service() -> None:
+    """进入前 suspended 的 service 在可恢复 ACK 后仍禁止新 capture。"""
+    service = FenceLidarService(state="suspended")
+    runtime, _robot, _transport, _clock = make_runtime(
+        mode="ecal",
+        backend=Backend(),
+        document=scene_document(),
+        lidar_scan_service=service,
+        capture_lidar_top_view=False,
+    )
+    install_frozen_async_sensors(runtime)
+    try:
+        fence = runtime.begin_sensor_fence()
+        runtime.complete_sensor_fence(fence, resume_capture=True)
+        runtime.after_physics_step(0.1)
+
+        assert service.state == "suspended"
+        assert service.captures == []
+    finally:
+        runtime.close()
+
+
+def test_final_sensor_fence_stays_stopped_after_ack() -> None:
+    """最终协议 ACK 不得重新打开此前 ready 的 capture gate。"""
+    service = FenceLidarService(state="ready")
+    runtime, _robot, transport, _clock = make_runtime(
+        mode="ecal",
+        backend=Backend(),
+        document=scene_document(),
+        lidar_scan_service=service,
+        capture_lidar_top_view=False,
+    )
+    install_frozen_async_sensors(runtime)
+    try:
+        fence = runtime.begin_sensor_fence()
+        runtime.complete_sensor_fence(fence, resume_capture=False)
+        runtime.after_physics_step(0.1)
+
+        assert service.captures == []
+        published_topics = {item[0] for item in transport.published}
+        assert runtime.config.rtk.topic in published_topics
+        assert runtime.config.imu.topic in published_topics
+    finally:
+        runtime.close()
+
+
+def test_sensor_fence_without_async_service_is_explicit_noop() -> None:
+    """local/no-service fence 不得冻结原有同步传感器发布路径。"""
+    runtime, _robot, transport, _clock = make_runtime(
+        backend=Backend(),
+        document=scene_document(),
+        capture_lidar_top_view=False,
+    )
+    runtime._front_lidar = StubLidar("lidar_front", 1)
+    runtime._rear_lidar = StubLidar("lidar_rear", 2)
+    runtime._truth_sensor_suite = StubTruth()
+    try:
+        fence = runtime.begin_sensor_fence()
+        runtime.complete_sensor_fence(fence, resume_capture=True)
+        runtime.after_physics_step(0.1)
+
+        topics = [item[0] for item in transport.published]
+        assert runtime.config.lidar_front.topic in topics
+        assert runtime.config.lidar_rear.topic in topics
+    finally:
+        runtime.close()
+
+
+def test_sensor_fence_timeout_keeps_capture_stopped() -> None:
+    """250 ms 未收敛时抛错，并保持 gate 关闭以阻止越界帧。"""
+    service = FenceLidarService(
+        state="ready",
+        in_flight_identity=(1, 0, 0, "lidar_front", 50_000_000),
+    )
+    runtime, _robot, _transport, _clock = make_runtime(
+        mode="ecal",
+        backend=Backend(),
+        document=scene_document(),
+        lidar_scan_service=service,
+        capture_lidar_top_view=False,
+    )
+    install_frozen_async_sensors(runtime)
+    fence_times = iter((10.0, 10.0, 10.125, 10.250))
+    runtime._monotonic = lambda: next(fence_times)
+    try:
+        with pytest.raises(TimeoutError, match="sensor fence"):
+            runtime.begin_sensor_fence()
+
+        assert service.poll_count == 2
+        runtime.after_physics_step(0.1)
+        assert service.captures == []
+    finally:
+        runtime.close()
+
+
+def test_sensor_fence_counts_initial_snapshot_in_total_budget() -> None:
+    """初始 snapshot 到达 250 ms deadline 时也必须让 fence 失败。"""
+    service = FenceLidarService(state="ready")
+    runtime, _robot, _transport, _clock = make_runtime(
+        mode="ecal",
+        backend=Backend(),
+        document=scene_document(),
+        lidar_scan_service=service,
+        capture_lidar_top_view=False,
+    )
+    fence_times = iter((10.0, 10.250))
+    runtime._monotonic = lambda: next(fence_times)
+    try:
+        with pytest.raises(TimeoutError, match="sensor fence"):
+            runtime.begin_sensor_fence()
+
+        assert service.poll_count == 0
+    finally:
+        runtime.close()
+
+
+def test_sensor_fence_rejects_poll_completion_at_total_budget() -> None:
+    """in-flight 在 deadline 才变 idle 时不得生成成功 fence。"""
+    frame = prepared_lidar_frame(1, 50_000_000)
+    service = FenceLidarService(
+        state="ready",
+        in_flight_identity=(1, 0, 0, "lidar_front", 50_000_000),
+        poll_steps=((frame, None, None),),
+    )
+    runtime, _robot, _transport, _clock = make_runtime(
+        mode="ecal",
+        backend=Backend(),
+        document=scene_document(),
+        lidar_scan_service=service,
+        capture_lidar_top_view=False,
+    )
+    fence_times = iter((10.0, 10.0, 10.0, 10.250))
+    runtime._monotonic = lambda: next(fence_times)
+    try:
+        with pytest.raises(TimeoutError, match="sensor fence"):
+            runtime.begin_sensor_fence()
+
+        assert service.poll_count == 1
     finally:
         runtime.close()
 

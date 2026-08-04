@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import FrozenInstanceError, dataclass, field, replace
 import json
+import sys
 from threading import Event, Lock, Thread, current_thread, get_ident
 import time
 from types import SimpleNamespace
@@ -10,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from scripts import ecal_roundtrip_peer as peer_script
+from scripts import ecal_simulation_runtime as runtime_script
 from scripts import verify_ecal_roundtrip as verifier
 import slope_sim.interfaces.ecal_transport as ecal_transport_module
 from slope_sim.interfaces.codec import ProtoCodec
@@ -92,6 +94,8 @@ class FakeEcalBindings:
         self.participants: list[FakeResource] = []
         self.subscribers: list[FakeResource] = []
         self.publishers: list[FakeResource] = []
+        self.publisher_buffer_counts: list[int] = []
+        self.publisher_acknowledge_timeouts_ms: list[int] = []
         self.sent: list[tuple[str, bytes]] = []
         self.fail_on_publisher_number: int | None = None
 
@@ -110,12 +114,21 @@ class FakeEcalBindings:
         self.subscribers.append(resource)
         return resource
 
-    def create_publisher(self, topic: str, _message_type: type) -> FakeResource:
+    def create_publisher(
+        self,
+        topic: str,
+        _message_type: type,
+        *,
+        shm_buffer_count: int,
+        acknowledge_timeout_ms: int,
+    ) -> FakeResource:
         number = len(self.publishers) + 1
         if number == self.fail_on_publisher_number:
             raise RuntimeError(f"publisher {number} failed")
         resource = FakeResource("publisher", topic, self.close_log)
         self.publishers.append(resource)
+        self.publisher_buffer_counts.append(shm_buffer_count)
+        self.publisher_acknowledge_timeouts_ms.append(acknowledge_timeout_ms)
         return resource
 
     def send(self, publisher: FakeResource, payload: bytes, _message_type: type) -> None:
@@ -148,11 +161,12 @@ class _V61Publisher:
     instances: list["_V61Publisher"] = []
     fail_on_number: int | None = None
 
-    def __init__(self, message_type: type, topic: str) -> None:
+    def __init__(self, message_type: type, topic: str, config: object) -> None:
         number = len(type(self).instances) + 1
         if number == type(self).fail_on_number:
             raise RuntimeError(f"publisher {number} failed")
         self.constructor_args = (message_type, topic)
+        self.config = config
         self.subscriber_count: object = 0
         self.sent: list[object] = []
         type(self).instances.append(self)
@@ -209,6 +223,18 @@ class _V61Core:
     def finalize(self) -> bool:
         self.finalize_calls += 1
         return True
+
+    @staticmethod
+    def get_publisher_configuration() -> object:
+        """返回与官方 binding 同形状、每次独立的 publisher 配置副本。"""
+        return SimpleNamespace(
+            layer=SimpleNamespace(
+                shm=SimpleNamespace(
+                    acknowledge_timeout_ms=0,
+                    memfile_buffer_count=1,
+                ),
+            )
+        )
 
 
 def _fake_v61_importer():
@@ -493,6 +519,74 @@ def test_load_bindings_never_swallows_non_import_errors(monkeypatch):
     assert imported == ["ecal.nanobind_core"]
 
 
+def test_v61_binding_applies_requested_shm_multibuffer_count(monkeypatch):
+    """追赶帧必须使用 SHM ring，不能继续复用默认单 memory file。"""
+    importer, _imported, _core = _fake_v61_importer()
+    monkeypatch.setattr("slope_sim.interfaces.ecal_transport.import_module", importer)
+    bindings = load_ecal_bindings()
+
+    publisher = bindings.create_publisher(
+        "/out",
+        pb.WheelState,
+        shm_buffer_count=7,
+        acknowledge_timeout_ms=100,
+    )
+
+    assert publisher.raw.config.layer.shm.memfile_buffer_count == 7
+    assert publisher.raw.config.layer.shm.acknowledge_timeout_ms == 100
+
+
+def test_v61_binding_rejects_shm_buffer_count_above_uint32(monkeypatch):
+    """binding 字段是 unsigned int，越界值必须在进入 nanobind 前明确拒绝。"""
+    importer, _imported, _core = _fake_v61_importer()
+    monkeypatch.setattr("slope_sim.interfaces.ecal_transport.import_module", importer)
+    bindings = load_ecal_bindings()
+
+    with pytest.raises(ValueError, match="queue_size"):
+        bindings.create_publisher(
+            "/out",
+            pb.WheelState,
+            shm_buffer_count=2**32,
+            acknowledge_timeout_ms=100,
+        )
+
+
+def test_v61_binding_allows_zero_to_disable_acknowledgement(monkeypatch) -> None:
+    """输出 publisher 可显式保留 ACK=0，同时继续使用多 SHM buffer。"""
+    importer, _imported, _core = _fake_v61_importer()
+    monkeypatch.setattr("slope_sim.interfaces.ecal_transport.import_module", importer)
+    bindings = load_ecal_bindings()
+
+    publisher = bindings.create_publisher(
+        "/out",
+        pb.WheelState,
+        shm_buffer_count=7,
+        acknowledge_timeout_ms=0,
+    )
+
+    assert publisher.raw.config.layer.shm.acknowledge_timeout_ms == 0
+    assert publisher.raw.config.layer.shm.memfile_buffer_count == 7
+
+
+@pytest.mark.parametrize("timeout_ms", (-1, 2**32))
+def test_v61_binding_rejects_acknowledge_timeout_outside_uint32(
+    monkeypatch,
+    timeout_ms: int,
+) -> None:
+    """ACK 原生字段允许零禁用，但拒绝负数与 unsigned int 上溢。"""
+    importer, _imported, _core = _fake_v61_importer()
+    monkeypatch.setattr("slope_sim.interfaces.ecal_transport.import_module", importer)
+    bindings = load_ecal_bindings()
+
+    with pytest.raises(ValueError, match="acknowledge_timeout_ms"):
+        bindings.create_publisher(
+            "/out",
+            pb.WheelState,
+            shm_buffer_count=7,
+            acknowledge_timeout_ms=timeout_ms,
+        )
+
+
 def test_v61_binding_uses_official_constructor_callback_and_cleanup_contract(monkeypatch):
     importer, _imported, core = _fake_v61_importer()
     monkeypatch.setattr("slope_sim.interfaces.ecal_transport.import_module", importer)
@@ -500,12 +594,22 @@ def test_v61_binding_uses_official_constructor_callback_and_cleanup_contract(mon
     received: list[bytes] = []
 
     participant = bindings.create_participant("official-v61")
-    publisher = bindings.create_publisher("/out", pb.WheelState)
+    publisher = bindings.create_publisher(
+        "/out",
+        pb.WheelState,
+        shm_buffer_count=TEST_CONFIG.outgoing_queue_size,
+        acknowledge_timeout_ms=100,
+    )
     subscriber = bindings.create_subscriber("/in", pb.WheelCommand, received.append)
     raw_publisher = publisher.raw
     raw_subscriber = subscriber.raw
 
     assert raw_publisher.constructor_args == (pb.WheelState, "/out")
+    assert (
+        raw_publisher.config.layer.shm.memfile_buffer_count
+        == TEST_CONFIG.outgoing_queue_size
+    )
+    assert raw_publisher.config.layer.shm.acknowledge_timeout_ms == 100
     assert raw_subscriber.constructor_args == (pb.WheelCommand, "/in")
     message = pb.WheelCommand(timestamp_ns=7, drive_wheel_speed_rad_s=(1.0, 2.0))
     raw_subscriber.emit(message)
@@ -557,6 +661,40 @@ def test_transport_centrally_creates_one_subscriber_and_five_publishers():
         ]
     finally:
         transport.close()
+
+
+def test_transport_enables_watchdog_ack_only_for_command_publisher() -> None:
+    """输出只用 SHM ring；command publisher 才等待 subscriber callback。"""
+    config = replace(
+        _config(),
+        outgoing_queue_size=7,
+        command_timeout_sec=0.125,
+    )
+    simulation_bindings = FakeEcalBindings()
+    simulation = EcalTransport(
+        config,
+        bindings=simulation_bindings,
+        start_worker=False,
+        role="simulation",
+    )
+    try:
+        assert simulation_bindings.publisher_buffer_counts == [7] * 5
+        assert simulation_bindings.publisher_acknowledge_timeouts_ms == [0] * 5
+    finally:
+        simulation.close()
+
+    peer_bindings = FakeEcalBindings()
+    peer = EcalTransport(
+        config,
+        bindings=peer_bindings,
+        start_worker=False,
+        role="peer",
+    )
+    try:
+        assert peer_bindings.publisher_buffer_counts == [7]
+        assert peer_bindings.publisher_acknowledge_timeouts_ms == [125]
+    finally:
+        peer.close()
 
 
 def test_transport_topic_quality_peer_state_is_optional_and_strictly_boolean():
@@ -724,6 +862,116 @@ def test_receive_callback_copies_payload_reads_clock_once_and_calls_upper_layer(
         assert transport.snapshot().received_count == 1
     finally:
         transport.close()
+
+
+def test_lidar_scan_hands_off_to_pending_command_before_encoding() -> None:
+    """扫描中到达的 command 必须在点云编码提交前获得一次调度机会。"""
+    bindings = FakeEcalBindings()
+    transport = EcalTransport(
+        _config(),
+        bindings=bindings,
+        start_worker=False,
+    )
+    runtime = InterfaceRuntime(
+        RuntimeRobot(),
+        config=_config(),
+        transport=transport,
+        capture_lidar_top_view=False,
+    )
+    scan_started = Event()
+    command_thread_ready = Event()
+    command_finished = Event()
+    command_errors: list[BaseException] = []
+    front_publish_observations: list[bool] = []
+
+    class BusyFrontLidar:
+        def scan(self, timestamp_ns: int) -> LidarPointCloud:
+            scan_started.set()
+            deadline = time.perf_counter() + 0.030
+            while time.perf_counter() < deadline:
+                pass
+            return LidarPointCloud(timestamp_ns, "lidar_front", 0, 1, ())
+
+    class RearLidar:
+        @staticmethod
+        def scan(timestamp_ns: int) -> LidarPointCloud:
+            return LidarPointCloud(timestamp_ns, "lidar_rear", 0, 2, ())
+
+    class TruthSensors:
+        @staticmethod
+        def read_rtk(timestamp_ns: int) -> RtkState:
+            return RtkState(timestamp_ns, 0.0, 0.0, 0.0, 0.0)
+
+        @staticmethod
+        def read_imu(timestamp_ns: int) -> ImuAttitude:
+            return ImuAttitude(timestamp_ns, 0.0, 0.0)
+
+    runtime._front_lidar = BusyFrontLidar()
+    runtime._rear_lidar = RearLidar()
+    runtime._truth_sensor_suite = TruthSensors()
+    original_publish = transport.publish
+
+    def observe_publish(topic, payload, type_name, sim_time_ns, *, wall_time=None):
+        if topic == runtime.config.lidar_front.topic:
+            front_publish_observations.append(command_finished.is_set())
+        return original_publish(
+            topic,
+            payload,
+            type_name,
+            sim_time_ns,
+            wall_time=wall_time,
+        )
+
+    transport.publish = observe_publish
+
+    def deliver_command() -> None:
+        command_thread_ready.set()
+        try:
+            if not scan_started.wait(timeout=3.0):
+                raise TimeoutError("front LiDAR scan did not start")
+            _command_subscriber(bindings).emit(_valid_command_payload())
+        except BaseException as error:  # pragma: no cover - 主线程汇合后断言
+            command_errors.append(error)
+        finally:
+            command_finished.set()
+
+    worker = Thread(target=deliver_command)
+    previous_switch_interval = sys.getswitchinterval()
+    try:
+        worker.start()
+        assert command_thread_ready.wait(timeout=3.0)
+        # 先模拟不利宿主值，再要求正式 runtime 安装并恢复自己的回调策略。
+        sys.setswitchinterval(1.0)
+        install_scheduling = getattr(
+            runtime_script,
+            "_install_command_callback_scheduling",
+            None,
+        )
+        restore_scheduling = getattr(
+            runtime_script,
+            "_restore_command_callback_scheduling",
+            None,
+        )
+        assert callable(install_scheduling), "runtime needs command callback scheduling"
+        assert callable(restore_scheduling), "runtime must restore callback scheduling"
+        installed_from = install_scheduling()
+        try:
+            runtime.after_physics_step(0.1)
+        finally:
+            restore_scheduling(installed_from)
+    finally:
+        sys.setswitchinterval(previous_switch_interval)
+        worker.join(timeout=3.0)
+
+    try:
+        assert not worker.is_alive()
+        assert command_errors == []
+        assert command_finished.is_set()
+        assert transport.snapshot().received_count == 1
+        assert runtime.status_snapshot().command.valid_count == 1
+        assert front_publish_observations == [True]
+    finally:
+        runtime.close()
 
 
 def test_outgoing_queue_keeps_latest_per_topic_and_counts_every_overwrite():
@@ -1681,6 +1929,56 @@ def test_wait_idle_blocks_until_claimed_send_completes():
     finally:
         release_send.set()
         waiter.join(timeout=2.0)
+        transport.close()
+
+
+def test_is_idle_reports_claimed_native_send_without_waiting():
+    """调度层必须能只读识别 native in-flight，避免再产生可覆盖 latest。"""
+    bindings = FakeEcalBindings()
+    send_started = Event()
+    release_send = Event()
+
+    def blocked_send(publisher, payload: bytes, _message_type) -> None:
+        send_started.set()
+        if not release_send.wait(timeout=2.0):
+            raise TimeoutError("test send was not released")
+        bindings.sent.append((publisher.topic, bytes(payload)))
+
+    bindings.send = blocked_send
+    transport = EcalTransport(_config(), bindings=bindings, start_worker=True)
+    try:
+        assert transport.is_idle() is True
+        transport.publish(WHEEL_STATE_TOPIC, b"claimed", WHEEL_STATE_TYPE, 1)
+        assert send_started.wait(timeout=1.0)
+
+        assert transport.is_idle() is False
+        assert transport.is_topic_idle(WHEEL_STATE_TOPIC) is False
+        assert transport.is_topic_idle(TEST_CONFIG.lidar_front.topic) is True
+
+        release_send.set()
+        transport.wait_idle(timeout_sec=1.0)
+        assert transport.is_idle() is True
+        assert transport.is_topic_idle(WHEEL_STATE_TOPIC) is True
+    finally:
+        release_send.set()
+        transport.close()
+
+
+def test_topic_idle_isolated_from_other_publisher_lanes() -> None:
+    """单条 publisher lane 的 ready/latest 不得把忙状态扩散到其他话题。"""
+    bindings = FakeEcalBindings()
+    transport = EcalTransport(_config(), bindings=bindings, start_worker=False)
+    lidar_topic = TEST_CONFIG.lidar_front.topic
+    try:
+        assert transport.is_topic_idle(WHEEL_STATE_TOPIC) is True
+        assert transport.is_topic_idle(lidar_topic) is True
+
+        transport.publish(WHEEL_STATE_TOPIC, b"wheel", WHEEL_STATE_TYPE, 1)
+
+        assert transport.is_topic_idle(WHEEL_STATE_TOPIC) is False
+        assert transport.is_topic_idle(lidar_topic) is True
+        assert transport.is_idle() is False
+    finally:
         transport.close()
 
 
@@ -2767,6 +3065,69 @@ def test_output_event_type_comes_from_decoded_message_and_configured_topic():
             TEST_CONFIG,
             TEST_CODEC,
             TEST_CONFIG.wheel_state.topic,
+            b"\x80",
+        )
+
+
+def test_lidar_output_event_uses_generated_metadata_without_materializing_points() -> None:
+    """peer 热回调只解析 LiDAR timebase/type，不遍历点云构造领域模型。"""
+    decode_event = getattr(peer_script, "_decode_output_event", None)
+    assert callable(decode_event), "peer must expose configured payload decoding"
+
+    class RejectPointMaterialization:
+        def decode_lidar_point_cloud(self, _payload: bytes) -> object:
+            raise AssertionError("peer callback must not materialize LiDAR points")
+
+        def type_name(self, _message: object) -> str:
+            raise AssertionError("generated descriptor must provide the LiDAR type")
+
+    message = pb.LidarPointCloud(
+        timebase_ns=123_000_000,
+        frame_id="lidar_front",
+        point_num=1,
+        lidar_id=1,
+    )
+    point = message.points.add()
+    point.x = 1.0
+
+    timestamp_ns, type_name = decode_event(
+        TEST_CONFIG,
+        RejectPointMaterialization(),
+        TEST_CONFIG.lidar_front.topic,
+        message.SerializeToString(deterministic=True),
+    )
+
+    assert timestamp_ns == 123_000_000
+    assert type_name == pb.LidarPointCloud.DESCRIPTOR.full_name
+
+    empty_frame = pb.LidarPointCloud(timebase_ns=1, point_num=0, lidar_id=1)
+    with pytest.raises(ValueError, match="frame_id"):
+        decode_event(
+            TEST_CONFIG,
+            RejectPointMaterialization(),
+            TEST_CONFIG.lidar_front.topic,
+            empty_frame.SerializeToString(deterministic=True),
+        )
+
+    mismatched_count = pb.LidarPointCloud(
+        timebase_ns=1,
+        frame_id="lidar_front",
+        point_num=1,
+        lidar_id=1,
+    )
+    with pytest.raises(ValueError, match="point_num"):
+        decode_event(
+            TEST_CONFIG,
+            RejectPointMaterialization(),
+            TEST_CONFIG.lidar_front.topic,
+            mismatched_count.SerializeToString(deterministic=True),
+        )
+
+    with pytest.raises(ValueError, match="decode"):
+        decode_event(
+            TEST_CONFIG,
+            RejectPointMaterialization(),
+            TEST_CONFIG.lidar_front.topic,
             b"\x80",
         )
 

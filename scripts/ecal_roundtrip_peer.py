@@ -13,6 +13,8 @@ from threading import Lock
 import time
 from typing import Callable, Mapping, Sequence
 
+from google.protobuf.message import DecodeError
+
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -20,8 +22,12 @@ if str(ROOT) not in sys.path:
 
 from slope_sim.interfaces.codec import ProtoCodec
 from slope_sim.interfaces.config import ChannelConfig, InterfaceConfig
-from slope_sim.interfaces.ecal_transport import EcalTransport, create_transport
-from slope_sim.interfaces.ecal_transport import load_ecal_bindings
+from slope_sim.interfaces.ecal_transport import (
+    EcalTransport,
+    create_transport,
+    load_ecal_bindings,
+    publisher_acknowledge_timeout_ms,
+)
 from slope_sim.interfaces.generated import slope_sim_interfaces_pb2 as pb
 from slope_sim.interfaces.models import (
     ImuAttitude,
@@ -88,13 +94,21 @@ def _decode_output_event(
     topic: str,
     payload: bytes,
 ) -> tuple[int, str]:
-    """按配置选择 decoder，并从真实解码模型提取时间戳和类型。"""
+    """按配置解码时间戳和类型；LiDAR 热路径不物化点云领域对象。"""
     if topic == config.wheel_state.topic:
         message = codec.decode_wheel_state(payload)
         timestamp_ns = message.timestamp_ns
     elif topic in {config.lidar_front.topic, config.lidar_rear.topic}:
-        message = codec.decode_lidar_point_cloud(payload)
-        timestamp_ns = message.timebase_ns
+        message = pb.LidarPointCloud()
+        try:
+            message.ParseFromString(payload)
+        except DecodeError as error:
+            raise ValueError("failed to decode LidarPointCloud") from error
+        if not message.frame_id:
+            raise ValueError("LidarPointCloud frame_id must be nonempty")
+        if message.point_num != len(message.points):
+            raise ValueError("LidarPointCloud point_num must equal len(points)")
+        return message.timebase_ns, message.DESCRIPTOR.full_name
     elif topic == config.rtk.topic:
         message = codec.decode_rtk_state(payload)
         timestamp_ns = message.timestamp_ns
@@ -343,6 +357,34 @@ def _wait_for_all_transport_peers(
         time.sleep(0.01)
 
 
+def _wait_for_output_delivery(
+    received: Mapping[str, Sequence[object]],
+    event_lock: Lock,
+    topics: Sequence[str],
+    *,
+    timeout_sec: float,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> None:
+    """共同 start 后等待五个输出首帧，确认 eCAL 数据面已能投递。"""
+    if not topics or any(not isinstance(topic, str) or not topic for topic in topics):
+        raise ValueError("topics must contain nonempty topic names")
+    timeout = _positive_finite("timeout_sec", timeout_sec)
+    deadline = monotonic() + timeout
+    while True:
+        with event_lock:
+            missing = tuple(topic for topic in topics if not received.get(topic, ()))
+        if not missing:
+            return
+        now = monotonic()
+        if now >= deadline:
+            raise TimeoutError(
+                "timed out waiting for output data-plane delivery: "
+                + ", ".join(missing)
+            )
+        sleep(min(0.005, deadline - now))
+
+
 def _wait_for_v61_resource_peer(
     bindings: object,
     resource: object,
@@ -450,6 +492,16 @@ def _run_v61_command_schedule(
     return events, started_at, ended_at
 
 
+def _create_command_publisher(bindings: object, config: InterfaceConfig) -> object:
+    """按 transport 容量和 watchdog 创建带 ACK 的 command SHM ring。"""
+    return bindings.create_publisher(
+        config.wheel_command.topic,
+        pb.WheelCommand,
+        shm_buffer_count=config.outgoing_queue_size,
+        acknowledge_timeout_ms=publisher_acknowledge_timeout_ms(config),
+    )
+
+
 def run_simulation_peer(
     *,
     result_json: Path,
@@ -497,19 +549,15 @@ def run_simulation_peer(
 
     try:
         participant = bindings.create_participant(participant_name)
-        command_publisher = bindings.create_publisher(
-            config.wheel_command.topic, pb.WheelCommand
-        )
+        command_publisher = _create_command_publisher(bindings, config)
         for topic, message_type in _official_output_message_types().items():
             subscribers[topic] = bindings.create_subscriber(
                 topic, message_type, make_callback(topic)
             )
 
         scenario_dir.mkdir(parents=True, exist_ok=True)
-        ready_file.parent.mkdir(parents=True, exist_ok=True)
-        ready_file.write_text("ready\n", encoding="utf-8")
-        _wait_for_start(start_file, timeout)
-
+        # runtime 已在自身 ready 前创建全部端点；先完成双向 discovery，
+        # 避免共同 start 后首帧因尚无订阅者而被 eCAL 合法拒绝。
         discovery_deadline = time.monotonic() + timeout
         while True:
             resources = [command_publisher, *subscribers.values()]
@@ -518,6 +566,18 @@ def run_simulation_peer(
             if time.monotonic() >= discovery_deadline:
                 raise TimeoutError("all six eCAL peers were not discovered before measurement")
             time.sleep(0.01)
+
+        ready_file.parent.mkdir(parents=True, exist_ok=True)
+        ready_file.write_text("ready\n", encoding="utf-8")
+        _wait_for_start(start_file, timeout)
+
+        # 端点 count 可先于共享内存数据通路可写；首帧必须实际到达 peer。
+        _wait_for_output_delivery(
+            received,
+            event_lock,
+            tuple(subscribers),
+            timeout_sec=_SCENARIO_ACK_TIMEOUT_SEC,
+        )
 
         # 共享 start 门闩之后用同一正式 peer 驱动真实生产预热。
         warmup_events, _warmup_start, _warmup_end = _run_v61_command_schedule(
@@ -678,9 +738,7 @@ def run_simulation_peer(
         )
         disconnected_marker.unlink(missing_ok=True)
 
-        command_publisher = bindings.create_publisher(
-            config.wheel_command.topic, pb.WheelCommand
-        )
+        command_publisher = _create_command_publisher(bindings, config)
         reconnect_marker = scenario_dir / "command_reconnected_wait.active"
         _write_marker(reconnect_marker, {})
         _wait_for_file(
