@@ -9,10 +9,12 @@ import csv
 from email.parser import BytesParser
 import hashlib
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import stat
 from urllib.parse import urlsplit
 import zipfile
+
+from wheel_elf import elf_inventory
 
 
 PINNED_WHEEL_FIELDS = {
@@ -99,6 +101,211 @@ def _wheel_digest(path: Path) -> tuple[int, str]:
     return size, digest.hexdigest()
 
 
+def _require_safe_member_paths(member_names: tuple[str, ...]) -> None:
+    """拒绝 ZIP 安装时可逃逸目标根的绝对、回退或 NUL 路径。"""
+    for member_name in member_names:
+        normalized = member_name.removesuffix("/")
+        relative = PurePosixPath(normalized)
+        if (
+            not normalized
+            or "\0" in member_name
+            or "\\" in member_name
+            or relative.is_absolute()
+            or any(part in {"", ".", ".."} for part in relative.parts)
+        ):
+            raise ValueError("wheel ZIP member path is unsafe")
+
+
+def _dist_info_members(
+    archive: zipfile.ZipFile, member_names: tuple[str, ...]
+) -> tuple[dict[str, str], dict[str, bytes]]:
+    """读取唯一 dist-info 核心成员，拒绝歧义 ZIP 名称或缺失文件。"""
+    _require_safe_member_paths(member_names)
+    if len(member_names) != len(set(member_names)):
+        raise ValueError("wheel must not contain duplicate ZIP members")
+    metadata_paths = tuple(
+        name for name in member_names if name.endswith(".dist-info/METADATA")
+    )
+    if len(metadata_paths) != 1:
+        raise ValueError("wheel must contain exactly one dist-info METADATA member")
+    metadata_path = metadata_paths[0]
+    prefix = metadata_path.removesuffix("METADATA")
+    expected_paths = {
+        "metadata": metadata_path,
+        "wheel": f"{prefix}WHEEL",
+        "record": f"{prefix}RECORD",
+    }
+    if expected_paths["wheel"] not in member_names:
+        raise ValueError("wheel dist-info WHEEL member is missing")
+    if expected_paths["record"] not in member_names:
+        raise ValueError("wheel dist-info RECORD member is missing")
+    payloads = {
+        name: archive.read(member_path) for name, member_path in expected_paths.items()
+    }
+    return expected_paths, payloads
+
+
+def _verify_dist_info_digests(artifact: Path, wheel: dict[str, object]) -> None:
+    """manifest 必须精确绑定唯一 dist-info 核心成员的路径和内容摘要。"""
+    try:
+        with zipfile.ZipFile(artifact) as archive:
+            member_names = tuple(info.filename for info in archive.infolist())
+            expected_paths, payloads = _dist_info_members(archive, member_names)
+    except zipfile.BadZipFile as error:
+        raise ValueError("wheel artifact is not a valid ZIP file") from error
+    paths = wheel.get("dist_info_paths")
+    digests = wheel.get("dist_info_digests")
+    if paths != expected_paths:
+        raise ValueError("wheel manifest dist-info paths differ from ZIP")
+    if not isinstance(digests, dict) or set(digests) != set(expected_paths):
+        raise ValueError("wheel manifest dist-info digests are incomplete")
+    for name in expected_paths:
+        expected_digest = digests[name]
+        if not _is_sha256(expected_digest):
+            raise ValueError("wheel manifest dist-info digest is invalid")
+        if hashlib.sha256(payloads[name]).hexdigest() != expected_digest:
+            raise ValueError("wheel manifest dist-info digest differs from ZIP")
+
+
+def _license_member_path(dist_info_prefix: str, value: str) -> str:
+    """仅允许 METADATA 的相对 License-File 指向自身 dist-info licenses 目录。"""
+    relative = PurePosixPath(value)
+    if (
+        not value
+        or relative.is_absolute()
+        or any(part in {"", ".", ".."} for part in relative.parts)
+    ):
+        raise ValueError("wheel METADATA License-File path is unsafe")
+    return f"{dist_info_prefix}licenses/{relative.as_posix()}"
+
+
+def _verify_license_contract(artifact: Path, wheel: dict[str, object]) -> None:
+    """逐项复算 METADATA 声明的 license/NOTICE 文件，禁止清单漂移。"""
+    licenses = wheel.get("licenses")
+    if not isinstance(licenses, dict) or set(licenses) != {"expression", "files"}:
+        raise ValueError("wheel manifest license contract is incomplete")
+    expression = licenses["expression"]
+    files = licenses["files"]
+    if not isinstance(expression, str) or not expression or not isinstance(files, dict):
+        raise ValueError("wheel manifest license contract is invalid")
+    try:
+        with zipfile.ZipFile(artifact) as archive:
+            member_names = tuple(info.filename for info in archive.infolist())
+            paths, payloads = _dist_info_members(archive, member_names)
+            metadata = BytesParser().parsebytes(payloads["metadata"])
+            if metadata.get("License-Expression") != expression:
+                raise ValueError("wheel METADATA License-Expression differs from manifest")
+            license_files = tuple(metadata.get_all("License-File", ()))
+            if not license_files or len(license_files) != len(set(license_files)):
+                raise ValueError("wheel METADATA License-File entries are invalid")
+            prefix = paths["metadata"].removesuffix("METADATA")
+            expected_paths = {
+                _license_member_path(prefix, value) for value in license_files
+            }
+            if set(files) != expected_paths:
+                raise ValueError("wheel manifest license paths differ from METADATA")
+            for member_path in expected_paths:
+                digest = files[member_path]
+                if not _is_sha256(digest):
+                    raise ValueError("wheel manifest license digest is invalid")
+                if member_path not in member_names:
+                    raise ValueError("wheel License-File member is missing")
+                if hashlib.sha256(archive.read(member_path)).hexdigest() != digest:
+                    raise ValueError("wheel manifest license digest differs from ZIP")
+    except zipfile.BadZipFile as error:
+        raise ValueError("wheel artifact is not a valid ZIP file") from error
+
+
+def _verify_member_contract(artifact: Path, wheel: dict[str, object]) -> None:
+    """复算完整 ZIP 树和 RECORD 非 self 行，阻断自洽清单替换。"""
+    expected = wheel.get("members")
+    if not isinstance(expected, dict) or set(expected) != {
+        "count",
+        "record_members",
+        "tree_sha256",
+    }:
+        raise ValueError("wheel manifest member contract is incomplete")
+    count = expected["count"]
+    record_members = expected["record_members"]
+    tree_sha256 = expected["tree_sha256"]
+    if (
+        not isinstance(count, int)
+        or isinstance(count, bool)
+        or count < 1
+        or not isinstance(record_members, dict)
+        or not _is_sha256(tree_sha256)
+    ):
+        raise ValueError("wheel manifest member contract is invalid")
+    try:
+        with zipfile.ZipFile(artifact) as archive:
+            infos = tuple(info for info in archive.infolist() if not info.filename.endswith("/"))
+            member_names = tuple(info.filename for info in infos)
+            if len(member_names) != len(set(member_names)):
+                raise ValueError("wheel must not contain duplicate ZIP members")
+            paths, _ = _dist_info_members(archive, member_names)
+            try:
+                rows = tuple(
+                    csv.reader(archive.read(paths["record"]).decode("utf-8").splitlines())
+                )
+            except UnicodeDecodeError as error:
+                raise ValueError("wheel RECORD must be UTF-8") from error
+            if any(len(row) != 3 for row in rows):
+                raise ValueError("wheel RECORD rows must contain path, hash, and size")
+            if {row[0] for row in rows} != set(member_names) or len(rows) != len(member_names):
+                raise ValueError("wheel RECORD does not enumerate all archive members")
+            actual_members: dict[str, dict[str, object]] = {}
+            tree = hashlib.sha256()
+            for member_path in sorted(member_names):
+                payload = archive.read(member_path)
+                payload_sha256 = hashlib.sha256(payload).hexdigest()
+                tree.update(member_path.encode("utf-8"))
+                tree.update(b"\0")
+                tree.update(str(len(payload)).encode("ascii"))
+                tree.update(b"\0")
+                tree.update(payload_sha256.encode("ascii"))
+                tree.update(b"\n")
+            for member_path, encoded_digest, declared_size in rows:
+                if member_path == paths["record"]:
+                    continue
+                payload = archive.read(member_path)
+                actual_members[member_path] = {
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                    "size": len(payload),
+                }
+                if (
+                    not isinstance(encoded_digest, str)
+                    or not encoded_digest.startswith("sha256=")
+                    or not declared_size.isdecimal()
+                ):
+                    raise ValueError("wheel RECORD row is invalid")
+            if count != len(member_names):
+                raise ValueError("wheel manifest member count differs from ZIP")
+            if tree.hexdigest() != tree_sha256:
+                raise ValueError("wheel manifest member tree digest differs from ZIP")
+            if record_members != actual_members:
+                raise ValueError("wheel manifest RECORD members differ from ZIP")
+    except zipfile.BadZipFile as error:
+        raise ValueError("wheel artifact is not a valid ZIP file") from error
+
+
+def _verify_elf_contract(artifact: Path, wheel: dict[str, object]) -> None:
+    """重建全部 ELF 的动态链接 ABI 清单，拒绝任何 wheel 内 Protobuf。"""
+    expected = wheel.get("elf")
+    if not isinstance(expected, dict) or set(expected) != {"forbidden_soname", "members"}:
+        raise ValueError("wheel manifest ELF contract is incomplete")
+    if expected["forbidden_soname"] != "libprotobuf.so" or not isinstance(
+        expected["members"], list
+    ):
+        raise ValueError("wheel manifest ELF contract is invalid")
+    try:
+        with zipfile.ZipFile(artifact) as archive:
+            actual = elf_inventory(archive)
+    except zipfile.BadZipFile as error:
+        raise ValueError("wheel artifact is not a valid ZIP file") from error
+    if expected["members"] != actual:
+        raise ValueError("wheel manifest ELF inventory differs from ZIP")
+
+
 def _verify_zip_wheel_contract(artifact: Path, wheel: dict[str, object]) -> None:
     """ABI 元数据一经写入 manifest，就必须能由真实 ZIP wheel 读取。"""
     contract_fields = (
@@ -117,19 +324,10 @@ def _verify_zip_wheel_contract(artifact: Path, wheel: dict[str, object]) -> None
     try:
         with zipfile.ZipFile(artifact) as archive:
             member_names = tuple(info.filename for info in archive.infolist())
-            metadata_paths = tuple(
-                name for name in member_names if name.endswith(".dist-info/METADATA")
-            )
-            if len(metadata_paths) != 1:
-                raise ValueError("wheel must contain exactly one dist-info METADATA member")
-            metadata_path = metadata_paths[0]
-            dist_info_prefix = metadata_path.removesuffix("METADATA")
-            wheel_path = f"{dist_info_prefix}WHEEL"
-            if wheel_path not in member_names:
-                raise ValueError("wheel dist-info WHEEL member is missing")
-            record_path = f"{dist_info_prefix}RECORD"
-            if record_path not in member_names:
-                raise ValueError("wheel dist-info RECORD member is missing")
+            paths, _ = _dist_info_members(archive, member_names)
+            metadata_path = paths["metadata"]
+            wheel_path = paths["wheel"]
+            record_path = paths["record"]
             metadata = BytesParser().parsebytes(archive.read(metadata_path))
             wheel_metadata = BytesParser().parsebytes(archive.read(wheel_path))
             try:
@@ -227,6 +425,10 @@ def _verify_manifest(manifest_path: Path, cache_root: Path) -> None:
         raise ValueError("wheel artifact SHA-256 differs from manifest")
     _verify_zip_wheel_contract(artifact, wheel)
     _verify_pinned_wheel_identity(wheel)
+    _verify_dist_info_digests(artifact, wheel)
+    _verify_license_contract(artifact, wheel)
+    _verify_member_contract(artifact, wheel)
+    _verify_elf_contract(artifact, wheel)
     files, directories = _cache_census(cache_root)
     if files != {relative_path} or directories != _expected_directories({relative_path}):
         raise ValueError("wheel cache contains files outside the manifest")

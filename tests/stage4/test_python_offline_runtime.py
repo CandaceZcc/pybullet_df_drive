@@ -22,6 +22,7 @@ VIRTUAL_PACKAGES = ROOT / "packaging" / "locks" / "virtual-packages.yml"
 LOCK_CACHE_VERIFIER = ROOT / "scripts" / "verify_python_lock_cache.py"
 LOCK_CACHE_FREEZER = ROOT / "scripts" / "freeze_python_lock_cache.py"
 WHEEL_CACHE_VERIFIER = ROOT / "scripts" / "verify_python_wheel_cache.py"
+WHEEL_CACHE_FREEZER = ROOT / "scripts" / "freeze_python_wheel_cache.py"
 PRIVATE_PROTOBUF_BUILDER = ROOT / "scripts" / "build_private_protobuf_conda.py"
 PRIVATE_PROTOBUF_RECIPE = ROOT / "packaging" / "recipes" / "protobuf-python" / "meta.yaml"
 PRIVATE_PROTOBUF_VARIANTS = PRIVATE_PROTOBUF_RECIPE.parent / "conda_build_config.yaml"
@@ -794,6 +795,310 @@ def test_python_lock_freezer_downloads_into_seed_then_writes_canonical_cache(
     assert json.loads(cache_manifest.read_text(encoding="utf-8"))["archives"]
 
 
+def test_python_wheel_freezer_writes_verified_canonical_artifact(
+    tmp_path, monkeypatch
+) -> None:
+    """wheel producer 必须固定下载 bytes 并物化唯一 canonical 副本。"""
+    assert WHEEL_CACHE_FREEZER.is_file(), "stage 4 Python wheel freezer is not implemented"
+    scripts_dir = str(WHEEL_CACHE_FREEZER.parent)
+    sys.path.insert(0, scripts_dir)
+    try:
+        module_spec = importlib.util.spec_from_file_location(
+            "stage4_freeze_python_wheel_cache", WHEEL_CACHE_FREEZER
+        )
+        assert module_spec is not None and module_spec.loader is not None
+        module = importlib.util.module_from_spec(module_spec)
+        module_spec.loader.exec_module(module)
+    finally:
+        sys.path.remove(scripts_dir)
+
+    filename = "eclipse_ecal-6.1.1-cp310-cp310-manylinux_2_28_x86_64.whl"
+    dist_info = "eclipse_ecal-6.1.1.dist-info"
+    metadata_path = f"{dist_info}/METADATA"
+    wheel_path = f"{dist_info}/WHEEL"
+    record_path = f"{dist_info}/RECORD"
+    license_path = f"{dist_info}/licenses/LICENSE.txt"
+    license_contents = b"Apache License\n"
+    metadata = (
+        b"Metadata-Version: 2.1\nName: eclipse-ecal\nVersion: 6.1.1\n"
+        b"License-Expression: Apache-2.0\nLicense-File: LICENSE.txt\n"
+    )
+    wheel_metadata = b"Wheel-Version: 1.0\nTag: cp310-cp310-manylinux_2_28_x86_64\n"
+    wheel_bytes = io.BytesIO()
+    with zipfile.ZipFile(wheel_bytes, "w") as archive:
+        archive.writestr(metadata_path, metadata)
+        archive.writestr(wheel_path, wheel_metadata)
+        archive.writestr(license_path, license_contents)
+        archive.writestr(
+            record_path,
+            _wheel_record(
+                record_path,
+                {
+                    metadata_path: metadata,
+                    wheel_path: wheel_metadata,
+                    license_path: license_contents,
+                },
+            ),
+        )
+    payload = wheel_bytes.getvalue()
+    sha256 = hashlib.sha256(payload).hexdigest()
+    record_contents = _wheel_record(
+        record_path,
+        {
+            metadata_path: metadata,
+            wheel_path: wheel_metadata,
+            license_path: license_contents,
+        },
+    ).encode("utf-8")
+    member_payloads = {
+        metadata_path: metadata,
+        wheel_path: wheel_metadata,
+        license_path: license_contents,
+        record_path: record_contents,
+    }
+    member_tree = hashlib.sha256()
+    for member_path, member_payload in sorted(member_payloads.items()):
+        member_tree.update(member_path.encode("utf-8"))
+        member_tree.update(b"\0")
+        member_tree.update(str(len(member_payload)).encode("ascii"))
+        member_tree.update(b"\0")
+        member_tree.update(hashlib.sha256(member_payload).hexdigest().encode("ascii"))
+        member_tree.update(b"\n")
+    pinned = {
+        "url": f"https://files.example.invalid/packages/{filename}",
+        "filename": filename,
+        "size": len(payload),
+        "sha256": sha256,
+        "distribution": "eclipse-ecal",
+        "version": "6.1.1",
+        "requires_python": ">=3.8",
+        "python_tag": "cp310",
+        "abi_tag": "cp310",
+        "platform_tag": "manylinux_2_28_x86_64",
+    }
+    monkeypatch.setattr(module, "PINNED_WHEEL", pinned)
+
+    monkeypatch.setattr(
+        module,
+        "_load_pypi_release",
+        lambda: {
+            "info": {
+                "name": pinned["distribution"],
+                "version": pinned["version"],
+                "requires_python": pinned["requires_python"],
+            },
+            "urls": [
+                {
+                    "filename": pinned["filename"],
+                    "url": pinned["url"],
+                    "size": pinned["size"],
+                    "digests": {"sha256": pinned["sha256"]},
+                    "packagetype": "bdist_wheel",
+                    "requires_python": pinned["requires_python"],
+                    "yanked": False,
+                }
+            ],
+        },
+    )
+
+    def fake_download(url: str, destination: Path) -> None:
+        assert url == pinned["url"]
+        destination.write_bytes(payload)
+
+    monkeypatch.setattr(module, "_download", fake_download)
+    download_root = tmp_path / "download"
+    cache_root = tmp_path / "wheel-cache"
+    manifest = tmp_path / "python-wheel-cache.manifest.json"
+
+    result = module.main(
+        [
+            "--download-root",
+            str(download_root),
+            "--cache-root",
+            str(cache_root),
+            "--manifest",
+            str(manifest),
+        ]
+    )
+
+    artifact = cache_root / "wheels" / sha256 / filename
+    assert result == 0
+    assert artifact.read_bytes() == payload
+    assert artifact.stat().st_nlink == 1
+    tree = hashlib.sha256()
+    for member_path, member_payload in sorted(
+        {
+            metadata_path: metadata,
+            wheel_path: wheel_metadata,
+            license_path: license_contents,
+            record_path: _wheel_record(
+                record_path,
+                {
+                    metadata_path: metadata,
+                    wheel_path: wheel_metadata,
+                    license_path: license_contents,
+                },
+            ).encode("utf-8"),
+        }.items()
+    ):
+        tree.update(member_path.encode("utf-8"))
+        tree.update(b"\0")
+        tree.update(str(len(member_payload)).encode("ascii"))
+        tree.update(b"\0")
+        tree.update(hashlib.sha256(member_payload).hexdigest().encode("ascii"))
+        tree.update(b"\n")
+    assert json.loads(manifest.read_text(encoding="utf-8"))["wheel"] == {
+        **pinned,
+        "relative_path": f"wheels/{sha256}/{filename}",
+        "dist_info_paths": {
+            "metadata": metadata_path,
+            "wheel": wheel_path,
+            "record": record_path,
+        },
+        "dist_info_digests": {
+            "metadata": hashlib.sha256(metadata).hexdigest(),
+            "wheel": hashlib.sha256(wheel_metadata).hexdigest(),
+            "record": hashlib.sha256(
+                _wheel_record(
+                    record_path,
+                    {
+                        metadata_path: metadata,
+                        wheel_path: wheel_metadata,
+                        license_path: license_contents,
+                    },
+                ).encode("utf-8")
+            ).hexdigest(),
+        },
+        "licenses": {
+            "expression": "Apache-2.0",
+            "files": {license_path: hashlib.sha256(license_contents).hexdigest()},
+        },
+        "members": {
+            "count": 4,
+            "record_members": {
+                metadata_path: {"sha256": hashlib.sha256(metadata).hexdigest(), "size": len(metadata)},
+                wheel_path: {"sha256": hashlib.sha256(wheel_metadata).hexdigest(), "size": len(wheel_metadata)},
+                license_path: {"sha256": hashlib.sha256(license_contents).hexdigest(), "size": len(license_contents)},
+            },
+            "tree_sha256": tree.hexdigest(),
+        },
+        "elf": {"forbidden_soname": "libprotobuf.so", "members": []},
+    }
+
+
+def test_python_wheel_freezer_rejects_pypi_release_metadata_drift(monkeypatch) -> None:
+    """联网 producer 必须先将 PyPI release JSON 与固定 wheel identity 交叉核验。"""
+    scripts_dir = str(WHEEL_CACHE_FREEZER.parent)
+    sys.path.insert(0, scripts_dir)
+    try:
+        module_spec = importlib.util.spec_from_file_location(
+            "stage4_freeze_python_wheel_cache", WHEEL_CACHE_FREEZER
+        )
+        assert module_spec is not None and module_spec.loader is not None
+        module = importlib.util.module_from_spec(module_spec)
+        module_spec.loader.exec_module(module)
+    finally:
+        sys.path.remove(scripts_dir)
+
+    verify_release = getattr(module, "_verify_pypi_release", None)
+    assert callable(verify_release), "wheel freezer does not verify PyPI release JSON"
+    document = {
+        "info": {
+            "name": "eclipse-ecal",
+            "version": "6.1.1",
+            "requires_python": ">=3.8",
+        },
+        "urls": [
+            {
+                "filename": module.PINNED_WHEEL["filename"],
+                "url": module.PINNED_WHEEL["url"],
+                "size": module.PINNED_WHEEL["size"] + 1,
+                "digests": {"sha256": module.PINNED_WHEEL["sha256"]},
+                "packagetype": "bdist_wheel",
+                "requires_python": module.PINNED_WHEEL["requires_python"],
+                "yanked": False,
+            }
+        ],
+    }
+    try:
+        verify_release(document)
+    except ValueError as error:
+        assert str(error) == "PyPI release metadata differs from pinned wheel"
+    else:
+        raise AssertionError("drifted PyPI release metadata was accepted")
+
+
+def test_python_wheel_manifest_freezes_core_zip_member_digests() -> None:
+    """正式 manifest 必须绑定 METADATA、WHEEL 与 RECORD 的内容摘要。"""
+    manifest = ROOT / "packaging" / "locks" / "python-wheel-cache.manifest.json"
+    wheel = json.loads(manifest.read_text(encoding="utf-8"))["wheel"]
+    digests = wheel["dist_info_digests"]
+    assert set(digests) == {"metadata", "wheel", "record"}
+    assert all(len(value) == 64 for value in digests.values())
+
+
+def test_python_wheel_manifest_freezes_all_declared_license_files() -> None:
+    """正式 manifest 必须绑定 METADATA 所声明的全部 license/NOTICE 内容。"""
+    manifest = ROOT / "packaging" / "locks" / "python-wheel-cache.manifest.json"
+    wheel = json.loads(manifest.read_text(encoding="utf-8"))["wheel"]
+    licenses = wheel["licenses"]
+    assert licenses["expression"] == "Apache-2.0"
+    files = licenses["files"]
+    assert len(files) == 25
+    assert all(
+        path.startswith("eclipse_ecal-6.1.1.dist-info/licenses/")
+        and len(digest) == 64
+        for path, digest in files.items()
+    )
+    assert "eclipse_ecal-6.1.1.dist-info/licenses/NOTICE.md" in files
+
+
+def test_python_wheel_manifest_freezes_complete_record_member_inventory() -> None:
+    """正式 manifest 必须绑定整个 wheel 树与 RECORD 的每个可安装成员。"""
+    manifest = ROOT / "packaging" / "locks" / "python-wheel-cache.manifest.json"
+    wheel = json.loads(manifest.read_text(encoding="utf-8"))["wheel"]
+    members = wheel["members"]
+    assert members["count"] == 58
+    assert len(members["tree_sha256"]) == 64
+    record_members = members["record_members"]
+    assert len(record_members) == 57
+    assert all(
+        set(entry) == {"sha256", "size"}
+        and len(entry["sha256"]) == 64
+        and isinstance(entry["size"], int)
+        and entry["size"] >= 0
+        for entry in record_members.values()
+    )
+
+
+def test_python_wheel_manifest_freezes_elf_abi_inventory() -> None:
+    """正式 manifest 必须冻结所有 wheel ELF，并禁止 bundled libprotobuf。"""
+    manifest = ROOT / "packaging" / "locks" / "python-wheel-cache.manifest.json"
+    wheel = json.loads(manifest.read_text(encoding="utf-8"))["wheel"]
+    elf = wheel["elf"]
+    assert elf["forbidden_soname"] == "libprotobuf.so"
+    members = elf["members"]
+    assert {member["path"] for member in members} == {
+        "ecal/_ecal_core_py.cpython-310-x86_64-linux-gnu.so",
+        "ecal/_ecal_hdf5_py.cpython-310-x86_64-linux-gnu.so",
+        "ecal/libecal_core.so.6",
+        "ecal/libecal_core.so.6.1.1",
+        "ecal/libhdf5.so.310",
+        "ecal/libhdf5.so.310.3.0",
+        "ecal/nanobind_core.cpython-310-x86_64-linux-gnu.so",
+    }
+    assert all(
+        set(member) == {"class", "machine", "needed", "path", "runpath", "sha256", "soname"}
+        and member["class"] == "ELF64"
+        and member["machine"] == "EM_X86_64"
+        and len(member["sha256"]) == 64
+        and isinstance(member["needed"], list)
+        and (member["runpath"] is None or isinstance(member["runpath"], str))
+        and (member["soname"] is None or isinstance(member["soname"], str))
+        for member in members
+    )
+
+
 def test_python_wheel_verifier_requires_unique_canonical_wheel_artifact(tmp_path) -> None:
     """wheel cache 只能包含 manifest 精确声明的一份单链接嵌套制品。"""
     assert WHEEL_CACHE_VERIFIER.is_file(), "stage 4 python wheel cache verifier is not implemented"
@@ -801,7 +1106,8 @@ def test_python_wheel_verifier_requires_unique_canonical_wheel_artifact(tmp_path
     dist_info = "eclipse_ecal-6.1.1.dist-info"
     metadata = (
         b"Metadata-Version: 2.1\nName: eclipse-ecal\nVersion: 6.1.1\n"
-        b"Requires-Python: >=3.10\n"
+        b"Requires-Python: >=3.10\nLicense-Expression: Apache-2.0\n"
+        b"License-File: LICENSE.txt\n"
     )
     wheel_metadata = (
         b"Wheel-Version: 1.0\nRoot-Is-Purelib: false\n"
@@ -812,15 +1118,47 @@ def test_python_wheel_verifier_requires_unique_canonical_wheel_artifact(tmp_path
         metadata_path = f"{dist_info}/METADATA"
         wheel_path = f"{dist_info}/WHEEL"
         record_path = f"{dist_info}/RECORD"
+        license_path = f"{dist_info}/licenses/LICENSE.txt"
+        license_contents = b"Apache License\n"
         archive.writestr(metadata_path, metadata)
         archive.writestr(wheel_path, wheel_metadata)
+        archive.writestr(license_path, license_contents)
         archive.writestr(
             record_path,
-            _wheel_record(record_path, {metadata_path: metadata, wheel_path: wheel_metadata}),
+            _wheel_record(
+                record_path,
+                {
+                    metadata_path: metadata,
+                    wheel_path: wheel_metadata,
+                    license_path: license_contents,
+                },
+            ),
         )
     payload = wheel_bytes.getvalue()
     sha256 = hashlib.sha256(payload).hexdigest()
     url = f"https://files.example.invalid/packages/{filename}"
+    record_contents = _wheel_record(
+        record_path,
+        {
+            metadata_path: metadata,
+            wheel_path: wheel_metadata,
+            license_path: license_contents,
+        },
+    ).encode("utf-8")
+    member_payloads = {
+        metadata_path: metadata,
+        wheel_path: wheel_metadata,
+        license_path: license_contents,
+        record_path: record_contents,
+    }
+    member_tree = hashlib.sha256()
+    for member_path, member_payload in sorted(member_payloads.items()):
+        member_tree.update(member_path.encode("utf-8"))
+        member_tree.update(b"\0")
+        member_tree.update(str(len(member_payload)).encode("ascii"))
+        member_tree.update(b"\0")
+        member_tree.update(hashlib.sha256(member_payload).hexdigest().encode("ascii"))
+        member_tree.update(b"\n")
     cache_root = tmp_path / "wheel-cache"
     wheel = cache_root / "wheels" / sha256 / filename
     wheel.parent.mkdir(parents=True)
@@ -839,11 +1177,49 @@ def test_python_wheel_verifier_requires_unique_canonical_wheel_artifact(tmp_path
                     "distribution": "eclipse-ecal",
                     "version": "6.1.1",
                     "requires_python": ">=3.10",
-                    "python_tag": "cp310",
-                    "abi_tag": "cp310",
-                    "platform_tag": "manylinux_2_28_x86_64",
-                },
-            }
+                        "python_tag": "cp310",
+                        "abi_tag": "cp310",
+                        "platform_tag": "manylinux_2_28_x86_64",
+                        "dist_info_paths": {
+                            "metadata": metadata_path,
+                            "wheel": wheel_path,
+                            "record": record_path,
+                        },
+                        "dist_info_digests": {
+                            "metadata": hashlib.sha256(metadata).hexdigest(),
+                            "wheel": hashlib.sha256(wheel_metadata).hexdigest(),
+                            "record": hashlib.sha256(
+                                _wheel_record(
+                                    record_path,
+                                    {
+                                        metadata_path: metadata,
+                                        wheel_path: wheel_metadata,
+                                        license_path: license_contents,
+                                    },
+                                ).encode("utf-8")
+                            ).hexdigest(),
+                        },
+                        "licenses": {
+                            "expression": "Apache-2.0",
+                            "files": {
+                                license_path: hashlib.sha256(license_contents).hexdigest()
+                            },
+                        },
+                        "members": {
+                            "count": len(member_payloads),
+                            "record_members": {
+                                member_path: {
+                                    "sha256": hashlib.sha256(member_payload).hexdigest(),
+                                    "size": len(member_payload),
+                                }
+                                for member_path, member_payload in member_payloads.items()
+                                if member_path != record_path
+                            },
+                            "tree_sha256": member_tree.hexdigest(),
+                        },
+                        "elf": {"forbidden_soname": "libprotobuf.so", "members": []},
+                    },
+                }
         ),
         encoding="utf-8",
     )
@@ -1157,6 +1533,62 @@ def test_python_wheel_verifier_requires_dist_info_record(tmp_path) -> None:
 
     assert rejected.returncode != 0
     assert "wheel dist-info RECORD member is missing" in rejected.stdout
+
+
+def test_python_wheel_verifier_rejects_zip_member_path_escape(tmp_path) -> None:
+    """wheel ZIP 不能借 RECORD 自洽地携带会逃出安装根的成员路径。"""
+    scripts_dir = str(WHEEL_CACHE_VERIFIER.parent)
+    sys.path.insert(0, scripts_dir)
+    try:
+        module_spec = importlib.util.spec_from_file_location(
+            "stage4_verify_python_wheel_cache", WHEEL_CACHE_VERIFIER
+        )
+        assert module_spec is not None and module_spec.loader is not None
+        module = importlib.util.module_from_spec(module_spec)
+        module_spec.loader.exec_module(module)
+    finally:
+        sys.path.remove(scripts_dir)
+
+    artifact = tmp_path / "path-escape.whl"
+    metadata_path = "eclipse_ecal-6.1.1.dist-info/METADATA"
+    wheel_path = "eclipse_ecal-6.1.1.dist-info/WHEEL"
+    record_path = "eclipse_ecal-6.1.1.dist-info/RECORD"
+    escaped_path = "../outside.py"
+    metadata = (
+        b"Metadata-Version: 2.1\nName: eclipse-ecal\nVersion: 6.1.1\n"
+        b"Requires-Python: >=3.10\n"
+    )
+    wheel_metadata = b"Wheel-Version: 1.0\nTag: cp310-cp310-manylinux_2_28_x86_64\n"
+    with zipfile.ZipFile(artifact, "w") as archive:
+        archive.writestr(escaped_path, b"escaped\n")
+        archive.writestr(metadata_path, metadata)
+        archive.writestr(wheel_path, wheel_metadata)
+        archive.writestr(
+            record_path,
+            _wheel_record(
+                record_path,
+                {
+                    escaped_path: b"escaped\n",
+                    metadata_path: metadata,
+                    wheel_path: wheel_metadata,
+                },
+            ),
+        )
+
+    contract = {
+        "distribution": "eclipse-ecal",
+        "version": "6.1.1",
+        "requires_python": ">=3.10",
+        "python_tag": "cp310",
+        "abi_tag": "cp310",
+        "platform_tag": "manylinux_2_28_x86_64",
+    }
+    try:
+        module._verify_zip_wheel_contract(artifact, contract)
+    except ValueError as error:
+        assert str(error) == "wheel ZIP member path is unsafe"
+    else:
+        raise AssertionError("ZIP member path escape was accepted")
 
 
 def test_python_wheel_verifier_requires_record_to_enumerate_all_members(tmp_path) -> None:
