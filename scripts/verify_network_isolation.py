@@ -63,7 +63,7 @@ def _verify_loopback() -> None:
         listener.close()
 
 
-def verify(evidence_dir: Path) -> None:
+def verify(evidence_dir: Path, process_pid: int | None = None) -> None:
     """将 evidence 与实时 parent/child netns、链路、路由和 socket 行为逐项比对。"""
     evidence = evidence_dir.resolve()
     if not evidence.is_absolute() or os.environ.get("STAGE4_NETWORK_ISOLATION_EVIDENCE") != str(evidence):
@@ -75,9 +75,12 @@ def verify(evidence_dir: Path) -> None:
         raise ValueError("network isolation evidence PIDs are invalid")
     if not _is_positive_int(document["parent_netns_inode"]) or not _is_positive_int(document["child_netns_inode"]):
         raise ValueError("network isolation evidence netns inodes are invalid")
-    if document["child_pid"] != os.getpid():
+    observed_pid = os.getpid() if process_pid is None else process_pid
+    if not _is_positive_int(observed_pid):
+        raise ValueError("network isolation process PID is invalid")
+    if document["child_pid"] != observed_pid:
         raise ValueError("network isolation child PID differs from evidence")
-    child_inode = os.stat("/proc/self/ns/net").st_ino
+    child_inode = os.stat(f"/proc/{observed_pid}/ns/net").st_ino
     parent_path = f"/proc/{document['parent_pid']}/ns/net"
     parent_inode = os.stat(parent_path).st_ino
     if (
@@ -116,9 +119,10 @@ def main(argv: list[str] | None = None) -> int:
     """验证当前进程确实位于 wrapper 创建并已证明的隔离 namespace。"""
     parser = argparse.ArgumentParser(description="Verify live stage 4 network isolation.")
     parser.add_argument("--evidence", type=Path, required=True)
+    parser.add_argument("--process-pid", type=int)
     args = parser.parse_args(argv)
     try:
-        verify(args.evidence)
+        verify(args.evidence, args.process_pid)
     except (OSError, ValueError, json.JSONDecodeError, subprocess.CalledProcessError) as error:
         print(f"FAIL: {error}", file=sys.stderr)
         return 1

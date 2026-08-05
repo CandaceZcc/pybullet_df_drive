@@ -10,6 +10,7 @@ from pathlib import Path
 import subprocess
 import sys
 import os
+import tomli
 import zipfile
 
 import yaml
@@ -28,6 +29,15 @@ PRIVATE_PROTOBUF_RECIPE = ROOT / "packaging" / "recipes" / "protobuf-python" / "
 PRIVATE_PROTOBUF_VARIANTS = PRIVATE_PROTOBUF_RECIPE.parent / "conda_build_config.yaml"
 PYTHON_CACHE_MATERIALIZER = ROOT / "scripts" / "materialize_python_package_cache.py"
 PYTHON_WHEEL_MATERIALIZER = ROOT / "scripts" / "materialize_python_wheel_cache.py"
+RUNTIME_ECAL_INSTALL_VERIFIER = ROOT / "scripts" / "verify_python_runtime_ecal_install.py"
+RUNTIME_ECAL_WHEEL = (
+    ROOT
+    / "build"
+    / "stage4-python-wheel-cache-20260805T172013+0800"
+    / "wheels"
+    / "57a23af7d83c077c04f01852db13f8cda7686a052d41659fafcbe6b3dbe9f6bc"
+    / "eclipse_ecal-6.1.1-cp310-cp310-manylinux_2_28_x86_64.whl"
+)
 ABSEIL_SOURCE_ARCHIVE = (
     ROOT / "build" / "stage4-source-archive-input" / "76bb24329e8bf5f39704eb10d21b9a80befa7c81.tar.gz"
 )
@@ -50,6 +60,46 @@ def _wheel_record(record_path: str, members: dict[str, bytes]) -> str:
         rows.append(f"{path},sha256={encoded_digest},{len(payload)}")
     rows.append(f"{record_path},,")
     return "\n".join(rows) + "\n"
+
+
+def test_project_wheel_configuration_discovers_only_slope_sim_packages() -> None:
+    """独立 source-build 必须只打包项目模块，不能把仓库资源目录误认为 Python 包。"""
+    document = tomli.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    assert document["build-system"] == {
+        "build-backend": "setuptools.build_meta",
+        "requires": ["setuptools>=68", "wheel"],
+    }
+    assert document["tool"]["setuptools"]["packages"]["find"] == {
+        "include": ["slope_sim*"]
+    }
+
+
+def test_runtime_ecal_install_verifier_accepts_frozen_wheel_tree(tmp_path) -> None:
+    """pip staging 的 eCAL 文件、license 与 ELF 必须仍完整匹配冻结 wheel manifest。"""
+    assert RUNTIME_ECAL_INSTALL_VERIFIER.is_file(), "stage 4 installed eCAL verifier is not implemented"
+    assert RUNTIME_ECAL_WHEEL.is_file(), "frozen eCAL wheel fixture is unavailable"
+    runtime = tmp_path / "runtime"
+    site_packages = runtime / "lib" / "python3.10" / "site-packages"
+    site_packages.mkdir(parents=True)
+    with zipfile.ZipFile(RUNTIME_ECAL_WHEEL) as archive:
+        archive.extractall(site_packages)
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(RUNTIME_ECAL_INSTALL_VERIFIER),
+            "--runtime-root",
+            str(runtime),
+            "--manifest",
+            str(ROOT / "packaging" / "locks" / "python-wheel-cache.manifest.json"),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stdout
+    assert completed.stdout == "PASS: installed eCAL runtime matches frozen wheel contract\n"
 
 
 def test_python_package_materializer_creates_sorted_flat_native_cache(tmp_path) -> None:

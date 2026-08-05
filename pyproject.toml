@@ -1,4 +1,8 @@
 # Python 项目与测试配置。
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "pybullet-df-drive"
 version = "0.1.0"
@@ -9,6 +13,9 @@ dependencies = ["protobuf>=6.33.6,<6.34"]
 [project.optional-dependencies]
 dev = ["grpcio-tools==1.76.0"]
 interfaces = ["eclipse-ecal==6.1.1"]
+
+[tool.setuptools.packages.find]
+include = ["slope_sim*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
