@@ -26,6 +26,8 @@ WHEEL_CACHE_FREEZER = ROOT / "scripts" / "freeze_python_wheel_cache.py"
 PRIVATE_PROTOBUF_BUILDER = ROOT / "scripts" / "build_private_protobuf_conda.py"
 PRIVATE_PROTOBUF_RECIPE = ROOT / "packaging" / "recipes" / "protobuf-python" / "meta.yaml"
 PRIVATE_PROTOBUF_VARIANTS = PRIVATE_PROTOBUF_RECIPE.parent / "conda_build_config.yaml"
+PYTHON_CACHE_MATERIALIZER = ROOT / "scripts" / "materialize_python_package_cache.py"
+PYTHON_WHEEL_MATERIALIZER = ROOT / "scripts" / "materialize_python_wheel_cache.py"
 ABSEIL_SOURCE_ARCHIVE = (
     ROOT / "build" / "stage4-source-archive-input" / "76bb24329e8bf5f39704eb10d21b9a80befa7c81.tar.gz"
 )
@@ -48,6 +50,182 @@ def _wheel_record(record_path: str, members: dict[str, bytes]) -> str:
         rows.append(f"{path},sha256={encoded_digest},{len(payload)}")
     rows.append(f"{record_path},,")
     return "\n".join(rows) + "\n"
+
+
+def test_python_package_materializer_creates_sorted_flat_native_cache(tmp_path) -> None:
+    """builder 必须将 canonical nested archive 精确复制为本轮原生 flat cache。"""
+    assert PYTHON_CACHE_MATERIALIZER.is_file(), "stage 4 Python cache materializer is not implemented"
+    canonical = tmp_path / "canonical"
+    destination = tmp_path / "native" / "pkgs"
+    evidence = tmp_path / "materialization.json"
+    first = b"archive-one"
+    second = b"archive-two"
+    records = []
+    for filename, payload, url in (
+        ("first.conda", first, "https://packages.example.invalid/main/linux-64/first.conda"),
+        ("second.tar.bz2", second, "https://packages.example.invalid/main/noarch/second.tar.bz2"),
+    ):
+        sha256 = hashlib.sha256(payload).hexdigest()
+        relative_path = f"pkgs/https/packages.example.invalid/main/linux-64/{filename}"
+        artifact = canonical / relative_path
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        artifact.write_bytes(payload)
+        records.append(
+            {
+                "filename": filename,
+                "locks": ["runtime"],
+                "md5": hashlib.md5(payload).hexdigest(),
+                "relative_path": relative_path,
+                "sha256": sha256,
+                "size": len(payload),
+                "url": url,
+            }
+        )
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps({"schema_version": 1, "archives": records}), encoding="utf-8"
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(PYTHON_CACHE_MATERIALIZER),
+            "--manifest",
+            str(manifest),
+            "--canonical-cache",
+            str(canonical),
+            "--destination",
+            str(destination),
+            "--evidence",
+            str(evidence),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert (destination / "first.conda").read_bytes() == first
+    assert (destination / "second.tar.bz2").read_bytes() == second
+    assert (destination / "urls.txt").read_text(encoding="utf-8") == (
+        "https://packages.example.invalid/main/linux-64/first.conda\n"
+        "https://packages.example.invalid/main/noarch/second.tar.bz2\n"
+    )
+    document = json.loads(evidence.read_text(encoding="utf-8"))
+    assert document["archives"] == ["first.conda", "second.tar.bz2"]
+
+
+def test_python_package_materializer_rejects_nonobject_manifest_before_output(tmp_path) -> None:
+    """非对象 manifest 必须 fail closed，且不能创建任何 native cache 输出。"""
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text("[]\n", encoding="utf-8")
+    destination = tmp_path / "native" / "pkgs"
+    evidence = tmp_path / "evidence.json"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(PYTHON_CACHE_MATERIALIZER),
+            "--manifest",
+            str(manifest),
+            "--canonical-cache",
+            str(tmp_path),
+            "--destination",
+            str(destination),
+            "--evidence",
+            str(evidence),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode != 0
+    assert completed.stdout == "FAIL: package cache manifest is invalid\n"
+    assert not destination.exists()
+    assert not evidence.exists()
+
+
+def test_python_wheel_materializer_exclusive_copies_canonical_artifact(tmp_path) -> None:
+    """eCAL wheel 必须复制到本轮私有路径，不能直接复用 canonical cache 文件。"""
+    assert PYTHON_WHEEL_MATERIALIZER.is_file(), "stage 4 Python wheel materializer is not implemented"
+    payload = b"canonical ecal wheel"
+    sha256 = hashlib.sha256(payload).hexdigest()
+    filename = "eclipse_ecal-6.1.1-cp310-cp310-manylinux_2_28_x86_64.whl"
+    canonical = tmp_path / "canonical"
+    source = canonical / "wheels" / sha256 / filename
+    source.parent.mkdir(parents=True)
+    source.write_bytes(payload)
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "wheel": {
+                    "filename": filename,
+                    "relative_path": f"wheels/{sha256}/{filename}",
+                    "sha256": sha256,
+                    "size": len(payload),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    destination = tmp_path / "work" / "wheel-cache"
+    evidence = tmp_path / "evidence.json"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(PYTHON_WHEEL_MATERIALIZER),
+            "--manifest",
+            str(manifest),
+            "--canonical-cache",
+            str(canonical),
+            "--destination",
+            str(destination),
+            "--evidence",
+            str(evidence),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    copied = destination / filename
+    assert completed.returncode == 0, completed.stderr
+    assert copied.read_bytes() == payload
+    assert copied.stat().st_nlink == 1
+    assert copied.resolve() != source.resolve()
+    assert json.loads(evidence.read_text(encoding="utf-8"))["sha256"] == sha256
+
+
+def test_python_wheel_materializer_rejects_nonobject_manifest_before_output(tmp_path) -> None:
+    """wheel manifest 类型错误必须在创建私有副本之前标准化失败。"""
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text("[]\n", encoding="utf-8")
+    destination = tmp_path / "private-wheel"
+    evidence = tmp_path / "evidence.json"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(PYTHON_WHEEL_MATERIALIZER),
+            "--manifest",
+            str(manifest),
+            "--canonical-cache",
+            str(tmp_path),
+            "--destination",
+            str(destination),
+            "--evidence",
+            str(evidence),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode != 0
+    assert completed.stdout == "FAIL: wheel cache manifest is invalid\n"
+    assert not destination.exists()
+    assert not evidence.exists()
 
 
 def test_python_environment_specs_separate_runtime_from_toolchain_without_pip() -> None:
