@@ -1,0 +1,77 @@
+# 阶段四私有 Protobuf Python Conda recipe：源码只能由 builder 从冻结 v33.6 archive 安全物化。
+{% set source_dir = environ.get("STAGE4_PROTOBUF_SOURCE_DIR") %}
+
+package:
+  name: protobuf
+  version: 6.33.6
+
+source:
+  path: {{ source_dir }}
+
+build:
+  number: 0
+  string: py310_0
+  skip: true  # [not linux]
+  script_env:
+    - STAGE4_ABSEIL_SOURCE_DIR
+  script: |
+    set -eu
+    stage_dir="$SRC_DIR/../stage4-python-dist"
+    test ! -e "$stage_dir"
+    mkdir -p "$stage_dir/python"
+    cp -R python/google "$stage_dir/google"
+    cp python/*.c "$stage_dir/python/"
+    cp python/*.h "$stage_dir/python/"
+    cp upb/reflection/cmake/google/protobuf/descriptor.upb.h "$stage_dir/google/protobuf/"
+    cp upb/reflection/cmake/google/protobuf/descriptor.upb_minitable.h "$stage_dir/google/protobuf/"
+    cp -R upb "$stage_dir/upb"
+    rm -rf "$stage_dir/upb/reflection/stage0"
+    rm -rf "$stage_dir/upb/conformance"
+    cp -R third_party/utf8_range "$stage_dir/utf8_range"
+    # 上游 setup.py 会 glob 全部 C 文件；Linux-64 基线仅保留实际接口所需的可移植实现。
+    rm -f "$stage_dir"/utf8_range/lemire-*.c
+    rm -f "$stage_dir"/utf8_range/range-*.c
+    rm -f "$stage_dir"/utf8_range/range2-*.c
+    rm -f "$stage_dir"/utf8_range/lookup.c
+    rm -f "$stage_dir"/utf8_range/main.c
+    rm -f "$stage_dir"/utf8_range/naive.c
+    cp python/dist/setup.py "$stage_dir/setup.py"
+    generator_dir="$SRC_DIR/../stage4-upbdefs-generator"
+    test ! -e "$generator_dir"
+    test -n "${STAGE4_ABSEIL_SOURCE_DIR:-}"
+    test -d "$STAGE4_ABSEIL_SOURCE_DIR"
+    "$BUILD_PREFIX/bin/cmake" -S "$SRC_DIR" -B "$generator_dir" -G Ninja \
+      -DCMAKE_PREFIX_PATH="$PREFIX" \
+      -Dprotobuf_BUILD_TESTS=OFF \
+      -Dprotobuf_BUILD_SHARED_LIBS=OFF \
+      -Dprotobuf_INSTALL=OFF \
+      -Dprotobuf_FORCE_FETCH_DEPENDENCIES=ON \
+      -DFETCHCONTENT_SOURCE_DIR_ABSL="$STAGE4_ABSEIL_SOURCE_DIR"
+    "$BUILD_PREFIX/bin/cmake" --build "$generator_dir" \
+      --target protoc protoc-gen-upbdefs --parallel 2
+    "$generator_dir/protoc" \
+      --proto_path="$SRC_DIR/src" \
+      --plugin=protoc-gen-upbdefs="$generator_dir/protoc-gen-upbdefs" \
+      --upbdefs_out="$stage_dir" \
+      "$SRC_DIR/src/google/protobuf/descriptor.proto"
+    cd "$stage_dir"
+    $PYTHON setup.py install --single-version-externally-managed --record=record.txt
+
+requirements:
+  build:
+    - cmake 3.28.*
+    - ninja
+    - {{ compiler('c') }}
+    - {{ compiler('cxx') }}
+    - {{ stdlib('c') }}
+  host:
+    - python 3.10.*
+    - setuptools
+  run:
+    - python >=3.10,<3.11
+
+about:
+  home: https://github.com/protocolbuffers/protobuf
+  license: BSD-3-Clause
+  license_file: LICENSE
+  summary: Frozen private Python Protobuf package for stage 4.

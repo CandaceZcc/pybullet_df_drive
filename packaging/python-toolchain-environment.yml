@@ -1,0 +1,11 @@
+# 阶段四构建工具 Conda 声明；不与生产 runtime 或其 wheel 安装混用。
+name: slope-sim-stage4-toolchain
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - python-build
+  - conda-build
+  - pip
+  - conda-lock=4.0.2
+  - conda-pack=0.9.2
