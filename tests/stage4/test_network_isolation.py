@@ -159,6 +159,11 @@ done
 payload=$(mktemp -d)
 mkdir -p "$payload/bin" "$payload/conda-meta"
 printf 'python' > "$payload/bin/python"
+cat > "$payload/bin/conda-unpack" <<'STAGE4_CONDA_UNPACK'
+#!/bin/sh
+printf '%s\\n' "$0" > "$(dirname "$0")/conda-unpack-ran.txt"
+STAGE4_CONDA_UNPACK
+chmod 755 "$payload/bin/conda-unpack"
 printf 'history' > "$payload/conda-meta/history"
 mkdir -p "$(dirname "$output")"
 tar -cf "$output" -C "$payload" .
@@ -183,7 +188,11 @@ tar -cf "$output" -C "$payload" .
 
 
 def _write_wheel_install_micromamba(
-    path: Path, record: Path, *, fail_project_pip: bool = True
+    path: Path,
+    record: Path,
+    *,
+    fail_project_pip: bool = True,
+    create_project_console_script: bool = False,
 ) -> None:
     """模拟 tool env 的 build/pip，锁定 pack 后 wheel 构建与两次安装的真实 argv。"""
     conda_pack = """#!/usr/bin/env bash
@@ -196,6 +205,11 @@ done
 payload=$(mktemp -d)
 mkdir -p "$payload/bin" "$payload/conda-meta"
 printf 'python' > "$payload/bin/python"
+cat > "$payload/bin/conda-unpack" <<'STAGE4_CONDA_UNPACK'
+#!/bin/sh
+printf '%s\\n' "$0" > "$(dirname "$0")/conda-unpack-ran.txt"
+STAGE4_CONDA_UNPACK
+chmod 755 "$payload/bin/conda-unpack"
 printf 'history' > "$payload/conda-meta/history"
 mkdir -p "$(dirname "$output")"
 tar -cf "$output" -C "$payload" .
@@ -263,6 +277,33 @@ rows.append((f'{{dist_info}}/direct_url.json', f'sha256={{digest}}', str(len(pay
 with record.open('w', encoding='utf-8', newline='') as stream:
     csv.writer(stream, lineterminator='\\n').writerows(rows)
 PY
+  if [[ "$count" == 2 && {str(create_project_console_script).lower()} == true ]]; then
+    entry_points="$site_packages/$dist_info/entry_points.txt"
+    printf '[console_scripts]\nfixture-command = fixture.module:main\n' > "$entry_points"
+    mkdir -p "$prefix/bin"
+    script_path="$prefix/bin/fixture-command"
+    printf '#!/bin/sh\n' > "$script_path"
+    chmod 755 "$script_path"
+    python3 - "$site_packages/$dist_info/RECORD" "$entry_points" "$script_path" "$dist_info" <<'PY'
+import base64
+import csv
+import hashlib
+from pathlib import Path
+import sys
+
+record, entry_points, script_path, dist_info = map(Path, sys.argv[1:])
+rows = list(csv.reader(record.read_text(encoding='utf-8').splitlines()))
+for path, relative in (
+    (entry_points, f'{{dist_info}}/entry_points.txt'),
+    (script_path, '../../../bin/fixture-command'),
+):
+    payload = path.read_bytes()
+    digest = base64.urlsafe_b64encode(hashlib.sha256(payload).digest()).rstrip(b'=').decode('ascii')
+    rows.insert(-1, (relative, f'sha256={{digest}}', str(len(payload))))
+with record.open('w', encoding='utf-8', newline='') as stream:
+    csv.writer(stream, lineterminator='\\n').writerows(rows)
+PY
+  fi
   if [[ "$count" == 2 && {str(fail_project_pip).lower()} == true ]]; then
     printf 'FAKE_PROJECT_PIP\\n' >&2
     exit 26
@@ -987,6 +1028,42 @@ def test_python_runtime_builder_removes_pip_direct_urls_and_refreshes_records(tm
     ) == "fixture_project-0.1.0.dist-info/RECORD,,\n"
 
 
+def test_python_runtime_builder_removes_only_project_console_scripts(tmp_path) -> None:
+    """项目 wheel 的 console_scripts 必须按 entry_points 精确删除并从 RECORD 移除。"""
+    evidence = tmp_path / "network-evidence"
+    source = tmp_path / "source"
+    _write_python_runtime_builder_fixture(source, tmp_path / "unused")
+    micromamba = source / "pinned-micromamba"
+    _write_wheel_install_micromamba(
+        micromamba,
+        tmp_path / "tool-python.argv",
+        fail_project_pip=False,
+        create_project_console_script=True,
+    )
+    package_cache = tmp_path / "package-cache"
+    package_cache.mkdir()
+    wheel_cache = tmp_path / "wheel-cache"
+    wheel_cache.mkdir()
+    work = tmp_path / "work"
+
+    completed = subprocess.run(
+        [
+            str(WRAPPER), "--evidence-dir", str(evidence), "--",
+            str(PYTHON_RUNTIME_BUILDER), "--source", str(source),
+            "--work", str(work), "--root", str(work / "root"),
+            "--micromamba", str(micromamba), "--package-cache", str(package_cache),
+            "--wheel-cache", str(wheel_cache), "--source-date-epoch", "1",
+        ],
+        check=False, capture_output=True, text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    runtime = work / "root" / "runtime" / "python"
+    assert not (runtime / "bin" / "fixture-command").exists()
+    record = runtime / "lib" / "python3.10" / "site-packages" / "fixture_project-0.1.0.dist-info" / "RECORD"
+    assert "../../../bin/fixture-command" not in record.read_text(encoding="utf-8")
+
+
 def test_python_runtime_builder_removes_history_and_bytecode_only_after_pip(tmp_path) -> None:
     """两个 wheel 都安装后，staging 才可删除 Conda history 与 Python bytecode。"""
     evidence = tmp_path / "network-evidence"
@@ -1015,3 +1092,38 @@ def test_python_runtime_builder_removes_history_and_bytecode_only_after_pip(tmp_
     assert not (runtime / "conda-meta" / "history").exists()
     assert not list(runtime.rglob("*.pyc"))
     assert not list(runtime.rglob("__pycache__"))
+
+
+def test_python_runtime_builder_runs_relocation_only_in_random_copy(tmp_path) -> None:
+    """builder 完成 staging 后只在随机副本执行 conda-unpack，并保留源 tree。"""
+    evidence = tmp_path / "network-evidence"
+    source = tmp_path / "source"
+    _write_python_runtime_builder_fixture(source, tmp_path / "unused")
+    micromamba = source / "pinned-micromamba"
+    _write_wheel_install_micromamba(micromamba, tmp_path / "tool-python.argv", fail_project_pip=False)
+    package_cache = tmp_path / "package-cache"
+    package_cache.mkdir()
+    wheel_cache = tmp_path / "wheel-cache"
+    wheel_cache.mkdir()
+    work = tmp_path / "work"
+
+    completed = subprocess.run(
+        [
+            str(WRAPPER), "--evidence-dir", str(evidence), "--",
+            str(PYTHON_RUNTIME_BUILDER), "--source", str(source),
+            "--work", str(work), "--root", str(work / "root"),
+            "--micromamba", str(micromamba), "--package-cache", str(package_cache),
+            "--wheel-cache", str(wheel_cache), "--source-date-epoch", "1",
+        ],
+        check=False, capture_output=True, text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    runtime = work / "root" / "runtime" / "python"
+    relocation = json.loads((work / "python-runtime-relocation.json").read_text(encoding="utf-8"))
+    assert relocation["source_runtime"] == str(runtime)
+    assert relocation["source_tree_before"] == relocation["source_tree_after"]
+    relocated_runtime = Path(relocation["relocated_runtime"])
+    assert relocated_runtime.parent.name.startswith("stage4-python-relocation-")
+    assert (relocated_runtime / "bin" / "conda-unpack-ran.txt").is_file()
+    assert not (runtime / "bin" / "conda-unpack-ran.txt").exists()

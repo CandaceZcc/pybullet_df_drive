@@ -18,6 +18,8 @@ DEPENDENCY_VERIFIER = ROOT / "scripts" / "verify_stage4_dependencies.py"
 SOURCE_ARCHIVE_PARSER = ROOT / "scripts" / "stage4_source_archive.py"
 SOURCE_CACHE_VERIFIER = ROOT / "scripts" / "verify_stage4_source_cache.py"
 SOURCE_CACHE_FREEZER = ROOT / "scripts" / "freeze_stage4_source_cache.py"
+DEPENDENCY_SOURCE_MATERIALIZER = ROOT / "scripts" / "materialize_stage4_dependency_sources.py"
+DEPENDENCY_BUILDER = ROOT / "packaging" / "build_dependencies.sh"
 CPP_DEPENDENCY_LOCK = ROOT / "packaging" / "locks" / "cpp-dependencies.lock"
 ROS2_DEPENDENCY_LOCK = ROOT / "packaging" / "locks" / "ros2-dependencies.lock"
 
@@ -92,6 +94,163 @@ def test_source_cache_freezer_exposes_a_stable_cli() -> None:
         text=True,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_dependency_builder_rejects_overlapping_output_roots_before_materializing(tmp_path) -> None:
+    """离线 builder 必须先拒绝交叠的私有输出根，且不得创建任何输出。"""
+    assert DEPENDENCY_BUILDER.is_file(), "offline C++ dependency builder is not implemented"
+    source_work = tmp_path / "source-work"
+    build_root = source_work / "build"
+    install_prefix = tmp_path / "install"
+
+    result = subprocess.run(
+        [
+            str(DEPENDENCY_BUILDER),
+            "--source-archive-cache",
+            str(tmp_path / "canonical-cache"),
+            "--source-work",
+            str(source_work),
+            "--build-root",
+            str(build_root),
+            "--install-prefix",
+            str(install_prefix),
+            "--source-date-epoch",
+            "1",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "output roots must be distinct and non-overlapping" in result.stderr
+    assert not source_work.exists()
+    assert not install_prefix.exists()
+
+
+def test_dependency_builder_rejects_missing_canonical_cache_before_creating_outputs(tmp_path) -> None:
+    """cache/lock/manifest 复核失败时，builder 不能创建 source、build 或 install 输出。"""
+    source_work = tmp_path / "source-work"
+    build_root = tmp_path / "build-root"
+    install_prefix = tmp_path / "install-prefix"
+
+    result = subprocess.run(
+        [
+            str(DEPENDENCY_BUILDER),
+            "--source-archive-cache",
+            str(tmp_path / "missing-cache"),
+            "--source-archive-manifest",
+            str(tmp_path / "missing-manifest.json"),
+            "--dependency-lock",
+            str(tmp_path / "missing-dependency.lock"),
+            "--source-work",
+            str(source_work),
+            "--build-root",
+            str(build_root),
+            "--install-prefix",
+            str(install_prefix),
+            "--source-date-epoch",
+            "1",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "canonical source archive cache verification failed" in result.stderr
+    assert not source_work.exists()
+    assert not build_root.exists()
+    assert not install_prefix.exists()
+
+
+def test_dependency_source_materializer_copies_and_safely_materializes_cpp_archives(tmp_path) -> None:
+    """cpp consumer 的 canonical archive 必须私有复制、复核并物化为零链接源码树。"""
+    assert DEPENDENCY_SOURCE_MATERIALIZER.is_file(), "dependency source materializer is not implemented"
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    archive = source_dir / "fixture.tar.gz"
+    with tarfile.open(archive, "w:gz") as handle:
+        member = tarfile.TarInfo("fixture-root/README.md")
+        member.size = 7
+        handle.addfile(member, io.BytesIO(b"payload"))
+    archive_bytes = archive.read_bytes()
+    sha256 = hashlib.sha256(archive_bytes).hexdigest()
+    lock = tmp_path / "dependency.lock"
+    lock.write_text(json.dumps({"schema_version": 1, "dependencies": [{
+        "name": "fixture", "url": "https://example.invalid/fixture.tar.gz",
+        "ref_kind": "commit", "ref": "a" * 40, "commit": "a" * 40,
+        "consumers": ["cpp_dependency"],
+        "archive": {"format": "tar.gz", "size": len(archive_bytes), "sha256": sha256},
+    }]}), encoding="utf-8")
+    cache = tmp_path / "canonical-cache"
+    manifest = tmp_path / "manifest.json"
+    frozen = subprocess.run([sys.executable, str(SOURCE_CACHE_FREEZER), "--lock", str(lock), "--source-dir", str(source_dir), "--cache-root", str(cache), "--manifest", str(manifest)], check=False, capture_output=True, text=True)
+    assert frozen.returncode == 0, frozen.stderr
+    source_work = tmp_path / "source-work"
+    evidence = tmp_path / "materialization.json"
+
+    result = subprocess.run([sys.executable, str(DEPENDENCY_SOURCE_MATERIALIZER), "--manifest", str(manifest), "--lock", str(lock), "--canonical-cache", str(cache), "--source-work", str(source_work), "--evidence", str(evidence)], check=False, capture_output=True, text=True)
+
+    assert result.returncode == 0, result.stderr
+    copied = source_work / "archives" / sha256 / "fixture.tar.gz"
+    tree = source_work / "trees" / "fixture" / "fixture-root"
+    assert copied.read_bytes() == archive_bytes
+    assert (tree / "README.md").read_bytes() == b"payload"
+    assert not (tree / "README.md").is_symlink()
+    document = json.loads(evidence.read_text(encoding="utf-8"))
+    assert document["archives"][0]["name"] == "fixture"
+    assert document["archives"][0]["tree"] == str(tree)
+
+
+def test_dependency_builder_materialize_only_runs_after_cache_verification(tmp_path) -> None:
+    """builder 的物化模式必须消费已验 cache，且不得提前创建 build/install 输出。"""
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    archive = source_dir / "fixture.tar.gz"
+    with tarfile.open(archive, "w:gz") as handle:
+        member = tarfile.TarInfo("fixture-root/value.txt")
+        member.size = 5
+        handle.addfile(member, io.BytesIO(b"value"))
+    payload = archive.read_bytes()
+    sha256 = hashlib.sha256(payload).hexdigest()
+    lock = tmp_path / "dependency.lock"
+    lock.write_text(json.dumps({"schema_version": 1, "dependencies": [{"name": "fixture", "url": "https://example.invalid/fixture.tar.gz", "ref_kind": "commit", "ref": "a" * 40, "commit": "a" * 40, "consumers": ["cpp_dependency"], "archive": {"format": "tar.gz", "size": len(payload), "sha256": sha256}}]}), encoding="utf-8")
+    cache, manifest = tmp_path / "cache", tmp_path / "manifest.json"
+    frozen = subprocess.run([sys.executable, str(SOURCE_CACHE_FREEZER), "--lock", str(lock), "--source-dir", str(source_dir), "--cache-root", str(cache), "--manifest", str(manifest)], check=False, capture_output=True, text=True)
+    assert frozen.returncode == 0, frozen.stderr
+    source_work, build_root, install_prefix = tmp_path / "source-work", tmp_path / "build", tmp_path / "install"
+
+    result = subprocess.run([str(DEPENDENCY_BUILDER), "--materialize-only", "--source-archive-cache", str(cache), "--source-archive-manifest", str(manifest), "--dependency-lock", str(lock), "--source-work", str(source_work), "--build-root", str(build_root), "--install-prefix", str(install_prefix), "--source-date-epoch", "1"], check=False, capture_output=True, text=True)
+
+    assert result.returncode == 0, result.stderr
+    assert (source_work / "trees" / "fixture" / "fixture-root" / "value.txt").read_bytes() == b"value"
+    assert (source_work / "materialization.json").is_file()
+    assert not build_root.exists()
+    assert not install_prefix.exists()
+
+
+def test_cpp_dependency_lock_includes_frozen_abseil_lts_source() -> None:
+    """私有 Protobuf producer 必须从锁定的 Abseil LTS 源码构建静态 targets。"""
+    document = json.loads(CPP_DEPENDENCY_LOCK.read_text(encoding="utf-8"))
+    records = document.get("dependencies")
+    assert isinstance(records, list)
+    abseil = next((record for record in records if record.get("name") == "abseil-cpp"), None)
+    assert abseil == {
+        "name": "abseil-cpp",
+        "url": "https://github.com/abseil/abseil-cpp/archive/76bb24329e8bf5f39704eb10d21b9a80befa7c81.tar.gz",
+        "ref_kind": "commit",
+        "ref": "76bb24329e8bf5f39704eb10d21b9a80befa7c81",
+        "commit": "76bb24329e8bf5f39704eb10d21b9a80befa7c81",
+        "license": "Apache-2.0",
+        "license_files": ["LICENSE"],
+        "consumers": ["cpp_dependency"],
+        "archive": {
+            "format": "tar.gz",
+            "size": 2220566,
+            "sha256": "ed8f7d9f39139c449e79fd19765e23c96fdb774172d32d191323d3e3ea06e5ff",
+        },
+    }
 
 
 def test_source_cache_freezer_writes_verifiable_canonical_cache(tmp_path) -> None:
@@ -449,7 +608,7 @@ def test_locks_only_cli_rejects_missing_lock_input() -> None:
 
 
 def test_real_dependency_locks_cover_the_frozen_stage4_source_set() -> None:
-    """真实 C++ 与 ROS 锁必须覆盖阶段四构建需要的全部七份源码。"""
+    """真实 C++ 与 ROS 锁必须覆盖阶段四构建需要的全部八份源码。"""
     assert CPP_DEPENDENCY_LOCK.is_file(), "C++ dependency lock is not implemented"
     assert ROS2_DEPENDENCY_LOCK.is_file(), "ROS 2 dependency lock is not implemented"
 
@@ -460,6 +619,7 @@ def test_real_dependency_locks_cover_the_frozen_stage4_source_set() -> None:
     by_name = {entry.name: entry for entry in entries}
 
     assert set(by_name) == {
+        "abseil-cpp",
         "ecal",
         "protobuf",
         "mcap",
@@ -471,7 +631,7 @@ def test_real_dependency_locks_cover_the_frozen_stage4_source_set() -> None:
     assert by_name["Livox-SDK2"].ref_kind == "commit"
     assert by_name["Livox-SDK2"].ref == by_name["Livox-SDK2"].commit
     for name, entry in by_name.items():
-        if name != "Livox-SDK2":
+        if name not in {"Livox-SDK2", "abseil-cpp"}:
             assert entry.ref_kind == "tag"
 
 

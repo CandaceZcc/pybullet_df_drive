@@ -12,6 +12,9 @@ VERIFY_NETWORK="$SCRIPT_DIR/../scripts/verify_network_isolation.py"
 NORMALIZE_RUNTIME_INSTALL="$SCRIPT_DIR/../scripts/normalize_python_runtime_install.py"
 SANITIZE_RUNTIME_TREE="$SCRIPT_DIR/../scripts/sanitize_python_runtime_tree.py"
 VERIFY_RUNTIME_ECAL_INSTALL="$SCRIPT_DIR/../scripts/verify_python_runtime_ecal_install.py"
+VERIFY_RUNTIME_ISOLATION="$SCRIPT_DIR/../scripts/verify_python_runtime_isolation.py"
+RUNTIME_TREE_DIGEST="$SCRIPT_DIR/../scripts/python_runtime_tree_digest.py"
+VERIFY_RUNTIME_RELOCATION="$SCRIPT_DIR/../scripts/verify_python_runtime_relocation.py"
 
 # 此检查必须先于参数解析和任何 mkdir/copy/create；环境 token 单独不能替代内核状态。
 EVIDENCE_DIR="${STAGE4_NETWORK_ISOLATION_EVIDENCE:-}"
@@ -20,6 +23,9 @@ command -v python3 >/dev/null 2>&1 || fail "python3 is required for network isol
 [[ -f "$NORMALIZE_RUNTIME_INSTALL" ]] || fail "Python runtime metadata normalizer is required"
 [[ -f "$SANITIZE_RUNTIME_TREE" ]] || fail "Python runtime staging sanitizer is required"
 [[ -f "$VERIFY_RUNTIME_ECAL_INSTALL" ]] || fail "Python runtime eCAL install verifier is required"
+[[ -f "$VERIFY_RUNTIME_ISOLATION" ]] || fail "Python runtime isolation verifier is required"
+[[ -f "$RUNTIME_TREE_DIGEST" ]] || fail "Python runtime tree digest helper is required"
+[[ -f "$VERIFY_RUNTIME_RELOCATION" ]] || fail "Python runtime relocation helper is required"
 python3 "$VERIFY_NETWORK" --evidence "$EVIDENCE_DIR" --process-pid "$$" >/dev/null || fail "network isolation verification failed"
 
 SOURCE=""
@@ -258,4 +264,24 @@ python3 "$NORMALIZE_RUNTIME_INSTALL" \
 python3 "$VERIFY_RUNTIME_ECAL_INSTALL" \
   --runtime-root "$ROOT/runtime/python" \
   --manifest "$SOURCE/packaging/locks/python-wheel-cache.manifest.json" >/dev/null
-python3 "$SANITIZE_RUNTIME_TREE" --runtime-root "$ROOT/runtime/python" >/dev/null
+python3 "$SANITIZE_RUNTIME_TREE" \
+  --runtime-root "$ROOT/runtime/python" \
+  --source-date-epoch "$SOURCE_DATE_EPOCH_VALUE" >/dev/null
+python3 "$VERIFY_RUNTIME_ISOLATION" \
+  --runtime-root "$ROOT/runtime/python" \
+  --forbidden-prefix "$SOURCE" \
+  --forbidden-prefix "$WORK/python-builder" \
+  --forbidden-prefix "$WORK/tool-env" \
+  --forbidden-prefix "$WORK/mamba-root" \
+  --forbidden-prefix "$WORK/wheel-cache" \
+  --forbidden-prefix "$PACKAGE_CACHE" \
+  --forbidden-prefix "$WHEEL_CACHE" \
+  --evidence "$WORK/python-runtime-isolation.json" >/dev/null
+python3 "$RUNTIME_TREE_DIGEST" --runtime-root "$ROOT/runtime/python" \
+  > "$WORK/python-runtime-tree-digest.json"
+
+# staging 保持原样；conda-unpack 只能在本轮随机副本执行，证据同时锁定源 tree 前后摘要。
+python3 "$VERIFY_RUNTIME_RELOCATION" \
+  --runtime-root "$ROOT/runtime/python" \
+  --copy-parent "$WORK" \
+  --evidence "$WORK/python-runtime-relocation.json" >/dev/null

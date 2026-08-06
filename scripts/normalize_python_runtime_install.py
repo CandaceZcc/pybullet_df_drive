@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import argparse
 import base64
+import configparser
 import csv
 import hashlib
 import json
 from pathlib import Path, PurePosixPath
+import stat
 from urllib.parse import unquote, urlsplit
 
 
@@ -47,8 +49,45 @@ def _safe_record_path(value: str) -> PurePosixPath:
     return path
 
 
-def _refresh_record(dist_info: Path) -> None:
-    """删除 direct_url 行后按路径排序重算同一 dist-info 的所有 RECORD 成员。"""
+def _project_console_scripts(dist_info: Path) -> dict[str, Path]:
+    """从项目自身 entry_points 精确解析 pip 应写入 prefix/bin 的脚本。"""
+    entry_points = dist_info / "entry_points.txt"
+    if not entry_points.exists():
+        return {}
+    if not entry_points.is_file() or entry_points.is_symlink():
+        raise ValueError("entry_points.txt must be a regular file")
+    parser = configparser.ConfigParser(interpolation=None)
+    parser.optionxform = str
+    try:
+        parser.read_file(entry_points.open(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, configparser.Error) as error:
+        raise ValueError("entry_points.txt is invalid") from error
+    if not parser.has_section("console_scripts"):
+        return {}
+    site_packages = dist_info.parent
+    python_lib = site_packages.parent.parent
+    if site_packages.name != "site-packages" or python_lib.name != "lib":
+        raise ValueError("site-packages layout cannot locate prefix/bin")
+    prefix = python_lib.parent
+    scripts: dict[str, Path] = {}
+    for name, _target in parser.items("console_scripts"):
+        candidate = PurePosixPath(name)
+        if (
+            candidate.name != name
+            or name in {"", ".", ".."}
+            or any(ord(character) < 32 for character in name)
+        ):
+            raise ValueError("console script name is unsafe")
+        script = prefix / "bin" / name
+        script_metadata = script.lstat()
+        if not stat.S_ISREG(script_metadata.st_mode) or stat.S_ISLNK(script_metadata.st_mode):
+            raise ValueError("console script must be a regular file")
+        scripts[f"../../../bin/{name}"] = script
+    return scripts
+
+
+def _refresh_record(dist_info: Path, removed_scripts: dict[str, Path]) -> None:
+    """删除本项目脚本与 direct_url 后按路径排序重算同一 dist-info 的 RECORD。"""
     record_path = dist_info / "RECORD"
     site_packages = dist_info.parent
     relative_record = record_path.relative_to(site_packages).as_posix()
@@ -61,10 +100,19 @@ def _refresh_record(dist_info: Path) -> None:
     if any(len(row) != 3 for row in rows):
         raise ValueError("RECORD rows must have three columns")
     if direct_url.exists():
+        if not direct_url.is_file() or direct_url.is_symlink():
+            raise ValueError("direct_url.json must be a regular file")
         direct_url.unlink()
+    record_paths = {row[0] for row in rows}
+    if len(record_paths) != len(rows):
+        raise ValueError("RECORD contains duplicate paths")
+    if not set(removed_scripts).issubset(record_paths):
+        raise ValueError("RECORD omits declared console script")
+    for script in removed_scripts.values():
+        script.unlink()
     members: set[str] = set()
     for relative_path, _digest, _size in rows:
-        if relative_path in {relative_record, relative_direct_url}:
+        if relative_path in {relative_record, relative_direct_url, *removed_scripts}:
             continue
         safe = _safe_record_path(relative_path)
         target = site_packages.joinpath(*safe.parts)
@@ -81,7 +129,7 @@ def _refresh_record(dist_info: Path) -> None:
 
 
 def normalize(runtime_root: Path, wheels: tuple[Path, ...]) -> None:
-    """精确匹配两个 pip wheel 的 direct_url，删除后刷新对应 RECORD。"""
+    """精确标准化 eCAL/项目 wheel，并只移除项目声明的 console scripts。"""
     if len(wheels) != 2 or len({wheel.resolve() for wheel in wheels}) != 2:
         raise ValueError("normalizer requires exactly two distinct wheel paths")
     expected_urls = {_wheel_url(wheel) for wheel in wheels}
@@ -96,8 +144,10 @@ def normalize(runtime_root: Path, wheels: tuple[Path, ...]) -> None:
             matches[actual_url] = direct_url.parent
     if set(matches) != expected_urls:
         raise ValueError("pip wheel direct_url.json record is missing")
-    for dist_info in matches.values():
-        _refresh_record(dist_info)
+    project_url = _wheel_url(wheels[1])
+    for wheel_url, dist_info in matches.items():
+        scripts = _project_console_scripts(dist_info) if wheel_url == project_url else {}
+        _refresh_record(dist_info, scripts)
 
 
 def main() -> int:

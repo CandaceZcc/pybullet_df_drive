@@ -10,6 +10,7 @@ from pathlib import Path
 import subprocess
 import sys
 import os
+import stat
 import tomli
 import zipfile
 
@@ -30,6 +31,22 @@ PRIVATE_PROTOBUF_VARIANTS = PRIVATE_PROTOBUF_RECIPE.parent / "conda_build_config
 PYTHON_CACHE_MATERIALIZER = ROOT / "scripts" / "materialize_python_package_cache.py"
 PYTHON_WHEEL_MATERIALIZER = ROOT / "scripts" / "materialize_python_wheel_cache.py"
 RUNTIME_ECAL_INSTALL_VERIFIER = ROOT / "scripts" / "verify_python_runtime_ecal_install.py"
+RUNTIME_TREE_SANITIZER = ROOT / "scripts" / "sanitize_python_runtime_tree.py"
+RUNTIME_ISOLATION_VERIFIER = ROOT / "scripts" / "verify_python_runtime_isolation.py"
+RUNTIME_TREE_DIGEST = ROOT / "scripts" / "python_runtime_tree_digest.py"
+RUNTIME_RELOCATION_SMOKE = ROOT / "scripts" / "verify_python_runtime_relocation.py"
+RUNTIME_REPRODUCIBILITY = ROOT / "scripts" / "verify_python_runtime_reproducibility.py"
+RUNTIME_NO_PARTICIPANT_LOADER = ROOT / "scripts" / "verify_python_runtime_no_participant_loader.py"
+RUNTIME_REPRODUCIBILITY_ROOT = (
+    ROOT
+    / "build"
+    / "stage4-python-repro-dual-20260805T194042+0800"
+    / "stage4-python-reproducibility-f4al59ub"
+    / "runtime-a"
+    / "root"
+    / "runtime"
+    / "python"
+)
 RUNTIME_ECAL_WHEEL = (
     ROOT
     / "build"
@@ -100,6 +117,355 @@ def test_runtime_ecal_install_verifier_accepts_frozen_wheel_tree(tmp_path) -> No
 
     assert completed.returncode == 0, completed.stdout
     assert completed.stdout == "PASS: installed eCAL runtime matches frozen wheel contract\n"
+
+
+def test_python_runtime_sanitizer_normalizes_modes_and_mtime(tmp_path) -> None:
+    """staging 清理必须固定目录、普通文件 mode 与全部成员 mtime。"""
+    runtime = tmp_path / "runtime"
+    nested = runtime / "lib" / "python3.10"
+    nested.mkdir(parents=True)
+    data_file = nested / "module.py"
+    data_file.write_text("value = 1\n", encoding="utf-8")
+    executable = runtime / "bin" / "python"
+    executable.parent.mkdir()
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    executable_alias = executable.parent / "python3"
+    executable_alias.symlink_to(executable.name)
+    data_file.chmod(0o666)
+    executable.chmod(0o711)
+    for path in (runtime, runtime / "lib", nested, executable.parent, data_file, executable, executable_alias):
+        os.utime(path, (123, 123), follow_symlinks=False)
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(RUNTIME_TREE_SANITIZER),
+            "--runtime-root",
+            str(runtime),
+            "--source-date-epoch",
+            "1700000000",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stdout
+    assert stat.S_IMODE(runtime.stat().st_mode) == 0o755
+    assert stat.S_IMODE(nested.stat().st_mode) == 0o755
+    assert stat.S_IMODE(data_file.stat().st_mode) == 0o644
+    assert stat.S_IMODE(executable.stat().st_mode) == 0o755
+    assert executable_alias.is_symlink()
+    assert os.readlink(executable_alias) == "python"
+    for path in (runtime, runtime / "lib", nested, executable.parent, data_file, executable, executable_alias):
+        assert path.stat(follow_symlinks=False).st_mtime == 1_700_000_000
+
+
+def test_python_runtime_sanitizer_canonicalizes_conda_prefix_hashes(tmp_path) -> None:
+    """保留 conda package record 时，随构建根变化的 prefix hash 必须规范化。"""
+    runtimes = []
+    for name, work_prefix in (("runtime-a", "/private/work-a/python-builder"), ("runtime-b", "/private/work-b/python-builder")):
+        runtime = tmp_path / name
+        conda_meta = runtime / "conda-meta"
+        conda_meta.mkdir(parents=True)
+        (conda_meta / "fixture-1.0-0.json").write_text(
+            json.dumps(
+                {
+                    "name": "fixture",
+                    "paths_data": {
+                        "paths": [
+                            {"_path": "bin/fixture", "sha256_in_prefix": hashlib.sha256(work_prefix.encode()).hexdigest()},
+                            {"_path": "share/fixture", "sha256_in_prefix": None},
+                        ]
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(RUNTIME_TREE_SANITIZER),
+                "--runtime-root",
+                str(runtime),
+                "--source-date-epoch",
+                "1700000000",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert completed.returncode == 0, completed.stdout
+        runtimes.append(runtime)
+
+    def digest(runtime: Path) -> dict[str, object]:
+        completed = subprocess.run(
+            [sys.executable, str(RUNTIME_TREE_DIGEST), "--runtime-root", str(runtime)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert completed.returncode == 0, completed.stdout
+        return json.loads(completed.stdout)
+
+    first_record = json.loads((runtimes[0] / "conda-meta" / "fixture-1.0-0.json").read_text())
+    second_record = json.loads((runtimes[1] / "conda-meta" / "fixture-1.0-0.json").read_text())
+    assert first_record == second_record
+    assert first_record["paths_data"]["paths"][1]["sha256_in_prefix"] is None
+    assert digest(runtimes[0]) == digest(runtimes[1])
+
+
+def test_python_runtime_isolation_verifier_rejects_forbidden_prefixes(tmp_path) -> None:
+    """运行时不得在文本、二进制、wheel 或 conda-unpack 中泄漏构建绝对路径。"""
+    assert RUNTIME_ISOLATION_VERIFIER.is_file(), "runtime isolation verifier is not implemented"
+    runtime = tmp_path / "runtime"
+    site_packages = runtime / "lib" / "python3.10" / "site-packages"
+    dist_info = site_packages / "package-1.0.dist-info"
+    dist_info.mkdir(parents=True)
+    forbidden = "/private/stage4/work/python-builder"
+    cases = {
+        "text": site_packages / "module.py",
+        "binary": site_packages / "native.so",
+        "wheel": dist_info / "METADATA",
+        "conda_unpack": runtime / "bin" / "conda-unpack",
+    }
+    for kind, path in cases.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = f"prefix={forbidden}\n".encode("utf-8")
+        path.write_bytes(payload if kind != "binary" else b"\x7fELF\x00" + payload)
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(RUNTIME_ISOLATION_VERIFIER),
+                "--runtime-root",
+                str(runtime),
+                "--forbidden-prefix",
+                forbidden,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert completed.returncode != 0
+        assert kind.replace("_", "-") in completed.stdout
+        path.unlink()
+
+
+def test_python_runtime_isolation_verifier_allows_only_in_tree_relative_links(tmp_path) -> None:
+    """conda-pack 相对链接可保留，但链接解析后不得离开 runtime 根。"""
+    runtime = tmp_path / "runtime"
+    bin_dir = runtime / "bin"
+    bin_dir.mkdir(parents=True)
+    target = bin_dir / "python3.10"
+    target.write_text("runtime\n", encoding="utf-8")
+    (bin_dir / "python").symlink_to(target.name)
+    forbidden = "/private/stage4/python-builder"
+
+    command = [
+        sys.executable,
+        str(RUNTIME_ISOLATION_VERIFIER),
+        "--runtime-root",
+        str(runtime),
+        "--forbidden-prefix",
+        forbidden,
+    ]
+    accepted = subprocess.run(command, check=False, capture_output=True, text=True)
+
+    assert accepted.returncode == 0, accepted.stdout
+    outside = tmp_path / "outside"
+    outside.write_text("outside\n", encoding="utf-8")
+    (bin_dir / "escape").symlink_to(outside)
+    rejected = subprocess.run(command, check=False, capture_output=True, text=True)
+    assert rejected.returncode != 0
+    assert "symbolic link escapes runtime root" in rejected.stdout
+
+
+def test_python_runtime_tree_digest_includes_mode_and_mtime(tmp_path) -> None:
+    """双根 gate 的 runtime tree digest 必须覆盖路径、内容、mode 和 mtime。"""
+    assert RUNTIME_TREE_DIGEST.is_file(), "runtime tree digest helper is not implemented"
+    runtime = tmp_path / "runtime"
+    payload = runtime / "bin" / "python"
+    payload.parent.mkdir(parents=True)
+    payload.write_text("#!/bin/sh\n", encoding="utf-8")
+    payload.chmod(0o755)
+    alias = payload.parent / "python3"
+    alias.symlink_to(payload.name)
+    for path in (runtime, payload.parent, payload, alias):
+        os.utime(path, (1_700_000_000, 1_700_000_000), follow_symlinks=False)
+
+    def digest() -> str:
+        completed = subprocess.run(
+            [sys.executable, str(RUNTIME_TREE_DIGEST), "--runtime-root", str(runtime)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert completed.returncode == 0, completed.stdout
+        return json.loads(completed.stdout)["tree_sha256"]
+
+    original = digest()
+    payload.chmod(0o644)
+    assert digest() != original
+    payload.chmod(0o755)
+    os.utime(payload, (1_700_000_001, 1_700_000_001), follow_symlinks=False)
+    assert digest() != original
+
+
+def test_python_runtime_relocation_smoke_runs_only_in_random_copy(tmp_path) -> None:
+    """relocation smoke 只能在随机副本运行 conda-unpack，不能修改规范 staging tree。"""
+    assert RUNTIME_RELOCATION_SMOKE.is_file(), "runtime relocation smoke helper is not implemented"
+    runtime = tmp_path / "staging-runtime"
+    conda_unpack = runtime / "bin" / "conda-unpack"
+    conda_unpack.parent.mkdir(parents=True)
+    conda_unpack.write_text(
+        "#!/bin/sh\n"
+        "case \":$PATH:\" in\n"
+        "  *\":$(dirname \"$0\"):\"*) ;;\n"
+        "  *) exit 73 ;;\n"
+        "esac\n"
+        "printf '%s\\n' \"$0\" > \"$(dirname \"$0\")/conda-unpack-ran.txt\"\n",
+        encoding="utf-8",
+    )
+    conda_unpack.chmod(0o755)
+    (runtime / "bin" / "python").write_text("runtime python\n", encoding="utf-8")
+    evidence = tmp_path / "relocation-evidence.json"
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(RUNTIME_RELOCATION_SMOKE),
+            "--runtime-root",
+            str(runtime),
+            "--evidence",
+            str(evidence),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stdout
+    document = json.loads(evidence.read_text(encoding="utf-8"))
+    assert document["source_runtime"] == str(runtime)
+    assert document["source_tree_before"] == document["source_tree_after"]
+    copied_runtime = Path(document["relocated_runtime"])
+    assert copied_runtime != runtime
+    assert copied_runtime.parent.name.startswith("stage4-python-relocation-")
+    assert (copied_runtime / "bin" / "conda-unpack-ran.txt").is_file()
+    assert not (runtime / "bin" / "conda-unpack-ran.txt").exists()
+
+
+def test_python_runtime_reproducibility_builds_two_fresh_roots_and_compares_digests(tmp_path) -> None:
+    """双根 gate 必须从两个全新 work 构建，并只比较规范 runtime tree digest。"""
+    assert RUNTIME_REPRODUCIBILITY.is_file(), "runtime reproducibility helper is not implemented"
+    builder = tmp_path / "fixture-builder"
+    builder.write_text(
+        "#!/bin/sh\n"
+        "set -eu\n"
+        "work=\n"
+        "while [ \"$#\" -gt 0 ]; do\n"
+        "  if [ \"$1\" = --work ]; then work=$2; shift 2; continue; fi\n"
+        "  shift\n"
+        "done\n"
+        "mkdir -p \"$work/root/runtime/python/bin\"\n"
+        "printf 'runtime\\n' > \"$work/root/runtime/python/bin/python\"\n"
+        "printf '%s\\n' '{\"directories\": 1, \"files\": 1, \"links\": 0, \"regular_bytes\": 8, \"tree_sha256\": \"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"}' > \"$work/python-runtime-tree-digest.json\"\n",
+        encoding="utf-8",
+    )
+    builder.chmod(0o755)
+    wrapper = tmp_path / "fixture-network-wrapper"
+    wrapper.write_text(
+        "#!/bin/sh\n"
+        "set -eu\n"
+        "test \"$1\" = --evidence-dir\n"
+        "shift 2\n"
+        "test \"$1\" = --\n"
+        "shift\n"
+        "exec \"$@\"\n",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    source = tmp_path / "source"
+    package_cache = tmp_path / "package-cache"
+    wheel_cache = tmp_path / "wheel-cache"
+    for directory in (source, package_cache, wheel_cache):
+        directory.mkdir()
+    micromamba = tmp_path / "micromamba"
+    micromamba.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    micromamba.chmod(0o755)
+    work_parent = tmp_path / "work-parent"
+    work_parent.mkdir()
+    evidence = tmp_path / "reproducibility.json"
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(RUNTIME_REPRODUCIBILITY),
+            "--builder", str(builder),
+            "--network-wrapper", str(wrapper),
+            "--source", str(source),
+            "--work-parent", str(work_parent),
+            "--micromamba", str(micromamba),
+            "--package-cache", str(package_cache),
+            "--wheel-cache", str(wheel_cache),
+            "--source-date-epoch", "1",
+            "--evidence", str(evidence),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stdout
+    document = json.loads(evidence.read_text(encoding="utf-8"))
+    assert document["runtime_tree_a"] == document["runtime_tree_b"]
+    assert document["runtime_tree_a"]["tree_sha256"] == "f" * 64
+    work_a = Path(document["runs"][0]["work"])
+    work_b = Path(document["runs"][1]["work"])
+    assert work_a != work_b
+    assert work_a.parent.parent == work_parent
+    assert work_b.parent.parent == work_parent
+    for run in document["runs"]:
+        network_evidence = Path(run["network_evidence"])
+        assert network_evidence.parent == Path(run["work"]).parent
+        assert network_evidence.parent != Path(run["work"])
+
+
+def test_python_runtime_no_participant_loader_maps_only_the_wheel_ecal_core(tmp_path) -> None:
+    """专用 loader 只能 dlopen staging wheel 的唯一 eCAL core，不能混入其他 eCAL/Protobuf。"""
+    assert RUNTIME_REPRODUCIBILITY_ROOT.is_dir(), "real Stage 4 Python runtime prerequisite is absent"
+    assert RUNTIME_NO_PARTICIPANT_LOADER.is_file(), "no-participant Python loader is not implemented"
+    evidence = tmp_path / "no-participant-loader.json"
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(RUNTIME_NO_PARTICIPANT_LOADER),
+            "--runtime-root",
+            str(RUNTIME_REPRODUCIBILITY_ROOT),
+            "--evidence",
+            str(evidence),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    document = json.loads(evidence.read_text(encoding="utf-8"))
+    expected_core = (
+        RUNTIME_REPRODUCIBILITY_ROOT
+        / "lib"
+        / "python3.10"
+        / "site-packages"
+        / "ecal"
+        / "libecal_core.so.6"
+    )
+    assert document["loaded_ecal_cores"] == [str(expected_core)]
+    assert document["loaded_protobuf_libraries"] == []
+    assert document["readelf"]["soname"] == "libecal_core.so.6"
+    assert document["ldd"]["unresolved"] == []
+    assert document["loader_audit"] == {"ecal_api_calls": 0, "mode": "ctypes-dlopen-only"}
 
 
 def test_python_package_materializer_creates_sorted_flat_native_cache(tmp_path) -> None:

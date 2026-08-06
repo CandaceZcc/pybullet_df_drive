@@ -2,6 +2,21 @@
   "schema_version": 1,
   "dependencies": [
     {
+      "name": "abseil-cpp",
+      "url": "https://github.com/abseil/abseil-cpp/archive/76bb24329e8bf5f39704eb10d21b9a80befa7c81.tar.gz",
+      "ref_kind": "commit",
+      "ref": "76bb24329e8bf5f39704eb10d21b9a80befa7c81",
+      "commit": "76bb24329e8bf5f39704eb10d21b9a80befa7c81",
+      "license": "Apache-2.0",
+      "license_files": ["LICENSE"],
+      "consumers": ["cpp_dependency"],
+      "archive": {
+        "format": "tar.gz",
+        "size": 2220566,
+        "sha256": "ed8f7d9f39139c449e79fd19765e23c96fdb774172d32d191323d3e3ea06e5ff"
+      }
+    },
+    {
       "name": "ecal",
       "url": "https://github.com/eclipse-ecal/ecal/archive/refs/tags/v6.1.1.tar.gz",
       "ref_kind": "tag",
