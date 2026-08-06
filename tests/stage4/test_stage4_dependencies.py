@@ -20,6 +20,7 @@ SOURCE_CACHE_VERIFIER = ROOT / "scripts" / "verify_stage4_source_cache.py"
 SOURCE_CACHE_FREEZER = ROOT / "scripts" / "freeze_stage4_source_cache.py"
 DEPENDENCY_SOURCE_MATERIALIZER = ROOT / "scripts" / "materialize_stage4_dependency_sources.py"
 DEPENDENCY_BUILDER = ROOT / "packaging" / "build_dependencies.sh"
+NETWORK_WRAPPER = ROOT / "packaging" / "run_network_isolated.sh"
 CPP_DEPENDENCY_LOCK = ROOT / "packaging" / "locks" / "cpp-dependencies.lock"
 ROS2_DEPENDENCY_LOCK = ROOT / "packaging" / "locks" / "ros2-dependencies.lock"
 
@@ -221,7 +222,8 @@ def test_dependency_builder_materialize_only_runs_after_cache_verification(tmp_p
     assert frozen.returncode == 0, frozen.stderr
     source_work, build_root, install_prefix = tmp_path / "source-work", tmp_path / "build", tmp_path / "install"
 
-    result = subprocess.run([str(DEPENDENCY_BUILDER), "--materialize-only", "--source-archive-cache", str(cache), "--source-archive-manifest", str(manifest), "--dependency-lock", str(lock), "--source-work", str(source_work), "--build-root", str(build_root), "--install-prefix", str(install_prefix), "--source-date-epoch", "1"], check=False, capture_output=True, text=True)
+    network_evidence = tmp_path / "network-evidence"
+    result = subprocess.run([str(NETWORK_WRAPPER), "--evidence-dir", str(network_evidence), "--", str(DEPENDENCY_BUILDER), "--network-evidence", str(network_evidence), "--materialize-only", "--source-archive-cache", str(cache), "--source-archive-manifest", str(manifest), "--dependency-lock", str(lock), "--source-work", str(source_work), "--build-root", str(build_root), "--install-prefix", str(install_prefix), "--source-date-epoch", "1"], check=False, capture_output=True, text=True)
 
     assert result.returncode == 0, result.stderr
     assert (source_work / "trees" / "fixture" / "fixture-root" / "value.txt").read_bytes() == b"value"
@@ -252,7 +254,8 @@ def test_dependency_builder_accepts_extra_lock_for_shared_canonical_cache(tmp_pa
     frozen = subprocess.run([sys.executable, str(SOURCE_CACHE_FREEZER), "--lock", str(locks[0]), "--lock", str(locks[1]), "--source-dir", str(source_dir), "--cache-root", str(cache), "--manifest", str(manifest)], check=False, capture_output=True, text=True)
     assert frozen.returncode == 0, frozen.stderr
     source_work = tmp_path / "source-work"
-    result = subprocess.run([str(DEPENDENCY_BUILDER), "--materialize-only", "--source-archive-cache", str(cache), "--source-archive-manifest", str(manifest), "--dependency-lock", str(locks[0]), "--source-cache-lock", str(locks[1]), "--source-work", str(source_work), "--build-root", str(tmp_path / "build"), "--install-prefix", str(tmp_path / "install"), "--source-date-epoch", "1"], check=False, capture_output=True, text=True)
+    network_evidence = tmp_path / "network-evidence"
+    result = subprocess.run([str(NETWORK_WRAPPER), "--evidence-dir", str(network_evidence), "--", str(DEPENDENCY_BUILDER), "--network-evidence", str(network_evidence), "--materialize-only", "--source-archive-cache", str(cache), "--source-archive-manifest", str(manifest), "--dependency-lock", str(locks[0]), "--source-cache-lock", str(locks[1]), "--source-work", str(source_work), "--build-root", str(tmp_path / "build"), "--install-prefix", str(tmp_path / "install"), "--source-date-epoch", "1"], check=False, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     assert (source_work / "trees" / "cpp" / "cpp-root" / "value.txt").read_text() == "cpp"
     assert not (source_work / "trees" / "ros").exists()

@@ -30,6 +30,7 @@ build_root=''
 install_prefix=''
 source_date_epoch=''
 source_cache_locks=()
+network_evidence=''
 materialize_only=false
 
 while [[ $# -gt 0 ]]; do
@@ -52,6 +53,11 @@ while [[ $# -gt 0 ]]; do
     --source-cache-lock)
       [[ $# -ge 2 ]] || die '--source-cache-lock requires a value'
       source_cache_locks+=("$2")
+      shift 2
+      ;;
+    --network-evidence)
+      [[ $# -ge 2 ]] || die '--network-evidence requires a value'
+      network_evidence="$2"
       shift 2
       ;;
     --source-work)
@@ -131,6 +137,13 @@ if ! python3 "$repository_root/scripts/verify_stage4_source_cache.py" \
   "${cache_lock_arguments[@]}" \
   --cache-root "$source_archive_cache"; then
   die 'canonical source archive cache verification failed'
+fi
+
+[[ -n "$network_evidence" ]] || die 'network evidence is required before materialization'
+require_absolute_path 'network evidence' "$network_evidence"
+if ! python3 "$repository_root/scripts/verify_network_isolation.py" \
+  --evidence "$network_evidence" --process-pid "$$"; then
+  die 'live network isolation verification failed'
 fi
 
 if [[ "$materialize_only" == true ]]; then
