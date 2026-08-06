@@ -29,6 +29,7 @@ source_work=''
 build_root=''
 install_prefix=''
 source_date_epoch=''
+source_cache_locks=()
 materialize_only=false
 
 while [[ $# -gt 0 ]]; do
@@ -46,6 +47,11 @@ while [[ $# -gt 0 ]]; do
     --dependency-lock)
       [[ $# -ge 2 ]] || die '--dependency-lock requires a value'
       dependency_lock="$2"
+      shift 2
+      ;;
+    --source-cache-lock)
+      [[ $# -ge 2 ]] || die '--source-cache-lock requires a value'
+      source_cache_locks+=("$2")
       shift 2
       ;;
     --source-work)
@@ -90,6 +96,10 @@ for pair in \
   [[ -n "$value" ]] || die "$label is required"
   require_absolute_path "$label" "$value"
 done
+
+for source_cache_lock in "${source_cache_locks[@]}"; do
+  require_absolute_path 'source cache lock' "$source_cache_lock"
+done
 [[ "$source_date_epoch" =~ ^[0-9]+$ ]] || die 'source date epoch must be a nonnegative integer'
 
 # 这三者都必须是本轮私有 sibling，交叠会让源码、构建和安装相互污染。
@@ -112,9 +122,13 @@ for pair in \
 done
 
 repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+cache_lock_arguments=(--lock "$dependency_lock")
+for source_cache_lock in "${source_cache_locks[@]}"; do
+  cache_lock_arguments+=(--lock "$source_cache_lock")
+done
 if ! python3 "$repository_root/scripts/verify_stage4_source_cache.py" \
   --manifest "$source_archive_manifest" \
-  --lock "$dependency_lock" \
+  "${cache_lock_arguments[@]}" \
   --cache-root "$source_archive_cache"; then
   die 'canonical source archive cache verification failed'
 fi

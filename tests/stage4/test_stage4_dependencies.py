@@ -230,6 +230,34 @@ def test_dependency_builder_materialize_only_runs_after_cache_verification(tmp_p
     assert not install_prefix.exists()
 
 
+def test_dependency_builder_accepts_extra_lock_for_shared_canonical_cache(tmp_path) -> None:
+    """共享 manifest 需同时复核 ROS lock，但 C++ builder 只能物化自己的 archive。"""
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    records = []
+    for name, consumer in (("cpp", "cpp_dependency"), ("ros", "ros_overlay")):
+        archive = source_dir / f"{name}.tar.gz"
+        with tarfile.open(archive, "w:gz") as handle:
+            member = tarfile.TarInfo(f"{name}-root/value.txt")
+            member.size = len(name)
+            handle.addfile(member, io.BytesIO(name.encode()))
+        payload = archive.read_bytes()
+        records.append((name, consumer, payload))
+    locks = []
+    for name, consumer, payload in records:
+        lock = tmp_path / f"{name}.lock"
+        lock.write_text(json.dumps({"schema_version": 1, "dependencies": [{"name": name, "url": f"https://example.invalid/{name}.tar.gz", "ref_kind": "commit", "ref": "a" * 40, "commit": "a" * 40, "consumers": [consumer], "archive": {"format": "tar.gz", "size": len(payload), "sha256": hashlib.sha256(payload).hexdigest()}}]}), encoding="utf-8")
+        locks.append(lock)
+    cache, manifest = tmp_path / "cache", tmp_path / "manifest.json"
+    frozen = subprocess.run([sys.executable, str(SOURCE_CACHE_FREEZER), "--lock", str(locks[0]), "--lock", str(locks[1]), "--source-dir", str(source_dir), "--cache-root", str(cache), "--manifest", str(manifest)], check=False, capture_output=True, text=True)
+    assert frozen.returncode == 0, frozen.stderr
+    source_work = tmp_path / "source-work"
+    result = subprocess.run([str(DEPENDENCY_BUILDER), "--materialize-only", "--source-archive-cache", str(cache), "--source-archive-manifest", str(manifest), "--dependency-lock", str(locks[0]), "--source-cache-lock", str(locks[1]), "--source-work", str(source_work), "--build-root", str(tmp_path / "build"), "--install-prefix", str(tmp_path / "install"), "--source-date-epoch", "1"], check=False, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert (source_work / "trees" / "cpp" / "cpp-root" / "value.txt").read_text() == "cpp"
+    assert not (source_work / "trees" / "ros").exists()
+
+
 def test_cpp_dependency_lock_includes_frozen_abseil_lts_source() -> None:
     """私有 Protobuf producer 必须从锁定的 Abseil LTS 源码构建静态 targets。"""
     document = json.loads(CPP_DEPENDENCY_LOCK.read_text(encoding="utf-8"))
