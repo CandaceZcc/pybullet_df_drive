@@ -250,8 +250,11 @@ Expected: rc=0 且同一完整 oracle 通过；失败保留证据并停止，不
 - Create: `packaging/run_network_isolated.sh`
 - Create: `scripts/freeze_python_lock_cache.py`
 - Create: `scripts/verify_python_lock_cache.py`
+- Create: `scripts/materialize_python_package_cache.py`
+- Create: `scripts/materialize_python_package_channel.py`
 - Create: `scripts/freeze_python_wheel_cache.py`
 - Create: `scripts/verify_python_wheel_cache.py`
+- Create: `scripts/materialize_python_wheel_cache.py`
 - Create: `scripts/freeze_stage4_source_cache.py`
 - Create: `scripts/verify_stage4_source_cache.py`
 - Create: `scripts/stage4_source_archive.py`
@@ -477,16 +480,37 @@ Run:
 
 ```bash
 test -x "$STAGE4_MICROMAMBA_INPUT"
+test -x "$STAGE4_CMAKE_INPUT"
+test -x "$STAGE4_CTEST_INPUT"
+test -x "$STAGE4_CC_INPUT"
+test -x "$STAGE4_CXX_INPUT"
+test -x "$STAGE4_PROTOC_INPUT"
+test -x "$STAGE4_PCL_PCD2PLY_INPUT"
+test -x "$STAGE4_LDD_INPUT"
+test -x "$STAGE4_DPKG_QUERY_INPUT"
 test -d "$STAGE4_PYTHON_PACKAGE_CACHE_INPUT"
 test -d "$STAGE4_PYTHON_WHEEL_CACHE_INPUT"
 test -d "$STAGE4_SOURCE_ARCHIVE_CACHE_INPUT"
+test -d "$STAGE4_DEPENDENCY_PREFIX_INPUT"
+test -f "$STAGE4_MID360_REFERENCE_LVX2_INPUT"
+test -f packaging/locks/ubuntu24-system-dependencies.lock
 STAGE4_BUILD_ENV_FILE="$PWD/build/stage4-toolchain.env.sh"
 STAGE4_BUILD_ENV_EVIDENCE="$PWD/build/stage4-toolchain.env.json"
 conda run -n slope-sim python scripts/verify_stage4_dependencies.py \
+  --cmake "$STAGE4_CMAKE_INPUT" \
+  --ctest "$STAGE4_CTEST_INPUT" \
+  --cc "$STAGE4_CC_INPUT" \
+  --cxx "$STAGE4_CXX_INPUT" \
+  --protoc "$STAGE4_PROTOC_INPUT" \
   --micromamba "$STAGE4_MICROMAMBA_INPUT" \
   --python-package-cache "$STAGE4_PYTHON_PACKAGE_CACHE_INPUT" \
   --python-wheel-cache "$STAGE4_PYTHON_WHEEL_CACHE_INPUT" \
   --source-archive-cache "$STAGE4_SOURCE_ARCHIVE_CACHE_INPUT" \
+  --dependency-prefix "$STAGE4_DEPENDENCY_PREFIX_INPUT" \
+  --pcl-pcd2ply "$STAGE4_PCL_PCD2PLY_INPUT" \
+  --system-lock "$PWD/packaging/locks/ubuntu24-system-dependencies.lock" \
+  --ldd "$STAGE4_LDD_INPUT" \
+  --dpkg-query "$STAGE4_DPKG_QUERY_INPUT" \
   --mid360-reference-lvx2 "$STAGE4_MID360_REFERENCE_LVX2_INPUT" \
   --rviz2 "$STAGE4_RVIZ2_INPUT" \
   --write-env "$STAGE4_BUILD_ENV_FILE" \
@@ -497,22 +521,20 @@ test -d "$STAGE4_PYTHON_PACKAGE_CACHE"
 test -d "$STAGE4_PYTHON_WHEEL_CACHE"
 test -d "$STAGE4_SOURCE_ARCHIVE_CACHE"
 conda run -n slope-sim python scripts/verify_python_lock_cache.py \
-  --environment packaging/python-environment.yml \
-  --toolchain-environment packaging/python-toolchain-environment.yml \
+  --runtime-spec packaging/python-environment.yml \
+  --toolchain-spec packaging/python-toolchain-environment.yml \
   --virtual-packages packaging/locks/virtual-packages.yml \
   --runtime-unified packaging/locks/python.conda-lock.yml \
   --runtime-explicit packaging/locks/python-linux-64.lock \
   --toolchain-unified packaging/locks/python-toolchain.conda-lock.yml \
   --toolchain-explicit packaging/locks/python-toolchain-linux-64.lock \
-  --toolchain packaging/locks/python-toolchain.lock \
   --cache-manifest packaging/locks/python-package-cache.manifest.json \
-  --cache-root "$STAGE4_PYTHON_PACKAGE_CACHE" \
-  --micromamba "$STAGE4_MICROMAMBA"
+  --cache-root "$STAGE4_PYTHON_PACKAGE_CACHE"
 ```
 
 Expected: rc=0；两组 lock 与 canonical artifact 一一对应，micromamba binary hash 精确匹配，artifact tree digest 固定，且 producer evidence 证明 fake channel 已完成“嵌套 artifact -> 每轮私有 native flat cache -> 严格断网 explicit create”的双根 GREEN；不存在 basename hash 碰撞。
 
-Run: `conda run -n slope-sim python scripts/verify_python_wheel_cache.py --manifest packaging/locks/python-wheel-cache.manifest.json --cache-root "$STAGE4_PYTHON_WHEEL_CACHE" --python-tag cp310 --abi-tag cp310 --platform-tag manylinux_2_28_x86_64`
+Run: `conda run -n slope-sim python scripts/verify_python_wheel_cache.py --manifest packaging/locks/python-wheel-cache.manifest.json --cache-root "$STAGE4_PYTHON_WHEEL_CACHE"`
 
 Expected: rc=0；唯一官方 eCAL 6.1.1 wheel 的 URL/filename/tag/size/SHA-256、METADATA/WHEEL/RECORD、全部 license/NOTICE 和 ELF/DSO inventory 精确匹配，未携带 `libprotobuf.so`，artifact 无链接或额外成员。
 

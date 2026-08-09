@@ -18,11 +18,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Verify stage 4 Python lock and cache inputs.")
     parser.add_argument("--runtime-spec", type=Path, required=True)
     parser.add_argument("--toolchain-spec", type=Path, required=True)
+    parser.add_argument("--protobuf-build-spec", type=Path)
     parser.add_argument("--virtual-packages", type=Path, required=True)
     parser.add_argument("--runtime-unified", type=Path)
     parser.add_argument("--runtime-explicit", type=Path)
     parser.add_argument("--toolchain-unified", type=Path)
     parser.add_argument("--toolchain-explicit", type=Path)
+    parser.add_argument("--protobuf-build-unified", type=Path)
+    parser.add_argument("--protobuf-build-explicit", type=Path)
     parser.add_argument("--cache-manifest", type=Path)
     parser.add_argument("--cache-root", type=Path)
     parser.add_argument("--static-only", action="store_true")
@@ -70,6 +73,22 @@ def _verify_toolchain_spec(document: dict[str, object]) -> None:
     }
     if not required.issubset(dependencies):
         raise ValueError("toolchain dependencies are missing required Conda packages")
+
+
+def _verify_protobuf_build_spec(document: dict[str, object]) -> None:
+    """确认私有 Protobuf recipe 的编译器闭包从独立声明冻结。"""
+    dependencies = _dependencies(document, "protobuf build")
+    required = {
+        "cmake=3.28",
+        "ninja",
+        "gcc_linux-64=13",
+        "gxx_linux-64=13",
+        "sysroot_linux-64=2.17",
+    }
+    if not all(isinstance(item, str) for item in dependencies) or not required.issubset(
+        dependencies
+    ):
+        raise ValueError("protobuf build dependencies are missing required Conda packages")
 
 
 def _verify_virtual_packages(document: dict[str, object]) -> None:
@@ -164,7 +183,9 @@ def _verify_lock_pair(unified_path: Path, explicit_path: Path, label: str) -> No
         raise ValueError("explicit lock packages differ from unified records")
 
 
-def _require_frozen_lock_paths(args: argparse.Namespace) -> tuple[Path, Path, Path, Path]:
+def _require_frozen_lock_paths(
+    args: argparse.Namespace,
+) -> tuple[tuple[Path, Path, Path, Path], tuple[Path, Path] | None]:
     """仅在非静态模式接收四份明确锁文件，避免按目录或默认名猜测。"""
     names = (
         "runtime_unified",
@@ -175,7 +196,17 @@ def _require_frozen_lock_paths(args: argparse.Namespace) -> tuple[Path, Path, Pa
     paths = tuple(getattr(args, name) for name in names)
     if any(path is None for path in paths):
         raise ValueError("frozen lock verification requires all unified and explicit lock paths")
-    return tuple(Path(path) for path in paths)  # type: ignore[arg-type,return-value]
+    build_paths = (args.protobuf_build_unified, args.protobuf_build_explicit)
+    if any(path is None for path in build_paths) and not all(
+        path is None for path in build_paths
+    ):
+        raise ValueError("protobuf build unified and explicit locks must be supplied together")
+    return (
+        tuple(Path(path) for path in paths),  # type: ignore[arg-type,return-value]
+        None
+        if all(path is None for path in build_paths)
+        else tuple(Path(path) for path in build_paths),  # type: ignore[arg-type,return-value]
+    )
 
 
 def _canonical_archive_relative_path(url: str) -> tuple[str, str]:
@@ -204,10 +235,15 @@ def _archive_digests(path: Path) -> tuple[int, str, str]:
 def _expected_cache_records(
     runtime_records: dict[str, tuple[str, str]],
     toolchain_records: dict[str, tuple[str, str]],
+    *,
+    protobuf_build_records: dict[str, tuple[str, str]] | None = None,
 ) -> dict[str, tuple[str, str, frozenset[str]]]:
-    """合并两份 unified lock，并拒绝同 URL 的不一致摘要。"""
+    """合并 runtime、toolchain 与可选 build lock，拒绝同 URL 摘要漂移。"""
     expected: dict[str, tuple[str, str, frozenset[str]]] = {}
-    for label, records in (("runtime", runtime_records), ("toolchain", toolchain_records)):
+    sources = (("runtime", runtime_records), ("toolchain", toolchain_records))
+    if protobuf_build_records is not None:
+        sources += (("protobuf_build", protobuf_build_records),)
+    for label, records in sources:
         for url, (md5, sha256) in records.items():
             previous = expected.get(url)
             if previous is not None and previous[:2] != (md5, sha256):
@@ -254,6 +290,7 @@ def _verify_cache_manifest(
     cache_root: Path,
     runtime_records: dict[str, tuple[str, str]],
     toolchain_records: dict[str, tuple[str, str]],
+    protobuf_build_records: dict[str, tuple[str, str]] | None = None,
 ) -> None:
     """校验 canonical cache 清单、锁身份与 archive bytes 一一对应。"""
     document = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -262,7 +299,11 @@ def _verify_cache_manifest(
     archives = document.get("archives")
     if not isinstance(archives, list):
         raise ValueError("package cache manifest must contain archives")
-    expected = _expected_cache_records(runtime_records, toolchain_records)
+    expected = _expected_cache_records(
+        runtime_records,
+        toolchain_records,
+        protobuf_build_records=protobuf_build_records,
+    )
     seen_urls: set[str] = set()
     seen_paths: set[str] = set()
     for record in archives:
@@ -323,6 +364,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         virtual_packages = _load_mapping(args.virtual_packages, "virtual package spec")
         _verify_runtime_spec(runtime)
         _verify_toolchain_spec(toolchain)
+        if args.protobuf_build_spec is not None:
+            _verify_protobuf_build_spec(
+                _load_mapping(args.protobuf_build_spec, "protobuf build spec")
+            )
         _verify_virtual_packages(virtual_packages)
         if args.static_only:
             if any(
@@ -332,6 +377,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "runtime_explicit",
                     "toolchain_unified",
                     "toolchain_explicit",
+                    "protobuf_build_unified",
+                    "protobuf_build_explicit",
                     "cache_manifest",
                     "cache_root",
                 )
@@ -339,11 +386,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise ValueError("--static-only cannot be combined with frozen lock paths")
             print("PASS: stage 4 Python static environment inputs verified")
             return 0
-        runtime_unified, runtime_explicit, toolchain_unified, toolchain_explicit = (
-            _require_frozen_lock_paths(args)
-        )
+        lock_paths, protobuf_build_lock_paths = _require_frozen_lock_paths(args)
+        runtime_unified, runtime_explicit, toolchain_unified, toolchain_explicit = lock_paths
         _verify_lock_pair(runtime_unified, runtime_explicit, "runtime")
         _verify_lock_pair(toolchain_unified, toolchain_explicit, "toolchain")
+        protobuf_build_records = None
+        if protobuf_build_lock_paths is not None:
+            protobuf_build_unified, protobuf_build_explicit = protobuf_build_lock_paths
+            _verify_lock_pair(
+                protobuf_build_unified, protobuf_build_explicit, "protobuf build"
+            )
+            protobuf_build_records = _unified_conda_records(
+                protobuf_build_unified, "protobuf build"
+            )
         if (args.cache_manifest is None) != (args.cache_root is None):
             raise ValueError("cache verification requires both --cache-manifest and --cache-root")
         if args.cache_manifest is not None:
@@ -352,6 +407,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.cache_root,
                 _unified_conda_records(runtime_unified, "runtime"),
                 _unified_conda_records(toolchain_unified, "toolchain"),
+                protobuf_build_records,
             )
         print("PASS: stage 4 Python unified and explicit locks verified")
         return 0

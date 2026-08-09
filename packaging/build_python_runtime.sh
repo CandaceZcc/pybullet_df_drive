@@ -82,11 +82,14 @@ for required_source_file in \
   "$SOURCE/pyproject.toml" \
   "$SOURCE/packaging/python-environment.yml" \
   "$SOURCE/packaging/python-toolchain-environment.yml" \
+  "$SOURCE/packaging/python-protobuf-build-environment.yml" \
   "$SOURCE/packaging/locks/virtual-packages.yml" \
   "$SOURCE/packaging/locks/python.conda-lock.yml" \
   "$SOURCE/packaging/locks/python-linux-64.lock" \
   "$SOURCE/packaging/locks/python-toolchain.conda-lock.yml" \
   "$SOURCE/packaging/locks/python-toolchain-linux-64.lock" \
+  "$SOURCE/packaging/locks/python-protobuf-build.conda-lock.yml" \
+  "$SOURCE/packaging/locks/python-protobuf-build-linux-64.lock" \
   "$SOURCE/packaging/locks/python-package-cache.manifest.json" \
   "$SOURCE/packaging/locks/python-wheel-cache.manifest.json" \
   "$SOURCE/scripts/freeze_python_lock_cache.py" \
@@ -108,11 +111,14 @@ python3 "$SOURCE/scripts/freeze_python_lock_cache.py" \
 python3 "$SOURCE/scripts/verify_python_lock_cache.py" \
   --runtime-spec "$SOURCE/packaging/python-environment.yml" \
   --toolchain-spec "$SOURCE/packaging/python-toolchain-environment.yml" \
+  --protobuf-build-spec "$SOURCE/packaging/python-protobuf-build-environment.yml" \
   --virtual-packages "$SOURCE/packaging/locks/virtual-packages.yml" \
   --runtime-unified "$SOURCE/packaging/locks/python.conda-lock.yml" \
   --runtime-explicit "$SOURCE/packaging/locks/python-linux-64.lock" \
   --toolchain-unified "$SOURCE/packaging/locks/python-toolchain.conda-lock.yml" \
   --toolchain-explicit "$SOURCE/packaging/locks/python-toolchain-linux-64.lock" \
+  --protobuf-build-unified "$SOURCE/packaging/locks/python-protobuf-build.conda-lock.yml" \
+  --protobuf-build-explicit "$SOURCE/packaging/locks/python-protobuf-build-linux-64.lock" \
   --cache-manifest "$SOURCE/packaging/locks/python-package-cache.manifest.json" \
   --cache-root "$PACKAGE_CACHE" >/dev/null || fail "Python lock and package cache verification failed"
 python3 "$SOURCE/scripts/verify_python_wheel_cache.py" \

@@ -32,6 +32,111 @@
       }
     },
     {
+      "name": "ecal-asio",
+      "url": "https://github.com/chriskohlhoff/asio/archive/ed6aa8a13d51dfc6c00ae453fc9fb7df5d6ea963.tar.gz",
+      "ref_kind": "commit",
+      "ref": "ed6aa8a13d51dfc6c00ae453fc9fb7df5d6ea963",
+      "commit": "ed6aa8a13d51dfc6c00ae453fc9fb7df5d6ea963",
+      "license": "BSL-1.0",
+      "license_files": ["asio/COPYING", "asio/LICENSE_1_0.txt"],
+      "consumers": ["cpp_dependency"],
+      "archive": {
+        "format": "tar.gz",
+        "size": 2851316,
+        "sha256": "9d4619e1ea963d3c72c8dc07d5d8c9c4fab67141990b4f8cb10e5d8ad2c83f42"
+      }
+    },
+    {
+      "name": "ecal-ecaludp",
+      "url": "https://github.com/eclipse-ecal/ecaludp/archive/96e29b8cecfc56a627f7920d972930ebc62d1e79.tar.gz",
+      "ref_kind": "commit",
+      "ref": "96e29b8cecfc56a627f7920d972930ebc62d1e79",
+      "commit": "96e29b8cecfc56a627f7920d972930ebc62d1e79",
+      "license": "Apache-2.0",
+      "license_files": ["LICENSE"],
+      "consumers": ["cpp_dependency"],
+      "archive": {
+        "format": "tar.gz",
+        "size": 56232,
+        "sha256": "aaea85d04fe288860ec05078b5ff5472d356ec42f2e15ae9882597b88842235c"
+      }
+    },
+    {
+      "name": "ecal-protozero",
+      "url": "https://github.com/mapbox/protozero/archive/89a55ad2962cca3adbe8383a4b6d9a8411352ef2.tar.gz",
+      "ref_kind": "commit",
+      "ref": "89a55ad2962cca3adbe8383a4b6d9a8411352ef2",
+      "commit": "89a55ad2962cca3adbe8383a4b6d9a8411352ef2",
+      "license": "BSD-2-Clause",
+      "license_files": ["LICENSE.md", "LICENSE.from_folly"],
+      "consumers": ["cpp_dependency"],
+      "archive": {
+        "format": "tar.gz",
+        "size": 1125465,
+        "sha256": "e2b73677a09b57bcb17906a56d4c9ca119a45f66a3195fa1d6f101a8888ac2c7"
+      }
+    },
+    {
+      "name": "ecal-recycle",
+      "url": "https://github.com/steinwurf/recycle/archive/3f3d27ecdee87af9167adf1d2c2345ca2cbe1c94.tar.gz",
+      "ref_kind": "commit",
+      "ref": "3f3d27ecdee87af9167adf1d2c2345ca2cbe1c94",
+      "commit": "3f3d27ecdee87af9167adf1d2c2345ca2cbe1c94",
+      "license": "BSD-3-Clause",
+      "license_files": ["LICENSE.rst"],
+      "consumers": ["cpp_dependency"],
+      "archive": {
+        "format": "tar.gz",
+        "size": 132951,
+        "sha256": "c5227da34959120dac49aceba0a34d294d39a6f56ffbf93e10cb6fe98fd7635f"
+      }
+    },
+    {
+      "name": "ecal-tclap",
+      "url": "https://github.com/DAarno/tclap/archive/58c5c8ef24111072fc21fb723f8ab45d23395809.tar.gz",
+      "ref_kind": "commit",
+      "ref": "58c5c8ef24111072fc21fb723f8ab45d23395809",
+      "commit": "58c5c8ef24111072fc21fb723f8ab45d23395809",
+      "license": "MIT",
+      "license_files": ["COPYING"],
+      "consumers": ["cpp_dependency"],
+      "archive": {
+        "format": "tar.gz",
+        "size": 130256,
+        "sha256": "8e02340d1ca762f9b7c49c62c8f07a37fc9f9f87d58051987ce7e73a95921871"
+      }
+    },
+    {
+      "name": "ecal-tcp-pubsub",
+      "url": "https://github.com/eclipse-ecal/tcp_pubsub/archive/352e711b9ef10fec42ba7536bda244f43bf092cc.tar.gz",
+      "ref_kind": "commit",
+      "ref": "352e711b9ef10fec42ba7536bda244f43bf092cc",
+      "commit": "352e711b9ef10fec42ba7536bda244f43bf092cc",
+      "license": "MIT",
+      "license_files": ["LICENSE"],
+      "consumers": ["cpp_dependency"],
+      "archive": {
+        "format": "tar.gz",
+        "size": 39984,
+        "sha256": "984077107af61399b1d15698f47da17b2d88defbca0a6a2e4e58a6b7cd0acdde"
+      }
+    },
+    {
+      "name": "ecal-yaml-cpp",
+      "url": "https://github.com/jbeder/yaml-cpp/archive/3d2888cc8a45da2f420454ad728cdfad01a3d54f.tar.gz",
+      "ref_kind": "commit",
+      "ref": "3d2888cc8a45da2f420454ad728cdfad01a3d54f",
+      "commit": "3d2888cc8a45da2f420454ad728cdfad01a3d54f",
+      "license": "MIT",
+      "license_files": ["LICENSE"],
+      "consumers": ["cpp_dependency"],
+      "archive": {
+        "format": "tar.gz",
+        "size": 1023183,
+        "sha256": "1ed4333bf0ede41dcc653edca89aaa48e0a036a5b7b58ee1126439072b4888c6"
+      }
+    },
+    {
       "name": "protobuf",
       "url": "https://github.com/protocolbuffers/protobuf/archive/refs/tags/v33.6.tar.gz",
       "ref_kind": "tag",

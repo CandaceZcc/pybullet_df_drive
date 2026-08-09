@@ -23,11 +23,14 @@ def _write_python_runtime_builder_fixture(source: Path, micromamba_record: Path)
         "pyproject.toml",
         "packaging/python-environment.yml",
         "packaging/python-toolchain-environment.yml",
+        "packaging/python-protobuf-build-environment.yml",
         "packaging/locks/virtual-packages.yml",
         "packaging/locks/python.conda-lock.yml",
         "packaging/locks/python-linux-64.lock",
         "packaging/locks/python-toolchain.conda-lock.yml",
         "packaging/locks/python-toolchain-linux-64.lock",
+        "packaging/locks/python-protobuf-build.conda-lock.yml",
+        "packaging/locks/python-protobuf-build-linux-64.lock",
         "packaging/locks/python-package-cache.manifest.json",
     ):
         (source / relative_path).write_text("fixture\n", encoding="utf-8")

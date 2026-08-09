@@ -72,6 +72,167 @@
     {
       "archive": {
         "format": "tar.gz",
+        "sha256": "9d4619e1ea963d3c72c8dc07d5d8c9c4fab67141990b4f8cb10e5d8ad2c83f42",
+        "size": 2851316
+      },
+      "commit": "ed6aa8a13d51dfc6c00ae453fc9fb7df5d6ea963",
+      "consumers": [
+        "cpp_dependency"
+      ],
+      "materialized_member_count": 1532,
+      "materialized_regular_bytes": 15807448,
+      "materialized_tree_sha256": "ccb076ab27ad26d0aa0eb5a182c1c9d13a87c67ffc50abc428bfb0d51c7fd248",
+      "member_count": 1655,
+      "name": "ecal-asio",
+      "ref": "ed6aa8a13d51dfc6c00ae453fc9fb7df5d6ea963",
+      "ref_kind": "commit",
+      "regular_bytes": 15807448,
+      "relative_path": "archives/9d4619e1ea963d3c72c8dc07d5d8c9c4fab67141990b4f8cb10e5d8ad2c83f42/ed6aa8a13d51dfc6c00ae453fc9fb7df5d6ea963.tar.gz",
+      "symlink_count": 0,
+      "top_level_root": "asio-ed6aa8a13d51dfc6c00ae453fc9fb7df5d6ea963",
+      "url": "https://github.com/chriskohlhoff/asio/archive/ed6aa8a13d51dfc6c00ae453fc9fb7df5d6ea963.tar.gz"
+    },
+    {
+      "archive": {
+        "format": "tar.gz",
+        "sha256": "aaea85d04fe288860ec05078b5ff5472d356ec42f2e15ae9882597b88842235c",
+        "size": 56232
+      },
+      "commit": "96e29b8cecfc56a627f7920d972930ebc62d1e79",
+      "consumers": [
+        "cpp_dependency"
+      ],
+      "materialized_member_count": 88,
+      "materialized_regular_bytes": 364833,
+      "materialized_tree_sha256": "fe6c6678b4becf2deb32a8d11783df12a95e36defde06bb2804588908ccd22ce",
+      "member_count": 127,
+      "name": "ecal-ecaludp",
+      "ref": "96e29b8cecfc56a627f7920d972930ebc62d1e79",
+      "ref_kind": "commit",
+      "regular_bytes": 364833,
+      "relative_path": "archives/aaea85d04fe288860ec05078b5ff5472d356ec42f2e15ae9882597b88842235c/96e29b8cecfc56a627f7920d972930ebc62d1e79.tar.gz",
+      "symlink_count": 0,
+      "top_level_root": "ecaludp-96e29b8cecfc56a627f7920d972930ebc62d1e79",
+      "url": "https://github.com/eclipse-ecal/ecaludp/archive/96e29b8cecfc56a627f7920d972930ebc62d1e79.tar.gz"
+    },
+    {
+      "archive": {
+        "format": "tar.gz",
+        "sha256": "e2b73677a09b57bcb17906a56d4c9ca119a45f66a3195fa1d6f101a8888ac2c7",
+        "size": 1125465
+      },
+      "commit": "89a55ad2962cca3adbe8383a4b6d9a8411352ef2",
+      "consumers": [
+        "cpp_dependency"
+      ],
+      "materialized_member_count": 336,
+      "materialized_regular_bytes": 2248320,
+      "materialized_tree_sha256": "f026eeaa441017f6ac63d804a14cdc4a93396f0b43c6c3991b9bbaeee9e4a7f8",
+      "member_count": 400,
+      "name": "ecal-protozero",
+      "ref": "89a55ad2962cca3adbe8383a4b6d9a8411352ef2",
+      "ref_kind": "commit",
+      "regular_bytes": 2248320,
+      "relative_path": "archives/e2b73677a09b57bcb17906a56d4c9ca119a45f66a3195fa1d6f101a8888ac2c7/89a55ad2962cca3adbe8383a4b6d9a8411352ef2.tar.gz",
+      "symlink_count": 0,
+      "top_level_root": "protozero-89a55ad2962cca3adbe8383a4b6d9a8411352ef2",
+      "url": "https://github.com/mapbox/protozero/archive/89a55ad2962cca3adbe8383a4b6d9a8411352ef2.tar.gz"
+    },
+    {
+      "archive": {
+        "format": "tar.gz",
+        "sha256": "c5227da34959120dac49aceba0a34d294d39a6f56ffbf93e10cb6fe98fd7635f",
+        "size": 132951
+      },
+      "commit": "3f3d27ecdee87af9167adf1d2c2345ca2cbe1c94",
+      "consumers": [
+        "cpp_dependency"
+      ],
+      "materialized_member_count": 29,
+      "materialized_regular_bytes": 186699,
+      "materialized_tree_sha256": "dff318dcf3908bd5068e3787886e7e7c343aa57f5cda78f4963292f9219373e4",
+      "member_count": 36,
+      "name": "ecal-recycle",
+      "ref": "3f3d27ecdee87af9167adf1d2c2345ca2cbe1c94",
+      "ref_kind": "commit",
+      "regular_bytes": 186699,
+      "relative_path": "archives/c5227da34959120dac49aceba0a34d294d39a6f56ffbf93e10cb6fe98fd7635f/3f3d27ecdee87af9167adf1d2c2345ca2cbe1c94.tar.gz",
+      "symlink_count": 0,
+      "top_level_root": "recycle-3f3d27ecdee87af9167adf1d2c2345ca2cbe1c94",
+      "url": "https://github.com/steinwurf/recycle/archive/3f3d27ecdee87af9167adf1d2c2345ca2cbe1c94.tar.gz"
+    },
+    {
+      "archive": {
+        "format": "tar.gz",
+        "sha256": "8e02340d1ca762f9b7c49c62c8f07a37fc9f9f87d58051987ce7e73a95921871",
+        "size": 130256
+      },
+      "commit": "58c5c8ef24111072fc21fb723f8ab45d23395809",
+      "consumers": [
+        "cpp_dependency"
+      ],
+      "materialized_member_count": 298,
+      "materialized_regular_bytes": 599680,
+      "materialized_tree_sha256": "d3a6ef11ed2a197cf5555ec484fc782e139cd0339df94a874971c9624f065b4a",
+      "member_count": 308,
+      "name": "ecal-tclap",
+      "ref": "58c5c8ef24111072fc21fb723f8ab45d23395809",
+      "ref_kind": "commit",
+      "regular_bytes": 599680,
+      "relative_path": "archives/8e02340d1ca762f9b7c49c62c8f07a37fc9f9f87d58051987ce7e73a95921871/58c5c8ef24111072fc21fb723f8ab45d23395809.tar.gz",
+      "symlink_count": 0,
+      "top_level_root": "tclap-58c5c8ef24111072fc21fb723f8ab45d23395809",
+      "url": "https://github.com/DAarno/tclap/archive/58c5c8ef24111072fc21fb723f8ab45d23395809.tar.gz"
+    },
+    {
+      "archive": {
+        "format": "tar.gz",
+        "sha256": "984077107af61399b1d15698f47da17b2d88defbca0a6a2e4e58a6b7cd0acdde",
+        "size": 39984
+      },
+      "commit": "352e711b9ef10fec42ba7536bda244f43bf092cc",
+      "consumers": [
+        "cpp_dependency"
+      ],
+      "materialized_member_count": 63,
+      "materialized_regular_bytes": 200929,
+      "materialized_tree_sha256": "530b362b3ba9e42ccd7536c28e8211ffa4dbb4de47bb58c57c3568c283c16720",
+      "member_count": 101,
+      "name": "ecal-tcp-pubsub",
+      "ref": "352e711b9ef10fec42ba7536bda244f43bf092cc",
+      "ref_kind": "commit",
+      "regular_bytes": 200929,
+      "relative_path": "archives/984077107af61399b1d15698f47da17b2d88defbca0a6a2e4e58a6b7cd0acdde/352e711b9ef10fec42ba7536bda244f43bf092cc.tar.gz",
+      "symlink_count": 0,
+      "top_level_root": "tcp_pubsub-352e711b9ef10fec42ba7536bda244f43bf092cc",
+      "url": "https://github.com/eclipse-ecal/tcp_pubsub/archive/352e711b9ef10fec42ba7536bda244f43bf092cc.tar.gz"
+    },
+    {
+      "archive": {
+        "format": "tar.gz",
+        "sha256": "1ed4333bf0ede41dcc653edca89aaa48e0a036a5b7b58ee1126439072b4888c6",
+        "size": 1023183
+      },
+      "commit": "3d2888cc8a45da2f420454ad728cdfad01a3d54f",
+      "consumers": [
+        "cpp_dependency"
+      ],
+      "materialized_member_count": 403,
+      "materialized_regular_bytes": 4931640,
+      "materialized_tree_sha256": "b81fce640f7576842333d7954c37800794593f010a4633f2aaa5295c600aee1a",
+      "member_count": 453,
+      "name": "ecal-yaml-cpp",
+      "ref": "3d2888cc8a45da2f420454ad728cdfad01a3d54f",
+      "ref_kind": "commit",
+      "regular_bytes": 4931640,
+      "relative_path": "archives/1ed4333bf0ede41dcc653edca89aaa48e0a036a5b7b58ee1126439072b4888c6/3d2888cc8a45da2f420454ad728cdfad01a3d54f.tar.gz",
+      "symlink_count": 0,
+      "top_level_root": "yaml-cpp-3d2888cc8a45da2f420454ad728cdfad01a3d54f",
+      "url": "https://github.com/jbeder/yaml-cpp/archive/3d2888cc8a45da2f420454ad728cdfad01a3d54f.tar.gz"
+    },
+    {
+      "archive": {
+        "format": "tar.gz",
         "sha256": "185e2fec89c06bec1abf2e2ededc4be23fc6d5347cc88b992f84074bc3795c76",
         "size": 166453
       },

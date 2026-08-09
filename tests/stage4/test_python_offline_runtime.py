@@ -20,16 +20,28 @@ import yaml
 ROOT = Path(__file__).resolve().parents[2]
 RUNTIME_SPEC = ROOT / "packaging" / "python-environment.yml"
 TOOLCHAIN_SPEC = ROOT / "packaging" / "python-toolchain-environment.yml"
+PROTOBUF_BUILD_SPEC = ROOT / "packaging" / "python-protobuf-build-environment.yml"
 VIRTUAL_PACKAGES = ROOT / "packaging" / "locks" / "virtual-packages.yml"
 LOCK_CACHE_VERIFIER = ROOT / "scripts" / "verify_python_lock_cache.py"
 LOCK_CACHE_FREEZER = ROOT / "scripts" / "freeze_python_lock_cache.py"
 WHEEL_CACHE_VERIFIER = ROOT / "scripts" / "verify_python_wheel_cache.py"
 WHEEL_CACHE_FREEZER = ROOT / "scripts" / "freeze_python_wheel_cache.py"
 PRIVATE_PROTOBUF_BUILDER = ROOT / "scripts" / "build_private_protobuf_conda.py"
+PRIVATE_PROTOBUF_CANONICALIZER = ROOT / "scripts" / "canonicalize_private_conda_package.py"
+PRIVATE_PROTOBUF_BUILD_PYTHON = (
+    ROOT
+    / "build"
+    / "stage4-python-producers"
+    / "micromamba.JFOCPK"
+    / "lock-env-conda-build"
+    / "bin"
+    / "python"
+)
 PRIVATE_PROTOBUF_RECIPE = ROOT / "packaging" / "recipes" / "protobuf-python" / "meta.yaml"
 PRIVATE_PROTOBUF_VARIANTS = PRIVATE_PROTOBUF_RECIPE.parent / "conda_build_config.yaml"
 PYTHON_CACHE_MATERIALIZER = ROOT / "scripts" / "materialize_python_package_cache.py"
 PYTHON_WHEEL_MATERIALIZER = ROOT / "scripts" / "materialize_python_wheel_cache.py"
+PYTHON_RUNTIME_BUILDER = ROOT / "packaging" / "build_python_runtime.sh"
 RUNTIME_ECAL_INSTALL_VERIFIER = ROOT / "scripts" / "verify_python_runtime_ecal_install.py"
 RUNTIME_TREE_SANITIZER = ROOT / "scripts" / "sanitize_python_runtime_tree.py"
 RUNTIME_ISOLATION_VERIFIER = ROOT / "scripts" / "verify_python_runtime_isolation.py"
@@ -670,6 +682,85 @@ def test_python_environment_specs_separate_runtime_from_toolchain_without_pip() 
     assert isinstance(virtual_packages, dict) and virtual_packages
 
 
+def test_private_protobuf_build_spec_pins_recipe_solver_inputs() -> None:
+    """私有 Protobuf 生产器的 build 闭包必须从独立人工声明开始冻结。"""
+    assert PROTOBUF_BUILD_SPEC.is_file(), "private protobuf build spec is not implemented"
+    build = yaml.safe_load(PROTOBUF_BUILD_SPEC.read_text(encoding="utf-8"))
+    dependencies = _dependencies(build)
+
+    assert build.get("name") == "slope-sim-stage4-protobuf-build"
+    assert build.get("channels") == ["conda-forge"]
+    assert set(dependencies) == {
+        "cmake=3.28",
+        "ninja",
+        "gcc_linux-64=13",
+        "gxx_linux-64=13",
+        "sysroot_linux-64=2.17",
+        "libzlib=1.2.13",
+    }
+
+
+def test_python_runtime_builder_verifies_private_protobuf_build_lock_inputs() -> None:
+    """正式 runtime builder 必须在物化 cache 前验证私有 Protobuf build 闭包。"""
+    text = PYTHON_RUNTIME_BUILDER.read_text(encoding="utf-8")
+
+    for path in (
+        "packaging/python-protobuf-build-environment.yml",
+        "packaging/locks/python-protobuf-build.conda-lock.yml",
+        "packaging/locks/python-protobuf-build-linux-64.lock",
+    ):
+        assert path in text
+    assert "--protobuf-build-spec" in text
+    assert "--protobuf-build-unified" in text
+    assert "--protobuf-build-explicit" in text
+
+
+def test_python_lock_verifier_requires_private_protobuf_build_inputs(tmp_path) -> None:
+    """静态 verifier 必须拒绝缺少 sysroot 的私有 Protobuf build 声明。"""
+    runtime = tmp_path / "runtime.yml"
+    toolchain = tmp_path / "toolchain.yml"
+    protobuf_build = tmp_path / "protobuf-build.yml"
+    virtual_packages = tmp_path / "virtual-packages.yml"
+    runtime.write_text(
+        """name: runtime\nchannels: [conda-forge]\ndependencies:\n  - python=3.10\n  - protobuf=6.33.6\n  - packaging\n""",
+        encoding="utf-8",
+    )
+    toolchain.write_text(
+        """name: toolchain\nchannels: [conda-forge]\ndependencies:\n  - python=3.10\n  - python-build\n  - conda-build\n  - pip\n  - conda-lock=4.0.2\n  - conda-pack=0.9.2\n""",
+        encoding="utf-8",
+    )
+    protobuf_build.write_text(
+        """name: protobuf-build\nchannels: [conda-forge]\ndependencies:\n  - cmake=3.28\n  - ninja\n  - gcc_linux-64=13\n  - gxx_linux-64=13\n""",
+        encoding="utf-8",
+    )
+    virtual_packages.write_text(
+        """subdirs:\n  linux-64:\n    packages:\n      __archspec: 1=x86_64\n      __glibc: \"2.28\"\n      __linux: \"5.15\"\n      __unix: \"0\"\n""",
+        encoding="utf-8",
+    )
+
+    rejected = subprocess.run(
+        [
+            sys.executable,
+            str(LOCK_CACHE_VERIFIER),
+            "--runtime-spec",
+            str(runtime),
+            "--toolchain-spec",
+            str(toolchain),
+            "--protobuf-build-spec",
+            str(protobuf_build),
+            "--virtual-packages",
+            str(virtual_packages),
+            "--static-only",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert rejected.returncode != 0
+    assert "protobuf build dependencies are missing required Conda packages" in rejected.stdout
+
+
 def test_python_lock_verifier_rejects_runtime_pip_dependencies(tmp_path) -> None:
     """静态 verifier 必须在锁解析前拒绝 runtime 的 pip 求解分支。"""
     assert LOCK_CACHE_VERIFIER.is_file(), "stage 4 python lock cache verifier is not implemented"
@@ -846,6 +937,64 @@ def test_python_lock_verifier_crosschecks_explicit_urls_with_unified_records(tmp
     md5_drift = subprocess.run(command, check=False, capture_output=True, text=True)
     assert md5_drift.returncode != 0
     assert "explicit lock MD5 differs from unified record" in md5_drift.stdout
+
+
+def test_python_lock_verifier_labels_private_protobuf_build_records() -> None:
+    """build-only 归档必须以独立标签进入 canonical cache identity。"""
+    scripts_dir = str(LOCK_CACHE_VERIFIER.parent)
+    sys.path.insert(0, scripts_dir)
+    try:
+        module_spec = importlib.util.spec_from_file_location(
+            "stage4_verify_python_lock_cache", LOCK_CACHE_VERIFIER
+        )
+        assert module_spec is not None and module_spec.loader is not None
+        module = importlib.util.module_from_spec(module_spec)
+        module_spec.loader.exec_module(module)
+    finally:
+        sys.path.remove(scripts_dir)
+
+    url = "https://packages.example.invalid/linux-64/cmake-3.28.4-0.conda"
+    records = module._expected_cache_records(
+        {},
+        {},
+        protobuf_build_records={url: ("0" * 32, "a" * 64)},
+    )
+
+    assert records == {url: ("0" * 32, "a" * 64, frozenset({"protobuf_build"}))}
+
+
+def test_python_lock_verifier_requires_complete_private_protobuf_build_lock_pair(tmp_path) -> None:
+    """私有 Protobuf build 的 unified/explicit lock 不得允许半份输入。"""
+    rejected = subprocess.run(
+        [
+            sys.executable,
+            str(LOCK_CACHE_VERIFIER),
+            "--runtime-spec",
+            str(RUNTIME_SPEC),
+            "--toolchain-spec",
+            str(TOOLCHAIN_SPEC),
+            "--protobuf-build-spec",
+            str(PROTOBUF_BUILD_SPEC),
+            "--virtual-packages",
+            str(VIRTUAL_PACKAGES),
+            "--runtime-unified",
+            str(tmp_path / "runtime.conda-lock.yml"),
+            "--runtime-explicit",
+            str(tmp_path / "runtime-linux-64.lock"),
+            "--toolchain-unified",
+            str(tmp_path / "toolchain.conda-lock.yml"),
+            "--toolchain-explicit",
+            str(tmp_path / "toolchain-linux-64.lock"),
+            "--protobuf-build-unified",
+            str(tmp_path / "protobuf-build.conda-lock.yml"),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert rejected.returncode != 0
+    assert "protobuf build unified and explicit locks must be supplied together" in rejected.stdout
 
 
 def test_python_lock_verifier_crosschecks_canonical_cache_archives(tmp_path) -> None:
@@ -1058,6 +1207,74 @@ def test_python_lock_freezer_runs_pinned_lock_and_render_commands(tmp_path) -> N
     assert toolchain_unified.is_file() and toolchain_explicit.is_file()
 
 
+def test_python_lock_freezer_constructs_private_protobuf_build_lock_commands(tmp_path) -> None:
+    """私有 Protobuf build 闭包必须使用同一 pinned conda-lock 生成双格式锁。"""
+    scripts_dir = str(LOCK_CACHE_FREEZER.parent)
+    sys.path.insert(0, scripts_dir)
+    try:
+        module_spec = importlib.util.spec_from_file_location(
+            "stage4_freeze_python_lock_cache", LOCK_CACHE_FREEZER
+        )
+        assert module_spec is not None and module_spec.loader is not None
+        module = importlib.util.module_from_spec(module_spec)
+        module_spec.loader.exec_module(module)
+    finally:
+        sys.path.remove(scripts_dir)
+
+    conda_lock = tmp_path / "lock-env" / "bin" / "conda-lock"
+    micromamba = tmp_path / "micromamba"
+    build_unified = tmp_path / "protobuf-build.conda-lock.yml"
+    build_explicit = tmp_path / "protobuf-build-linux-64.lock"
+    commands = module._lock_commands(
+        conda_lock=conda_lock,
+        micromamba=micromamba,
+        runtime_spec=tmp_path / "runtime.yml",
+        toolchain_spec=tmp_path / "toolchain.yml",
+        protobuf_build_spec=tmp_path / "protobuf-build.yml",
+        virtual_packages=tmp_path / "virtual-packages.yml",
+        runtime_unified=tmp_path / "runtime.conda-lock.yml",
+        runtime_explicit=tmp_path / "runtime-linux-64.lock",
+        toolchain_unified=tmp_path / "toolchain.conda-lock.yml",
+        toolchain_explicit=tmp_path / "toolchain-linux-64.lock",
+        protobuf_build_unified=build_unified,
+        protobuf_build_explicit=build_explicit,
+    )
+
+    assert commands[-2:] == (
+        (
+            str(conda_lock),
+            "lock",
+            "--conda",
+            str(micromamba),
+            "--no-mamba",
+            "--no-micromamba",
+            "--file",
+            str(tmp_path / "protobuf-build.yml"),
+            "--platform",
+            "linux-64",
+            "--kind",
+            "lock",
+            "--lockfile",
+            str(build_unified),
+            "--virtual-package-spec",
+            str(tmp_path / "virtual-packages.yml"),
+            "--no-dev-dependencies",
+        ),
+        (
+            str(conda_lock),
+            "render",
+            "--kind",
+            "explicit",
+            "--platform",
+            "linux-64",
+            "--no-dev-dependencies",
+            "--filename-template",
+            str(tmp_path / "protobuf-build-{platform}.lock"),
+            str(build_unified),
+        ),
+    )
+
+
 def test_python_lock_freezer_constructs_isolated_download_commands(tmp_path) -> None:
     """下载锁包时必须固定本轮 CA、seed root 与两个独立 prefix。"""
     scripts_dir = str(LOCK_CACHE_FREEZER.parent)
@@ -1123,6 +1340,50 @@ def test_python_lock_freezer_constructs_isolated_download_commands(tmp_path) -> 
             "enabled",
             "--yes",
         ),
+    )
+
+
+def test_python_lock_freezer_downloads_private_protobuf_build_lock(tmp_path) -> None:
+    """私有 Protobuf build lock 必须使用独立 prefix 的 download-only 命令。"""
+    scripts_dir = str(LOCK_CACHE_FREEZER.parent)
+    sys.path.insert(0, scripts_dir)
+    try:
+        module_spec = importlib.util.spec_from_file_location(
+            "stage4_freeze_python_lock_cache", LOCK_CACHE_FREEZER
+        )
+        assert module_spec is not None and module_spec.loader is not None
+        module = importlib.util.module_from_spec(module_spec)
+        module_spec.loader.exec_module(module)
+    finally:
+        sys.path.remove(scripts_dir)
+
+    commands = module._download_commands(
+        micromamba=tmp_path / "micromamba",
+        ca_bundle=tmp_path / "channel-ca.pem",
+        seed=tmp_path / "seed",
+        runtime_explicit=tmp_path / "runtime-linux-64.lock",
+        toolchain_explicit=tmp_path / "toolchain-linux-64.lock",
+        protobuf_build_explicit=tmp_path / "protobuf-build-linux-64.lock",
+    )
+
+    assert len(commands) == 3
+    assert commands[-1] == (
+        str(tmp_path / "micromamba"),
+        "create",
+        "--no-rc",
+        "--no-env",
+        "--ssl-verify",
+        str(tmp_path / "channel-ca.pem"),
+        "--root-prefix",
+        str(tmp_path / "seed" / "mamba-root"),
+        "--prefix",
+        str(tmp_path / "seed" / "protobuf-build-download-prefix"),
+        "--file",
+        str(tmp_path / "protobuf-build-linux-64.lock"),
+        "--download-only",
+        "--safety-checks",
+        "enabled",
+        "--yes",
     )
 
 
@@ -2296,6 +2557,122 @@ def test_python_wheel_verifier_rejects_record_member_sha256_mismatch(tmp_path) -
         raise AssertionError("RECORD member hash mismatch was accepted")
 
 
+def test_private_protobuf_canonicalizer_rewrites_volatile_metadata_deterministically(tmp_path) -> None:
+    """同一 payload 的临时路径、时间和无序 metadata 必须得到同一 Conda bytes。"""
+    assert PRIVATE_PROTOBUF_BUILD_PYTHON.is_file(), "locked Conda-build Python fixture is unavailable"
+
+    def write_fixture(root: Path, *, channel: str, source: str, timestamp: int, keys: list[str]) -> Path:
+        """构造仅自动 metadata 不同的最小 Conda v2 输入包。"""
+        (root / "info" / "recipe").mkdir(parents=True)
+        (root / "lib").mkdir()
+        (root / "lib" / "payload.bin").write_bytes(b"protobuf payload\n")
+        (root / "info" / "about.json").write_text(
+            json.dumps({"channels": [channel], "summary": "fixture"}),
+            encoding="utf-8",
+        )
+        (root / "info" / "index.json").write_text(
+            json.dumps({"name": "protobuf", "timestamp": timestamp, "version": "6.33.6"}),
+            encoding="utf-8",
+        )
+        (root / "info" / "hash_input.json").write_text(
+            json.dumps(
+                {
+                    key: {"c_compiler": "gcc", "target_platform": "linux-64"}[key]
+                    for key in keys
+                }
+            ),
+            encoding="utf-8",
+        )
+        (root / "info" / "recipe" / "meta.yaml").write_text(
+            f"source:\n  path: {source}\npackage:\n  name: protobuf\n",
+            encoding="utf-8",
+        )
+        (root / "info" / "recipe" / "conda_build_config.yaml").write_text(
+            "extend_keys:\n" + "".join(f"  - {key}\n" for key in keys),
+            encoding="utf-8",
+        )
+        (root / "info" / "files").write_text("lib/payload.bin\n", encoding="utf-8")
+        package = root.parent / "protobuf-6.33.6-py310_0.conda"
+        producer = subprocess.run(
+            [
+                str(PRIVATE_PROTOBUF_BUILD_PYTHON),
+                "-c",
+                (
+                    "import sys; from pathlib import Path; "
+                    "import conda_package_handling.api as api; "
+                    "root = Path(sys.argv[1]); "
+                    "files = sorted(path.relative_to(root).as_posix() "
+                    "for path in root.rglob('*') if path.is_file()); "
+                    "api.create(str(root), files, sys.argv[2])"
+                ),
+                str(root),
+                str(package),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert producer.returncode == 0, producer.stderr
+        return package
+
+    package_a = write_fixture(
+        tmp_path / "a" / "input",
+        channel="file:///private/a/channel",
+        source="/private/a/source/protobuf-33.6",
+        timestamp=11,
+        keys=["c_compiler", "target_platform"],
+    )
+    package_b = write_fixture(
+        tmp_path / "b" / "input",
+        channel="file:///private/b/channel",
+        source="/private/b/source/protobuf-33.6",
+        timestamp=99,
+        keys=["target_platform", "c_compiler"],
+    )
+    outputs = []
+    for name, package in (("a", package_a), ("b", package_b)):
+        output_directory = tmp_path / name / "canonical"
+        output_directory.mkdir()
+        output = output_directory / package.name
+        completed = subprocess.run(
+            [
+                str(PRIVATE_PROTOBUF_BUILD_PYTHON),
+                str(PRIVATE_PROTOBUF_CANONICALIZER),
+                "--input",
+                str(package),
+                "--output",
+                str(output),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert completed.returncode == 0, completed.stdout
+        outputs.append(output)
+
+    assert outputs[0].read_bytes() == outputs[1].read_bytes()
+    extracted = tmp_path / "canonical-extracted"
+    extractor = subprocess.run(
+        [
+            str(PRIVATE_PROTOBUF_BUILD_PYTHON),
+            "-c",
+            "import sys; import conda_package_handling.api as api; api.extract(sys.argv[1], dest_dir=sys.argv[2])",
+            str(outputs[0]),
+            str(extracted),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert extractor.returncode == 0, extractor.stderr
+    assert (extracted / "lib" / "payload.bin").read_bytes() == b"protobuf payload\n"
+    assert json.loads((extracted / "info" / "about.json").read_text(encoding="utf-8"))["channels"] == []
+    assert json.loads((extracted / "info" / "index.json").read_text(encoding="utf-8"))["timestamp"] == 0
+    assert "/stage4/protobuf-work/source/protobuf-33.6" in (
+        extracted / "info" / "recipe" / "meta.yaml"
+    ).read_text(encoding="utf-8")
+
+
 def test_private_protobuf_builder_rejects_noncanonical_source_before_build(tmp_path) -> None:
     """私有 Conda 包只能从已冻结的 Protobuf v33.6 archive 构建。"""
     assert PRIVATE_PROTOBUF_BUILDER.is_file(), "private protobuf Conda builder is not implemented"
@@ -2547,6 +2924,9 @@ def test_private_protobuf_builder_materializes_source_then_invokes_isolated_prod
     conda = tmp_path / "conda"
     conda.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     conda.chmod(0o700)
+    python = tmp_path / "python"
+    python.write_text("#!/bin/sh\ncp \"$3\" \"$5\"\n", encoding="utf-8")
+    python.chmod(0o700)
 
     result = subprocess.run(
         [
@@ -2610,6 +2990,9 @@ def test_private_protobuf_builder_indexes_local_channel_with_same_toolchain_pref
         encoding="utf-8",
     )
     conda.chmod(0o700)
+    python = toolchain_bin / "python"
+    python.write_text("#!/bin/sh\ncp \"$3\" \"$5\"\n", encoding="utf-8")
+    python.chmod(0o700)
     channel_root = tmp_path / "channel"
 
     result = subprocess.run(
@@ -2638,6 +3021,243 @@ def test_private_protobuf_builder_indexes_local_channel_with_same_toolchain_pref
     assert index_record.read_text(encoding="utf-8").splitlines() == [
         "index",
         str(channel_root),
+    ]
+
+
+def test_private_protobuf_builder_canonicalizes_output_before_channel_index(tmp_path) -> None:
+    """producer 必须在索引前调用同一 toolchain 的 canonicalizer 重封装输出包。"""
+    source = ROOT / "build" / "stage4-source-archive-input" / "v33.6.tar.gz"
+    assert source.is_file(), "locked protobuf archive fixture is unavailable"
+    toolchain_bin = tmp_path / "toolchain" / "bin"
+    toolchain_bin.mkdir(parents=True)
+    conda_build = toolchain_bin / "conda-build"
+    conda_build.write_text(
+        "#!/bin/sh\n"
+        "previous=\n"
+        "for argument in \"$@\"; do\n"
+        "  if [ \"$previous\" = --output-folder ]; then\n"
+        "    mkdir -p \"$argument/linux-64\"\n"
+        "    : > \"$argument/linux-64/protobuf-6.33.6-0.conda\"\n"
+        "  fi\n"
+        "  previous=\"$argument\"\n"
+        "done\n",
+        encoding="utf-8",
+    )
+    conda_build.chmod(0o700)
+    index_record = tmp_path / "index-record.txt"
+    conda = toolchain_bin / "conda"
+    conda.write_text(
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$STAGE4_TEST_INDEX_RECORD\"\n",
+        encoding="utf-8",
+    )
+    conda.chmod(0o700)
+    canonicalizer_record = tmp_path / "canonicalizer-record.txt"
+    python_target = toolchain_bin / "python3.10"
+    python_target.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"$@\" > \"$STAGE4_TEST_CANONICALIZER_RECORD\"\n"
+        "cp \"$3\" \"$5\"\n",
+        encoding="utf-8",
+    )
+    python_target.chmod(0o700)
+    (toolchain_bin / "python").symlink_to(python_target.name)
+    channel_root = tmp_path / "channel"
+    work_root = tmp_path / "work"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(PRIVATE_PROTOBUF_BUILDER),
+            "--source-archive",
+            str(source),
+            "--abseil-source-archive",
+            str(ABSEIL_SOURCE_ARCHIVE),
+            "--work-root",
+            str(work_root),
+            "--channel-root",
+            str(channel_root),
+            "--conda-build",
+            str(conda_build),
+        ],
+        check=False,
+        capture_output=True,
+        env={
+            **os.environ,
+            "STAGE4_TEST_INDEX_RECORD": str(index_record),
+            "STAGE4_TEST_CANONICALIZER_RECORD": str(canonicalizer_record),
+        },
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stdout
+    package = channel_root / "linux-64" / "protobuf-6.33.6-0.conda"
+    assert canonicalizer_record.read_text(encoding="utf-8").splitlines() == [
+        str(PRIVATE_PROTOBUF_CANONICALIZER),
+        "--input",
+        str(package),
+        "--output",
+        str(work_root / "canonical-package" / package.name),
+    ]
+    assert package.is_file()
+    assert not (work_root / "canonical-package" / package.name).exists()
+    assert index_record.read_text(encoding="utf-8").splitlines() == ["index", str(channel_root)]
+
+
+def test_private_protobuf_builder_uses_only_explicit_offline_package_cache(tmp_path) -> None:
+    """私有 producer 只能写本轮 native cache，canonical 输入保持只读。"""
+    source = ROOT / "build" / "stage4-source-archive-input" / "v33.6.tar.gz"
+    assert source.is_file(), "locked protobuf archive fixture is unavailable"
+    package_cache = tmp_path / "package-cache"
+    archive = package_cache / "https" / "example.test" / "stage4" / "linux-64" / "example-1.0-0.conda"
+    archive.parent.mkdir(parents=True)
+    archive.write_bytes(b"private package cache fixture\n")
+    archive_md5 = hashlib.md5(archive.read_bytes()).hexdigest()
+    archive_sha256 = hashlib.sha256(archive.read_bytes()).hexdigest()
+    package_cache_manifest = tmp_path / "package-cache.manifest.json"
+    package_cache_manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "archives": [
+                    {
+                        "filename": archive.name,
+                        "relative_path": "https/example.test/stage4/linux-64/example-1.0-0.conda",
+                        "url": "https://example.test/stage4/linux-64/example-1.0-0.conda",
+                        "size": archive.stat().st_size,
+                        "md5": archive_md5,
+                        "sha256": archive_sha256,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    canonical_files_before = tuple(
+        sorted(
+            path.relative_to(package_cache).as_posix()
+            for path in package_cache.rglob("*")
+            if path.is_file()
+        )
+    )
+    toolchain_bin = tmp_path / "toolchain" / "bin"
+    toolchain_bin.mkdir(parents=True)
+    record = tmp_path / "producer-environment.txt"
+    command_record = tmp_path / "producer-command.txt"
+    index_record = tmp_path / "index-command.txt"
+    conda_build = toolchain_bin / "conda-build"
+    conda_build.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n' \"$CONDA_PKGS_DIRS\" \"$CONDA_OFFLINE\" \"$CONDARC\" \"${CONDA_CHANNELS-}\" \"${SOURCE_DATE_EPOCH-}\" \"${CFLAGS-}\" \"${CXXFLAGS-}\" > \"$STAGE4_TEST_PRODUCER_ENV\"\n"
+        "printf '%s\\n' \"$@\" > \"$STAGE4_TEST_PRODUCER_COMMAND\"\n"
+        "mkdir -p \"$CONDA_PKGS_DIRS/cache\"\n"
+        ": > \"$CONDA_PKGS_DIRS/cache/producer-state\"\n"
+        "previous=\n"
+        "for argument in \"$@\"; do\n"
+        "  if [ \"$previous\" = --output-folder ]; then\n"
+        "    mkdir -p \"$argument/linux-64\"\n"
+        "    : > \"$argument/linux-64/protobuf-6.33.6-0.conda\"\n"
+        "  fi\n"
+        "  previous=\"$argument\"\n"
+        "done\n",
+        encoding="utf-8",
+    )
+    conda_build.chmod(0o700)
+    conda = toolchain_bin / "conda"
+    conda.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"$@\" >> \"$STAGE4_TEST_INDEX_COMMAND\"\n",
+        encoding="utf-8",
+    )
+    conda.chmod(0o700)
+    python = toolchain_bin / "python"
+    python.write_text("#!/bin/sh\ncp \"$3\" \"$5\"\n", encoding="utf-8")
+    python.chmod(0o700)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(PRIVATE_PROTOBUF_BUILDER),
+            "--source-archive",
+            str(source),
+            "--abseil-source-archive",
+            str(ABSEIL_SOURCE_ARCHIVE),
+            "--work-root",
+            str(tmp_path / "work"),
+            "--channel-root",
+            str(tmp_path / "channel"),
+            "--conda-build",
+            str(conda_build),
+            "--package-cache",
+            str(package_cache),
+            "--package-cache-manifest",
+            str(package_cache_manifest),
+        ],
+        check=False,
+        capture_output=True,
+        env={
+            **os.environ,
+            "CONDARC": str(tmp_path / "foreign.condarc"),
+            "CONDA_CHANNELS": "https://foreign.invalid/channel",
+            "STAGE4_TEST_PRODUCER_ENV": str(record),
+            "STAGE4_TEST_PRODUCER_COMMAND": str(command_record),
+            "STAGE4_TEST_INDEX_COMMAND": str(index_record),
+        },
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stdout
+    assert record.read_text(encoding="utf-8").splitlines() == [
+        str(tmp_path / "work" / "native-conda-pkgs"),
+        "true",
+        str(tmp_path / "work" / "producer.condarc"),
+        "",
+        "0",
+        " ".join(
+            (
+                f"-ffile-prefix-map={tmp_path / 'work'}=/stage4/protobuf-work",
+                f"-fdebug-prefix-map={tmp_path / 'work'}=/stage4/protobuf-work",
+                f"-fmacro-prefix-map={tmp_path / 'work'}=/stage4/protobuf-work",
+            )
+        ),
+        " ".join(
+            (
+                f"-ffile-prefix-map={tmp_path / 'work'}=/stage4/protobuf-work",
+                f"-fdebug-prefix-map={tmp_path / 'work'}=/stage4/protobuf-work",
+                f"-fmacro-prefix-map={tmp_path / 'work'}=/stage4/protobuf-work",
+            )
+        ),
+    ]
+    assert (tmp_path / "work" / "producer.condarc").read_text(encoding="utf-8") == (
+        "channels:\n"
+        f"  - file://{tmp_path / 'work' / 'private-conda-channel'}\n"
+        "channel_priority: strict\n"
+        "offline: true\n"
+    )
+    assert tuple(
+        sorted(
+            path.relative_to(package_cache).as_posix()
+            for path in package_cache.rglob("*")
+            if path.is_file()
+        )
+    ) == canonical_files_before
+    assert (tmp_path / "work" / "native-conda-pkgs" / "example-1.0-0.conda").is_file()
+    assert (tmp_path / "work" / "native-conda-pkgs" / "cache" / "producer-state").is_file()
+    assert (tmp_path / "work" / "private-conda-channel" / "linux-64" / archive.name).is_file()
+    assert command_record.read_text(encoding="utf-8").splitlines() == [
+        str(PRIVATE_PROTOBUF_RECIPE.parent),
+        "--croot",
+        str(tmp_path / "work" / "croot"),
+        "--output-folder",
+        str(tmp_path / "channel"),
+        "--override-channels",
+        "--channel",
+        f"file://{tmp_path / 'work' / 'private-conda-channel'}",
+    ]
+    assert index_record.read_text(encoding="utf-8").splitlines() == [
+        "index",
+        str(tmp_path / "work" / "private-conda-channel"),
+        "index",
+        str(tmp_path / "channel"),
     ]
 
 

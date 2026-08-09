@@ -13,6 +13,8 @@ from urllib.parse import urlsplit
 from stage4_source_archive import materialize_archive, materialized_tree_digest
 from verify_stage4_dependencies import load_dependency_lock
 
+_SUPPORTED_CONSUMERS = frozenset({"cpp_dependency", "validation", "ros_overlay"})
+
 
 def _digest(path: Path) -> tuple[int, str]:
     """流式复算归档大小和 SHA-256，复制前后使用同一规则。"""
@@ -25,8 +27,17 @@ def _digest(path: Path) -> tuple[int, str]:
     return size, digest.hexdigest()
 
 
-def materialize(manifest: Path, lock: Path, canonical_cache: Path, source_work: Path, evidence: Path) -> None:
-    """为 C++ consumer 创建本轮独占 archive 副本、源码树及其可审计证据。"""
+def materialize(
+    manifest: Path,
+    lock: Path,
+    canonical_cache: Path,
+    source_work: Path,
+    evidence: Path,
+    consumer: str = "cpp_dependency",
+) -> None:
+    """为指定 consumer 创建本轮独占 archive 副本、源码树及其可审计证据。"""
+    if consumer not in _SUPPORTED_CONSUMERS:
+        raise ValueError("source consumer is unsupported")
     if source_work.exists() or evidence.exists() or (
         evidence.parent != source_work and not evidence.parent.is_dir()
     ):
@@ -36,9 +47,13 @@ def materialize(manifest: Path, lock: Path, canonical_cache: Path, source_work: 
     if document.get("schema_version") != 1 or not isinstance(records, list):
         raise ValueError("source cache manifest is invalid")
     entries = {entry.name: entry for entry in load_dependency_lock(lock)}
-    selected = [record for record in records if isinstance(record, dict) and "cpp_dependency" in record.get("consumers", [])]
+    selected = [
+        record
+        for record in records
+        if isinstance(record, dict) and consumer in record.get("consumers", [])
+    ]
     if not selected:
-        raise ValueError("source cache has no cpp_dependency archives")
+        raise ValueError(f"source cache has no {consumer} archives")
     source_work.mkdir(mode=0o755)
     archives = source_work / "archives"
     trees = source_work / "trees"
@@ -85,12 +100,20 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Materialize private Stage 4 C++ dependency sources.")
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--lock", type=Path, required=True)
+    parser.add_argument("--consumer", choices=sorted(_SUPPORTED_CONSUMERS), default="cpp_dependency")
     parser.add_argument("--canonical-cache", type=Path, required=True)
     parser.add_argument("--source-work", type=Path, required=True)
     parser.add_argument("--evidence", type=Path, required=True)
     args = parser.parse_args()
     try:
-        materialize(args.manifest.resolve(), args.lock.resolve(), args.canonical_cache.resolve(), args.source_work.resolve(), args.evidence.resolve())
+        materialize(
+            args.manifest.resolve(),
+            args.lock.resolve(),
+            args.canonical_cache.resolve(),
+            args.source_work.resolve(),
+            args.evidence.resolve(),
+            args.consumer,
+        )
     except (OSError, ValueError, json.JSONDecodeError) as error:
         print(f"FAIL: {error}")
         return 1

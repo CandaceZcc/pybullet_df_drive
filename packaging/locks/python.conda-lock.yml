@@ -1505,8 +1505,8 @@ package:
     python_abi: 3.10.*
   url: https://candace.tail39defd.ts.net:8443/linux-64/protobuf-6.33.6-py310_0.conda
   hash:
-    md5: 7c17145412d67776c15765ce9c20abdf
-    sha256: 6b9ea864223664c2d842df745cd22561c2e843c3693768dee7257fcd5ebf0a2c
+    md5: 2d130b9d9f4cb60d654440cca396c267
+    sha256: 4cd4a8a90e5960c38db7e39a453c768a53159140fb3a5e6bac6534a9ec2f8d78
   category: main
   optional: false
 - name: pthread-stubs

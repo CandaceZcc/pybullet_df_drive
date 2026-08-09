@@ -36,6 +36,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--runtime-explicit", type=Path)
     parser.add_argument("--toolchain-unified", type=Path)
     parser.add_argument("--toolchain-explicit", type=Path)
+    parser.add_argument("--protobuf-build-spec", type=Path)
+    parser.add_argument("--protobuf-build-unified", type=Path)
+    parser.add_argument("--protobuf-build-explicit", type=Path)
     parser.add_argument("--seed", type=Path)
     parser.add_argument("--cache-root", type=Path)
     parser.add_argument("--cache-manifest", type=Path)
@@ -70,6 +73,20 @@ def _require_producer_paths(args: argparse.Namespace) -> tuple[Path, ...]:
     if any(path is None for path in paths):
         raise ValueError("lock producer requires explicit lock, spec, and output paths")
     return tuple(Path(path).resolve() for path in paths)
+
+
+def _require_protobuf_build_paths(args: argparse.Namespace) -> tuple[Path, Path, Path] | None:
+    """接受完整的私有 Protobuf build 锁三元组，拒绝半配置输入。"""
+    paths = (
+        args.protobuf_build_spec,
+        args.protobuf_build_unified,
+        args.protobuf_build_explicit,
+    )
+    if all(path is None for path in paths):
+        return None
+    if any(path is None for path in paths):
+        raise ValueError("protobuf build spec and lock outputs must be supplied together")
+    return tuple(Path(path).resolve() for path in paths)  # type: ignore[return-value]
 
 
 def _verify_conda_lock(lock_env: Path) -> Path:
@@ -145,6 +162,9 @@ def _lock_commands(
     runtime_explicit: Path,
     toolchain_unified: Path,
     toolchain_explicit: Path,
+    protobuf_build_spec: Path | None = None,
+    protobuf_build_unified: Path | None = None,
+    protobuf_build_explicit: Path | None = None,
 ) -> tuple[tuple[str, ...], ...]:
     """构造计划冻结的四条 argv，避免 shell 拼接或 PATH 回退。"""
     common_lock = (
@@ -165,7 +185,7 @@ def _lock_commands(
         "--no-dev-dependencies",
         "--filename-template",
     )
-    return (
+    commands = (
         common_lock
         + (
             "--file",
@@ -197,6 +217,36 @@ def _lock_commands(
         ),
         common_render + (str(_render_template(toolchain_explicit)), str(toolchain_unified)),
     )
+    protobuf_paths = (
+        protobuf_build_spec,
+        protobuf_build_unified,
+        protobuf_build_explicit,
+    )
+    if all(path is None for path in protobuf_paths):
+        return commands
+    if any(path is None for path in protobuf_paths):
+        raise ValueError("protobuf build lock commands require complete paths")
+    return commands + (
+        common_lock
+        + (
+            "--file",
+            str(protobuf_build_spec),
+            "--platform",
+            "linux-64",
+            "--kind",
+            "lock",
+            "--lockfile",
+            str(protobuf_build_unified),
+            "--virtual-package-spec",
+            str(virtual_packages),
+            "--no-dev-dependencies",
+        ),
+        common_render
+        + (
+            str(_render_template(protobuf_build_explicit)),
+            str(protobuf_build_unified),
+        ),
+    )
 
 
 def _download_commands(
@@ -206,8 +256,9 @@ def _download_commands(
     seed: Path,
     runtime_explicit: Path,
     toolchain_explicit: Path,
-) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    """构造两份显式锁的隔离 download-only argv，禁止使用用户 cache。"""
+    protobuf_build_explicit: Path | None = None,
+) -> tuple[tuple[str, ...], ...]:
+    """构造显式锁的隔离 download-only argv，禁止使用用户 cache。"""
     common = (
         str(micromamba),
         "create",
@@ -218,7 +269,7 @@ def _download_commands(
         "--root-prefix",
         str(seed / "mamba-root"),
     )
-    return (
+    commands = (
         common
         + (
             "--prefix",
@@ -236,6 +287,21 @@ def _download_commands(
             str(seed / "toolchain-download-prefix"),
             "--file",
             str(toolchain_explicit),
+            "--download-only",
+            "--safety-checks",
+            "enabled",
+            "--yes",
+        ),
+    )
+    if protobuf_build_explicit is None:
+        return commands
+    return commands + (
+        common
+        + (
+            "--prefix",
+            str(seed / "protobuf-build-download-prefix"),
+            "--file",
+            str(protobuf_build_explicit),
             "--download-only",
             "--safety-checks",
             "enabled",
@@ -357,6 +423,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 toolchain_unified,
                 toolchain_explicit,
             ) = _require_producer_paths(args)
+            protobuf_build_paths = _require_protobuf_build_paths(args)
             cache_outputs = _require_cache_outputs(args)
             conda_lock = _verify_conda_lock(lock_env)
             ca_bundle = (
@@ -366,9 +433,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             if ca_bundle is not None:
                 # conda-lock 的求解器会另起 micromamba，需显式传递同一 CA。
                 producer_env["MAMBA_SSL_VERIFY"] = str(ca_bundle)
-            _verify_lock_output_paths(
-                (runtime_unified, runtime_explicit, toolchain_unified, toolchain_explicit)
-            )
+            output_paths = (runtime_unified, runtime_explicit, toolchain_unified, toolchain_explicit)
+            if protobuf_build_paths is not None:
+                output_paths += protobuf_build_paths[1:]
+            _verify_lock_output_paths(output_paths)
             for command in _lock_commands(
                 conda_lock=conda_lock,
                 micromamba=micromamba,
@@ -379,6 +447,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 runtime_explicit=runtime_explicit,
                 toolchain_unified=toolchain_unified,
                 toolchain_explicit=toolchain_explicit,
+                protobuf_build_spec=(
+                    None if protobuf_build_paths is None else protobuf_build_paths[0]
+                ),
+                protobuf_build_unified=(
+                    None if protobuf_build_paths is None else protobuf_build_paths[1]
+                ),
+                protobuf_build_explicit=(
+                    None if protobuf_build_paths is None else protobuf_build_paths[2]
+                ),
             ):
                 subprocess.run(command, check=True, env=producer_env)
             if cache_outputs is None:
@@ -394,13 +471,25 @@ def main(argv: Sequence[str] | None = None) -> int:
                 seed=seed,
                 runtime_explicit=runtime_explicit,
                 toolchain_explicit=toolchain_explicit,
+                protobuf_build_explicit=(
+                    None if protobuf_build_paths is None else protobuf_build_paths[2]
+                ),
             ):
                 subprocess.run(command, check=True, env=producer_env)
             _verify_lock_pair(runtime_unified, runtime_explicit, "runtime")
             _verify_lock_pair(toolchain_unified, toolchain_explicit, "toolchain")
+            protobuf_build_records = None
+            if protobuf_build_paths is not None:
+                _verify_lock_pair(
+                    protobuf_build_paths[1], protobuf_build_paths[2], "protobuf build"
+                )
+                protobuf_build_records = _unified_conda_records(
+                    protobuf_build_paths[1], "protobuf build"
+                )
             records = _expected_cache_records(
                 _unified_conda_records(runtime_unified, "runtime"),
                 _unified_conda_records(toolchain_unified, "toolchain"),
+                protobuf_build_records=protobuf_build_records,
             )
             _write_canonical_cache(
                 seed=seed,

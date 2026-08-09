@@ -12,6 +12,7 @@ __pycache__/
 venv/
 
 build/
+*.egg-info/
 
 results/logs/*
 !results/logs/.gitkeep
