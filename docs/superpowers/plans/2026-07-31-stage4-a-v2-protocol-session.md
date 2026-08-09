@@ -110,7 +110,7 @@ tests/stage4/
 - Create: `tests/stage4/test_v1_descriptor_frozen.py`
 - Test: `tests/test_proto_contract.py`
 
-- [ ] **Step 1: 写冻结清单 RED**
+- [x] **Step 1: 写冻结清单 RED**
 
 ```python
 # tests/stage4/test_v1_descriptor_frozen.py
@@ -137,13 +137,13 @@ def test_v1_source_and_descriptor_are_frozen() -> None:
     )
 ```
 
-- [ ] **Step 2: 运行 RED**
+- [x] **Step 2: 运行 RED**
 
 Run: `conda run -n slope-sim python -m pytest -q tests/stage4/test_v1_descriptor_frozen.py`
 
 Expected: pytest 正常收集后 `FAILED`，且唯一失败是 `v1 SHA-256 manifest is not implemented`；不得是文件读取异常、collection error 或 skip。
 
-- [ ] **Step 3: 写入已核对的冻结值**
+- [x] **Step 3: 写入已核对的冻结值**
 
 ```text
 source 9de0e629a6494ea9446893043c7e30ca9d6370868f23def4fcd4f2af5cd102d4
@@ -156,13 +156,13 @@ descriptor 6a524cce7b11ca72f73214394097407c2f8ddc50ea40ca6ffef7be1c248dc2e9
 """阶段四协议、传感器、跨语言和交付门禁测试。"""
 ```
 
-- [ ] **Step 4: 运行 GREEN 和原 v1 合同**
+- [x] **Step 4: 运行 GREEN 和原 v1 合同**
 
 Run: `conda run -n slope-sim python -m pytest -q tests/stage4/test_v1_descriptor_frozen.py tests/test_proto_contract.py`
 
 Expected: `3 passed`，且 `git diff -- proto/slope_sim_interfaces.proto` 无输出。
 
-- [ ] **Step 5: REFACTOR 冻结值读取与断言表达**
+- [x] **Step 5: REFACTOR 冻结值读取与断言表达**
 
 只合并测试内重复的 SHA-256 读取/格式断言，不改变冻结常量、manifest 字节或 v1 生成物。原样重跑 Step 4 的 GREEN 命令，Expected: `3 passed`，且 v1 proto diff 仍为空。
 
@@ -176,7 +176,7 @@ Expected: `3 passed`，且 `git diff -- proto/slope_sim_interfaces.proto` 无输
 - Create: `tests/stage4/test_v2_proto_contract.py`
 - Create: `tests/stage4/test_v2_generated_artifacts.py`
 
-- [ ] **Step 1: 写 schema 与独立生成产物 oracle RED**
+- [x] **Step 1: 写 schema 与独立生成产物 oracle RED**
 
 ```python
 # tests/stage4/test_v2_proto_contract.py
@@ -267,13 +267,13 @@ EXPECTED_FIELDS = {
 
 当 wished-for 文件存在时，测试从 `STAGE4_PROTOC` 取得并独立验证 `libprotoc 33.6`，在 pytest 临时目录直接调用该 executable，逐 byte 比较临时 `.desc` 与仓库 `.desc`，并比较临时模块的 `DESCRIPTOR.serialized_pb` 与跟踪模块；测试不得导入生产生成函数、不得调用 `grpc_tools.protoc`，也不得通过读取生产输出常量来自证。
 
-- [ ] **Step 2: 运行 RED**
+- [x] **Step 2: 运行 RED**
 
 Run: `STAGE4_PROTOC="$STAGE4_PROTOC" conda run -n slope-sim python -m pytest -q tests/stage4/test_v2_proto_contract.py tests/stage4/test_v2_generated_artifacts.py`
 
 Expected: 两个测试文件都正常收集并 `FAILED`；失败消息分别精确指出 v2 generated module 与 v2 generated artifacts 尚未实现，不得是 collection error、fixture error、subprocess 文件错误或 skip。保存该失败输出后才可进入 Step 3。
 
-- [ ] **Step 3: 创建唯一 v2 schema**
+- [x] **Step 3: 创建唯一 v2 schema**
 
 ```proto
 // 阶段四企业接口：定义跨 Python/C++ 的会话化 v2 线协议。
@@ -372,7 +372,7 @@ message ImuAttitude {
 }
 ```
 
-- [ ] **Step 4: 新建独立 v2 生成脚本并强制 protoc 33.6**
+- [x] **Step 4: 新建独立 v2 生成脚本并强制 protoc 33.6**
 
 ```python
 import os
@@ -427,7 +427,7 @@ if __name__ == "__main__":
 
 `scripts/generate_protos.py` 与它的历史 v1/internal `grpc_tools.protoc` 流程保持不变；新脚本是 v2 唯一生成入口。测试额外核对独立 compiler 与冻结 libprotobuf 33.6，禁止从 Conda Python wheel、grpcio-tools 或另一套 `libprotobuf.so` 取得 v2 编译器/runtime。
 
-- [ ] **Step 5: 生成最小实现并运行可复现 GREEN**
+- [x] **Step 5: 生成最小实现并运行可复现 GREEN**
 
 Run: `test -x "$STAGE4_PROTOC" && test "$("$STAGE4_PROTOC" --version)" = "libprotoc 33.6"`
 
@@ -441,7 +441,7 @@ Run: `STAGE4_PROTOC="$STAGE4_PROTOC" conda run -n slope-sim python -m pytest -q 
 
 Expected: PASS。
 
-- [ ] **Step 6: REFACTOR schema oracle 与生成脚本参数构造**
+- [x] **Step 6: REFACTOR schema oracle 与生成脚本参数构造**
 
 只去除 descriptor 字段 oracle、路径解析和 subprocess 参数构造中的重复代码；不得改变 schema、字段号、protoc 绝对路径门或生成 bytes。原样重跑 Step 5 的三个 Run，Expected 与 Step 5 完全相同。
 
@@ -454,7 +454,7 @@ Expected: PASS。
 - Create: `slope_sim/interfaces/v2/descriptor.py`
 - Create: `tests/stage4/test_v2_descriptor.py`
 
-- [ ] **Step 1: 写缺少冻结值和篡改拒绝 RED**
+- [x] **Step 1: 写缺少冻结值和篡改拒绝 RED**
 
 ```python
 from hashlib import sha256
@@ -482,13 +482,13 @@ def test_descriptor_loader_rejects_manifest_mismatch(tmp_path) -> None:
         load_v2_descriptor(descriptor, manifest)
 ```
 
-- [ ] **Step 2: 运行 RED**
+- [x] **Step 2: 运行 RED**
 
 Run: `conda run -n slope-sim python -m pytest -q tests/stage4/test_v2_descriptor.py`
 
 Expected: pytest 正常收集后 `FAILED`，失败消息精确指出 descriptor loader 尚未实现；不得是 collection error、fixture error 或 skip。
 
-- [ ] **Step 3: 实现一次性冻结脚本**
+- [x] **Step 3: 实现一次性冻结脚本**
 
 ```python
 """v2 descriptor 冻结工具：首次创建，后续只校验并拒绝覆盖。"""
@@ -511,13 +511,13 @@ def freeze(descriptor: Path, manifest: Path, *, create: bool) -> str:
 
 CLI 固定参数 `--create`；无参数执行校验。`--create` 遇到已存在 manifest 必须由 `open("x")` 非零退出，防止 schema 变化时顺手改写冻结值。
 
-- [ ] **Step 4: 首次创建 v2 冻结值**
+- [x] **Step 4: 首次创建 v2 冻结值**
 
 Run: `conda run -n slope-sim python scripts/freeze_v2_descriptor.py --create`
 
 Expected: rc=0，标准输出是一行 64 位小写十六进制；该值必须与 `sha256sum slope_sim/interfaces/generated/slope_sim_interfaces_v2.desc` 完全一致。以后只运行不带 `--create` 的校验模式。
 
-- [ ] **Step 5: 建立运行时唯一读取入口**
+- [x] **Step 5: 建立运行时唯一读取入口**
 
 ```python
 # slope_sim/interfaces/v2/descriptor.py
@@ -551,7 +551,7 @@ def load_v2_descriptor(
     return DescriptorIdentity(payload, digest)
 ```
 
-- [ ] **Step 6: 运行 GREEN 与覆盖保护**
+- [x] **Step 6: 运行 GREEN 与覆盖保护**
 
 Run: `STAGE4_PROTOC="$STAGE4_PROTOC" conda run -n slope-sim python -m pytest -q tests/stage4/test_v2_descriptor.py tests/stage4/test_v2_generated_artifacts.py`
 
@@ -561,7 +561,7 @@ Run: `conda run -n slope-sim python scripts/freeze_v2_descriptor.py --create`
 
 Expected: rc!=0，错误为 manifest 已存在；已有冻结文件内容不变。
 
-- [ ] **Step 7: REFACTOR descriptor 路径与 digest 校验**
+- [x] **Step 7: REFACTOR descriptor 路径与 digest 校验**
 
 只共用“读取 bytes -> 计算 digest -> 校验 32-byte identity”的内部逻辑；`--create` exclusive-create 语义和运行时失败类型不变。原样重跑 Step 6 的 GREEN 与覆盖保护命令，Expected 与 Step 6 完全相同。
 
