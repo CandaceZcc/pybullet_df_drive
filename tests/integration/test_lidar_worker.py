@@ -717,7 +717,7 @@ def test_stage4_coordinator_stop_uses_shard_pids_and_rejects_wrong_shard_ack(
 def test_stage4_coordinator_bounds_shard_timeout_or_exception_to_one_whole_frame_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """两个 shard 共用一帧 100ms deadline，异常只产生一个完整帧 failure。"""
+    """两个 shard 共用一帧 100ms deadline，超时只产生一个完整帧 failure。"""
     module = _worker_module()
     descriptor = importlib.import_module("slope_sim.interfaces.v2.descriptor").load_v2_descriptor()
     identity = importlib.import_module("slope_sim.interfaces.v2.session").OutputIdentity(
@@ -759,18 +759,19 @@ def test_stage4_coordinator_bounds_shard_timeout_or_exception_to_one_whole_frame
                 ),
                 object(),
             ]
-            self.timed_out = False
+            self.poll_count = 0
             self.shard_id = shard_id
 
         def poll(self, timeout: float) -> bool:
-            assert 0.0 <= timeout <= 0.1
-            self.timed_out = True
-            return False
+            assert timeout >= 0.0
+            self.poll_count += 1
+            # 第一帧严格走 100 ms timeout；随后 Stop 必须仍能完成正常握手。
+            return self.poll_count > 1 or self.shard_id == 1
 
         def recv(self) -> object:
             if self.values:
                 return self.values.pop(0)
-            if self.timed_out:
+            if self.poll_count > 1 or self.shard_id == 1:
                 return module._Stage4ShardStopped(self.shard_id, shard_pids[self.shard_id])
             raise RuntimeError("unexpected direct shard recv")
 
@@ -802,6 +803,7 @@ def test_stage4_coordinator_bounds_shard_timeout_or_exception_to_one_whole_frame
         failures[0].topic, failures[0].timestamp_ns,
     ) == (7, 1, 0, "lidar_link", 700_000_000)
     assert not merged
+    assert outer[-1] == module.LidarWorkerStopped(1, os.getpid())
 
 
 def test_stage4_shard_runtime_exception_sends_exact_typed_failure(

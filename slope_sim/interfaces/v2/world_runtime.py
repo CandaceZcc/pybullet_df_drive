@@ -217,11 +217,6 @@ class V2ManualWorldRuntime:
         self._reset_dashboard_snapshot_store()
         self._runtime = self._make_runtime()
 
-    def update_moving_scene_document(self, scene_document: SceneDocument) -> None:
-        """移动障碍物只更新同帧逻辑快照，不重建 worker 或 generation。"""
-        if not isinstance(scene_document, SceneDocument):
-            raise ValueError("scene_document must be a SceneDocument")
-        self._world_runtime.update_moving_scene_document(scene_document)
         subscribe = getattr(self._transport, "subscribe", None)
         if not callable(subscribe):
             self._world_runtime.close()
@@ -308,6 +303,12 @@ class V2ManualWorldRuntime:
         self._world_runtime.update_scene_document(scene_document)
         self._reset_dashboard_snapshot_store()
         self._runtime = self._make_runtime()
+
+    def update_moving_scene_document(self, scene_document: SceneDocument) -> None:
+        """移动障碍物只更新同帧逻辑快照，不重建 worker 或 generation。"""
+        if not isinstance(scene_document, SceneDocument):
+            raise ValueError("scene_document must be a SceneDocument")
+        self._world_runtime.update_moving_scene_document(scene_document)
 
     def refresh_scene_bindings(
         self,

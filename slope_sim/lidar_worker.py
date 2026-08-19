@@ -3050,6 +3050,13 @@ def stage4_coordinator_entrypoint(
                         )
                     )
                 response_sender.send(_stage4_payload_from_shards(validated, codec, tuple(responses)))
+            except TimeoutError as error:
+                response_sender.send(
+                    _scan_failure(validated, "pointcloud_failed", "Stage4 shard frame", error, frame_started_ns)
+                )
+                # 单帧失败已显式回传；coordinator 必须保留 Stop 握手，不能让
+                # 父端在回收仍运行的 shard 时提前关闭它们的 response pipe。
+                continue
             except BaseException as error:
                 response_sender.send(
                     _scan_failure(validated, "pointcloud_failed", "Stage4 shard frame", error, frame_started_ns)
