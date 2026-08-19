@@ -425,6 +425,14 @@ class SimulationCoordinator:
             self.last_result = self._advance_active_action()
 
         self.obstacle_manager.update_moving(dt)
+        if self.interface_runtime is not None and self._manager_has_moving_obstacles():
+            document = self.logical_scene_document()
+            update_moving = getattr(self.interface_runtime, "update_moving_scene_document", None)
+            updater = update_moving if callable(update_moving) else getattr(
+                self.interface_runtime, "update_scene_document", None
+            )
+            if callable(updater):
+                updater(document)
         # 移动位姿由 v2 capture 在同一物理帧冻结；仅 body 集变化的事务才重建 worker。
         self._step_physics(self.client_id)
         return self.last_result

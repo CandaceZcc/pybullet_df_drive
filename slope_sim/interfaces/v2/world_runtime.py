@@ -80,6 +80,14 @@ class V2WorldRuntime:
         """返回当前 worker 已绑定的完整逻辑场景。"""
         return self._scene_document
 
+    def update_moving_scene_document(self, scene_document: SceneDocument) -> None:
+        """移动障碍物只推进逻辑快照，worker 仍由同帧 capture 快照驱动。"""
+        if not isinstance(scene_document, SceneDocument):
+            raise ValueError("scene_document must be a SceneDocument")
+        if scene_document.sensors != self._scene_document.sensors:
+            raise ValueError("scene_document sensors must match the active binding")
+        self._scene_document = scene_document
+
     @property
     def worker(self) -> object:
         """返回当前 worker/service，由同一物理主线程消费。"""
@@ -208,6 +216,12 @@ class V2ManualWorldRuntime:
         )
         self._reset_dashboard_snapshot_store()
         self._runtime = self._make_runtime()
+
+    def update_moving_scene_document(self, scene_document: SceneDocument) -> None:
+        """移动障碍物只更新同帧逻辑快照，不重建 worker 或 generation。"""
+        if not isinstance(scene_document, SceneDocument):
+            raise ValueError("scene_document must be a SceneDocument")
+        self._world_runtime.update_moving_scene_document(scene_document)
         subscribe = getattr(self._transport, "subscribe", None)
         if not callable(subscribe):
             self._world_runtime.close()

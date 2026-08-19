@@ -517,7 +517,7 @@ def test_dashboard_control_scroll_includes_obstacle_group(monkeypatch):
         terrain_switch_enabled=True,
     )
     try:
-        assert [group.title() for group in dashboard.control_groups] == ["仿真控制", "机器人", "场地", "障碍物"]
+        assert [group.title() for group in dashboard.control_groups] == ["仿真控制", "机器人", "场地", "障碍物", "MID-360 采集"]
         assert dashboard.obstacle_group.parentWidget() is dashboard.control_content
         assert dashboard.control_scroll.isAncestorOf(dashboard.obstacle_group)
         assert not dashboard.tabs.isAncestorOf(dashboard.obstacle_group)
@@ -994,7 +994,7 @@ def test_dashboard_applied_rect_keeps_enterprise_and_diagnostic_scrolls_separate
         assert dashboard.control_scroll.widget() is dashboard.control_content
         assert dashboard.control_scroll.horizontalScrollBarPolicy() == QtCore.Qt.ScrollBarAlwaysOff
         assert dashboard.control_scroll.verticalScrollBar().maximum() > 0
-        assert [group.title() for group in dashboard.control_groups] == ["仿真控制", "机器人", "场地", "障碍物"]
+        assert [group.title() for group in dashboard.control_groups] == ["仿真控制", "机器人", "场地", "障碍物", "MID-360 采集"]
         assert all(group.parentWidget() is dashboard.control_content for group in dashboard.control_groups)
         assert not dashboard.control_scroll.isAncestorOf(dashboard.tabs)
         assert all(not dashboard.control_scroll.isAncestorOf(canvas) for canvas in dashboard.plot_canvases.values())
@@ -1169,7 +1169,7 @@ def test_dashboard_small_fixed_window_keeps_plot_content_and_controls_visible(
         assert tabs_rect.bottom() < controls_rect.top()
         assert dashboard.control_scroll.viewport().height() > 0
         assert dashboard.control_scroll.verticalScrollBar().maximum() > 0
-        assert [group.title() for group in dashboard.control_groups] == ["仿真控制", "机器人", "场地", "障碍物"]
+        assert [group.title() for group in dashboard.control_groups] == ["仿真控制", "机器人", "场地", "障碍物", "MID-360 采集"]
 
         dashboard.control_scroll.verticalScrollBar().setValue(dashboard.control_scroll.verticalScrollBar().maximum())
         dashboard.process_events()

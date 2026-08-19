@@ -26,7 +26,7 @@ def test_offline_schedule_uses_20000_five_us_slots_without_changing_realtime() -
     assert profile.firing_interval_ns == 5_000
     assert profile.frame_period_ns == 100_000_000
     assert profile.min_range_m == pytest.approx(0.1)
-    assert profile.max_range_m == pytest.approx(40.0)
+    assert profile.max_range_m == pytest.approx(60.0)
     assert tuple(len(slot_range) for slot_range in profile.physics_step_slot_ranges) == (
         834,
         833,
@@ -80,7 +80,7 @@ class _MovingPoseBackend:
         self.batch_sizes.append(len(starts))
         pose_x = self._step * 0.1
         assert np.linalg.norm(starts[0] - np.array((pose_x, 0.0, 0.0))) == pytest.approx(0.1)
-        assert np.linalg.norm(ends[0] - np.array((pose_x, 0.0, 0.0))) == pytest.approx(40.0)
+        assert np.linalg.norm(ends[0] - np.array((pose_x, 0.0, 0.0))) == pytest.approx(60.0)
         if self._step == 23:
             return ()
         return ((0, RayHit((10.0, 0.0, 0.0), 7, -1, "moving_obstacle")),)

@@ -468,7 +468,7 @@ def test_stage4_numpy_batch_matches_scalar_oracle():
         scalar_ends = lidar_pointcloud_module._transform_points(
             mount,
             tuple(
-                tuple(component * 30.0 for component in direction)
+                tuple(component * 45.0 for component in direction)
                 for direction in scalar_directions
             ),
         )

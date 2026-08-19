@@ -104,4 +104,4 @@ sensors:
     horizontal_fov_deg: 180.0
     vertical_fov_deg: [-15.0, 15.0]
     min_range_m: 0.10
-    max_range_m: 30.0
+    max_range_m: 45.0
