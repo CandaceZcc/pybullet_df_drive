@@ -20,6 +20,8 @@ _REQUIRED_FILES = (
     "scripts/stage4_release_setup.py",
     "scripts/run_mid360_golf_mapping.py",
     "scripts/verify_mid360_golf_mapping_replay.py",
+    "scripts/verify_livox_viewer2_linux.py",
+    "scripts/verify_lvx2.py",
     "scripts/mid360_golf_simulation.py",
     "scripts/mid360_golf_command_peer.py",
     "packaging/python-environment.yml",
