@@ -126,6 +126,27 @@ def test_installed_run_sim_supplies_its_bundled_ecal_defaults(tmp_path: Path) ->
     ]
 
 
+def test_installed_run_sim_prevents_release_bytecode_writes(tmp_path: Path) -> None:
+    """发行入口不能让 Python 的 __pycache__ 破坏安装器完整性校验。"""
+    release = tmp_path / "release"
+    launcher = release / "bin" / "runSim"
+    runtime = release / "runtime" / "bin" / "python"
+    launcher.parent.mkdir(parents=True)
+    runtime.parent.mkdir(parents=True)
+    shutil.copy2(ROOT / "runSim", launcher)
+    (release / "main.py").write_text("# release entrypoint\n", encoding="utf-8")
+    runtime.write_text(
+        "#!/usr/bin/env sh\nprintf '%s\\n' \"${PYTHONDONTWRITEBYTECODE:-}\"\n",
+        encoding="utf-8",
+    )
+    runtime.chmod(0o755)
+
+    completed = subprocess.run([str(launcher), "--help"], capture_output=True, text=True)
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout == "1\n"
+
+
 def test_run_sim_defaults_to_formal_v2_ecal_keyboard_control(
     tmp_path: Path,
 ) -> None:

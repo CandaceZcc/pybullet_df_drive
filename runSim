@@ -19,6 +19,10 @@ fi
 
 cd "$root"
 
+# release manifest 覆盖全部常规文件；禁止 Python 在安装目录落下 __pycache__，
+# 否则正常启动后会被下一次同版本安装误判为篡改。
+export PYTHONDONTWRITEBYTECODE=1
+
 # 已安装 release 自带 eCAL 数据与 localtime plugin 时直接使用；调用者显式
 # 设置的路径始终优先，便于诊断或接入受管 eCAL 环境。
 if [ -z "${ECAL_CONFIG_PATH:-}" ] && [ -z "${ECAL_DATA:-}" ] && [ -f "$root/etc/ecal/ecal.yaml" ]; then
