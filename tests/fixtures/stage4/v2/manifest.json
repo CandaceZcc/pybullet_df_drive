@@ -1,0 +1,40 @@
+{
+  "descriptor_sha256": "b06b8f284542774c18d5738c2bd6c88360ee84dfe552a96a88b0159419cf7c2e",
+  "messages": {
+    "ImuAttitude": {
+      "descriptor_sha256": "b06b8f284542774c18d5738c2bd6c88360ee84dfe552a96a88b0159419cf7c2e",
+      "payload_sha256": "8675f60e8e0917e3dcae5a12380aa13f3e7689bd80a245331b8ce195670620a2",
+      "simulation_session_id": "00112233445566778899aabbccddeeff",
+      "type_name": "slope_sim.interfaces.v2.ImuAttitude",
+      "world_generation": 7
+    },
+    "LidarPointCloud": {
+      "descriptor_sha256": "b06b8f284542774c18d5738c2bd6c88360ee84dfe552a96a88b0159419cf7c2e",
+      "payload_sha256": "14f3fe426f1a6ab58597951073adfa91a94b6621ef23e9cbbc056a27ec17c6fa",
+      "simulation_session_id": "00112233445566778899aabbccddeeff",
+      "type_name": "slope_sim.interfaces.v2.LidarPointCloud",
+      "world_generation": 7
+    },
+    "RtkState": {
+      "descriptor_sha256": "b06b8f284542774c18d5738c2bd6c88360ee84dfe552a96a88b0159419cf7c2e",
+      "payload_sha256": "bfec10ec934c74076c959888c6bb3e31eb53e6d40c54e0b27e30d59242c6eafd",
+      "simulation_session_id": "00112233445566778899aabbccddeeff",
+      "type_name": "slope_sim.interfaces.v2.RtkState",
+      "world_generation": 7
+    },
+    "WheelCommand": {
+      "descriptor_sha256": "b06b8f284542774c18d5738c2bd6c88360ee84dfe552a96a88b0159419cf7c2e",
+      "payload_sha256": "072663fdf5f5c8ac88669416d30172d60991eafd7a612c75908d9c42e2dfeca8",
+      "simulation_session_id": "00112233445566778899aabbccddeeff",
+      "type_name": "slope_sim.interfaces.v2.WheelCommand",
+      "world_generation": 7
+    },
+    "WheelState": {
+      "descriptor_sha256": "b06b8f284542774c18d5738c2bd6c88360ee84dfe552a96a88b0159419cf7c2e",
+      "payload_sha256": "ea5c1bd472334b6ef15abd41415d3fb047e1d1332e1e5866e86dbed9abc91d84",
+      "simulation_session_id": "00112233445566778899aabbccddeeff",
+      "type_name": "slope_sim.interfaces.v2.WheelState",
+      "world_generation": 7
+    }
+  }
+}

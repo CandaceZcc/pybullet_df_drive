@@ -36,6 +36,10 @@ class EcalUnavailableError(RuntimeError):
     """表示已知的 eCAL Python binding 均无法导入。"""
 
 
+class ProtocolConflictError(RuntimeError):
+    """表示 discovery 已确认同名远端与本地协议 metadata 冲突。"""
+
+
 @contextmanager
 def _transport_callback_context(transport: object):
     """标记当前用户回调及其所属 transport，供重入生命周期操作识别。"""
@@ -77,7 +81,10 @@ class _ChannelBinding:
     topic: str
     direction: str
     type_name: str
-    message_type: type[Message]
+    message_type: type[Message] | None = None
+    descriptor: object | None = None
+    raw_wire: bool = False
+    raw_parser: Callable[[bytes], object] | None = None
 
 
 @dataclass(frozen=True)
@@ -147,8 +154,8 @@ def _resource_raw(resource: _ProtoResource) -> object:
     return resource.raw
 
 
-def _resource_peer_connected(resource: _ProtoResource) -> bool:
-    """严格读取官方 v6 discovery count，拒绝 bool 和伪整数。"""
+def _resource_peer_count(resource: _ProtoResource) -> int:
+    """读取官方 discovery count，保留 0、1 和冲突 peer 的精确值。"""
     raw = _resource_raw(resource)
     method_name = (
         "get_publisher_count"
@@ -161,7 +168,12 @@ def _resource_peer_connected(resource: _ProtoResource) -> bool:
     count = count_method()
     if isinstance(count, bool) or not isinstance(count, int) or count < 0:
         raise RuntimeError("eCAL peer count must be a nonnegative integer")
-    return count > 0
+    return count
+
+
+def _resource_peer_connected(resource: _ProtoResource) -> bool:
+    """兼容旧调用方，以精确 discovery count 派生连接布尔值。"""
+    return _resource_peer_count(resource) > 0
 
 
 @dataclass(frozen=True)
@@ -288,6 +300,11 @@ class EcalBindings:
         result = send(message)
         if result is False:
             raise RuntimeError("eCAL ProtoPublisher.send returned False")
+
+    @staticmethod
+    def peer_count(resource: _ProtoResource) -> int:
+        """公开 raw discovery count，供 v2 命令权区分 0/1/>1。"""
+        return _resource_peer_count(resource)
 
     @staticmethod
     def is_peer_connected(resource: _ProtoResource) -> bool:
@@ -490,9 +507,16 @@ class EcalTransport:
         participant_name: str = "slope-sim",
         role: str = "simulation",
         peer_state_callback: Callable[[str], None] | None = None,
+        channel_bindings: tuple[_ChannelBinding, ...] | None = None,
     ) -> None:
-        selected_config = InterfaceConfig.default(transport_mode="ecal") if config is None else config
-        if not isinstance(selected_config, InterfaceConfig):
+        if channel_bindings is not None and config is not None:
+            raise ValueError("channel_bindings cannot be combined with config")
+        selected_config = (
+            None
+            if channel_bindings is not None
+            else InterfaceConfig.default(transport_mode="ecal") if config is None else config
+        )
+        if selected_config is not None and not isinstance(selected_config, InterfaceConfig):
             raise ValueError("config must be an InterfaceConfig")
         if not callable(monotonic):
             raise ValueError("monotonic must be callable")
@@ -504,7 +528,9 @@ class EcalTransport:
             raise ValueError("peer_state_callback must be callable")
         normalized_name = _require_nonempty_text("participant_name", participant_name)
         selected_queue_size = (
-            selected_config.outgoing_queue_size if queue_size is None else queue_size
+            32 if selected_config is None and queue_size is None
+            else selected_config.outgoing_queue_size if queue_size is None
+            else queue_size
         )
 
         self._config = selected_config
@@ -513,7 +539,7 @@ class EcalTransport:
         self._queue_size = _require_queue_size(selected_queue_size)
         self._acknowledge_timeout_ms = (
             publisher_acknowledge_timeout_ms(selected_config)
-            if role == "peer"
+            if role == "peer" and selected_config is not None
             else 0
         )
         self._role = role
@@ -525,13 +551,16 @@ class EcalTransport:
         self._stop_worker = False
         self._in_flight_deliveries = 0
         self._in_flight_discoveries = 0
+        self._in_flight_raw_callbacks = 0
         self._cleanup_thread: Thread | None = None
         self._cleanup_claimed = False
         self._close_error: BaseException | None = None
         self._quiesce_started = False
         self._quiesce_complete = False
         self._peer_connected = False
-        self._deferred_peer_connected: tuple[int, dict[str, bool]] | None = None
+        self._deferred_peer_connected: (
+            tuple[int, dict[str, int], dict[str, object]] | None
+        ) = None
         self._next_discovery_revision = 0
         self._applied_discovery_revision = -1
         self._generation = 0
@@ -550,12 +579,35 @@ class EcalTransport:
         self._subscriber_by_topic: dict[str, tuple[_ChannelBinding, object]] = {}
         self._send_locks: dict[str, Lock] = {}
         self._worker_events: dict[str, Event] = {}
+        self._receive_pending: dict[str, object] = {}
+        self._claimed_received: dict[str, object] = {}
+        self._receive_worker_events: dict[str, Event] = {}
         self._participant: object | None = None
         self._workers: dict[str, Thread] = {}
         self._worker_exited_topics: set[str] = set()
+        self._receive_workers: dict[str, Thread] = {}
+        self._receive_worker_exited_topics: set[str] = set()
         self._fatal_worker_fault: tuple[str, BaseException] | None = None
 
-        channels = _channel_bindings(selected_config)
+        channels = _channel_bindings(selected_config) if channel_bindings is None else channel_bindings
+        if not channels:
+            raise ValueError("channel_bindings must not be empty")
+        if len({channel.topic for channel in channels}) != len(channels):
+            raise ValueError("channel_bindings must use unique topics")
+        if any(channel.direction not in {"publish", "subscribe"} for channel in channels):
+            raise ValueError("channel_bindings contain an invalid direction")
+        if sum(channel.direction == "subscribe" for channel in channels) != 1:
+            raise ValueError("channel_bindings require exactly one subscribe topic")
+        if any(
+            channel.raw_wire and (channel.message_type is not None or channel.descriptor is None)
+            for channel in channels
+        ):
+            raise ValueError("raw channel bindings require a descriptor and no message_type")
+        if any(
+            not channel.raw_wire and channel.message_type is None
+            for channel in channels
+        ):
+            raise ValueError("typed channel bindings require message_type")
         if role == "peer":
             channels = tuple(
                 _ChannelBinding(
@@ -563,10 +615,16 @@ class EcalTransport:
                     "publish" if channel.direction == "subscribe" else "subscribe",
                     channel.type_name,
                     channel.message_type,
+                    channel.descriptor,
+                    channel.raw_wire,
+                    channel.raw_parser,
                 )
                 for channel in channels
             )
         self._channels = channels
+        self._command_topic = next(
+            channel.topic for channel in channels if channel.direction == "subscribe"
+        )
         self._topic_quality = {
             channel.topic: TransportTopicQuality(channel.topic)
             for channel in channels
@@ -578,23 +636,44 @@ class EcalTransport:
             for channel in channels:
                 if channel.direction != "subscribe":
                     continue
-                resource = self._bindings.create_subscriber(
-                    channel.topic,
-                    channel.message_type,
-                    lambda payload, topic=channel.topic: self._on_payload(topic, payload),
-                )
+                if channel.raw_wire:
+                    resource = self._bindings.create_raw_subscriber(
+                        channel.topic,
+                        channel.type_name,
+                        channel.descriptor,
+                        lambda frame, channel=channel: self._on_raw_payload(
+                            channel, frame
+                        ),
+                    )
+                else:
+                    assert channel.message_type is not None
+                    resource = self._bindings.create_subscriber(
+                        channel.topic,
+                        channel.message_type,
+                        lambda payload, topic=channel.topic: self._on_payload(topic, payload),
+                    )
                 self._subscriber_resources.append((channel, resource))
                 self._subscriber_by_topic[channel.topic] = (channel, resource)
                 self._subscriptions[channel.topic] = []
+                if channel.raw_wire:
+                    self._receive_worker_events[channel.topic] = Event()
             for channel in channels:
                 if channel.direction != "publish":
                     continue
-                resource = self._bindings.create_publisher(
-                    channel.topic,
-                    channel.message_type,
-                    shm_buffer_count=self._queue_size,
-                    acknowledge_timeout_ms=self._acknowledge_timeout_ms,
-                )
+                if channel.raw_wire:
+                    resource = self._bindings.create_raw_publisher(
+                        channel.topic,
+                        channel.type_name,
+                        channel.descriptor,
+                    )
+                else:
+                    assert channel.message_type is not None
+                    resource = self._bindings.create_publisher(
+                        channel.topic,
+                        channel.message_type,
+                        shm_buffer_count=self._queue_size,
+                        acknowledge_timeout_ms=self._acknowledge_timeout_ms,
+                    )
                 self._publisher_resources.append((channel, resource))
                 self._publisher_by_topic[channel.topic] = (channel, resource)
                 self._send_locks[channel.topic] = Lock()
@@ -613,6 +692,20 @@ class EcalTransport:
                     )
                     self._workers[channel.topic] = worker
                     worker.start()
+                for index, (channel, _resource) in enumerate(
+                    self._subscriber_resources,
+                    start=1,
+                ):
+                    if not channel.raw_wire:
+                        continue
+                    worker = Thread(
+                        target=self._receive_worker_main,
+                        args=(channel.topic,),
+                        name=f"ecal-{role}-receiver-{index}",
+                        daemon=True,
+                    )
+                    self._receive_workers[channel.topic] = worker
+                    worker.start()
         except BaseException:
             self._cleanup_partial_initialization()
             raise
@@ -629,9 +722,12 @@ class EcalTransport:
         return self._role
 
     def _is_worker_thread(self) -> bool:
-        """判断当前调用是否来自任一 publisher lane。"""
+        """判断当前调用是否来自任一发送或接收 worker lane。"""
         caller = current_thread()
-        return any(caller is worker for worker in self._workers.values())
+        return any(
+            caller is worker
+            for worker in (*self._workers.values(), *self._receive_workers.values())
+        )
 
     def _cleanup_partial_initialization(self) -> None:
         """初始化失败时继续清理全部资源，并保留最初的创建异常。"""
@@ -640,9 +736,13 @@ class EcalTransport:
             self._pending.clear()
             self._claimed_pending.clear()
             self._claimed_send_started.clear()
+            self._receive_pending.clear()
+            self._claimed_received.clear()
             for worker_event in self._worker_events.values():
                 worker_event.set()
-        for worker in tuple(self._workers.values()):
+            for worker_event in self._receive_worker_events.values():
+                worker_event.set()
+        for worker in (*self._workers.values(), *self._receive_workers.values()):
             try:
                 is_alive = getattr(worker, "is_alive", None)
                 join = getattr(worker, "join", None)
@@ -652,6 +752,8 @@ class EcalTransport:
                 pass
         self._workers.clear()
         self._worker_exited_topics.clear()
+        self._receive_workers.clear()
+        self._receive_worker_exited_topics.clear()
         for _channel, resource in reversed(self._publisher_resources):
             try:
                 self._bindings.close(resource)
@@ -668,6 +770,7 @@ class EcalTransport:
         self._subscriber_by_topic.clear()
         self._send_locks.clear()
         self._worker_events.clear()
+        self._receive_worker_events.clear()
         self._publisher_resources.clear()
         self._subscriber_resources.clear()
         if participant is not None:
@@ -866,10 +969,81 @@ class EcalTransport:
                 self._condition.wait(timeout=remaining)
                 self._require_open_locked()
 
-    def _on_payload(self, topic: str, payload: object) -> None:
+    def _on_raw_payload(self, channel: _ChannelBinding, frame: object) -> None:
+        """native callback 只转交 owned raw frame，禁止同步 hash、解析或用户交付。"""
+        with self._condition:
+            if self._state in _STOPPING_STATES:
+                return
+            self._in_flight_raw_callbacks += 1
+        try:
+            with self._condition:
+                if self._state in _STOPPING_STATES:
+                    return
+                replaced = self._receive_pending.get(channel.topic)
+                if replaced is not None:
+                    self._dropped_count += 1
+                    self._state = "degraded"
+                    self._detail = "输入队列覆盖旧消息"
+                    self._update_topic_quality_locked(
+                        channel.topic,
+                        dropped_delta=1,
+                        state="degraded",
+                        detail="input queue replaced a pending message",
+                    )
+                self._receive_pending[channel.topic] = frame
+                worker_event = self._receive_worker_events.get(channel.topic)
+                if worker_event is not None:
+                    worker_event.set()
+        finally:
+            with self._condition:
+                self._in_flight_raw_callbacks -= 1
+                self._condition.notify_all()
+
+    def _process_raw_payload(self, channel: _ChannelBinding, frame: object) -> None:
+        """receive worker 按 metadata、discovery gate、Protobuf parse 的固定顺序交付。"""
+        from slope_sim.interfaces.v2.ecal_raw import validate_raw_frame_metadata
+
+        with self._delivery_gate:
+            with self._condition:
+                if self._state in _STOPPING_STATES:
+                    return
+                if self._topic_quality[channel.topic].protocol_state != "verified":
+                    return
+            if channel.descriptor is None or channel.raw_parser is None:
+                raise RuntimeError("raw subscriber channel is incomplete")
+            try:
+                validate_raw_frame_metadata(
+                    frame,
+                    expected_type=channel.type_name,
+                    descriptor=channel.descriptor,
+                )
+            except (RuntimeError, ValueError) as error:
+                with self._condition:
+                    self._record_topic_error_locked(channel.topic, error)
+                return
+            with self._condition:
+                if (
+                    self._state in _STOPPING_STATES
+                    or self._topic_quality[channel.topic].protocol_state != "verified"
+                ):
+                    return
+            try:
+                channel.raw_parser(frame.payload)
+            except (RuntimeError, ValueError, TypeError) as error:
+                with self._condition:
+                    self._record_topic_error_locked(channel.topic, error)
+                return
+            self._on_payload(channel.topic, frame.payload, received_at=frame.received_at)
+
+    def _on_payload(
+        self, topic: str, payload: object, *, received_at: float | None = None
+    ) -> None:
         """锁外交付负载；至少一次成功且没有明确拒绝时才激活当前代。"""
         copied_payload = _copy_ecal_payload(payload)
-        received_at = _require_wall_time("received_at", self._monotonic())
+        # raw worker 必须保留 native callback 时刻，不能把排队旧帧重打为新命令。
+        delivered_at = _require_wall_time(
+            "received_at", self._monotonic() if received_at is None else received_at
+        )
         with self._condition:
             if self._state in _STOPPING_STATES:
                 return
@@ -902,7 +1076,7 @@ class EcalTransport:
                 accepted: bool | None = None
                 with _transport_callback_context(self):
                     try:
-                        accepted = subscription._callback(copied_payload, received_at)
+                        accepted = subscription._callback(copied_payload, delivered_at)
                     except Exception as exc:
                         callback_error = exc
 
@@ -929,8 +1103,8 @@ class EcalTransport:
                     self._state not in _STOPPING_STATES
                     and callback_generation == self._generation
                 ):
-                    self._set_topic_peer_connected_locked(topic, True)
-                    if topic == self._config.wheel_command.topic:
+                    self._mark_topic_peer_observed_locked(topic)
+                    if topic == self._command_topic:
                         self._peer_connected = True
                         if (
                             accepted_current_generation
@@ -1007,29 +1181,48 @@ class EcalTransport:
 
     def _apply_peer_states_locked(
         self,
-        observed: dict[str, bool],
+        observed: dict[str, int],
+        protocol_observations: dict[str, object] | None = None,
     ) -> str | None:
         """原子提交六话题 discovery，命令边沿单独驱动 mailbox 生命周期。"""
-        command_topic = self._config.wheel_command.topic
+        protocol_observations = {} if protocol_observations is None else protocol_observations
+        command_topic = self._command_topic
         command_quality = self._topic_quality[command_topic]
         command_previously_known = command_quality.peer_connected is not None
-        for topic, connected in observed.items():
-            self._set_topic_peer_connected_locked(topic, connected)
+        for topic, peer_count in observed.items():
+            self._set_topic_peer_count_locked(topic, peer_count)
+            verification = protocol_observations.get(topic)
+            if verification is not None:
+                self._set_topic_protocol_locked(topic, verification)
         return self._apply_peer_state_locked(
-            observed[command_topic],
+            observed[command_topic] > 0,
             previously_known=command_previously_known,
         )
 
     def _apply_discovery_observation_locked(
         self,
         revision: int,
-        observed: dict[str, bool],
+        observed: dict[str, int],
+        protocol_observations: dict[str, object] | None = None,
     ) -> str | None:
         """只提交最新 discovery revision，迟到旧观察不得回退连接状态。"""
         if revision <= self._applied_discovery_revision:
             return None
         self._applied_discovery_revision = revision
-        return self._apply_peer_states_locked(observed)
+        protocol_observations = {} if protocol_observations is None else protocol_observations
+        transition = self._apply_peer_states_locked(observed, protocol_observations)
+        conflicts = tuple(
+            verification
+            for verification in protocol_observations.values()
+            if getattr(getattr(verification, "state", None), "value", None)
+            == "conflict"
+        )
+        if conflicts:
+            detail = str(getattr(conflicts[0], "detail", "protocol metadata conflict"))
+            self._state = "error"
+            self._detail = detail
+            raise ProtocolConflictError(f"protocol conflict: {detail}")
+        return transition
 
     def _drain_deferred_peer_state(self) -> None:
         """在 delivery gate 内处理用户回调重入时暂存的最新 discovery 结果。"""
@@ -1042,10 +1235,11 @@ class EcalTransport:
                 self._deferred_peer_connected = None
                 if deferred is None:
                     return
-                revision, observed = deferred
+                revision, observed, protocol_observations = deferred
                 transition = self._apply_discovery_observation_locked(
                     revision,
                     observed,
+                    protocol_observations,
                 )
             self._notify_peer_transition(transition)
 
@@ -1066,6 +1260,20 @@ class EcalTransport:
 
     def _record_publish_error_locked(self, topic: str, error: Exception) -> None:
         """同步累计全局和话题发送错误，关闭期不得改写 lifecycle 状态。"""
+        detail = _error_detail(error)
+        self._error_count += 1
+        self._update_topic_quality_locked(
+            topic,
+            error_delta=1,
+            state="error",
+            detail=detail,
+        )
+        if self._state not in _STOPPING_STATES:
+            self._state = "error"
+            self._detail = detail
+
+    def _record_topic_error_locked(self, topic: str, error: Exception) -> None:
+        """记录 raw receive worker 的单话题失败，并锁存正式 transport 错误状态。"""
         detail = _error_detail(error)
         self._error_count += 1
         self._update_topic_quality_locked(
@@ -1103,12 +1311,24 @@ class EcalTransport:
                 detail if dropped_delta else current.last_drop_detail
             ),
             peer_connected=current.peer_connected,
+            peer_count=current.peer_count,
+            protocol_state=current.protocol_state,
+            protocol_detail=current.protocol_detail,
+            remote_type_names=current.remote_type_names,
+            remote_encodings=current.remote_encodings,
+            remote_descriptor_sha256=current.remote_descriptor_sha256,
         )
 
-    def _set_topic_peer_connected_locked(self, topic: str, connected: bool) -> None:
-        """只在单话题 discovery 值变化时推进质量 revision。"""
+    def _set_topic_peer_count_locked(self, topic: str, peer_count: int) -> None:
+        """写入原始 discovery count，并从中派生兼容的连接布尔值。"""
         current = self._topic_quality[topic]
-        if current.peer_connected is connected:
+        connected = peer_count > 0
+        protocol_state = "pending" if connected else "waiting"
+        if (
+            current.peer_connected is connected
+            and current.peer_count == peer_count
+            and current.protocol_state == protocol_state
+        ):
             return
         self._topic_quality[topic] = TransportTopicQuality(
             topic=topic,
@@ -1120,6 +1340,75 @@ class EcalTransport:
             last_error_detail=current.last_error_detail,
             last_drop_detail=current.last_drop_detail,
             peer_connected=connected,
+            peer_count=peer_count,
+            protocol_state=protocol_state,
+            protocol_detail="",
+            remote_type_names=(),
+            remote_encodings=(),
+            remote_descriptor_sha256=(),
+        )
+
+    def _set_topic_protocol_locked(self, topic: str, verification: object) -> None:
+        """把 raw monitoring 的单次 metadata 判定原子投影到 topic quality。"""
+        raw_state = getattr(verification, "state", None)
+        state = getattr(raw_state, "value", None)
+        peer_count = getattr(verification, "peer_count", None)
+        type_names = getattr(verification, "type_names", None)
+        encodings = getattr(verification, "encodings", None)
+        descriptor_sha256 = getattr(verification, "descriptor_sha256", None)
+        detail = getattr(verification, "detail", None)
+        if (
+            state not in {"waiting", "pending", "verified", "conflict"}
+            or not isinstance(peer_count, int)
+            or isinstance(peer_count, bool)
+            or peer_count < 0
+            or not isinstance(type_names, tuple)
+            or not isinstance(encodings, tuple)
+            or not isinstance(descriptor_sha256, tuple)
+            or not isinstance(detail, str)
+        ):
+            raise RuntimeError("raw protocol verification is invalid")
+        current = self._topic_quality[topic]
+        first_conflict = state == "conflict" and current.protocol_state != "conflict"
+        self._topic_quality[topic] = TransportTopicQuality(
+            topic=topic,
+            error_count=current.error_count + int(first_conflict),
+            dropped_count=current.dropped_count,
+            state="error" if state == "conflict" else current.state,
+            detail=detail if state == "conflict" else current.detail,
+            revision=current.revision + 1,
+            last_error_detail=detail if first_conflict else current.last_error_detail,
+            last_drop_detail=current.last_drop_detail,
+            peer_connected=peer_count > 0,
+            peer_count=peer_count,
+            protocol_state=state,
+            protocol_detail=detail,
+            remote_type_names=type_names,
+            remote_encodings=encodings,
+            remote_descriptor_sha256=descriptor_sha256,
+        )
+
+    def _mark_topic_peer_observed_locked(self, topic: str) -> None:
+        """回调只能证明存在 peer；精确数量仍必须由 discovery 轮询写入。"""
+        current = self._topic_quality[topic]
+        if current.peer_connected is True:
+            return
+        self._topic_quality[topic] = TransportTopicQuality(
+            topic=topic,
+            error_count=current.error_count,
+            dropped_count=current.dropped_count,
+            state=current.state,
+            detail=current.detail,
+            revision=current.revision + 1,
+            last_error_detail=current.last_error_detail,
+            last_drop_detail=current.last_drop_detail,
+            peer_connected=True,
+            peer_count=None,
+            protocol_state="not_checked",
+            protocol_detail="",
+            remote_type_names=(),
+            remote_encodings=(),
+            remote_descriptor_sha256=(),
         )
 
     def _recover_topic_quality_locked(self, topic: str) -> None:
@@ -1137,6 +1426,12 @@ class EcalTransport:
             last_error_detail=current.last_error_detail,
             last_drop_detail=current.last_drop_detail,
             peer_connected=current.peer_connected,
+            peer_count=current.peer_count,
+            protocol_state=current.protocol_state,
+            protocol_detail=current.protocol_detail,
+            remote_type_names=current.remote_type_names,
+            remote_encodings=current.remote_encodings,
+            remote_descriptor_sha256=current.remote_descriptor_sha256,
         )
 
     def poll_peer_state(self) -> str:
@@ -1156,9 +1451,19 @@ class EcalTransport:
                     discovery_registered = True
                 try:
                     observed = {
-                        topic: self._bindings.is_peer_connected(resource)
+                        topic: self._bindings.peer_count(resource)
                         for topic, resource in monitored
                     }
+                    protocol_observations = {}
+                    for topic, resource in monitored:
+                        channel = next(
+                            item for item in self._channels if item.topic == topic
+                        )
+                        if channel.raw_wire:
+                            snapshot = self._bindings.snapshot_remote_endpoints(
+                                channel, resource, observed[topic]
+                            )
+                            protocol_observations[topic] = snapshot.verification
                 except Exception as exc:
                     self._record_error(exc)
                     raise
@@ -1170,7 +1475,11 @@ class EcalTransport:
                         return "disconnected"
                     deferred = self._deferred_peer_connected
                     if deferred is None or revision > deferred[0]:
-                        self._deferred_peer_connected = (revision, observed)
+                        self._deferred_peer_connected = (
+                            revision,
+                            observed,
+                            protocol_observations,
+                        )
                     return self._state
 
             # delivery 与 discovery 共用独立门，确保断线清邮箱后旧 payload 不再进入上层。
@@ -1181,6 +1490,7 @@ class EcalTransport:
                     transition = self._apply_discovery_observation_locked(
                         revision,
                         observed,
+                        protocol_observations,
                     )
                 self._notify_peer_transition(transition)
                 self._drain_deferred_peer_state()
@@ -1234,13 +1544,66 @@ class EcalTransport:
                 self._worker_exited_topics.add(topic)
                 if (
                     self._quiesce_started
-                    and len(self._worker_exited_topics) == len(self._workers)
+                    and self._all_workers_exited_locked()
                 ):
                     self._quiesce_complete = True
                     if self._state == "quiescing":
                         self._state = "quiesced"
                 self._condition.notify_all()
             self._run_deferred_cleanup_if_safe(worker_epilogue=True)
+
+    def _receive_worker_main(self, topic: str) -> None:
+        """串行处理单话题 owner+latest receive lane，物理回调始终不阻塞。"""
+        escaped_error: BaseException | None = None
+        try:
+            self._receive_worker_loop(topic)
+        except BaseException as exc:
+            escaped_error = exc
+            raise
+        finally:
+            with self._condition:
+                if escaped_error is not None:
+                    self._record_topic_error_locked(topic, escaped_error)
+                self._receive_worker_exited_topics.add(topic)
+                if self._quiesce_started and self._all_workers_exited_locked():
+                    self._quiesce_complete = True
+                    if self._state == "quiescing":
+                        self._state = "quiesced"
+                self._condition.notify_all()
+            self._run_deferred_cleanup_if_safe(worker_epilogue=True)
+
+    def _receive_worker_loop(self, topic: str) -> None:
+        """从 single owner 与 latest 槽取帧，worker 外执行完整 raw 校验和交付。"""
+        worker_event = self._receive_worker_events[topic]
+        channel, _subscriber = self._subscriber_by_topic[topic]
+        while True:
+            worker_event.wait()
+            worker_event.clear()
+            while True:
+                with self._condition:
+                    if self._stop_worker or self._state in _STOPPING_STATES:
+                        return
+                    frame = self._receive_pending.pop(topic, None)
+                    if frame is None:
+                        break
+                    if topic in self._claimed_received:
+                        raise RuntimeError("receive lane already owns an in-flight frame")
+                    self._claimed_received[topic] = frame
+                try:
+                    self._process_raw_payload(channel, frame)
+                finally:
+                    with self._condition:
+                        claimed = self._claimed_received.pop(topic, None)
+                        if claimed is not frame:
+                            raise RuntimeError("receive lane ownership changed unexpectedly")
+                        self._condition.notify_all()
+
+    def _all_workers_exited_locked(self) -> bool:
+        """调用方持锁时判断发送与 raw 接收 worker 是否均已退出。"""
+        return (
+            len(self._worker_exited_topics) == len(self._workers)
+            and len(self._receive_worker_exited_topics) == len(self._receive_workers)
+        )
 
     def _worker_loop(self, topic: str) -> None:
         """持续排空单话题 ready/latest，并把 native send 与 ready 明确区分。"""
@@ -1260,11 +1623,15 @@ class EcalTransport:
 
                     send_error: Exception | None = None
                     try:
-                        self._bindings.send(
-                            publisher,
-                            message.payload,
-                            channel.message_type,
-                        )
+                        if channel.raw_wire:
+                            self._bindings.send_raw(publisher, message.payload)
+                        else:
+                            assert channel.message_type is not None
+                            self._bindings.send(
+                                publisher,
+                                message.payload,
+                                channel.message_type,
+                            )
                     except Exception as exc:
                         send_error = exc
 
@@ -1369,8 +1736,11 @@ class EcalTransport:
                 subscription._active = False
             subscriptions.clear()
         self._reclaim_unsent_locked()
+        self._reclaim_unprocessed_raw_locked()
         self._stop_worker = True
         for worker_event in self._worker_events.values():
+            worker_event.set()
+        for worker_event in self._receive_worker_events.values():
             worker_event.set()
         self._condition.notify_all()
 
@@ -1394,8 +1764,20 @@ class EcalTransport:
             )
         self._pending.clear()
 
+    def _reclaim_unprocessed_raw_locked(self) -> None:
+        """关闭时丢弃尚未由 receive worker 认领的 latest raw frame。"""
+        for topic in tuple(self._receive_pending):
+            self._dropped_count += 1
+            self._update_topic_quality_locked(
+                topic,
+                dropped_delta=1,
+                state="degraded",
+                detail="transport closed before pending raw frame was processed",
+            )
+        self._receive_pending.clear()
+
     def _finish_quiesce(self, *, wait_for_deliveries: bool) -> EcalTransportSnapshot:
-        """停止并汇合全部 publisher lane；外部 quiesce 还等待既有 delivery。"""
+        """停止并汇合全部发送/接收 lane；外部 quiesce 还等待既有 delivery。"""
         callback_context = _inside_transport_callback(self)
         caller = current_thread()
         worker_context = self._is_worker_thread()
@@ -1403,7 +1785,7 @@ class EcalTransport:
             if self._state == "closed":
                 return self._snapshot_locked()
             self._begin_quiesce_locked()
-            workers = tuple(self._workers.values())
+            workers = (*self._workers.values(), *self._receive_workers.values())
 
         for worker in workers:
             if worker is not caller:
@@ -1419,6 +1801,7 @@ class EcalTransport:
                 while (
                     self._in_flight_deliveries > 0
                     or self._in_flight_discoveries > 0
+                    or self._in_flight_raw_callbacks > 0
                 ):
                     self._condition.wait()
             return self._snapshot_locked()
@@ -1514,6 +1897,8 @@ class EcalTransport:
         with self._condition:
             while self._in_flight_discoveries > 0:
                 self._condition.wait()
+            while self._in_flight_raw_callbacks > 0:
+                self._condition.wait()
 
         for _channel, resource in reversed(self._subscriber_resources):
             try:
@@ -1539,6 +1924,7 @@ class EcalTransport:
         self._subscriber_by_topic.clear()
         self._send_locks.clear()
         self._worker_events.clear()
+        self._receive_worker_events.clear()
         self._publisher_resources.clear()
         self._subscriber_resources.clear()
         if participant is not None:

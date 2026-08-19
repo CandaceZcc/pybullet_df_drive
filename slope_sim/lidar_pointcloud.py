@@ -3,24 +3,36 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from functools import lru_cache
+import hashlib
 import math
 from numbers import Integral, Real
+from pathlib import Path
 
 from slope_sim.interfaces.dashboard_snapshot import LidarTopViewFrame, LidarTopViewPoint
+from slope_sim.interfaces.generated import slope_sim_interfaces_v2_pb2 as pb
 from slope_sim.interfaces.models import LidarPoint, LidarPointCloud
 from slope_sim.scene import LIDAR_VISIBLE_GROUP
 from slope_sim.sensor_backend import Pose, RayHit, SensorBackend, Vec3
-from slope_sim.truth_sensors import MountPose, SensorMounts
+from slope_sim.truth_sensors import MountPose, SensorMounts, Stage4SensorMounts
 
 
 LIDAR_SCAN_PERIOD_NS = 100_000_000
+MID360_PATTERN_VERSION = "livox-mid360-800000-v1"
+MID360_PATTERN_SHA256 = "4077e0b68a68e40ba8a5da17d4aff5ba86ea4fb557a4f8b594e4de1ebbeb20ca"
+_MID360_PATTERN_ROWS = 800_000
+_MID360_FIRING_SLOTS = 5_760
+_MID360_PATTERN_BYTES = _MID360_PATTERN_ROWS * 16
+_MID360_PHASE_DOMAIN = b"pybullet-df-drive/mid360-phase/v1\0"
+_MID360_PATTERN_PATH = Path(__file__).with_name("assets") / "mid360_pattern.bin"
 _UINT64_MAX = (1 << 64) - 1
 _SUPPORTED_VERTICAL_LINES = 16
 _SUPPORTED_HORIZONTAL_SAMPLES = 180
 _SUPPORTED_HORIZONTAL_FOV_DEG = 180.0
 _SUPPORTED_VERTICAL_FOV_DEG = (-15.0, 15.0)
 _SUPPORTED_MIN_RANGE_M = 0.10
-_SUPPORTED_MAX_RANGE_M = 30.0
+# 正式中心 MID-360 量程扩展 50%，不改变 5,760 firing slots 或 10 Hz 节拍。
+_SUPPORTED_MAX_RANGE_M = 45.0
 _SUPPORTED_RAY_COUNT = _SUPPORTED_VERTICAL_LINES * _SUPPORTED_HORIZONTAL_SAMPLES
 _RANGE_REL_TOLERANCE = 1e-6
 _RANGE_ABS_TOLERANCE_M = 1e-5
@@ -30,6 +42,10 @@ _POINT_SEMANTICS = {
     "static_obstacle": (2, 160),
     "moving_obstacle": (3, 200),
 }
+
+
+class _V2PayloadSerializationError(RuntimeError):
+    """标记中心 LiDAR protobuf 的最终编码边界失败。"""
 
 
 def _require_integral(name: str, value: object) -> int:
@@ -123,7 +139,7 @@ class LidarConfig:
 
     @classmethod
     def default(cls) -> "LidarConfig":
-        """返回阶段三冻结的 16 线、180 度、30 米扫描参数。"""
+        """返回 16 线、180 度、45 米扫描参数。"""
         return cls(
             vertical_lines=_SUPPORTED_VERTICAL_LINES,
             horizontal_samples=_SUPPORTED_HORIZONTAL_SAMPLES,
@@ -137,6 +153,26 @@ class LidarConfig:
     def ray_count(self) -> int:
         """返回每帧固定射线总数。"""
         return self.vertical_lines * self.horizontal_samples
+
+
+@dataclass(frozen=True, slots=True)
+class Stage4LidarProfile:
+    """阶段四单中心 MID-360 的冻结 progressive firing slot 合同。"""
+
+    @classmethod
+    def realtime(cls) -> "Stage4LidarProfile":
+        """返回 10 Hz 实时路径使用的固定 firing slot 合同。"""
+        return cls()
+
+    @property
+    def firing_slot_count(self) -> int:
+        """返回每个 100 ms progressive 帧的固定 firing slot 数。"""
+        return _MID360_FIRING_SLOTS
+
+    @property
+    def ray_count(self) -> int:
+        """保留扫描器内部消费的 firing slot 数别名。"""
+        return self.firing_slot_count
 
 
 def _inclusive_angles(lower: float, upper: float, count: int) -> tuple[float, ...]:
@@ -187,6 +223,147 @@ def _require_uint64(name: str, value: object) -> int:
     ):
         raise ValueError(f"{name} must be a uint64")
     return value
+
+
+def _require_mid360_pattern_version(pattern_version: object) -> str:
+    if type(pattern_version) is not str or pattern_version != MID360_PATTERN_VERSION:
+        raise ValueError(f"pattern_version must be {MID360_PATTERN_VERSION!r}")
+    return pattern_version
+
+
+def _require_mid360_global_slot(global_slot: object) -> int:
+    if type(global_slot) is not int or not 0 <= global_slot < _MID360_FIRING_SLOTS:
+        raise ValueError("global_slot must be an integer in [0, 5759]")
+    return global_slot
+
+
+@lru_cache(maxsize=16)
+def _mid360_pattern_base_for_identity(version: str, generation: int) -> int:
+    """缓存已验证 world identity 的冻结 phase base，避免逐 firing 重算 SHA。"""
+    digest = hashlib.sha256(
+        _MID360_PHASE_DOMAIN
+        + version.encode("ascii")
+        + b"\0"
+        + generation.to_bytes(8, "big", signed=False)
+    ).digest()
+    return int.from_bytes(digest, "big") % _MID360_PATTERN_ROWS
+
+
+def _mid360_pattern_base(pattern_version: object, world_generation: object) -> int:
+    version = _require_mid360_pattern_version(pattern_version)
+    generation = _require_uint64("world_generation", world_generation)
+    if generation == 0:
+        raise ValueError("world_generation must be a positive uint64")
+    return _mid360_pattern_base_for_identity(version, generation)
+
+
+def mid360_pattern_row_index(
+    pattern_version: object,
+    world_generation: object,
+    sequence: object,
+    global_slot: object,
+) -> int:
+    """把输出身份与全局 firing slot 映射到冻结官方 pattern 行。"""
+    base = _mid360_pattern_base(pattern_version, world_generation)
+    normalized_sequence = _require_uint64("sequence", sequence)
+    slot = _require_mid360_global_slot(global_slot)
+    return (base + normalized_sequence * _MID360_FIRING_SLOTS + slot) % _MID360_PATTERN_ROWS
+
+
+def mid360_offset_time_ns(global_slot: object) -> int:
+    """返回 100 ms 帧内严格递增的全局 firing 时间。"""
+    slot = _require_mid360_global_slot(global_slot)
+    return slot * LIDAR_SCAN_PERIOD_NS // _MID360_FIRING_SLOTS
+
+
+def mid360_line_for_slot(
+    pattern_version: object,
+    world_generation: object,
+    sequence: object,
+    global_slot: object,
+) -> int:
+    """按官方 pattern 行为 Stage4 点选择冻结的四线编号。"""
+    return mid360_pattern_row_index(
+        pattern_version,
+        world_generation,
+        sequence,
+        global_slot,
+    ) % 4
+
+
+@lru_cache(maxsize=1)
+def _mid360_pattern_table():
+    """只从包内资产建立 readonly memmap，并在首次使用时校验冻结摘要。"""
+    if not _MID360_PATTERN_PATH.is_file() or _MID360_PATTERN_PATH.stat().st_size != _MID360_PATTERN_BYTES:
+        raise RuntimeError("frozen MID-360 pattern asset is missing or has the wrong size")
+    digest = hashlib.sha256()
+    with _MID360_PATTERN_PATH.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    if digest.hexdigest() != MID360_PATTERN_SHA256:
+        raise RuntimeError("frozen MID-360 pattern asset SHA-256 does not match")
+    import numpy as np
+
+    table = np.memmap(
+        _MID360_PATTERN_PATH,
+        dtype="<f8",
+        mode="r",
+        shape=(_MID360_PATTERN_ROWS, 2),
+        order="C",
+    )
+    table.setflags(write=False)
+    return table
+
+
+def _mid360_unit_directions_from_rows(row_indexes: Sequence[int]):
+    """批量把 azimuth/zenith 转为项目 x-forward、z-up 单位方向。"""
+    import numpy as np
+
+    rows = np.asarray(tuple(row_indexes), dtype=np.int64, order="C")
+    angles = np.asarray(_mid360_pattern_table()[rows], dtype=np.float64, order="C")
+    azimuth = np.deg2rad(angles[:, 0])
+    zenith = np.deg2rad(angles[:, 1])
+    sin_zenith = np.sin(zenith)
+    directions = np.empty((len(rows), 3), dtype=np.float64, order="C")
+    directions[:, 0] = sin_zenith * np.cos(azimuth)
+    directions[:, 1] = sin_zenith * np.sin(azimuth)
+    directions[:, 2] = np.cos(zenith)
+    directions.setflags(write=False)
+    return directions
+
+
+def _mid360_unit_directions_for_slots(
+    pattern_version: object,
+    world_generation: object,
+    sequence: object,
+    global_slots: object,
+):
+    invalid_types = (str, bytes, set, frozenset, Mapping, Iterator)
+    if isinstance(global_slots, invalid_types) or not isinstance(global_slots, Sequence):
+        raise ValueError("global_slots must be an ordered sequence")
+    slots = tuple(_require_mid360_global_slot(slot) for slot in global_slots)
+    base = _mid360_pattern_base(pattern_version, world_generation)
+    normalized_sequence = _require_uint64("sequence", sequence)
+    first_row = (base + normalized_sequence * _MID360_FIRING_SLOTS) % _MID360_PATTERN_ROWS
+    return _mid360_unit_directions_from_rows(
+        tuple((first_row + slot) % _MID360_PATTERN_ROWS for slot in slots)
+    )
+
+
+def mid360_direction_for_slot(
+    pattern_version: object,
+    world_generation: object,
+    sequence: object,
+    global_slot: object,
+) -> Vec3:
+    """返回一个冻结 firing slot 的官方单位方向。"""
+    directions = _mid360_unit_directions_for_slots(
+        pattern_version,
+        world_generation,
+        sequence,
+        (_require_mid360_global_slot(global_slot),),
+    )
+    return tuple(float(value) for value in directions[0])  # type: ignore[return-value]
 
 
 def _rotation_matrix(orientation: tuple[float, float, float, float]) -> tuple[float, ...]:
@@ -305,23 +482,23 @@ class MultiLineLidar:
     def __init__(
         self,
         backend: SensorBackend,
-        config: LidarConfig,
+        config: LidarConfig | Stage4LidarProfile,
         mount: MountPose,
         *,
         frame_id: str,
         lidar_id: int,
     ) -> None:
-        if not isinstance(config, LidarConfig):
-            raise ValueError("config must be a LidarConfig value")
+        if not isinstance(config, (LidarConfig, Stage4LidarProfile)):
+            raise ValueError("config must be a LidarConfig or Stage4LidarProfile value")
         if not isinstance(mount, MountPose):
             raise ValueError("mount must be a MountPose value")
         if (
             type(frame_id) is not str
             or type(lidar_id) is not int
             or (frame_id, lidar_id)
-            not in {("lidar_front", 1), ("lidar_rear", 2)}
+            not in {("lidar_front", 1), ("lidar_rear", 2), ("lidar_link", 1)}
         ):
-            raise ValueError("frame_id and lidar_id must identify the front or rear lidar")
+            raise ValueError("frame_id and lidar_id must identify a configured lidar")
         try:
             link_names = tuple(backend.link_names())
         except (AttributeError, TypeError) as exc:
@@ -334,17 +511,26 @@ class MultiLineLidar:
         self._mount = mount
         self.frame_id = frame_id
         self.lidar_id = lidar_id
-        unit_rays = build_unit_rays(config)
-        if len(unit_rays) != config.ray_count:
-            raise RuntimeError("fixed lidar ray table length does not match config.ray_count")
-        self._local_starts = tuple(
-            tuple(component * config.min_range_m for component in ray)
-            for ray in unit_rays
-        )
-        self._local_ends = tuple(
-            tuple(component * config.max_range_m for component in ray)
-            for ray in unit_rays
-        )
+        self._stage4_numpy = None
+        if isinstance(config, Stage4LidarProfile):
+            # Shard 初始化不构造 5,760 表；每帧按自己的 global slots 直接查 pattern。
+            import numpy as np
+
+            self._stage4_numpy = np
+            self._local_starts = ()
+            self._local_ends = ()
+        else:
+            unit_rays = build_unit_rays(config)
+            if len(unit_rays) != config.ray_count:
+                raise RuntimeError("fixed lidar ray table length does not match config.ray_count")
+            self._local_starts = tuple(
+                tuple(component * config.min_range_m for component in ray)
+                for ray in unit_rays
+            )
+            self._local_ends = tuple(
+                tuple(component * config.max_range_m for component in ray)
+                for ray in unit_rays
+            )
 
     @classmethod
     def front(cls, backend: SensorBackend, config: LidarConfig) -> "MultiLineLidar":
@@ -368,6 +554,21 @@ class MultiLineLidar:
             lidar_id=2,
         )
 
+    @classmethod
+    def stage4(
+        cls,
+        backend: SensorBackend,
+        profile: Stage4LidarProfile,
+    ) -> "MultiLineLidar":
+        """构造阶段四唯一中心 LiDAR，后续 v2 runtime 只使用该入口。"""
+        return cls(
+            backend,
+            profile,
+            Stage4SensorMounts.default().lidar,
+            frame_id="lidar_link",
+            lidar_id=1,
+        )
+
     def _world_mount(self) -> Pose:
         parent = self._backend.world_pose(self._mount.parent_link)
         if not isinstance(parent, Pose):
@@ -387,6 +588,54 @@ class MultiLineLidar:
             self._local_ends,
         )
 
+    def _stage4_transform_points(self, local_points, mount: Pose):
+        """按标量左结合顺序批量变换 readonly C-contiguous Stage4 端点。"""
+        np = self._stage4_numpy
+        if np is None:
+            raise RuntimeError("Stage4 numpy rays are only available to a Stage4 scanner")
+        matrix = _rotation_matrix(mount.orientation)
+        px, py, pz = mount.position
+        world_points = np.empty_like(local_points)
+        scratch = np.empty(local_points.shape[0], dtype=np.float64)
+        for column, origin, row_offset in (
+            (0, px, 0),
+            (1, py, 3),
+            (2, pz, 6),
+        ):
+            np.multiply(local_points[:, 0], matrix[row_offset], out=world_points[:, column])
+            np.add(origin, world_points[:, column], out=world_points[:, column])
+            np.multiply(local_points[:, 1], matrix[row_offset + 1], out=scratch)
+            np.add(world_points[:, column], scratch, out=world_points[:, column])
+            np.multiply(local_points[:, 2], matrix[row_offset + 2], out=scratch)
+            np.add(world_points[:, column], scratch, out=world_points[:, column])
+        world_points.setflags(write=False)
+        return world_points
+
+    def _stage4_world_rays_for_slots(
+        self,
+        mount: Pose,
+        *,
+        pattern_version: object,
+        world_generation: object,
+        sequence: object,
+        global_slots: object,
+    ):
+        """只为调用方所属 global slots 生成两个 readonly C-order 射线数组。"""
+        directions = _mid360_unit_directions_for_slots(
+            pattern_version,
+            world_generation,
+            sequence,
+            global_slots,
+        )
+        local_starts = directions * _SUPPORTED_MIN_RANGE_M
+        local_ends = directions * _SUPPORTED_MAX_RANGE_M
+        local_starts.setflags(write=False)
+        local_ends.setflags(write=False)
+        return (
+            self._stage4_transform_points(local_starts, mount),
+            self._stage4_transform_points(local_ends, mount),
+        )
+
     def _point_from_hit(
         self,
         ray_index: int,
@@ -394,17 +643,54 @@ class MultiLineLidar:
         local_point: Vec3,
     ) -> LidarPoint | None:
         """把已完成后端边界校验的局部命中转换为企业点。"""
+        values = self._point_values_from_hit(ray_index, hit, local_point)
+        return None if values is None else LidarPoint(*values)
+
+    def _point_values_from_hit(
+        self,
+        ray_index: int,
+        hit: RayHit,
+        local_point: Vec3,
+    ) -> tuple[int, float, float, float, int, int, int] | None:
+        """按阶段三规则网格定义 offset 与 line。"""
+        if not isinstance(self.config, LidarConfig):
+            raise RuntimeError("Stage3 point conversion requires LidarConfig")
+        measurement = self._point_measurement_from_hit(
+            ray_index,
+            hit,
+            local_point,
+            min_range_m=self.config.min_range_m,
+            max_range_m=self.config.max_range_m,
+        )
+        if measurement is None:
+            return None
+        return (
+            ray_index * LIDAR_SCAN_PERIOD_NS // self.config.ray_count,
+            *measurement,
+            ray_index // self.config.horizontal_samples,
+        )
+
+    def _point_measurement_from_hit(
+        self,
+        ray_index: int,
+        hit: RayHit,
+        local_point: Vec3,
+        *,
+        min_range_m: float,
+        max_range_m: float,
+    ) -> tuple[float, float, float, int, int] | None:
+        """共享范围筛选和命中语义，不混入各扫描领域的时序与线号。"""
         distance = math.hypot(*local_point)
         # PyBullet 变换返回单精度坐标，边界比较只吸收其数值回差。
-        below_minimum = distance < self.config.min_range_m and not math.isclose(
+        below_minimum = distance < min_range_m and not math.isclose(
             distance,
-            self.config.min_range_m,
+            min_range_m,
             rel_tol=_RANGE_REL_TOLERANCE,
             abs_tol=_RANGE_ABS_TOLERANCE_M,
         )
-        above_maximum = distance > self.config.max_range_m and not math.isclose(
+        above_maximum = distance > max_range_m and not math.isclose(
             distance,
-            self.config.max_range_m,
+            max_range_m,
             rel_tol=_RANGE_REL_TOLERANCE,
             abs_tol=_RANGE_ABS_TOLERANCE_M,
         )
@@ -414,15 +700,162 @@ class MultiLineLidar:
             tag, reflectivity = _POINT_SEMANTICS[hit.category]
         except KeyError as exc:
             raise RuntimeError(f"ray {ray_index} has unsupported hit category {hit.category!r}") from exc
-        return LidarPoint(
-            ray_index * LIDAR_SCAN_PERIOD_NS // _SUPPORTED_RAY_COUNT,
+        return (
             local_point[0],
             local_point[1],
             local_point[2],
             reflectivity,
             tag,
-            ray_index // self.config.horizontal_samples,
         )
+
+    def _stage4_point_values_from_hit(
+        self,
+        global_slot: int,
+        hit: RayHit,
+        local_point: Vec3,
+        *,
+        pattern_version: object,
+        world_generation: object,
+        sequence: object,
+    ) -> tuple[int, float, float, float, int, int, int] | None:
+        """保留命中语义，仅把 Stage4 的 firing offset 与四线编号换为冻结合同。"""
+        measurement = self._point_measurement_from_hit(
+            global_slot,
+            hit,
+            local_point,
+            min_range_m=_SUPPORTED_MIN_RANGE_M,
+            max_range_m=_SUPPORTED_MAX_RANGE_M,
+        )
+        if measurement is None:
+            return None
+        return (
+            mid360_offset_time_ns(global_slot),
+            *measurement,
+            mid360_line_for_slot(
+                pattern_version,
+                world_generation,
+                sequence,
+                global_slot,
+            ),
+        )
+
+    def _indexed_local_hits_at_mount(
+        self,
+        mount: Pose,
+        *,
+        pattern_version: object = MID360_PATTERN_VERSION,
+        world_generation: object = 1,
+        sequence: object = 0,
+    ) -> tuple[tuple[tuple[int, RayHit], Vec3], ...]:
+        """执行射线与逆变换，保留已验证的紧凑命中顺序。"""
+        ndarray_query = getattr(self._backend, "_ray_test_indexed_hits_ndarray", None)
+        backend_type = type(self._backend)
+        # 同层声明是生产配对；仅子类覆写公开入口时保留完整批次观测路径。
+        batch_is_overridden = (
+            "ray_test_batch" in backend_type.__dict__
+            and "_ray_test_indexed_hits_ndarray" not in backend_type.__dict__
+        )
+        if self._stage4_numpy is not None:
+            starts, ends = self._stage4_world_rays_for_slots(
+                mount,
+                pattern_version=pattern_version,
+                world_generation=world_generation,
+                sequence=sequence,
+                global_slots=range(self.config.ray_count),
+            )
+            if len(starts) != self.config.ray_count or len(ends) != self.config.ray_count:
+                raise RuntimeError("lidar ray input batches must match config.ray_count")
+            if not batch_is_overridden and callable(ndarray_query):
+                indexed_hits = self._validated_indexed_hits(
+                    ndarray_query(
+                        starts,
+                        ends,
+                        collision_mask=LIDAR_VISIBLE_GROUP,
+                    )
+                )
+                used_compact_query = True
+            else:
+                scalar_starts = tuple(
+                    tuple(float(value) for value in row) for row in starts
+                )
+                scalar_ends = tuple(
+                    tuple(float(value) for value in row) for row in ends
+                )
+                indexed_hits, used_compact_query = self._indexed_hits(
+                    scalar_starts,
+                    scalar_ends,
+                )
+        else:
+            starts, ends = self._world_rays(mount)
+            if len(starts) != self.config.ray_count or len(ends) != self.config.ray_count:
+                raise RuntimeError("lidar ray input batches must match config.ray_count")
+            indexed_hits, used_compact_query = self._indexed_hits(starts, ends)
+        world_hit_points = tuple(hit.hit_position for _ray_index, hit in indexed_hits)
+        prevalidated_inverse = getattr(
+            self._backend,
+            "inverse_transform_points_prevalidated",
+            None,
+        )
+        if used_compact_query and callable(prevalidated_inverse):
+            raw_local_points = prevalidated_inverse(mount, world_hit_points)
+            if type(raw_local_points) is not tuple or len(raw_local_points) != len(indexed_hits):
+                raise RuntimeError("prevalidated inverse transform returned an unexpected result")
+            local_points = tuple(
+                _require_local_point(point, point_index)
+                for point_index, point in enumerate(raw_local_points)
+            )
+        else:
+            raw_local_points = self._backend.inverse_transform_points(mount, world_hit_points)
+            local_points = _require_inverse_points(raw_local_points, len(indexed_hits))
+        return tuple(zip(indexed_hits, local_points, strict=True))
+
+    def _scan_v2_payload_at_mount(
+        self,
+        scan_time: int,
+        mount: Pose,
+        *,
+        sequence: int,
+        world_generation: int,
+        simulation_session_id: bytes,
+        descriptor_sha256: bytes,
+    ) -> bytes:
+        """中心无俯视帧路径直接把紧凑命中确定性写入 v2 protobuf。"""
+        encoded = pb.LidarPointCloud(
+            timebase_ns=scan_time,
+            frame_id=self.frame_id,
+            lidar_id=self.lidar_id,
+            sequence=sequence,
+            world_generation=world_generation,
+            simulation_session_id=simulation_session_id,
+            descriptor_sha256=descriptor_sha256,
+        )
+        add_point = encoded.points.add
+        point_num = 0
+        for (ray_index, hit), local_point in self._indexed_local_hits_at_mount(
+            mount,
+            pattern_version=MID360_PATTERN_VERSION,
+            world_generation=world_generation,
+            sequence=sequence,
+        ):
+            values = self._stage4_point_values_from_hit(
+                ray_index,
+                hit,
+                local_point,
+                pattern_version=MID360_PATTERN_VERSION,
+                world_generation=world_generation,
+                sequence=sequence,
+            )
+            if values is not None:
+                add_point(
+                    offset_time_ns=values[0], x=values[1], y=values[2], z=values[3],
+                    reflectivity=values[4], tag=values[5], line=values[6],
+                )
+                point_num += 1
+        encoded.point_num = point_num
+        try:
+            return encoded.SerializeToString(deterministic=True)
+        except BaseException as error:
+            raise _V2PayloadSerializationError("center lidar protobuf serialization failed") from error
 
     def _indexed_hits(
         self,
@@ -433,38 +866,13 @@ class MultiLineLidar:
         compact_query = getattr(self._backend, "ray_test_indexed_hits", None)
         compact_declared = "ray_test_indexed_hits" in type(self._backend).__dict__
         if compact_declared and callable(compact_query):
-            raw_indexed = compact_query(
-                starts,
-                ends,
-                collision_mask=LIDAR_VISIBLE_GROUP,
-            )
-            invalid_types = (str, bytes, set, frozenset, Mapping, Iterator)
-            if isinstance(raw_indexed, invalid_types) or not isinstance(
-                raw_indexed,
-                Sequence,
-            ):
-                raise RuntimeError(
-                    "sensor backend ray_test_indexed_hits must return an ordered sequence"
+            return self._validated_indexed_hits(
+                compact_query(
+                    starts,
+                    ends,
+                    collision_mask=LIDAR_VISIBLE_GROUP,
                 )
-            indexed = tuple(raw_indexed)
-            previous_index = -1
-            for item_index, item in enumerate(indexed):
-                if type(item) is not tuple or len(item) != 2:
-                    raise RuntimeError(
-                        f"sensor backend indexed hit {item_index} must contain index and RayHit"
-                    )
-                ray_index, hit = item
-                if (
-                    type(ray_index) is not int
-                    or not previous_index < ray_index < self.config.ray_count
-                    or type(hit) is not RayHit
-                    or not hit.hit
-                ):
-                    raise RuntimeError(
-                        f"sensor backend indexed hit {item_index} is invalid"
-                    )
-                previous_index = ray_index
-            return indexed, True
+            ), True
 
         raw_hits = self._backend.ray_test_batch(
             starts,
@@ -490,6 +898,31 @@ class MultiLineLidar:
             if hit.hit
         ), False
 
+    def _validated_indexed_hits(self, raw_indexed: object) -> tuple[tuple[int, RayHit], ...]:
+        """校验私有紧凑命中入口的顺序、索引范围和可信命中对象。"""
+        invalid_types = (str, bytes, set, frozenset, Mapping, Iterator)
+        if isinstance(raw_indexed, invalid_types) or not isinstance(raw_indexed, Sequence):
+            raise RuntimeError(
+                "sensor backend ray_test_indexed_hits must return an ordered sequence"
+            )
+        indexed = tuple(raw_indexed)
+        previous_index = -1
+        for item_index, item in enumerate(indexed):
+            if type(item) is not tuple or len(item) != 2:
+                raise RuntimeError(
+                    f"sensor backend indexed hit {item_index} must contain index and RayHit"
+                )
+            ray_index, hit = item
+            if (
+                type(ray_index) is not int
+                or not previous_index < ray_index < self.config.ray_count
+                or type(hit) is not RayHit
+                or not hit.hit
+            ):
+                raise RuntimeError(f"sensor backend indexed hit {item_index} is invalid")
+            previous_index = ray_index
+        return indexed
+
     def _scan_message_at_mount(
         self,
         scan_time: int,
@@ -498,40 +931,27 @@ class MultiLineLidar:
         capture_world_points: bool,
     ) -> tuple[LidarPointCloud, tuple[Vec3, ...]]:
         """执行一次射线批次，并按需保留构建俯视帧所需的世界命中点。"""
-        starts, ends = self._world_rays(mount)
-        if len(starts) != self.config.ray_count or len(ends) != self.config.ray_count:
-            raise RuntimeError("lidar ray input batches must match config.ray_count")
-        indexed_hits, used_compact_query = self._indexed_hits(starts, ends)
-        world_hit_points = tuple(hit.hit_position for _ray_index, hit in indexed_hits)
-        prevalidated_inverse = getattr(
-            self._backend,
-            "inverse_transform_points_prevalidated",
-            None,
-        )
-        if used_compact_query and callable(prevalidated_inverse):
-            raw_local_points = prevalidated_inverse(mount, world_hit_points)
-            if type(raw_local_points) is not tuple or len(raw_local_points) != len(
-                indexed_hits
-            ):
-                raise RuntimeError(
-                    "prevalidated inverse transform returned an unexpected result"
-                )
-            local_points = raw_local_points
-        else:
-            raw_local_points = self._backend.inverse_transform_points(
-                mount,
-                world_hit_points,
-            )
-            local_points = _require_inverse_points(raw_local_points, len(indexed_hits))
-
         points: list[LidarPoint] = []
         accepted_world_points: list[Vec3] | None = [] if capture_world_points else None
-        for (ray_index, hit), local_point in zip(
-            indexed_hits,
-            local_points,
-            strict=True,
+        stage4_sequence = scan_time // LIDAR_SCAN_PERIOD_NS
+        for (ray_index, hit), local_point in self._indexed_local_hits_at_mount(
+            mount,
+            pattern_version=MID360_PATTERN_VERSION,
+            world_generation=1,
+            sequence=stage4_sequence,
         ):
-            point = self._point_from_hit(ray_index, hit, local_point)
+            if isinstance(self.config, Stage4LidarProfile):
+                values = self._stage4_point_values_from_hit(
+                    ray_index,
+                    hit,
+                    local_point,
+                    pattern_version=MID360_PATTERN_VERSION,
+                    world_generation=1,
+                    sequence=stage4_sequence,
+                )
+                point = None if values is None else LidarPoint(*values)
+            else:
+                point = self._point_from_hit(ray_index, hit, local_point)
             if point is not None:
                 points.append(point)
                 if accepted_world_points is not None:

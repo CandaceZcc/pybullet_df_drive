@@ -722,8 +722,18 @@
       "architecture": "amd64"
     },
     {
+      "name": "libssl-dev",
+      "version": "3.0.13-0ubuntu3.12",
+      "architecture": "amd64"
+    },
+    {
+      "name": "libyaml-cpp-dev",
+      "version": "0.8.0+dfsg-6build1",
+      "architecture": "amd64"
+    },
+    {
       "name": "libssl3t64:amd64",
-      "version": "3.0.13-0ubuntu3.11",
+      "version": "3.0.13-0ubuntu3.12",
       "architecture": "amd64"
     },
     {

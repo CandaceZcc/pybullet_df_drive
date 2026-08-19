@@ -25,11 +25,19 @@ repositories:
       - PybulletBasic
       - MobileRobot
   - name: bullet3
+    stage: 4
     url: https://github.com/bulletphysics/bullet3.git
     branch: master
     commit: 63c4d67e337017f9d8b298c900e9aabdb69296e7
-    purpose: Official PyBullet examples, URDFs, and joint-control patterns.
+    license: Zlib
+    license_scope: first_party
+    license_files:
+      - LICENSE.txt
+    stars: 14673
+    stars_observed_at: "2026-08-15T04:09:00Z"
+    purpose: Official PyBullet rayTestBatch, URDF, and joint-control examples.
     focus:
+      - examples/pybullet/examples/batchRayCast.py
       - examples/pybullet/examples/racecar_differential.py
       - examples/pybullet/gym/pybullet_data/racecar
   - name: Two-Wheel-Robot-DeepRL
@@ -181,3 +189,60 @@ repositories:
       - tools/pcd2ply.cpp
       - tools/ply2pcd.cpp
       - test/io/test_ply_io.cpp
+  - name: livox_laser_simulation
+    stage: 4
+    url: https://github.com/Livox-SDK/livox_laser_simulation.git
+    branch: main
+    commit: 1cce1073633a062b92e30243a4c2920e45551bb5
+    license: MIT
+    license_scope: first_party
+    license_files:
+      - LICENSE
+    stars: 338
+    stars_observed_at: "2026-08-15T03:51:50Z"
+    purpose: Official Livox Gazebo ray plugin and time-ordered MID-360 scan-pattern reference for replacing fixed ring sampling.
+    focus:
+      - README.md
+      - scan_mode/mid360.csv
+      - include/livox_laser_simulation/csv_reader.hpp
+      - src/livox_points_plugin.cpp
+      - src/livox_ode_multiray_shape.cpp
+      - urdf/livox_mid360.xacro
+  - name: FAST_LIO
+    stage: 4
+    url: https://github.com/hku-mars/FAST_LIO.git
+    branch: main
+    commit: 7cc4175de6f8ba2edf34bab02a42195b141027e9
+    license: GPL-2.0-only
+    license_scope: first_party
+    license_files:
+      - LICENSE
+    stars: 5061
+    stars_observed_at: "2026-08-15T03:51:50Z"
+    purpose: Proven Livox point-time preprocessing, motion undistortion, scan-to-map odometry, and global PCD accumulation reference.
+    focus:
+      - README.md
+      - config/mid360.yaml
+      - launch/mapping_mid360.launch
+      - src/preprocess.cpp
+      - src/IMU_Processing.hpp
+      - src/laserMapping.cpp
+  - name: elevation_mapping
+    stage: 4
+    url: https://github.com/ANYbotics/elevation_mapping.git
+    branch: master
+    commit: f4b082c64a3e660980da53b33c7936a8f2a2ea22
+    license: BSD-3-Clause
+    license_scope: first_party
+    license_files:
+      - LICENSE
+    stars: 1847
+    stars_observed_at: "2026-08-15T03:51:50Z"
+    purpose: Proven point-cloud plus pose fusion into a probabilistic terrain elevation map with visibility cleanup.
+    focus:
+      - README.md
+      - elevation_mapping/src/ElevationMap.cpp
+      - elevation_mapping/src/ElevationMapping.cpp
+      - elevation_mapping/src/sensor_processors/LaserSensorProcessor.cpp
+      - elevation_mapping/test/ElevationMapTest.cpp
+      - elevation_mapping_demos/launch/ground_truth_demo.launch

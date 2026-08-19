@@ -22,7 +22,9 @@ from slope_sim.dashboard_charts import (
 )
 from slope_sim.interfaces.config import ChannelConfig, InterfaceConfig
 from slope_sim.interfaces.dashboard_snapshot import InterfaceDashboardSnapshot
+from slope_sim.interfaces.models import LidarPointCloud
 from slope_sim.interfaces.status import InterfaceStatusSnapshot
+from slope_sim.manual_capture import ManualCaptureAction, ManualCaptureUiState
 from slope_sim.model_registry import get_robot_model, robot_model_names
 from slope_sim.obstacles import (
     OBSTACLE_MODES,
@@ -30,6 +32,7 @@ from slope_sim.obstacles import (
     ObstacleGenerationRequest,
     ObstacleSnapshot,
 )
+from slope_sim.pointcloud_export import export_lidar_point_clouds
 from slope_sim.runtime_actions import (
     AddObstaclesAction,
     ClearObstaclesAction,
@@ -557,6 +560,8 @@ class TelemetryDashboard:
         camera_follow_view: str = "front",
         interface_config: InterfaceConfig | None = None,
         developer_diagnostics_enabled: bool = False,
+        show_lidar_tools: bool = True,
+        v2_dashboard_enabled: bool = False,
     ) -> None:
         """创建企业接口侧窗；内部诊断仅在显式开启时构建。"""
         from PySide6 import QtCore, QtGui, QtWidgets
@@ -567,12 +572,20 @@ class TelemetryDashboard:
             raise ValueError("interface_config must be an InterfaceConfig")
         if not isinstance(developer_diagnostics_enabled, bool):
             raise ValueError("developer_diagnostics_enabled must be a bool")
+        if not isinstance(show_lidar_tools, bool):
+            raise ValueError("show_lidar_tools must be a bool")
+        if not isinstance(v2_dashboard_enabled, bool):
+            raise ValueError("v2_dashboard_enabled must be a bool")
+        if v2_dashboard_enabled and show_lidar_tools:
+            raise ValueError("v2 dashboard requires legacy lidar tools to be disabled")
 
         self.QtCore = QtCore
         self.QtGui = QtGui
         self.QtWidgets = QtWidgets
         self.interface_config = interface_config
         self.developer_diagnostics_enabled = developer_diagnostics_enabled
+        self.show_lidar_tools = show_lidar_tools
+        self.v2_dashboard_enabled = v2_dashboard_enabled
         self._model_switch_enabled = bool(model_switch_enabled)
         self._terrain_switch_enabled = bool(terrain_switch_enabled)
         self._paused = False
@@ -581,6 +594,10 @@ class TelemetryDashboard:
         self._pressed_keys: set[int] = set()
         self._should_exit = False
         self._pending_actions: deque[RuntimeAction] = deque()
+        self._pending_capture_actions: deque[ManualCaptureAction] = deque()
+        self._capture_state = ManualCaptureUiState.IDLE
+        self._capture_start_pending = False
+        self._capture_lvx2_path: Path | None = None
         self._structure_busy = False
         self._switch_busy = False
         self._last_obstacle_refresh_time: float | None = None
@@ -588,11 +605,14 @@ class TelemetryDashboard:
         self.smoothing_alpha = smoothing_alpha
         self.plot_update_hz = plot_update_hz
         self.plot_snapshot_dir = Path(plot_snapshot_dir)
+        self.pointcloud_export_dir = self.plot_snapshot_dir.parent / "pointcloud"
         self.plot_buffer = TelemetryPlotBuffer(plot_window_sec)
         self.interface_plot_buffer = InterfaceChartBuffer(plot_window_sec, interface_config)
         self._interface_generation: int | None = None
         self._interface_robot_model = robot_model
         self._latest_lidar_views: dict[str, object | None] = {"front": None, "rear": None}
+        self._latest_lidar_clouds: dict[str, LidarPointCloud | None] = {"front": None, "rear": None}
+        self._lidar_view_enabled = True
         self._last_update_time: float | None = None
         self._last_plot_update_time: float | None = None
         self._smoothed_telemetry: RobotTelemetry | None = None
@@ -626,6 +646,10 @@ class TelemetryDashboard:
         self.lidar_range_ring = None
         self.lidar_front_time_text = None
         self.lidar_rear_time_text = None
+        self.lidar_view_checkbox = None
+        self.lidar_status_label = None
+        self.lidar_open_button = None
+        self.lidar_export_button = None
         self.developer_layout = None
         self.diagnostic_tabs = None
         self.telemetry_scroll = None
@@ -637,6 +661,13 @@ class TelemetryDashboard:
         self.camera_follow_checkbox = None
         self.camera_view_combo = None
         self.direction_buttons: list[object] = []
+        self.capture_duration_combo = None
+        self.capture_start_button = None
+        self.capture_stop_button = None
+        self.capture_viewer_button = None
+        self.capture_status_label = None
+        self.capture_path_label = None
+        self.v2_dashboard_widget = None
 
         self.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
         dashboard = self
@@ -651,7 +682,14 @@ class TelemetryDashboard:
                     return dashboard._handle_key_release(event.key())
                 return False
 
+        class DashboardSpinBoxWheelFilter(QtCore.QObject):
+            """阻止滚轮掠过参数框时无意修改数值，保留键盘和箭头按钮操作。"""
+
+            def eventFilter(self, _watched: object, event: object) -> bool:
+                return event.type() == QtCore.QEvent.Wheel
+
         self._key_event_filter = DashboardKeyEventFilter()
+        self._spinbox_wheel_filter = DashboardSpinBoxWheelFilter()
         self._key_event_filter_installed = False
         self._mpl_connections: list[tuple[object, str, int]] = []
         self._disposed = False
@@ -735,7 +773,10 @@ class TelemetryDashboard:
             golf_seed=golf_seed,
             golf_relief=golf_relief,
         )
+        if not self.show_lidar_tools and not self.v2_dashboard_enabled:
+            self._show_realtime_interface_inactive()
         self.window_layout.addWidget(self.control_scroll, stretch=DASHBOARD_CONTROL_AREA_STRETCH)
+        self._disable_spinbox_wheel_adjustment()
 
         screen = self.app.primaryScreen()
         if screen is not None:
@@ -753,6 +794,46 @@ class TelemetryDashboard:
         self.window.show()
         self.window.activateWindow()
         self.window.setFocus()
+
+    def _disable_spinbox_wheel_adjustment(self) -> None:
+        """所有参数框统一禁用滚轮，避免侧栏滚动时误改仿真配置。"""
+        for spinbox in self.window.findChildren(self.QtWidgets.QAbstractSpinBox):
+            spinbox.installEventFilter(self._spinbox_wheel_filter)
+
+    def attach_v2_dashboard_widget(self, widget: object) -> None:
+        """将 v2 不可变快照视图嵌入手动控制窗口，替代旧前后 LiDAR 页面。"""
+        from slope_sim.interfaces.v2.dashboard_adapter import V2DashboardWidget
+
+        if type(widget) is not V2DashboardWidget:
+            raise ValueError("widget must be an exact V2DashboardWidget")
+        if self.show_lidar_tools:
+            raise ValueError("v2 dashboard requires legacy lidar tools to be disabled")
+        if not self.v2_dashboard_enabled:
+            raise ValueError("v2 dashboard widget requires v2_dashboard_enabled")
+        if self.v2_dashboard_widget is not None:
+            raise RuntimeError("v2 dashboard widget is already attached")
+        page = self.QtWidgets.QWidget(self.tabs)
+        layout = self.QtWidgets.QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(widget)
+        self.tabs.addTab(page, "v2 eCAL")
+        self.v2_dashboard_widget = widget
+
+    def _show_realtime_interface_inactive(self) -> None:
+        """普通流畅启动未构造实时接口，明确区分“未启用”和“等待数据”。"""
+        self.transport_mode_label.setText("已关闭（流畅手动模式）")
+        self.ecal_status_label.setText("未启用")
+        self.transport_detail_label.setText(
+            "正常 runSim 为保持流畅已关闭实时接口；MID-360 在结束采集后离线重建。"
+        )
+        for row in self.interface_rows.values():
+            row.state_label.setText("未启用")
+            row.target_label.setText("--")
+            row.actual_label.setText("--")
+            row.timestamp_label.setText("--")
+            row.error_label.setText("0")
+            row.drop_label.setText("0")
+            row.detail_label.setText("此启动模式不运行实时传感器")
 
     def _add_interface_status_tab(self, tabs: object) -> None:
         """创建六话题企业状态页，所有值均由不可变快照更新。"""
@@ -896,7 +977,8 @@ class TelemetryDashboard:
         robot_group = self._create_robot_group(robot_model)
         terrain_group = self._create_terrain_group(terrain_model, slope_deg, golf_seed, golf_relief)
         obstacle_group = self._create_obstacle_group()
-        self.control_groups = [simulation_group, robot_group, terrain_group, obstacle_group]
+        capture_group = self._create_capture_group()
+        self.control_groups = [simulation_group, robot_group, terrain_group, obstacle_group, capture_group]
         for group in self.control_groups:
             self.control_layout.addWidget(group)
         self.control_layout.addStretch(1)
@@ -955,6 +1037,42 @@ class TelemetryDashboard:
         grid.addWidget(self.QtWidgets.QLabel("角速度"), 4, 0)
         grid.addWidget(self.angular_spin, 4, 1, 1, 2)
 
+        keyboard_hint = self.QtWidgets.QLabel(
+            "驾驶：↑↓ 前后，←→ 转向，Space 暂停，Q/Esc 退出"
+        )
+        keyboard_hint.setWordWrap(True)
+        grid.addWidget(keyboard_hint, 5, 0, 1, 3)
+        quit_row = 6
+        if self.show_lidar_tools:
+            self.lidar_view_checkbox = self.QtWidgets.QCheckBox("显示实时 LiDAR 点云")
+            self.lidar_view_checkbox.setChecked(self._lidar_view_enabled)
+            self.lidar_view_checkbox.setToolTip("只切换点云显示；传感器采集和接口发布保持运行")
+            self.lidar_view_checkbox.toggled.connect(self._set_lidar_view_enabled)
+            grid.addWidget(self.lidar_view_checkbox, 6, 0, 1, 3)
+            self.lidar_open_button = self.QtWidgets.QPushButton("打开实时点云")
+            self._configure_button(
+                self.lidar_open_button,
+                "打开 LiDAR点云 页面查看前后雷达的实时俯视投影",
+                self.QtWidgets.QStyle.StandardPixmap.SP_DesktopIcon,
+            )
+            self.lidar_open_button.clicked.connect(self.show_lidar_point_cloud)
+            grid.addWidget(self.lidar_open_button, 7, 0, 1, 3)
+            self.lidar_export_button = self.QtWidgets.QPushButton("导出当前点云")
+            self._configure_button(
+                self.lidar_export_button,
+                "导出当前前后 LiDAR 帧为可导入的 PCD 和 PLY 文件",
+                self.QtWidgets.QStyle.StandardPixmap.SP_DialogSaveButton,
+            )
+            self.lidar_export_button.clicked.connect(self._export_current_lidar_point_clouds)
+            grid.addWidget(self.lidar_export_button, 8, 0, 1, 3)
+            self.lidar_status_label = self.QtWidgets.QLabel("点云：等待前/后雷达帧")
+            self.lidar_status_label.setWordWrap(True)
+            self.lidar_status_label.setTextInteractionFlags(
+                self.QtCore.Qt.TextSelectableByMouse
+            )
+            grid.addWidget(self.lidar_status_label, 9, 0, 1, 3)
+            quit_row = 10
+
         self.quit_button = self.QtWidgets.QPushButton("退出")
         self._configure_button(
             self.quit_button,
@@ -962,7 +1080,7 @@ class TelemetryDashboard:
             self.QtWidgets.QStyle.StandardPixmap.SP_DialogCloseButton,
         )
         self.quit_button.clicked.connect(self.request_exit)
-        grid.addWidget(self.quit_button, 5, 0, 1, 3)
+        grid.addWidget(self.quit_button, quit_row, 0, 1, 3)
         return group
 
     def _create_robot_group(self, robot_model: str) -> object:
@@ -1129,6 +1247,71 @@ class TelemetryDashboard:
         self._update_delete_obstacle_button_state()
         return group
 
+    def _create_capture_group(self) -> object:
+        """创建手动 MID-360 采集入口；v2 由 C++ Recorder/Export 完成真实边界。"""
+        group = self.QtWidgets.QGroupBox("MID-360 采集")
+        layout = self.QtWidgets.QGridLayout(group)
+        layout.setContentsMargins(8, 7, 8, 7)
+        layout.setHorizontalSpacing(6)
+        layout.setVerticalSpacing(4)
+        layout.setColumnStretch(1, 1)
+
+        self.capture_duration_combo = self.QtWidgets.QComboBox()
+        for label, duration in (
+            ("1 分钟", 60),
+            ("1.5 分钟", 90),
+            ("3 分钟", 180),
+            ("不限", None),
+        ):
+            self.capture_duration_combo.addItem(label, duration)
+        layout.addWidget(self.QtWidgets.QLabel("最长采集"), 0, 0)
+        layout.addWidget(self.capture_duration_combo, 0, 1)
+
+        self.capture_status_label = self.QtWidgets.QLabel("状态：未采集")
+        self.capture_status_label.setWordWrap(True)
+        layout.addWidget(self.capture_status_label, 1, 0, 1, 2)
+        self.capture_path_label = self.QtWidgets.QLabel("输出：--")
+        self.capture_path_label.setWordWrap(True)
+        self.capture_path_label.setTextInteractionFlags(
+            self.QtCore.Qt.TextSelectableByMouse
+        )
+        layout.addWidget(self.capture_path_label, 2, 0, 1, 2)
+
+        self.capture_start_button = self.QtWidgets.QPushButton("启用采集")
+        self._configure_button(
+            self.capture_start_button,
+            (
+                "请求 C++ Recorder 在下一完整五 topic 边界开始采集"
+                if self.v2_dashboard_enabled
+                else "冻结当前车辆、地形和障碍物，再开始记录驾驶轨迹"
+            ),
+            self.QtWidgets.QStyle.StandardPixmap.SP_MediaPlay,
+        )
+        self.capture_start_button.clicked.connect(self.request_capture_start)
+        self.capture_stop_button = self.QtWidgets.QPushButton("结束采集")
+        self._configure_button(
+            self.capture_stop_button,
+            (
+                "请求 C++ Recorder 在下一完整五 topic 边界结束，并交给 C++ Export"
+                if self.v2_dashboard_enabled
+                else "结束轨迹记录并开始离线 MID-360 高保真重建"
+            ),
+            self.QtWidgets.QStyle.StandardPixmap.SP_MediaStop,
+        )
+        self.capture_stop_button.clicked.connect(self.request_capture_stop)
+        self.capture_viewer_button = self.QtWidgets.QPushButton("导入 Livox Viewer")
+        self._configure_button(
+            self.capture_viewer_button,
+            "打开已验证的本次 LVX2 文件",
+            self.QtWidgets.QStyle.StandardPixmap.SP_DialogOpenButton,
+        )
+        self.capture_viewer_button.clicked.connect(self.request_livox_viewer_import)
+        layout.addWidget(self.capture_start_button, 3, 0, 1, 2)
+        layout.addWidget(self.capture_stop_button, 4, 0, 1, 2)
+        layout.addWidget(self.capture_viewer_button, 5, 0, 1, 2)
+        self._refresh_capture_controls()
+        return group
+
     def _add_developer_diagnostics_tab(
         self,
         tabs: object,
@@ -1257,7 +1440,8 @@ class TelemetryDashboard:
         self.plot_buttons = []
         for spec in (*legacy_specs, *self.interface_plot_specs[:4]):
             self._add_line_plot_tab(tabs, spec, Figure=Figure, FigureCanvas=FigureCanvas)
-        self._add_lidar_plot_tab(tabs, Figure=Figure, FigureCanvas=FigureCanvas)
+        if self.show_lidar_tools:
+            self._add_lidar_plot_tab(tabs, Figure=Figure, FigureCanvas=FigureCanvas)
         for spec in self.interface_plot_specs[4:]:
             self._add_line_plot_tab(tabs, spec, Figure=Figure, FigureCanvas=FigureCanvas)
 
@@ -1409,7 +1593,7 @@ class TelemetryDashboard:
         Figure: object,
         FigureCanvas: object,
     ) -> None:
-        """创建单个可复用点云 artist；该页只有保存命令。"""
+        """创建单个可复用点云 artist，并提供显式的标准格式导出。"""
         import numpy as np
 
         plot_tab, plot_layout, _figure, _canvas, axis = self._register_plot_canvas(
@@ -1762,11 +1946,159 @@ class TelemetryDashboard:
             )
         self._update_layout_for_size(target.width, target.height)
 
+    @property
+    def capture_state(self) -> ManualCaptureUiState:
+        """返回当前采集 UI 状态；主循环据此决定是否写轨迹。"""
+        return self._capture_state
+
+    def _capture_locks_structure(self) -> bool:
+        return self._capture_start_pending or self._capture_state in {
+            ManualCaptureUiState.RECORDING,
+            ManualCaptureUiState.GENERATING,
+        }
+
+    def _refresh_capture_controls(self) -> None:
+        """只按状态切换采集控件，避免 GUI 线程推测后端重建结果。"""
+        if self.capture_start_button is None:
+            return
+        start_allowed = (
+            self._capture_state
+            in {
+                ManualCaptureUiState.IDLE,
+                ManualCaptureUiState.COMPLETED,
+                ManualCaptureUiState.FAILED,
+            }
+            and not self._structure_busy
+        )
+        self.capture_duration_combo.setEnabled(start_allowed)
+        self.capture_start_button.setEnabled(start_allowed)
+        self.capture_stop_button.setEnabled(
+            self._capture_state is ManualCaptureUiState.RECORDING
+        )
+        self.capture_viewer_button.setEnabled(
+            self._capture_state is ManualCaptureUiState.COMPLETED
+            and self._capture_lvx2_path is not None
+        )
+
+    def _refresh_structure_controls(self) -> None:
+        """结构事务和采集冻结共用一处按钮/输入框可用性判定。"""
+        locked = self._structure_busy or self._capture_locks_structure()
+        self.robot_combo.setEnabled(self._model_switch_enabled and not locked)
+        self.apply_robot_button.setEnabled(self._model_switch_enabled and not locked)
+        self.reset_button.setEnabled(not locked)
+        self.obstacle_group.setEnabled(not locked)
+        self._update_terrain_parameter_state()
+        if not locked:
+            self._update_obstacle_parameter_state()
+            self._update_delete_obstacle_button_state()
+
+    def take_capture_request(self) -> ManualCaptureAction | None:
+        """取走一个采集请求；与场景 RuntimeAction 队列保持独立。"""
+        if not self._pending_capture_actions:
+            return None
+        return self._pending_capture_actions.popleft()
+
+    def request_capture_start(self) -> None:
+        if (
+            self._capture_state
+            not in {
+                ManualCaptureUiState.IDLE,
+                ManualCaptureUiState.COMPLETED,
+                ManualCaptureUiState.FAILED,
+            }
+            or self._structure_busy
+        ):
+            return
+        duration = self.capture_duration_combo.currentData()
+        self._pending_capture_actions.append(ManualCaptureAction.start(duration))
+        self._capture_start_pending = True
+        self.capture_status_label.setText("状态：正在启用采集")
+        self._refresh_structure_controls()
+        self._refresh_capture_controls()
+
+    def set_capture_recording(self, *, duration_limit_sec: int | None) -> None:
+        ManualCaptureAction.start(duration_limit_sec)
+        self._capture_start_pending = False
+        self._capture_state = ManualCaptureUiState.RECORDING
+        limit_text = "不限" if duration_limit_sec is None else f"{duration_limit_sec} 秒"
+        self.capture_status_label.setText(f"状态：采集中（上限：{limit_text}）")
+        self.capture_path_label.setText("输出：等待结束采集后生成")
+        self._refresh_structure_controls()
+        self._refresh_capture_controls()
+
+    def request_capture_stop(self) -> None:
+        if self._capture_state is ManualCaptureUiState.RECORDING:
+            self._pending_capture_actions.append(ManualCaptureAction.stop())
+            self.capture_stop_button.setEnabled(False)
+            self.capture_status_label.setText("状态：正在结束采集")
+
+    def set_capture_generating(self, detail: str) -> None:
+        if not isinstance(detail, str) or not detail:
+            raise ValueError("detail must be nonempty text")
+        self._capture_state = ManualCaptureUiState.GENERATING
+        self.capture_status_label.setText(f"状态：{detail}")
+        self._refresh_structure_controls()
+        self._refresh_capture_controls()
+
+    def set_capture_completed(self, mcap_path: Path, lvx2_path: Path) -> None:
+        if (
+            not isinstance(mcap_path, Path)
+            or not mcap_path.is_absolute()
+            or not isinstance(lvx2_path, Path)
+            or not lvx2_path.is_absolute()
+        ):
+            raise ValueError("completed capture paths must be absolute Paths")
+        self._capture_state = ManualCaptureUiState.COMPLETED
+        self._capture_lvx2_path = lvx2_path
+        self.capture_status_label.setText("状态：采集完成，LVX2 已验证")
+        self.capture_path_label.setText(f"MCAP：{mcap_path}\nLVX2：{lvx2_path}")
+        self._refresh_structure_controls()
+        self._refresh_capture_controls()
+
+    def set_capture_failed(self, detail: str, *, output_dir: Path | None = None) -> None:
+        if not isinstance(detail, str) or not detail:
+            raise ValueError("detail must be nonempty text")
+        if output_dir is not None and (not isinstance(output_dir, Path) or not output_dir.is_absolute()):
+            raise ValueError("output_dir must be an absolute Path or None")
+        self._capture_state = ManualCaptureUiState.FAILED
+        self._capture_start_pending = False
+        self._capture_lvx2_path = None
+        self.capture_status_label.setText(f"状态：失败：{detail}")
+        self.capture_path_label.setText(
+            "输出：--" if output_dir is None else f"输出目录：{output_dir}"
+        )
+        self._refresh_structure_controls()
+        self._refresh_capture_controls()
+
+    def request_livox_viewer_import(self) -> None:
+        if (
+            self._capture_state is ManualCaptureUiState.COMPLETED
+            and self._capture_lvx2_path is not None
+        ):
+            self._pending_capture_actions.append(
+                ManualCaptureAction.open_viewer(self._capture_lvx2_path)
+            )
+            self.capture_viewer_button.setEnabled(False)
+            self.capture_status_label.setText("状态：正在打开 Livox Viewer")
+
+    def set_capture_viewer_result(self, *, success: bool, detail: str) -> None:
+        """回显 Viewer 导入结果，失败时保留已验证 LVX2 供用户重试。"""
+        if type(success) is not bool or not isinstance(detail, str) or not detail:
+            raise ValueError("Viewer result requires a boolean and nonempty detail")
+        if self._capture_state is not ManualCaptureUiState.COMPLETED:
+            return
+        self.capture_status_label.setText(
+            "状态：Livox Viewer 已打开文件" if success else f"状态：导入失败，可重试：{detail}"
+        )
+        self._refresh_capture_controls()
+
     def request_exit(self) -> None:
         self._should_exit = True
 
     def _enqueue_structural_action(self, action: RuntimeAction) -> None:
         """把结构动作放入 FIFO，确保同一帧多次请求不会互相覆盖。"""
+        if self._capture_locks_structure():
+            return
         self._pending_actions.append(action)
         self.set_structure_busy(True, "等待应用")
 
@@ -1827,7 +2159,7 @@ class TelemetryDashboard:
 
     def _update_terrain_parameter_state(self, _index: int | None = None) -> None:
         """只启用待应用场地真正使用的参数，减少误操作。"""
-        if not self._terrain_switch_enabled:
+        if not self._terrain_switch_enabled or self._capture_locks_structure():
             for control in (
                 self.terrain_combo,
                 self.slope_spin,
@@ -1946,11 +2278,8 @@ class TelemetryDashboard:
         """结构事务期间禁用相关按钮，完成后按选择状态恢复删除按钮。"""
         self._structure_busy = busy
         self._switch_busy = busy
-        self.apply_robot_button.setEnabled(not busy and self._model_switch_enabled)
-        self.apply_terrain_button.setEnabled(not busy and self._terrain_switch_enabled)
-        for button in (self.reset_button, self.add_obstacles_button, self.clear_obstacles_button):
-            button.setEnabled(not busy)
-        self._update_delete_obstacle_button_state()
+        self._refresh_structure_controls()
+        self._refresh_capture_controls()
         status_label = getattr(self, "structure_status_label", None)
         if status_label is None:
             return
@@ -2010,14 +2339,17 @@ class TelemetryDashboard:
         self.clear_plots()
         self._interface_generation = None
         self._latest_lidar_views = {"front": None, "rear": None}
-        import numpy as np
+        self._latest_lidar_clouds = {"front": None, "rear": None}
+        if self.show_lidar_tools:
+            import numpy as np
 
-        self.lidar_collection.set_offsets(np.empty((0, 2)))
-        self.lidar_collection.set_facecolors([])
-        self._set_lidar_limits(np.empty((0, 2)))
-        self.lidar_front_time_text.set_text("前: --")
-        self.lidar_rear_time_text.set_text("后: --")
-        self._mark_plot_data_changed(("LiDAR点云",))
+            self.lidar_collection.set_offsets(np.empty((0, 2)))
+            self.lidar_collection.set_facecolors([])
+            self._set_lidar_limits(np.empty((0, 2)))
+            self.lidar_front_time_text.set_text("前: --")
+            self.lidar_rear_time_text.set_text("后: --")
+            self._refresh_lidar_status()
+            self._mark_plot_data_changed(("LiDAR点云",))
 
     def save_plot_snapshot(self, tab_label: str | None = None) -> Path:
         """保存当前曲线页截图到配置的图像目录。"""
@@ -2640,6 +2972,7 @@ class TelemetryDashboard:
         """代际切换时原子丢弃旧业务、质量基线和 LiDAR 最后帧。"""
         self.interface_plot_buffer.clear()
         self._latest_lidar_views = {"front": None, "rear": None}
+        self._latest_lidar_clouds = {"front": None, "rear": None}
         self._last_interface_status_update_time = None
         if snapshot.robot_model != self._interface_robot_model:
             self._rebuild_interface_line_artists(snapshot.robot_model)
@@ -2651,17 +2984,34 @@ class TelemetryDashboard:
     def _capture_latest_lidar_views(self, snapshot: InterfaceDashboardSnapshot) -> bool:
         """仅替换各雷达更新的成功帧，失败或旧帧继续显示上次成功结果。"""
         changed = False
-        for side, view in (
-            ("front", snapshot.lidar_front_view),
-            ("rear", snapshot.lidar_rear_view),
+        for side, cloud, view in (
+            ("front", snapshot.lidar_front, snapshot.lidar_front_view),
+            ("rear", snapshot.lidar_rear, snapshot.lidar_rear_view),
         ):
             previous = self._latest_lidar_views[side]
             if view is not None and (
                 previous is None or view.timestamp_ns > previous.timestamp_ns
             ):
                 self._latest_lidar_views[side] = view
+                self._latest_lidar_clouds[side] = cloud
                 changed = True
+        self._refresh_lidar_status()
         return changed
+
+    def _refresh_lidar_status(self) -> None:
+        """在控制区给出点云是否到达及当前可导出点数。"""
+        if self.lidar_status_label is None:
+            return
+        front = self._latest_lidar_clouds["front"]
+        rear = self._latest_lidar_clouds["rear"]
+        if front is None and rear is None:
+            self.lidar_status_label.setText("点云：等待前/后雷达帧")
+            return
+        front_text = "--" if front is None else str(front.point_num)
+        rear_text = "--" if rear is None else str(rear.point_num)
+        self.lidar_status_label.setText(
+            f"点云：前 {front_text} 点，后 {rear_text} 点；可在“LiDAR点云”页导出 PCD/PLY"
+        )
 
     def update_interface_snapshot(self, snapshot: InterfaceDashboardSnapshot) -> None:
         """消费一次组合快照，缓存所有新数据但只请求当前图绘制。"""
@@ -2759,6 +3109,13 @@ class TelemetryDashboard:
         """把前后最后成功帧合并为一个 base_link 俯视散点集。"""
         import numpy as np
 
+        if not self._lidar_view_enabled:
+            self.lidar_collection.set_offsets(np.empty((0, 2)))
+            self.lidar_collection.set_facecolors([])
+            self.lidar_front_time_text.set_text("前: 已隐藏")
+            self.lidar_rear_time_text.set_text("后: 已隐藏")
+            self._set_lidar_limits(np.empty((0, 2)))
+            return
         points = []
         colors = []
         for side in ("front", "rear"):
@@ -2780,6 +3137,45 @@ class TelemetryDashboard:
             "后: --" if rear is None else f"后: {rear.timestamp_ns / 1_000_000_000.0:.3f} s"
         )
         self._set_lidar_limits(offsets)
+
+    def _set_lidar_view_enabled(self, enabled: bool) -> None:
+        """切换可视化而不影响运行时传感器采集、接口消息或当前帧缓存。"""
+        self._lidar_view_enabled = bool(enabled)
+        self._mark_plot_data_changed(("LiDAR点云",))
+        self._request_current_plot_draw(time.monotonic())
+
+    def show_lidar_point_cloud(self, _checked: bool = False) -> None:
+        """从控制区直接跳转到实时点云页，不要求用户滚动顶层标签栏。"""
+        for index in range(self.tabs.count()):
+            if self.tabs.tabText(index) == "LiDAR点云":
+                self.tabs.setCurrentIndex(index)
+                return
+        raise RuntimeError("LiDAR point-cloud tab is unavailable")
+
+    def export_current_lidar_point_clouds(self) -> tuple[Path, ...]:
+        """按需导出当前前后 LiDAR 原始帧，并在界面显示绝对目录。"""
+        clouds = tuple(
+            cloud
+            for cloud in (
+                self._latest_lidar_clouds["front"],
+                self._latest_lidar_clouds["rear"],
+            )
+            if cloud is not None
+        )
+        paths = export_lidar_point_clouds(self.pointcloud_export_dir, clouds)
+        if self.lidar_status_label is not None:
+            self.lidar_status_label.setText(
+                f"点云：已导出 {len(paths)} 个 PCD/PLY 文件到 {self.pointcloud_export_dir.resolve()}"
+            )
+        return paths
+
+    def _export_current_lidar_point_clouds(self) -> None:
+        """把按钮动作的无帧错误转换为可见状态，不终止仿真循环。"""
+        try:
+            self.export_current_lidar_point_clouds()
+        except ValueError:
+            if self.lidar_status_label is not None:
+                self.lidar_status_label.setText("点云：尚未收到可导出的前/后雷达帧")
 
     def _set_lidar_limits(self, offsets: object) -> None:
         """保持固定 base_link 视野；点云更新不能改变物理比例或 axes 几何。"""

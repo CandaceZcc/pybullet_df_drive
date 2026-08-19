@@ -8,7 +8,12 @@ name = "pybullet-df-drive"
 version = "0.1.0"
 description = "Lightweight PyBullet slope simulation for a differential-drive mobile base."
 requires-python = ">=3.10,<3.11"
-dependencies = ["protobuf>=6.33.6,<6.34"]
+dependencies = [
+    "protobuf>=6.33.6,<6.34",
+    "mcap>=1.4,<1.5",
+    "pyqtgraph>=0.14,<0.15",
+    "PyOpenGL>=3.1.10,<3.2",
+]
 
 [project.optional-dependencies]
 dev = ["grpcio-tools==1.76.0"]
@@ -17,9 +22,13 @@ interfaces = ["eclipse-ecal==6.1.1"]
 [tool.setuptools.packages.find]
 include = ["slope_sim*"]
 
+[tool.setuptools.package-data]
+slope_sim = ["assets/mid360_pattern.bin", "assets/mid360_pattern.provenance.json", "assets/livox_laser_simulation.LICENSE"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
 markers = [
     "ecal: requires a real Eclipse eCAL Python runtime and cross-process transport",
+    "stage4_artifact: requires a Stage 4 build, offline artifact, or materialized reference checkout",
 ]

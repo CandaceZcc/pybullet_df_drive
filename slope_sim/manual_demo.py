@@ -5,7 +5,9 @@ from collections import deque
 from collections.abc import Callable
 import os
 from pathlib import Path
+import multiprocessing
 import sys
+import threading
 import time
 
 import pandas as pd
@@ -21,8 +23,11 @@ from slope_sim.coordinator import (
 from slope_sim.dashboard import DashboardCommand, TelemetryDashboard
 from slope_sim.diagnostics import compute_diagnostic_summary, write_diagnostic_summary
 from slope_sim.interfaces.config import InterfaceConfig
+from slope_sim.interfaces.v2.world_runtime import V2ManualWorldRuntime
 from slope_sim.logger import CsvSimulationLogger, ObstacleEventLogger
+from slope_sim.manual_capture import ManualCaptureRecorder, ManualCaptureSession
 from slope_sim.manual_control import ManualCommand, ManualControlSettings, command_from_keyboard
+from slope_sim.manual_mid360_reconstruction import reconstruction_worker_entrypoint
 from slope_sim.metrics import compute_tracking_metrics
 from slope_sim.realtime import DeadlinePacer, RuntimeObservationCadence
 from slope_sim.runtime_actions import (
@@ -38,6 +43,8 @@ from slope_sim.runtime_actions import (
 )
 from slope_sim.scene import configure_gui_visualizer, update_follow_camera
 from slope_sim.scene_config import dump_scene_atomic
+from slope_sim.sensor_backend import PyBulletSensorBackend
+from slope_sim.sensors import LidarSummary
 from slope_sim.simulation import (
     InterfaceSession,
     SimulationResult,
@@ -73,6 +80,58 @@ def manual_step_limit(duration_limit_sec: float | None, time_step: float) -> int
     return max(1, int(duration_limit_sec / time_step))
 
 
+
+
+def _create_v2_dashboard_widget(
+    runtime: V2ManualWorldRuntime,
+    *,
+    live_viewer_launcher: Callable[[], Callable[[], None]] | None = None,
+) -> object:
+    """延迟导入 Qt v2 视图，确保非 v2 手动入口不依赖该可选 GUI 模块。"""
+    from slope_sim.interfaces.v2.dashboard_adapter import V2DashboardWidget
+
+    return V2DashboardWidget(
+        runtime.descriptor,
+        live_viewer_launcher=live_viewer_launcher,
+    )
+
+
+def _renew_v2_command_target(
+    command_client: object | None,
+    linear_velocity: float,
+    angular_velocity: float,
+    *,
+    now: float,
+) -> None:
+    """GUI 仅经已认证本机 socket 续租目标，不能直接发布 WheelCommand。"""
+    if command_client is None:
+        return
+    send_target = getattr(command_client, "send_target", None)
+    if not callable(send_target):
+        raise ValueError("v2_command_client must provide send_target")
+    send_target(linear_velocity, angular_velocity, now=now)
+
+
+def _start_v2_capture(*, release_root: Path, runtime: V2ManualWorldRuntime, output_root: Path) -> tuple[object, Path]:
+    """以当前 v2 session/world 启动唯一 C++ Recorder，并请求完整边界开始。"""
+    from slope_sim.interfaces.v2.runsim_v2_recorder import (
+        RunSimV2Recorder,
+        create_capture_output_dir,
+    )
+
+    output_dir = create_capture_output_dir(output_root)
+    recorder = RunSimV2Recorder.launch(
+        release_root=release_root,
+        snapshot=runtime.protocol_snapshot(),
+        scene_id=output_dir.name,
+        output_dir=output_dir,
+    )
+    try:
+        recorder.start()
+    except BaseException:
+        recorder.close()
+        raise
+    return recorder, output_dir
 
 
 def merge_manual_commands(dashboard_command: DashboardCommand, keyboard_command: ManualCommand) -> DashboardCommand:
@@ -292,10 +351,28 @@ def run_manual_demo(
     duration_limit_sec: float | None = None,
     monotonic: Callable[[], float] | None = None,
     sleep: Callable[[float], None] | None = None,
+    v2_session_id_factory: Callable[[], bytes] | None = None,
+    v2_command_client: object | None = None,
+    v2_capture_release_root: Path | None = None,
+    v2_capture_output_root: Path | None = None,
+    v2_viewer_root: Path | None = None,
+    v2_capture_duration_sec: int | None = None,
+    v2_open_live_viewer: bool = False,
 ) -> SimulationResult:
     """启动 PyBullet GUI，使用方向键手动控制当前地形中的车辆。"""
     if config.mode != "gui":
         raise ValueError("manual demo requires GUI mode; use --gui --manual")
+    if v2_capture_output_root is not None and not v2_capture_output_root.is_absolute():
+        raise ValueError("v2_capture_output_root must be an absolute Path")
+    if v2_viewer_root is not None and not v2_viewer_root.is_absolute():
+        raise ValueError("v2_viewer_root must be an absolute Path")
+    if v2_capture_duration_sec not in (None, 60, 90, 180):
+        raise ValueError("v2_capture_duration_sec must be 60, 90, or 180 seconds")
+    capture_root = (
+        (config.log_dir.parent / "manual-mid360").resolve()
+        if v2_capture_output_root is None
+        else v2_capture_output_root
+    )
     runtime_monotonic = time.monotonic if monotonic is None else monotonic
 
     # 配置文件先完成全量验证，失败时不能创建任何 PyBullet scene/robot body。
@@ -320,11 +397,22 @@ def run_manual_demo(
     logger: CsvSimulationLogger | None = None
     obstacle_event_logger: ObstacleEventLogger | None = None
     dashboard: TelemetryDashboard | None = None
+    v2_dashboard: object | None = None
     interface_session: InterfaceSession | None = None
+    v2_manual_runtime: V2ManualWorldRuntime | None = None
     interface_log_paths = None
     log_path: Path | None = None
     event_log_path: Path | None = None
     scene_export: Path | None = None
+    capture_session: ManualCaptureSession | None = None
+    capture_process: multiprocessing.Process | None = None
+    capture_receiver = None
+    capture_output_dir: Path | None = None
+    viewer_import_results: deque[tuple[bool, str]] = deque()
+    v2_capture_recorder: object | None = None
+    v2_capture_exporting = False
+    v2_capture_results: deque[tuple[bool, Path | None, Path | None, str]] = deque()
+    v2_capture_stop_deadline: float | None = None
     try:
         claim_token = os.environ.get(PYBULLET_WINDOW_TOKEN_ENV)
         claim_kwargs = {} if claim_token is None else {"claim_token": claim_token}
@@ -341,7 +429,22 @@ def run_manual_demo(
             config,
             document,
         )
-        if config.interface_enabled:
+        if config.interface_enabled and config.interface_mode == "ecal":
+            # 正式 runSim v2 只复用这个 GUI client；worker 只做异步中心 LiDAR 复制世界。
+            sensor_backend = PyBulletSensorBackend(client_id, world.active_robot.robot.robot_id)
+            sensor_backend.bind_scene(
+                world.scene.body_ids,
+                obstacle_manager.snapshot(include_body_id=True),
+            )
+            v2_manual_runtime = V2ManualWorldRuntime(
+                config=config,
+                scene_document=document,
+                robot=world.active_robot.robot,
+                sensor_backend=sensor_backend,
+                obstacle_manager=obstacle_manager,
+                session_id_factory=v2_session_id_factory,
+            )
+        elif config.interface_enabled:
             interface_session = create_interface_session(
                 config,
                 client_id=client_id,
@@ -355,7 +458,11 @@ def run_manual_demo(
             config,
             world,
             obstacle_manager,
-            interface_runtime=None if interface_session is None else interface_session.runtime,
+            interface_runtime=(
+                v2_manual_runtime
+                if v2_manual_runtime is not None
+                else None if interface_session is None else interface_session.runtime
+            ),
             sensor_document=document.sensors,
         )
         terrain = world.terrain
@@ -401,6 +508,8 @@ def run_manual_demo(
                     camera_follow_view=config.camera_follow_view,
                     interface_config=interface_config,
                     developer_diagnostics_enabled=config.developer_diagnostics_enabled,
+                    show_lidar_tools=v2_manual_runtime is None,
+                    v2_dashboard_enabled=v2_manual_runtime is not None,
                 )
             except Exception as exc:
                 raise RuntimeError(f"dashboard construction failed: {exc}") from exc
@@ -412,6 +521,46 @@ def run_manual_demo(
                 layout.dashboard,
                 display_metrics=display_metrics,
             )
+            if v2_manual_runtime is not None:
+                live_viewer_launcher = None
+                if v2_capture_release_root is not None:
+                    from slope_sim.interfaces.v2.runsim_v2_live_viewer import (
+                        build_live_viewer_launcher,
+                    )
+
+                    live_viewer_launcher = build_live_viewer_launcher(
+                        v2_capture_release_root
+                    )
+                v2_dashboard = _create_v2_dashboard_widget(
+                    v2_manual_runtime,
+                    live_viewer_launcher=live_viewer_launcher,
+                )
+                dashboard.attach_v2_dashboard_widget(v2_dashboard)
+                if v2_open_live_viewer:
+                    launch_live_viewer = getattr(v2_dashboard, "launch_live_viewer", None)
+                    if not callable(launch_live_viewer):
+                        raise RuntimeError("v2 dashboard does not provide live viewer startup")
+                    launch_live_viewer()
+                if v2_capture_duration_sec is not None:
+                    capture_index = dashboard.capture_duration_combo.findData(
+                        v2_capture_duration_sec
+                    )
+                    if capture_index < 0:
+                        raise RuntimeError("v2 dashboard does not support requested capture duration")
+                    dashboard.capture_duration_combo.setCurrentIndex(capture_index)
+                    dashboard.request_capture_start()
+                if v2_capture_release_root is not None:
+                    from slope_sim.interfaces.v2.runsim_v2_recorder import (
+                        load_latest_successful_lvx2_path,
+                    )
+
+                    latest_lvx2 = load_latest_successful_lvx2_path(
+                        capture_root
+                    )
+                    if latest_lvx2 is not None:
+                        latest_mcap = latest_lvx2.parent.parent / "session.mcap"
+                        if latest_mcap.is_file():
+                            dashboard.set_capture_completed(latest_mcap, latest_lvx2)
 
         if dashboard is None:
             # 仅 Dashboard 明确禁用时保留 PyBullet 自带调参滑条。
@@ -446,6 +595,158 @@ def run_manual_demo(
         while max_steps is None or step < max_steps:
             if dashboard is not None:
                 dashboard.process_events()
+                if v2_dashboard is not None and v2_manual_runtime is not None:
+                    v2_dashboard.refresh_from_store(
+                        v2_manual_runtime.dashboard_snapshot_store
+                    )
+                while viewer_import_results:
+                    viewer_success, viewer_detail = viewer_import_results.popleft()
+                    dashboard.set_capture_viewer_result(
+                        success=viewer_success,
+                        detail=viewer_detail,
+                    )
+                while v2_capture_results:
+                    capture_success, mcap_path, lvx2_path, detail = v2_capture_results.popleft()
+                    v2_capture_exporting = False
+                    if capture_success and mcap_path is not None and lvx2_path is not None:
+                        dashboard.set_capture_completed(mcap_path, lvx2_path)
+                    else:
+                        dashboard.set_capture_failed(detail, output_dir=capture_output_dir)
+                if capture_process is not None and not capture_process.is_alive():
+                    if capture_receiver is not None and capture_receiver.poll():
+                        capture_result = capture_receiver.recv()
+                        if capture_result.get("ok") is True:
+                            dashboard.set_capture_completed(
+                                Path(capture_result["mcap_path"]),
+                                Path(capture_result["lvx2_path"]),
+                            )
+                        else:
+                            dashboard.set_capture_failed(
+                                str(capture_result.get("error", "离线重建失败")),
+                                output_dir=capture_output_dir,
+                            )
+                    else:
+                        dashboard.set_capture_failed(
+                            "离线重建进程未返回结果",
+                            output_dir=capture_output_dir,
+                        )
+                    capture_process.join()
+                    capture_process = None
+                    if capture_receiver is not None:
+                        capture_receiver.close()
+                        capture_receiver = None
+                take_capture_request = getattr(dashboard, "take_capture_request", None)
+                if (
+                    v2_capture_recorder is not None
+                    and v2_capture_stop_deadline is not None
+                    and runtime_monotonic() >= v2_capture_stop_deadline
+                ):
+                    dashboard.request_capture_stop()
+                    v2_capture_stop_deadline = None
+                capture_request = (
+                    None if not callable(take_capture_request) else take_capture_request()
+                )
+                if capture_request is not None:
+                    if (
+                        capture_request.kind == "start"
+                        and v2_manual_runtime is not None
+                        and v2_capture_release_root is not None
+                        and v2_capture_recorder is None
+                        and not v2_capture_exporting
+                    ):
+                        v2_capture_recorder, capture_output_dir = _start_v2_capture(
+                            release_root=v2_capture_release_root,
+                            runtime=v2_manual_runtime,
+                            output_root=capture_root,
+                        )
+                        dashboard.set_capture_recording(
+                            duration_limit_sec=capture_request.duration_limit_sec
+                        )
+                        v2_capture_stop_deadline = (
+                            None
+                            if capture_request.duration_limit_sec is None
+                            else runtime_monotonic() + capture_request.duration_limit_sec
+                        )
+                    elif (
+                        capture_request.kind == "stop"
+                        and v2_capture_recorder is not None
+                        and v2_capture_release_root is not None
+                        and capture_output_dir is not None
+                    ):
+                        recorder = v2_capture_recorder
+                        output_dir = capture_output_dir
+                        v2_capture_recorder = None
+                        v2_capture_exporting = True
+                        v2_capture_stop_deadline = None
+                        recorder.stop()
+                        dashboard.set_capture_generating("正在导出 C++ Recorder MCAP 与 MID-360 点云")
+
+                        def finalize_v2_capture() -> None:
+                            try:
+                                mcap_path = recorder.wait_for_success(timeout_sec=15.0)
+                                lvx2_path, _export_result = recorder.export(
+                                    release_root=v2_capture_release_root,
+                                    mcap_path=mcap_path,
+                                )
+                                v2_capture_results.append((True, mcap_path, lvx2_path, ""))
+                            except Exception as error:
+                                v2_capture_results.append((False, None, None, str(error) or type(error).__name__))
+
+                        threading.Thread(
+                            target=finalize_v2_capture,
+                            name="runsim-v2-capture-export",
+                            daemon=True,
+                        ).start()
+                    elif capture_request.kind == "start" and capture_session is None and capture_process is None:
+                        capture_session = ManualCaptureRecorder(
+                            (config.log_dir.parent / "manual-mid360").resolve()
+                        ).start(
+                            scene_document=coordinator.logical_scene_document(),
+                            world_generation=1,
+                            duration_limit_sec=capture_request.duration_limit_sec,
+                            started_sim_time_ns=round(step * config.time_step * 1_000_000_000),
+                        )
+                        dashboard.set_capture_recording(
+                            duration_limit_sec=capture_request.duration_limit_sec
+                        )
+                    elif capture_request.kind == "stop" and capture_session is not None:
+                        receipt = capture_session.finish(
+                            finished_sim_time_ns=round(step * config.time_step * 1_000_000_000)
+                        )
+                        capture_output_dir = receipt.output_dir
+                        dashboard.set_capture_generating("正在离线重建 MID-360 点云")
+                        receiver, sender = multiprocessing.get_context("spawn").Pipe(duplex=False)
+                        capture_process = multiprocessing.get_context("spawn").Process(
+                            target=reconstruction_worker_entrypoint,
+                            args=(receipt, config, sender),
+                            daemon=True,
+                        )
+                        capture_process.start()
+                        sender.close()
+                        capture_receiver = receiver
+                        capture_session = None
+                    elif capture_request.kind == "open_viewer" and capture_request.lvx2_path is not None:
+                        def import_lvx2(path: Path = capture_request.lvx2_path) -> None:
+                            try:
+                                from scripts.verify_livox_viewer2_linux import import_lvx2_in_livox_viewer
+
+                                _pid, log_path = import_lvx2_in_livox_viewer(
+                                    path,
+                                    viewer_root=v2_viewer_root,
+                                )
+                                viewer_import_results.append(
+                                    (True, f"已确认打开：{log_path}")
+                                )
+                            except Exception as error:
+                                viewer_import_results.append(
+                                    (False, str(error) or type(error).__name__)
+                                )
+
+                        threading.Thread(
+                            target=import_lvx2,
+                            name="livox-viewer-import",
+                            daemon=True,
+                        ).start()
                 command = dashboard.current_command()
                 # Dashboard 窗口和 PyBullet 窗口谁拿到焦点，都能用物理方向键控制。
                 settings = ManualControlSettings(
@@ -483,8 +784,8 @@ def run_manual_demo(
                     dashboard.set_switch_busy(True, "应用中")
 
             target_command = DashboardCommand(
-                0.0 if out_of_bounds_latched or safe_stop_requested or command.paused else command.linear_velocity,
-                0.0 if out_of_bounds_latched or safe_stop_requested or command.paused else command.angular_velocity,
+                0.0 if out_of_bounds_latched or safe_stop_requested or command.paused or capture_process is not None else command.linear_velocity,
+                0.0 if out_of_bounds_latched or safe_stop_requested or command.paused or capture_process is not None else command.angular_velocity,
                 paused=command.paused,
                 should_exit=command.should_exit,
                 structural_action=structural_action,
@@ -506,7 +807,44 @@ def run_manual_demo(
             t = step * config.time_step
             interface_snapshot_due = False
             interface_snapshot_wall_time = runtime_monotonic()
-            if interface_session is not None:
+            if v2_manual_runtime is not None:
+                if command.paused:
+                    _renew_v2_command_target(
+                        v2_command_client,
+                        0.0,
+                        0.0,
+                        now=runtime_monotonic(),
+                    )
+                    observation_cadence.poll_if_due(v2_manual_runtime)
+                    manual_paused = True
+                    pacer.wait_for_next_deadline()
+                    continue
+                if manual_paused:
+                    observation_cadence.reset()
+                    manual_paused = False
+                    pacer.reset_deadline()
+                (
+                    _interface_snapshot_due,
+                    interface_snapshot_wall_time,
+                ) = observation_cadence.poll_if_due(v2_manual_runtime)
+                _renew_v2_command_target(
+                    v2_command_client,
+                    linear_velocity,
+                    angular_velocity,
+                    now=interface_snapshot_wall_time,
+                )
+                v2_decision = v2_manual_runtime.command_decision(
+                    now=interface_snapshot_wall_time,
+                )
+                robot.command_wheel_speeds(
+                    v2_decision.drive_wheel_speed_rad_s,
+                    v2_decision.steering_wheel_speed_rad_s,
+                    dt=config.time_step,
+                )
+                # GUI/Dashboard 不能绕过唯一 C++ Command 写入 wheel command。
+                reported_linear_velocity = 0.0
+                reported_angular_velocity = 0.0
+            elif interface_session is not None:
                 runtime = interface_session.runtime
                 if command.paused:
                     (
@@ -569,7 +907,16 @@ def run_manual_demo(
                 if dashboard is not None:
                     dashboard.show_switch_status(f"切换失败: {exc}", is_error=True)
                 raise
-            if interface_session is not None:
+            if v2_manual_runtime is not None:
+                v2_manual_runtime.after_physics_step(
+                    config.time_step,
+                    wall_time=interface_snapshot_wall_time,
+                )
+                if v2_dashboard is not None:
+                    v2_dashboard.refresh_from_store(
+                        v2_manual_runtime.dashboard_snapshot_store
+                    )
+            elif interface_session is not None:
                 interface_session.runtime.after_physics_step(config.time_step)
 
             # 结构事务可能替换整个 world，后续读取必须重新取得当前 robot 引用。
@@ -579,7 +926,12 @@ def run_manual_demo(
             active_robot = world.active_robot
             robot = active_robot.robot
             if config.drive_model == "physics":
-                lidar_summary = _read_lidar_for_robot(client_id, robot, config)
+                # v2 已由异步中心 worker 承担实时扫描；禁止回退 v1 同步射线。
+                lidar_summary = (
+                    LidarSummary()
+                    if v2_manual_runtime is not None
+                    else _read_lidar_for_robot(client_id, robot, config)
+                )
                 state = robot.read_physics_state(
                     t=t,
                     command_linear_velocity=reported_linear_velocity,
@@ -616,6 +968,10 @@ def run_manual_demo(
                 if result.world_reset:
                     # 新 world 已切换 runtime generation，下一帧必须立即刷新 discovery。
                     observation_cadence.reset()
+                    if v2_manual_runtime is not None:
+                        v2_manual_runtime.bind_obstacle_manager(
+                            coordinator.obstacle_manager
+                        )
                     configure_gui_visualizer(
                         client_id,
                         config.camera_distance,
@@ -670,6 +1026,24 @@ def run_manual_demo(
                     )
                 )
                 dashboard.update(state)
+            if capture_session is not None:
+                position, orientation = p.getBasePositionAndOrientation(
+                    robot.robot_id,
+                    physicsClientId=client_id,
+                )
+                simulation_time_ns = round((step + 1) * config.time_step * 1_000_000_000)
+                capture_session.record_pose(
+                    sim_time_ns=simulation_time_ns,
+                    position=tuple(float(value) for value in position),
+                    orientation=tuple(float(value) for value in orientation),
+                )
+                elapsed_ns = simulation_time_ns - capture_session.started_sim_time_ns
+                if (
+                    capture_session.duration_limit_sec is not None
+                    and elapsed_ns >= capture_session.duration_limit_sec * 1_000_000_000
+                    and dashboard is not None
+                ):
+                    dashboard.request_capture_stop()
             logger.record(
                 state,
                 reference_x=0.0,
@@ -689,11 +1063,44 @@ def run_manual_demo(
         # 正常和异常共用同一清理路径；主异常存续时只记录次生清理错误。
         primary_exception_active = sys.exc_info()[0] is not None
         cleanup_error: BaseException | None = None
+        if capture_session is not None:
+            try:
+                capture_session.abort(reason="manual simulation exited before capture finished")
+            except BaseException as exc:
+                cleanup_error = exc
+        if v2_capture_recorder is not None:
+            try:
+                close_recorder = getattr(v2_capture_recorder, "close", None)
+                if not callable(close_recorder):
+                    raise RuntimeError("v2 capture recorder does not provide close")
+                close_recorder()
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+        if capture_process is not None and capture_process.is_alive():
+            capture_process.terminate()
+            capture_process.join(timeout=2.0)
+        if capture_receiver is not None:
+            capture_receiver.close()
         if interface_session is not None:
             try:
                 interface_log_paths = interface_session.close()
             except BaseException as exc:
                 cleanup_error = exc
+        if v2_manual_runtime is not None:
+            close_v2_command_client = getattr(v2_command_client, "close", None)
+            if v2_command_client is not None and not callable(close_v2_command_client):
+                cleanup_error = ValueError("v2_command_client must provide close")
+            elif callable(close_v2_command_client):
+                try:
+                    close_v2_command_client()
+                except BaseException as exc:
+                    cleanup_error = exc
+            try:
+                v2_manual_runtime.close()
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
         if dashboard is not None:
             try:
                 dashboard.close()

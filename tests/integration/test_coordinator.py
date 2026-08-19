@@ -1,0 +1,589 @@
+# 场景协调器集成测试：验证运行时结构操作、障碍物事务和物理步进的主线程编排。
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pybullet as p
+import pytest
+
+import slope_sim.coordinator as coordinator_module
+import slope_sim.obstacles as obstacle_module
+from slope_sim.config import ExperimentConfig
+from slope_sim.coordinator import SimulationCoordinator, load_manual_world
+from slope_sim.obstacles import (
+    ObstacleGenerationRequest,
+    ObstacleGenerationSettings,
+    ObstacleGeometry,
+    ObstacleManager,
+    ObstaclePath,
+    ObstacleSpec,
+    ObstacleSnapshot,
+)
+from slope_sim.runtime_actions import (
+    AddObstaclesAction,
+    ClearObstaclesAction,
+    DeleteObstacleAction,
+    ResetRobotAction,
+    SwitchRobotAction,
+    SwitchTerrainAction,
+    TerrainSelection,
+)
+from slope_sim.scene import TerrainBounds
+
+
+def _body_ids(client_id: int) -> set[int]:
+    return {p.getBodyUniqueId(index, physicsClientId=client_id) for index in range(p.getNumBodies(client_id))}
+
+
+def _manager(client_id: int, world, *, soft_budget_seconds: float = 0.0) -> ObstacleManager:
+    bounds = world.scene.bounds or TerrainBounds(-8.0, 8.0, -4.0, 4.0)
+    return ObstacleManager(
+        client_id,
+        ObstacleGenerationSettings(
+            bounds=bounds,
+            spawn_position=world.scene.spawn_position,
+            spawn_protection_radius=0.4,
+            max_candidate_attempts=1000,
+        ),
+        terrain_body_ids=world.scene.body_ids,
+        soft_budget_seconds=soft_budget_seconds,
+    )
+
+
+def _restore_pair(manager: ObstacleManager) -> tuple[ObstacleSnapshot, ObstacleSnapshot]:
+    static = ObstacleSnapshot(
+        logical_id=1,
+        body_id=None,
+        mode="static",
+        shape="box",
+        position=(-2.0, -1.0, 0.3),
+        orientation=(0.0, 0.0, 0.0, 1.0),
+        geometry=ObstacleGeometry("box", (0.2, 0.2, 0.3)),
+    )
+    moving = ObstacleSnapshot(
+        logical_id=2,
+        body_id=None,
+        mode="moving",
+        shape="sphere",
+        position=(1.0, 0.5, 0.2),
+        orientation=(0.0, 0.0, 0.0, 1.0),
+        path=ObstaclePath(start_xy=(1.0, 0.5), end_xy=(2.0, 0.5), speed=0.4, progress=0.35, direction=-1),
+        geometry=ObstacleGeometry("sphere", (0.2, 0.2, 0.2)),
+    )
+    result = manager.restore((static, moving))
+    assert result.succeeded is True
+    return static, moving
+
+
+def test_coordinator_fifo_starts_one_structural_operation_at_a_time(monkeypatch):
+    """跨帧障碍物事务未完成前，后续结构操作不能插队执行。"""
+    started: list[str] = []
+
+    class SlowObstacleManager:
+        def __init__(self) -> None:
+            self.advances = 0
+
+        def begin_add(self, _request):
+            started.append("add")
+            return SimpleNamespace(done=False, succeeded=False, operation="add", message="pending")
+
+        def advance_pending_operation(self):
+            self.advances += 1
+            done = self.advances >= 2
+            return SimpleNamespace(done=done, succeeded=done, operation="add", message="pending")
+
+        def update_moving(self, _dt):
+            pass
+
+    world = SimpleNamespace(active_robot=SimpleNamespace(robot=SimpleNamespace(command_twist=lambda *_args, **_kwargs: None)))
+    coordinator = SimulationCoordinator(
+        client_id=0,
+        config=SimpleNamespace(time_step=0.01),
+        world=world,
+        obstacle_manager=SlowObstacleManager(),
+        step_physics=lambda _client_id: started.append("step"),
+    )
+    def fake_replace(_client_id, _config, current_world, _robot_model):
+        started.append("robot")
+        return SimpleNamespace(world=current_world, state_changed=True, world_reset=False, status_message="robot")
+
+    monkeypatch.setattr(coordinator_module, "replace_manual_world_robot", fake_replace)
+
+    coordinator.enqueue(AddObstaclesAction(ObstacleGenerationRequest("static", 1, seed=1)))
+    coordinator.enqueue(SwitchRobotAction("df_mid"))
+
+    coordinator.step(0.01)
+    assert started == ["add", "step"]
+
+    coordinator.step(0.01)
+    assert started == ["add", "step", "step"]
+
+    coordinator.step(0.01)
+    assert started[-2:] == ["robot", "step"]
+    assert started.count("robot") == 1
+
+
+def test_coordinator_reports_pending_after_immediate_action_when_queue_remains(monkeypatch):
+    """真实协调器完成一个即时结构动作后，后续 FIFO 未执行前仍应报告 pending。"""
+    events: list[str] = []
+    robot = SimpleNamespace(command_twist=lambda *_args, **_kwargs: None)
+    world = SimpleNamespace(active_robot=SimpleNamespace(robot=robot))
+    manager = SimpleNamespace(update_moving=lambda _dt: events.append("moving"))
+    coordinator = SimulationCoordinator(
+        client_id=0,
+        config=SimpleNamespace(time_step=0.01),
+        world=world,
+        obstacle_manager=manager,
+        step_physics=lambda _client_id: events.append("step"),
+    )
+
+    def finish_immediately(action):
+        events.append(type(action).__name__)
+        return SimpleNamespace(world=world, state_changed=True, world_reset=False, status_message="done")
+
+    monkeypatch.setattr(coordinator, "_apply_immediate_action", finish_immediately)
+    coordinator.enqueue(SwitchRobotAction("df_mid"))
+    coordinator.enqueue(DeleteObstacleAction(99))
+
+    result = coordinator.step(0.01)
+
+    assert getattr(result, "obstacle_result", None) is None
+    assert coordinator.has_pending_action is True
+    assert events == ["SwitchRobotAction", "moving", "step"]
+
+
+def test_robot_switch_and_reset_preserve_obstacle_manager_and_bodies():
+    client_id = p.connect(p.DIRECT)
+    try:
+        config = ExperimentConfig(mode="gui", robot_model="df_back", terrain_model="flat")
+        world = load_manual_world(client_id, config, TerrainSelection("flat"), "df_back")
+        manager = _manager(client_id, world)
+        _restore_pair(manager)
+        obstacle_body_ids = {snapshot.physics_body_id for snapshot in manager.snapshot()}
+        coordinator = SimulationCoordinator(client_id, config, world, manager)
+
+        switch_result = coordinator.apply_action(SwitchRobotAction("df_mid"))
+        reset_result = coordinator.apply_action(ResetRobotAction())
+
+        assert switch_result.state_changed is True
+        assert reset_result.state_changed is True
+        assert coordinator.obstacle_manager is manager
+        assert {snapshot.physics_body_id for snapshot in manager.snapshot()} == obstacle_body_ids
+        assert obstacle_body_ids <= _body_ids(client_id)
+    finally:
+        p.disconnect(client_id)
+
+
+def test_coordinator_add_rechecks_current_robot_aabb_after_robot_switch(monkeypatch):
+    """通过协调器添加障碍物时，提交前必须避开当前车辆 AABB。"""
+    client_id = p.connect(p.DIRECT)
+    try:
+        config = ExperimentConfig(mode="gui", robot_model="df_back", terrain_model="flat")
+        world = load_manual_world(client_id, config, TerrainSelection("flat"), "df_back")
+        manager = _manager(client_id, world)
+        coordinator = SimulationCoordinator(client_id, config, world, manager)
+        coordinator.apply_action(SwitchRobotAction("df_mid"))
+
+        robot_id = coordinator.world.active_robot.robot.robot_id
+        aabb_min, aabb_max = p.getAABB(robot_id, -1, physicsClientId=client_id)
+        center = ((aabb_min[0] + aabb_max[0]) / 2.0, (aabb_min[1] + aabb_max[1]) / 2.0)
+
+        def candidate_on_robot(*, logical_id, mode, terrain_sampler, **_kwargs):
+            probe = terrain_sampler(center[0], center[1])
+            geometry = ObstacleGeometry("box", (0.25, 0.25, 0.25))
+            return ObstacleSpec(
+                logical_id=logical_id,
+                mode=mode,
+                geometry=geometry,
+                position=(center[0], center[1], probe.local_ground_height + geometry.half_extents[2]),
+                orientation=(0.0, 0.0, 0.0, 1.0),
+            )
+
+        monkeypatch.setattr(obstacle_module, "_make_candidate_spec", candidate_on_robot)
+        # 模拟旧批量 planner 直接给出候选，专门覆盖提交前的实时 AABB 复查。
+        monkeypatch.setattr(obstacle_module, "_candidate_is_valid", lambda *_args: True)
+
+        coordinator.enqueue(AddObstaclesAction(ObstacleGenerationRequest("static", 1, seed=20)))
+        result = coordinator.step(config.time_step)
+        guard = 0
+        while result is not None and result.obstacle_result is not None and not result.obstacle_result.done:
+            guard += 1
+            assert guard < 10
+            result = coordinator.step(config.time_step)
+
+        assert result is not None
+        assert result.obstacle_result is not None
+        assert result.obstacle_result.done is True
+        assert result.obstacle_result.succeeded is False
+        assert "vehicle AABB" in result.obstacle_result.message
+        assert coordinator.obstacle_manager.snapshot() == ()
+    finally:
+        p.disconnect(client_id)
+
+
+def test_robot_switch_rolls_back_replacement_when_old_robot_removal_fails(monkeypatch):
+    """旧车删除失败时不能提交新车型，也不能留下重复车辆。"""
+    client_id = p.connect(p.DIRECT)
+    try:
+        config = ExperimentConfig(mode="gui", robot_model="df_back", terrain_model="flat")
+        world = load_manual_world(client_id, config, TerrainSelection("flat"), "df_back")
+        manager = _manager(client_id, world)
+        coordinator = SimulationCoordinator(client_id, config, world, manager)
+        old_robot_id = world.active_robot.robot.robot_id
+        before_ids = _body_ids(client_id)
+        original_remove_body = coordinator_module.p.removeBody
+
+        def fail_old_robot(body_id, **kwargs):
+            if body_id == old_robot_id:
+                raise RuntimeError("old robot stuck")
+            return original_remove_body(body_id, **kwargs)
+
+        monkeypatch.setattr(coordinator_module.p, "removeBody", fail_old_robot)
+
+        result = coordinator.apply_action(SwitchRobotAction("df_mid"))
+
+        assert result.state_changed is False
+        assert result.world.active_robot.robot.robot_id == old_robot_id
+        assert result.error_message is not None
+        assert "old robot stuck" in result.error_message
+        assert _body_ids(client_id) == before_ids
+    finally:
+        p.disconnect(client_id)
+
+
+def test_robot_switch_commits_replacement_when_old_removal_raises_after_deletion(
+    monkeypatch,
+):
+    """removeBody 删后抛错时，物理事实已提交，不能返回失效旧 world。"""
+    client_id = p.connect(p.DIRECT)
+    try:
+        config = ExperimentConfig(mode="gui", robot_model="df_back", terrain_model="flat")
+        world = load_manual_world(client_id, config, TerrainSelection("flat"), "df_back")
+        manager = _manager(client_id, world)
+        coordinator = SimulationCoordinator(client_id, config, world, manager)
+        old_robot_id = world.active_robot.robot.robot_id
+        original_remove = coordinator_module.p.removeBody
+
+        def remove_old_then_raise(body_id: int, **kwargs) -> None:
+            original_remove(body_id, **kwargs)
+            if body_id == old_robot_id:
+                raise RuntimeError("old robot removed before injected error")
+
+        monkeypatch.setattr(coordinator_module.p, "removeBody", remove_old_then_raise)
+
+        result = coordinator.apply_action(SwitchRobotAction("df_mid"))
+
+        assert result.state_changed is True
+        assert result.error_message is None
+        assert coordinator.world.active_robot.robot_model == "df_mid"
+        replacement_id = coordinator.world.active_robot.robot.robot_id
+        assert old_robot_id not in _body_ids(client_id)
+        assert _body_ids(client_id) == set(world.scene.body_ids) | {replacement_id}
+    finally:
+        p.disconnect(client_id)
+
+
+def test_robot_switch_rejects_remove_success_when_old_body_still_exists(monkeypatch):
+    """removeBody 假成功时必须清理 replacement，并继续返回仍有效的旧 world。"""
+    client_id = p.connect(p.DIRECT)
+    try:
+        config = ExperimentConfig(mode="gui", robot_model="df_back", terrain_model="flat")
+        world = load_manual_world(client_id, config, TerrainSelection("flat"), "df_back")
+        manager = _manager(client_id, world)
+        coordinator = SimulationCoordinator(client_id, config, world, manager)
+        old_robot_id = world.active_robot.robot.robot_id
+        before_ids = _body_ids(client_id)
+        original_remove = coordinator_module.p.removeBody
+
+        def leave_old_body(body_id: int, **kwargs) -> None:
+            if body_id == old_robot_id:
+                return
+            original_remove(body_id, **kwargs)
+
+        monkeypatch.setattr(coordinator_module.p, "removeBody", leave_old_body)
+
+        result = coordinator.apply_action(SwitchRobotAction("df_mid"))
+
+        assert result.state_changed is False
+        assert result.error_message is not None
+        assert "remained" in result.error_message
+        assert coordinator.world is world
+        assert _body_ids(client_id) == before_ids
+    finally:
+        p.disconnect(client_id)
+
+
+def test_robot_switch_body_diagnosis_failure_raises_instead_of_returning_world(
+    monkeypatch,
+):
+    """无法判断旧车是否删除时必须显式抛错，不能选择可能悬空的一侧。"""
+    client_id = p.connect(p.DIRECT)
+    try:
+        config = ExperimentConfig(mode="gui", robot_model="df_back", terrain_model="flat")
+        world = load_manual_world(client_id, config, TerrainSelection("flat"), "df_back")
+        manager = _manager(client_id, world)
+        coordinator = SimulationCoordinator(client_id, config, world, manager)
+        old_robot_id = world.active_robot.robot.robot_id
+        before_ids = _body_ids(client_id)
+        original_remove = coordinator_module.p.removeBody
+        original_current_body_ids = coordinator_module._current_body_ids
+        diagnosis_calls = 0
+
+        def leave_old_body(body_id: int, **kwargs) -> None:
+            if body_id == old_robot_id:
+                return
+            original_remove(body_id, **kwargs)
+
+        def fail_first_diagnosis(current_client_id: int) -> set[int]:
+            nonlocal diagnosis_calls
+            diagnosis_calls += 1
+            if diagnosis_calls == 1:
+                raise RuntimeError("robot body diagnosis unavailable")
+            return original_current_body_ids(current_client_id)
+
+        monkeypatch.setattr(coordinator_module.p, "removeBody", leave_old_body)
+        monkeypatch.setattr(
+            coordinator_module,
+            "_current_body_ids",
+            fail_first_diagnosis,
+        )
+
+        with pytest.raises(RuntimeError, match="robot body diagnosis unavailable"):
+            coordinator.apply_action(SwitchRobotAction("df_mid"))
+
+        assert coordinator.world is world
+        assert _body_ids(client_id) == before_ids
+    finally:
+        p.disconnect(client_id)
+
+
+def test_terrain_switch_snapshots_obstacles_and_restores_identity_xy_and_path_state():
+    client_id = p.connect(p.DIRECT)
+    try:
+        config = ExperimentConfig(mode="gui", robot_model="df_mid", terrain_model="flat")
+        world = load_manual_world(client_id, config, TerrainSelection("flat"), "df_mid")
+        manager = _manager(client_id, world)
+        _restore_pair(manager)
+        before = manager.snapshot()
+        coordinator = SimulationCoordinator(client_id, config, world, manager)
+
+        result = coordinator.apply_action(SwitchTerrainAction(TerrainSelection("slope", slope_deg=6.0)))
+
+        after = coordinator.obstacle_manager.snapshot()
+        assert result.state_changed is True
+        assert coordinator.world.terrain == TerrainSelection("slope", slope_deg=6.0)
+        assert [item.logical_id for item in after] == [item.logical_id for item in before]
+        assert [(item.position[0], item.position[1]) for item in after] == [
+            (item.position[0], item.position[1]) for item in before
+        ]
+        assert after[1].path is not None
+        assert before[1].path is not None
+        assert after[1].path.progress == pytest.approx(before[1].path.progress)
+        assert after[1].path.direction == before[1].path.direction
+    finally:
+        p.disconnect(client_id)
+
+
+def test_disabled_terrain_switch_recovers_when_active_body_removal_fails_once(
+    monkeypatch,
+):
+    client_id = p.connect(p.DIRECT)
+    try:
+        config = ExperimentConfig(mode="gui", robot_model="df_back", terrain_model="flat")
+        world = load_manual_world(client_id, config, TerrainSelection("flat"), "df_back")
+        manager = _manager(client_id, world)
+        coordinator = SimulationCoordinator(client_id, config, world, manager)
+        failed_body_id = world.scene.body_ids[0]
+        original_remove = coordinator_module.p.removeBody
+        failures = 0
+
+        def fail_once(body_id: int, **kwargs) -> None:
+            nonlocal failures
+            if body_id == failed_body_id and failures == 0:
+                failures += 1
+                raise RuntimeError("disabled old terrain removal failed")
+            original_remove(body_id, **kwargs)
+
+        monkeypatch.setattr(coordinator_module.p, "removeBody", fail_once)
+
+        result = coordinator.apply_action(
+            SwitchTerrainAction(TerrainSelection("slope", slope_deg=4.0))
+        )
+
+        assert result.error_message is not None
+        assert "disabled old terrain removal failed" in result.error_message
+        assert coordinator.world.terrain == TerrainSelection("flat")
+        expected_ids = set(coordinator.world.scene.body_ids) | {
+            coordinator.world.active_robot.robot.robot_id
+        }
+        assert _body_ids(client_id) == expected_ids
+    finally:
+        p.disconnect(client_id)
+
+
+def test_flat_edge_obstacles_switch_to_golf_and_preserve_logical_state():
+    client_id = p.connect(p.DIRECT)
+    try:
+        config = ExperimentConfig(mode="gui", robot_model="df_back", terrain_model="flat")
+        world = load_manual_world(client_id, config, TerrainSelection("flat"), "df_back")
+        manager = _manager(client_id, world)
+        edge_snapshots = (
+            ObstacleSnapshot(
+                logical_id=7,
+                body_id=None,
+                mode="static",
+                shape="box",
+                position=(8.5, -1.0, 0.2),
+                orientation=(0.0, 0.0, 0.0, 1.0),
+                geometry=ObstacleGeometry("box", (0.2, 0.2, 0.2)),
+            ),
+            ObstacleSnapshot(
+                logical_id=8,
+                body_id=None,
+                mode="moving",
+                shape="sphere",
+                position=(8.6, 1.0, 0.2),
+                orientation=(0.0, 0.0, 0.0, 1.0),
+                path=ObstaclePath(
+                    start_xy=(8.0, 1.0),
+                    end_xy=(9.5, 1.0),
+                    speed=0.4,
+                    progress=0.4,
+                    direction=-1,
+                ),
+                geometry=ObstacleGeometry("sphere", (0.2, 0.2, 0.2)),
+            ),
+        )
+        assert manager.restore(edge_snapshots).succeeded is True
+        before = manager.snapshot(include_body_id=False)
+        coordinator = SimulationCoordinator(client_id, config, world, manager)
+
+        result = coordinator.apply_action(SwitchTerrainAction(TerrainSelection("golf_heightfield", golf_seed=3)))
+
+        restored = coordinator.obstacle_manager.snapshot(include_body_id=False)
+        assert result.state_changed is True
+        assert result.world_reset is True
+        assert result.error_message is None
+        assert coordinator.world.terrain == TerrainSelection(
+            "golf_heightfield",
+            golf_seed=3,
+        )
+        assert coordinator.world.active_robot.robot_model == "df_back"
+        assert [item.logical_id for item in restored] == [item.logical_id for item in before]
+        assert [(item.position[0], item.position[1]) for item in restored] == [
+            (item.position[0], item.position[1]) for item in before
+        ]
+        assert [item.geometry for item in restored] == [item.geometry for item in before]
+        assert restored[1].path == before[1].path
+    finally:
+        p.disconnect(client_id)
+
+
+def test_target_failure_plus_rollback_failure_reports_both_reasons(monkeypatch):
+    client_id = p.connect(p.DIRECT)
+    try:
+        config = ExperimentConfig(mode="gui", robot_model="df_back", terrain_model="flat")
+        world = load_manual_world(client_id, config, TerrainSelection("flat"), "df_back")
+        manager = _manager(client_id, world)
+        coordinator = SimulationCoordinator(client_id, config, world, manager)
+
+        def fail_all(_client_id, _config, terrain, _robot_model):
+            if terrain.terrain_model == "slope":
+                raise RuntimeError("target exploded")
+            raise RuntimeError("rollback exploded")
+
+        monkeypatch.setattr(coordinator_module, "load_manual_world", fail_all)
+
+        with pytest.raises(RuntimeError) as excinfo:
+            coordinator.apply_action(SwitchTerrainAction(TerrainSelection("slope", slope_deg=5.0)))
+
+        assert "target exploded" in str(excinfo.value)
+        assert "rollback exploded" in str(excinfo.value)
+    finally:
+        p.disconnect(client_id)
+
+
+def test_pending_structural_task_still_updates_moving_obstacles_and_steps_physics():
+    events: list[str] = []
+
+    class PendingManager:
+        def begin_add(self, _request):
+            events.append("begin")
+            return SimpleNamespace(done=False, succeeded=False, operation="add", message="pending")
+
+        def advance_pending_operation(self):
+            events.append("advance")
+            return SimpleNamespace(done=False, succeeded=False, operation="add", message="pending")
+
+        def update_moving(self, dt):
+            events.append(f"moving:{dt:g}")
+
+    world = SimpleNamespace(active_robot=SimpleNamespace(robot=SimpleNamespace(command_twist=lambda *_args, **_kwargs: None)))
+    coordinator = SimulationCoordinator(
+        client_id=11,
+        config=SimpleNamespace(time_step=0.02),
+        world=world,
+        obstacle_manager=PendingManager(),
+        step_physics=lambda client_id: events.append(f"step:{client_id}"),
+    )
+    coordinator.enqueue(AddObstaclesAction(ObstacleGenerationRequest("static", 1, seed=1)))
+
+    coordinator.step(0.02)
+
+    assert events == ["begin", "advance", "moving:0.02", "step:11"]
+
+
+@pytest.mark.parametrize(
+    ("action", "should_stop"),
+    [
+        (SwitchTerrainAction(TerrainSelection("slope", slope_deg=4.0)), True),
+        (SwitchRobotAction("df_mid"), True),
+        (ResetRobotAction(), True),
+        (AddObstaclesAction(ObstacleGenerationRequest("static", 1, seed=10)), False),
+        (DeleteObstacleAction(1), False),
+        (ClearObstaclesAction(), False),
+    ],
+)
+def test_coordinator_safe_stop_only_for_world_and_robot_rebuild_actions(monkeypatch, action, should_stop):
+    """协调器只在重建车辆/场地前停车，障碍物增删清不能清零持续驾驶命令。"""
+    stop_calls: list[tuple[float, float]] = []
+    robot = SimpleNamespace(command_twist=lambda linear, angular, **_kwargs: stop_calls.append((linear, angular)))
+    world = SimpleNamespace(active_robot=SimpleNamespace(robot=robot))
+    manager = SimpleNamespace(update_moving=lambda _dt: None)
+    coordinator = SimulationCoordinator(
+        client_id=0,
+        config=SimpleNamespace(time_step=0.01),
+        world=world,
+        obstacle_manager=manager,
+    )
+
+    def finish_immediately(_action):
+        return SimpleNamespace(world=world, state_changed=True, world_reset=False, status_message="done")
+
+    monkeypatch.setattr(coordinator, "_apply_immediate_action", finish_immediately)
+
+    coordinator.apply_action(action)
+
+    assert stop_calls == ([(0.0, 0.0)] if should_stop else [])
+
+
+def test_rebuild_leaves_no_duplicate_terrain_robot_or_obstacle_bodies():
+    client_id = p.connect(p.DIRECT)
+    try:
+        config = ExperimentConfig(mode="gui", robot_model="df_back", terrain_model="flat")
+        world = load_manual_world(client_id, config, TerrainSelection("flat"), "df_back")
+        manager = _manager(client_id, world)
+        _restore_pair(manager)
+        coordinator = SimulationCoordinator(client_id, config, world, manager)
+
+        coordinator.apply_action(SwitchTerrainAction(TerrainSelection("slope", slope_deg=7.0)))
+
+        terrain_body_ids = set(coordinator.world.scene.body_ids)
+        robot_body_id = coordinator.world.active_robot.robot.robot_id
+        obstacle_body_ids = {snapshot.physics_body_id for snapshot in coordinator.obstacle_manager.snapshot()}
+        current_ids = _body_ids(client_id)
+        expected_ids = terrain_body_ids | {robot_body_id} | obstacle_body_ids
+        assert current_ids == expected_ids
+        assert len(current_ids) == len(terrain_body_ids) + 1 + len(obstacle_body_ids)
+    finally:
+        p.disconnect(client_id)

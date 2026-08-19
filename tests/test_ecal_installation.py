@@ -62,3 +62,12 @@ def test_official_ecal_611_bindings_import_with_project_protobuf_runtime() -> No
     assert core.get_version_string().removeprefix("v").startswith("6.1.1")
     assert callable(proto_core.Publisher)
     assert callable(proto_core.Subscriber)
+
+
+def test_official_raw_topic_id_preserves_entity_id_layering() -> None:
+    """raw callback 的 TopicId 和 monitoring 的整数 topic_id 不能混为同一层。"""
+    core = importlib.import_module("ecal.nanobind_core")
+    publisher_id = core.TopicId()
+    assert type(publisher_id) is core.TopicId
+    assert type(publisher_id.topic_id) is core.EntityId
+    assert type(publisher_id.topic_id.entity_id) is int

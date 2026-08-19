@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
+import sys
 from typing import Sequence
 
 from slope_sim.config import load_config
@@ -10,6 +12,13 @@ from slope_sim.manual_demo import run_manual_demo
 from slope_sim.model_registry import robot_model_names
 from slope_sim.scene import terrain_model_names
 from slope_sim.simulation import run_experiment
+from slope_sim.interfaces.v2.ecal_preflight import (
+    EcalPreflightReport,
+    LegacyInterfaceModeError,
+    require_v2_interface_mode,
+    run_v2_ecal_preflight,
+)
+from slope_sim.interfaces.v2.runsim_v2_command import RunSimV2Command
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -32,6 +41,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--robot-model", choices=robot_model_names(), default=None, help="Robot URDF model.")
     parser.add_argument("--drive-model", choices=["physics"], default=None, help="PyBullet joint physics model.")
     parser.add_argument("--interface-mode", choices=["auto", "ecal", "local"], default=None, help="Interface transport mode.")
+    parser.add_argument("--v2-realtime", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--ecal-config", type=Path, default=None, help="正式 v2 eCAL 配置文件路径（覆盖 ECAL_CONFIG_PATH）。")
+    parser.add_argument("--ecal-time-plugin-path", type=Path, default=None, help="正式 v2 eCAL time-sync 插件目录（覆盖 ECAL_TIME_PLUGIN_PATH）。")
+    parser.add_argument("--capture-output-dir", type=Path, default=None, help="正式 v2 C++ Recorder/Export 采集输出目录。")
+    parser.add_argument("--capture-duration-sec", type=int, choices=(60, 90, 180), default=None, help="启动正式 v2 采集并在 60、90 或 180 秒后自动导出。")
+    parser.add_argument("--viewer-root", type=Path, default=None, help="本地 Livox Viewer 2 安装根目录（用于打开导出的 LVX2）。")
+    parser.add_argument("--open-ros-rviz", action="store_true", help="启动时打开独立 ROS Bridge/RViz2 实时点云显示。")
     parser.add_argument("--no-interface", action="store_true", help="Disable the enterprise interface.")
     parser.add_argument("--no-interface-log", action="store_true", help="Disable enterprise interface logs.")
     parser.add_argument("--scene-in", type=Path, default=None, help="Input scene document path.")
@@ -40,8 +56,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--no-dashboard", action="store_true", help="Disable the PySide6 telemetry dashboard.")
     parser.add_argument("--dashboard-update-hz", type=float, default=None, help="Telemetry dashboard display refresh rate.")
     parser.add_argument("--dashboard-smoothing-alpha", type=float, default=None, help="Dashboard feedback smoothing alpha.")
-    parser.add_argument("--lidar", action="store_true", help="Enable the simple ray-cast LiDAR.")
-    parser.add_argument("--lidar-debug-draw", action="store_true", help="Draw LiDAR rays in the PyBullet GUI.")
+    parser.add_argument("--lidar", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--lidar-debug-draw", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--terrain-model", choices=terrain_model_names(), default=None, help="Terrain model.")
     parser.add_argument("--golf-seed", type=int, default=None, help="Reproducible golf heightfield seed.")
     parser.add_argument("--golf-relief", choices=["low", "medium", "high"], default=None, help="Golf terrain relief preset.")
@@ -54,6 +70,22 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--log-dir", type=Path, default=None, help="Directory for CSV logs.")
     parser.add_argument("--figure-dir", type=Path, default=None, help="Directory for generated figures.")
     return parser.parse_args(argv)
+
+
+def show_v2_preflight_failure_dashboard(report: EcalPreflightReport) -> None:
+    """在未创建 PyBullet 世界前展示可操作的 v2 Dashboard 启动诊断。"""
+    from PySide6 import QtWidgets
+
+    application = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    dialog = QtWidgets.QMessageBox()
+    dialog.setWindowTitle("Slope Sim Dashboard · eCAL v2 启动诊断")
+    dialog.setIcon(QtWidgets.QMessageBox.Icon.Critical)
+    dialog.setText("eCAL v2 预检失败，实时仿真未启动")
+    dialog.setInformativeText(report.format_dashboard())
+    dialog.setStandardButtons(QtWidgets.QMessageBox.StandardButton.Ok)
+    dialog.exec()
+    # 保留 QApplication 引用直到模态诊断窗口关闭。
+    _ = application
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -93,8 +125,76 @@ def main(argv: Sequence[str] | None = None) -> int:
         "figure_dir": args.figure_dir,
     }
     config = load_config(args.config, overrides=overrides)
+    formal_v2_requested = (
+        args.v2_realtime
+        or args.interface_mode is not None
+        or config.interface_mode == "ecal"
+    )
+    if args.manual and config.interface_enabled and formal_v2_requested:
+        if args.no_dashboard and (args.capture_duration_sec is not None or args.open_ros_rviz):
+            print("runSim v2 startup blocked: capture and ROS/RViz controls require Dashboard", file=sys.stderr)
+            return 2
+        try:
+            require_v2_interface_mode(config.interface_mode)
+        except LegacyInterfaceModeError as error:
+            print(f"runSim v2 startup blocked: {error}", file=sys.stderr)
+            return 2
+        # CLI 覆盖必须同时进入预检与随后创建的 eCAL participant/子进程，不能只复制给预检。
+        runtime_environment_overrides: dict[str, str] = {}
+        if args.ecal_config is not None:
+            runtime_environment_overrides["ECAL_CONFIG_PATH"] = str(args.ecal_config.resolve())
+        if args.ecal_time_plugin_path is not None:
+            runtime_environment_overrides["ECAL_TIME_PLUGIN_PATH"] = str(args.ecal_time_plugin_path.resolve())
+        environment = dict(os.environ)
+        environment.update(runtime_environment_overrides)
+        report = run_v2_ecal_preflight(environment=environment)
+        if not report.ok:
+            print(report.format_terminal(), file=sys.stderr)
+            if not args.no_dashboard:
+                show_v2_preflight_failure_dashboard(report)
+            return 2
     # 手动模式必须使用 PyBullet GUI；普通实验仍走 DIRECT/GUI 自动仿真路径。
-    if args.manual:
+    if args.manual and config.interface_enabled and formal_v2_requested:
+        previous_environment = {
+            name: os.environ.get(name) for name in runtime_environment_overrides
+        }
+        os.environ.update(runtime_environment_overrides)
+        try:
+            try:
+                command = RunSimV2Command.launch(
+                    release_root=Path(__file__).resolve().parent,
+                    robot_model=config.robot_model,
+                )
+            except RuntimeError as error:
+                print(f"runSim v2 Command startup blocked: {error}", file=sys.stderr)
+                return 2
+            try:
+                result = run_manual_demo(
+                    config,
+                    duration_limit_sec=args.duration_sec,
+                    v2_session_id_factory=command.session_id_factory,
+                    v2_command_client=command.client,
+                    v2_capture_release_root=Path(__file__).resolve().parent,
+                    v2_capture_output_root=(
+                        None
+                        if args.capture_output_dir is None
+                        else args.capture_output_dir.resolve()
+                    ),
+                    v2_viewer_root=(
+                        None if args.viewer_root is None else args.viewer_root.resolve()
+                    ),
+                    v2_capture_duration_sec=args.capture_duration_sec,
+                    v2_open_live_viewer=args.open_ros_rviz,
+                )
+            finally:
+                command.close()
+        finally:
+            for name, previous in previous_environment.items():
+                if previous is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = previous
+    elif args.manual:
         result = run_manual_demo(config, duration_limit_sec=args.duration_sec)
     else:
         result = run_experiment(config)

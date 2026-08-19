@@ -1,0 +1,17 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>livox_ros_driver2</name>
+  <version>1.2.6</version>
+  <description>Stage 4 builds the official Livox ROS 2 message definitions from a locked source archive.</description>
+  <maintainer email="noreply@example.invalid">slope-sim</maintainer>
+  <license>MIT</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <build_depend>rosidl_default_generators</build_depend>
+  <depend>builtin_interfaces</depend>
+  <depend>std_msgs</depend>
+  <exec_depend>rosidl_default_runtime</exec_depend>
+  <member_of_group>rosidl_interface_packages</member_of_group>
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

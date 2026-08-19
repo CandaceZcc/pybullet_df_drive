@@ -1,10 +1,13 @@
 # LiDAR 异步服务：负责父端有界调度、子进程握手、冻结扫描和单次预编码。
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, fields
 from functools import wraps
+import gc
 import hashlib
 import json
+import math
 from multiprocessing.connection import Connection
 import multiprocessing
 import os
@@ -15,8 +18,22 @@ from slope_sim.config import ExperimentConfig
 from slope_sim.coordinator import build_world_from_scene_document
 from slope_sim.interfaces.codec import ProtoCodec
 from slope_sim.interfaces.dashboard_snapshot import LidarTopViewFrame, LidarTopViewPoint
+from slope_sim.interfaces.generated import slope_sim_interfaces_v2_pb2 as pb
 from slope_sim.interfaces.models import LidarPoint, LidarPointCloud
-from slope_sim.lidar_pointcloud import LidarScanResult, MultiLineLidar
+from slope_sim.interfaces.v2.codec import V2ProtoCodec
+from slope_sim.interfaces.v2.descriptor import load_v2_descriptor
+from slope_sim.interfaces.v2.models import require_fixed_bytes
+from slope_sim.interfaces.v2.session import OutputIdentity
+from slope_sim.lidar_pointcloud import (
+    LIDAR_SCAN_PERIOD_NS,
+    MID360_PATTERN_VERSION,
+    LidarScanResult,
+    MultiLineLidar,
+    Stage4LidarProfile,
+    _V2PayloadSerializationError,
+    mid360_line_for_slot,
+    mid360_offset_time_ns,
+)
 from slope_sim.obstacles import (
     ObstacleGeometry,
     ObstaclePath,
@@ -27,18 +44,313 @@ from slope_sim.obstacles import (
     update_kinematic_obstacle,
 )
 from slope_sim.scene_config import SceneDocument, document_to_mapping, scene_document_from_mapping
+from slope_sim.scene import LIDAR_VISIBLE_GROUP
 from slope_sim.sensor_backend import Pose, PyBulletSensorBackend, RayHit, Vec3
 
 
 _PROTOCOL_VERSION = 1
 _UINT64_MAX = (1 << 64) - 1
+
+
+def _stage4_realtime_shard_assignments() -> tuple[
+    tuple[int, int, int, int], tuple[int, int, int, int]
+]:
+    """返回 Stage4 5,760 条实时射线固定的 even/odd 私有分配。"""
+    return ((0, 5760, 2, 2880), (1, 5760, 2, 2880))
+
+
+def _stage4_realtime_shard_thread_count(shard_id: int) -> int:
+    """两个均衡的交错 shard 各固定使用两个 Bullet ray 线程。"""
+    if type(shard_id) is not int or not 0 <= shard_id < 2:
+        raise ValueError("invalid Stage4 shard id")
+    return (2, 2)[shard_id]
+
+
+def _require_stage4_assignment(
+    shard_id: object, first: object, stop: object, stride: object, count: object
+) -> tuple[int, int, int, int, int]:
+    """把私有 shard assignment 收窄为冻结 even/odd 合同。"""
+    assignments = _stage4_realtime_shard_assignments()
+    if (
+        type(shard_id) is not int
+        or not 0 <= shard_id < len(assignments)
+        or type(first) is not int
+        or type(stop) is not int
+        or type(stride) is not int
+        or type(count) is not int
+        or (first, stop, stride, count) != assignments[shard_id]
+    ):
+        raise ValueError("invalid Stage4 shard assignment")
+    return shard_id, first, stop, stride, count
+
+
+def _require_stage4_indexed_values(
+    values: object, first: int, stop: int, stride: int
+) -> tuple[tuple[int, tuple[int, float, float, float, int, int, int]], ...]:
+    """验证紧凑命中仍严格属于 shard 的交错 global index 集合。"""
+    if type(values) is not tuple:
+        raise ValueError("Stage4 shard values must be an exact tuple")
+    validated = []
+    previous_index = first - stride
+    for raw_value in values:
+        if type(raw_value) is not tuple or len(raw_value) != 2:
+            raise ValueError("Stage4 shard indexed hit has an invalid shape")
+        ray_index, point_value = raw_value
+        if (
+            type(ray_index) is not int
+            or not first <= ray_index < stop
+            or (ray_index - first) % stride != 0
+            or ray_index <= previous_index
+            or type(point_value) is not tuple
+            or len(point_value) != 7
+        ):
+            raise ValueError("Stage4 shard indexed hit is outside its assigned range")
+        offset_time_ns, x, y, z, reflectivity, tag, line = point_value
+        if (
+            type(offset_time_ns) is not int
+            or type(x) is not float
+            or not math.isfinite(x)
+            or type(y) is not float
+            or not math.isfinite(y)
+            or type(z) is not float
+            or not math.isfinite(z)
+            or type(reflectivity) is not int
+            or type(tag) is not int
+            or type(line) is not int
+            or not 0 <= offset_time_ns <= 0xFFFFFFFF
+            or not 0 <= reflectivity <= 0xFFFFFFFF
+            or not 0 <= tag <= 3
+            or not 0 <= line <= 15
+        ):
+            raise ValueError("Stage4 shard indexed hit is outside its assigned range")
+        previous_index = ray_index
+        validated.append((ray_index, point_value))
+    return tuple(validated)
+
+
+def _require_stage4_firing_identity(
+    values: tuple[tuple[int, tuple[int, float, float, float, int, int, int]], ...],
+    *,
+    world_generation: int,
+    sequence: int,
+) -> None:
+    """按 request identity 精确核验每个紧凑命中的 firing 时间与四线编号。"""
+    if not values:
+        return
+    first_line = mid360_line_for_slot(
+        MID360_PATTERN_VERSION,
+        world_generation,
+        sequence,
+        0,
+    )
+    firing_slot_count = Stage4LidarProfile.realtime().firing_slot_count
+    for global_slot, point_value in values:
+        if (
+            point_value[0]
+            != global_slot * LIDAR_SCAN_PERIOD_NS // firing_slot_count
+            or point_value[6] != (first_line + global_slot) % 4
+        ):
+            raise ValueError("Stage4 shard point firing identity mismatch")
+
+
+def _merge_stage4_shard_indexed_values(
+    raw_shards: object,
+) -> tuple[tuple[int, float, float, float, int, int, int], ...]:
+    """验证冻结双 shard 覆盖后，线性归并接收边界已核验的紧凑点。"""
+    if type(raw_shards) is not tuple or len(raw_shards) != 2:
+        raise RuntimeError("Stage4 coordinator requires exactly two shard results")
+    assignments = _stage4_realtime_shard_assignments()
+    indexed_by_shard: list[
+        tuple[tuple[int, tuple[int, float, float, float, int, int, int]], ...] | None
+    ] = [None, None]
+    seen_shards: set[int] = set()
+    for raw_shard in raw_shards:
+        if type(raw_shard) is not tuple or len(raw_shard) != 7:
+            raise RuntimeError("Stage4 shard result has an invalid shape")
+        shard_id, first, stop, stride, count, examined_count, raw_values = raw_shard
+        if (
+            type(shard_id) is not int
+            or not 0 <= shard_id < len(assignments)
+            or shard_id in seen_shards
+            or (first, stop, stride, count) != assignments[shard_id]
+            or type(examined_count) is not int
+            or examined_count != count
+            or type(raw_values) is not tuple
+        ):
+            raise RuntimeError("Stage4 shard result does not prove its assigned coverage")
+        seen_shards.add(shard_id)
+        indexed_by_shard[shard_id] = raw_values
+    if seen_shards != {0, 1}:
+        raise RuntimeError("Stage4 shard results do not cover both assigned ranges")
+    even_values, odd_values = indexed_by_shard
+    if even_values is None or odd_values is None:
+        raise RuntimeError("Stage4 shard results do not cover both assigned ranges")
+    merged = []
+    even_index = 0
+    odd_index = 0
+    while even_index < len(even_values) and odd_index < len(odd_values):
+        if even_values[even_index][0] < odd_values[odd_index][0]:
+            merged.append(even_values[even_index][1])
+            even_index += 1
+        else:
+            merged.append(odd_values[odd_index][1])
+            odd_index += 1
+    while even_index < len(even_values):
+        merged.append(even_values[even_index][1])
+        even_index += 1
+    while odd_index < len(odd_values):
+        merged.append(odd_values[odd_index][1])
+        odd_index += 1
+    return tuple(merged)
+
+
+@dataclass(frozen=True, slots=True)
+class _Stage4ShardSpec:
+    """仅在父进程创建的 Stage4 sibling shard 间传递的冻结世界分配。"""
+
+    shard_id: int
+    first: int
+    stop: int
+    stride: int
+    count: int
+    world_spec: LidarWorkerWorldSpec
+
+    def __post_init__(self) -> None:
+        _require_stage4_assignment(self.shard_id, self.first, self.stop, self.stride, self.count)
+        if type(self.world_spec) is not LidarWorkerWorldSpec or self.world_spec.profile != "stage4":
+            raise ValueError("invalid Stage4 shard specification")
+
+
+@dataclass(frozen=True, slots=True)
+class _Stage4ShardReady:
+    shard_id: int
+    process_id: int
+    first: int
+    stop: int
+    stride: int
+    count: int
+    world_digest: str
+
+    def __post_init__(self) -> None:
+        _require_stage4_assignment(self.shard_id, self.first, self.stop, self.stride, self.count)
+        _require_positive_uint64("process_id", self.process_id)
+        _require_sha256("world_digest", self.world_digest)
+
+
+@dataclass(frozen=True, slots=True)
+class _Stage4ShardResult:
+    shard_id: int
+    process_id: int
+    first: int
+    stop: int
+    stride: int
+    count: int
+    examined_count: int
+    job_id: int
+    lifecycle_generation: int
+    pause_epoch: int
+    topic: str
+    timestamp_ns: int
+    values: tuple[tuple[int, tuple[int, float, float, float, int, int, int]], ...]
+
+    def __post_init__(self) -> None:
+        _require_stage4_assignment(self.shard_id, self.first, self.stop, self.stride, self.count)
+        _require_positive_uint64("process_id", self.process_id)
+        if type(self.examined_count) is not int or self.examined_count != self.count:
+            raise ValueError("invalid Stage4 shard examined count")
+        _require_job_identity((self.job_id, self.lifecycle_generation, self.pause_epoch, self.topic, self.timestamp_ns))
+
+
+@dataclass(frozen=True, slots=True)
+class _Stage4ShardPrewarm:
+    """shard 自己的真实 assignment 预热结果，供 coordinator 在 outer Ready 前验证。"""
+
+    shard_id: int
+    process_id: int
+    world_digest: str
+    first: int
+    stop: int
+    stride: int
+    count: int
+    examined_count: int
+    job_id: int
+    lifecycle_generation: int
+    pause_epoch: int
+    topic: str
+    timestamp_ns: int
+    output_identity: OutputIdentity
+    values: tuple[tuple[int, tuple[int, float, float, float, int, int, int]], ...]
+    duration_ns: int
+
+    def __post_init__(self) -> None:
+        _require_stage4_assignment(self.shard_id, self.first, self.stop, self.stride, self.count)
+        _require_positive_uint64("process_id", self.process_id)
+        _require_sha256("world_digest", self.world_digest)
+        if type(self.examined_count) is not int or self.examined_count != self.count:
+            raise ValueError("invalid Stage4 shard examined count")
+        if (
+            type(self.job_id) is not int
+            or type(self.lifecycle_generation) is not int
+            or type(self.pause_epoch) is not int
+            or type(self.topic) is not str
+            or type(self.timestamp_ns) is not int
+            or (self.job_id, self.lifecycle_generation, self.pause_epoch, self.topic, self.timestamp_ns)
+            != (0, 1, 0, "lidar_link", 0)
+        ):
+            raise ValueError("invalid Stage4 shard prewarm identity")
+        if type(self.duration_ns) is not int or self.duration_ns <= 0:
+            raise ValueError("invalid Stage4 shard prewarm duration")
+
+
+@dataclass(frozen=True, slots=True)
+class _Stage4ShardStopped:
+    shard_id: int
+    process_id: int
+
+    def __post_init__(self) -> None:
+        if type(self.shard_id) is not int or self.shard_id not in {0, 1}:
+            raise ValueError("invalid Stage4 shard id")
+        _require_positive_uint64("process_id", self.process_id)
+
+
+@dataclass(frozen=True, slots=True)
+class _Stage4ShardFailure:
+    """shard 私有扫描错误，供 coordinator 按整帧收口。"""
+
+    shard_id: int
+    process_id: int
+    first: int
+    stop: int
+    stride: int
+    count: int
+    job_id: int
+    lifecycle_generation: int
+    pause_epoch: int
+    topic: str
+    timestamp_ns: int
+    stable_error_code: str
+    bounded_detail: str
+
+    def __post_init__(self) -> None:
+        _require_stage4_assignment(self.shard_id, self.first, self.stop, self.stride, self.count)
+        _require_positive_uint64("process_id", self.process_id)
+        _require_job_identity((self.job_id, self.lifecycle_generation, self.pause_epoch, self.topic, self.timestamp_ns))
+        if self.stable_error_code != "shard_scan_failed":
+            raise ValueError("invalid Stage4 shard failure code")
+        _require_bounded_detail(self.bounded_detail)
 _PROCESS_ESCALATION_TIMEOUT_SEC = 1.0
 _LIDAR_JOB_BUDGET_NS = 100_000_000
 _TOPICS = ("lidar_front", "lidar_rear")
+_STAGE4_TOPICS = ("lidar_link",)
+_WORKER_TOPICS_BY_PROFILE = {
+    "stage3": _TOPICS,
+    "stage4": _STAGE4_TOPICS,
+}
 _STARTUP_PHASE_CODES = {
     "world_build": "worker_preflight_failed",
     "front_preflight": "worker_preflight_failed",
     "rear_preflight": "worker_preflight_failed",
+    "center_preflight": "worker_preflight_failed",
     "startup_cleanup": "worker_start_failed",
 }
 _STABLE_ERROR_CODES = frozenset(
@@ -59,6 +371,8 @@ _STABLE_ERROR_CODES = frozenset(
 _LIDAR_IDENTITIES = {
     "lidar_front": ("lidar_front", 1),
     "lidar_rear": ("lidar_rear", 2),
+    # 阶段四独立 profile 使用唯一中心 LiDAR，不与阶段三前后双雷达混用。
+    "lidar_link": ("lidar_link", 1),
 }
 _SERVICE_STATES = frozenset(
     {"starting", "ready", "suspended", "draining", "failed", "closed"}
@@ -74,6 +388,7 @@ _SERVICE_EVENT_KINDS = frozenset(
 )
 _FRAME_ERROR_CODES = frozenset(
     {
+        "sensor_overrun",
         "scene_reconcile_failed",
         "scene_state_unknown",
         "raycast_failed",
@@ -138,9 +453,9 @@ def _require_lidar_identity(
     frame_id: object | None = None,
     lidar_id: object | None = None,
 ) -> tuple[str, str, int]:
-    """把内部 topic、企业 frame 和 lidar id 约束为前后两组精确组合。"""
+    """把内部 topic、企业 frame 和 lidar id 约束为已登记的精确组合。"""
     if type(topic) is not str or topic not in _LIDAR_IDENTITIES:
-        raise ValueError("topic must identify lidar_front or lidar_rear")
+        raise ValueError("topic must identify a configured lidar")
     expected_frame, expected_lidar_id = _LIDAR_IDENTITIES[topic]
     selected_frame = expected_frame if frame_id is None else frame_id
     selected_lidar_id = expected_lidar_id if lidar_id is None else lidar_id
@@ -149,6 +464,38 @@ def _require_lidar_identity(
     if type(selected_lidar_id) is not int or selected_lidar_id != expected_lidar_id:
         raise ValueError("lidar_id must match topic")
     return topic, expected_frame, expected_lidar_id
+
+
+def _reconstruct_v2_output_identity(value: object) -> OutputIdentity | None:
+    """跨 IPC 重新校验 Stage4 预留的唯一 LiDAR 输出身份。"""
+    if value is None:
+        return None
+    if type(value) is not OutputIdentity:
+        raise ValueError("output_identity must be an exact OutputIdentity or None")
+    if value.topic != "/sim/lidar/points":
+        raise ValueError("output_identity must reserve the v2 lidar output topic")
+    session_id = require_fixed_bytes(
+        "output_identity.simulation_session_id",
+        value.simulation_session_id,
+        16,
+    )
+    descriptor_sha256 = require_fixed_bytes(
+        "output_identity.descriptor_sha256",
+        value.descriptor_sha256,
+        32,
+    )
+    world_generation = _require_uint64(
+        "output_identity.world_generation",
+        value.world_generation,
+    )
+    sequence = _require_uint64("output_identity.sequence", value.sequence)
+    return OutputIdentity(
+        "/sim/lidar/points",
+        session_id,
+        descriptor_sha256,
+        world_generation,
+        sequence,
+    )
 
 
 def _require_job_identity(value: object) -> tuple[int, int, int, str, int]:
@@ -301,18 +648,22 @@ def world_digest_for_document(document: object) -> str:
 
 @dataclass(frozen=True, slots=True)
 class LidarWorkerWorldSpec:
-    """spawn 时唯一传入 child 的、经过重新验证的完整世界输入。"""
+    """spawn 时唯一传入 child 的完整世界输入与显式扫描 profile。"""
 
     protocol_version: int
     experiment_config: ExperimentConfig
     scene_document: SceneDocument
     world_digest: str
+    profile: str = "stage3"
 
     def __post_init__(self) -> None:
         version = _require_protocol_version(self.protocol_version)
         config = _reconstruct_experiment_config(self.experiment_config)
         document = _reconstruct_scene_document(self.scene_document)
         digest = _require_sha256("world_digest", self.world_digest)
+        profile = self.profile
+        if type(profile) is not str or profile not in _WORKER_TOPICS_BY_PROFILE:
+            raise ValueError("profile must select a supported lidar worker profile")
         expected_digest = world_digest_for_document(document)
         if digest != expected_digest:
             raise ValueError("world_digest must match scene_document")
@@ -320,17 +671,18 @@ class LidarWorkerWorldSpec:
         object.__setattr__(self, "experiment_config", config)
         object.__setattr__(self, "scene_document", document)
         object.__setattr__(self, "world_digest", digest)
+        object.__setattr__(self, "profile", profile)
 
 
 @dataclass(frozen=True, slots=True)
 class LidarWorkerReady:
-    """只在前后双雷达完成完整预热后才允许发出的启动成功信封。"""
+    """只在所选 worker profile 的全部 LiDAR 完成预热后才发出的成功信封。"""
 
     protocol_version: int
     process_id: int
     world_digest: str
-    prewarmed_topics: tuple[str, str]
-    prewarm_payload_sha256_by_topic: tuple[tuple[str, str], tuple[str, str]]
+    prewarmed_topics: tuple[str, ...]
+    prewarm_payload_sha256_by_topic: tuple[tuple[str, str], ...]
     prewarm_max_scan_wall_duration_ns: int
 
     def __post_init__(self) -> None:
@@ -339,12 +691,12 @@ class LidarWorkerReady:
         digest = _require_sha256("world_digest", self.world_digest)
         topics = self.prewarmed_topics
         hashes = self.prewarm_payload_sha256_by_topic
-        if type(topics) is not tuple or topics != _TOPICS:
-            raise ValueError("prewarmed_topics must be the ordered front/rear topic tuple")
-        if type(hashes) is not tuple or len(hashes) != len(_TOPICS):
-            raise ValueError("prewarm_payload_sha256_by_topic must contain both topics")
+        if type(topics) is not tuple or topics not in _WORKER_TOPICS_BY_PROFILE.values():
+            raise ValueError("prewarmed_topics must match a supported worker profile")
+        if type(hashes) is not tuple or len(hashes) != len(topics):
+            raise ValueError("prewarm_payload_sha256_by_topic must cover every prewarmed topic")
         normalized_hashes: list[tuple[str, str]] = []
-        for topic, pair in zip(_TOPICS, hashes, strict=True):
+        for topic, pair in zip(topics, hashes, strict=True):
             if type(pair) is not tuple or len(pair) != 2 or pair[0] != topic:
                 raise ValueError("prewarm payload hashes must be ordered topic/hash pairs")
             normalized_hashes.append((topic, _require_sha256(f"{topic} prewarm payload", pair[1])))
@@ -355,7 +707,7 @@ class LidarWorkerReady:
         object.__setattr__(self, "protocol_version", version)
         object.__setattr__(self, "process_id", process_id)
         object.__setattr__(self, "world_digest", digest)
-        object.__setattr__(self, "prewarmed_topics", _TOPICS)
+        object.__setattr__(self, "prewarmed_topics", topics)
         object.__setattr__(self, "prewarm_payload_sha256_by_topic", tuple(normalized_hashes))
         object.__setattr__(self, "prewarm_max_scan_wall_duration_ns", duration)
 
@@ -435,6 +787,7 @@ class LidarScanRequest:
     world_mount_pose: Pose
     optional_base_pose: Pose | None
     complete_obstacle_snapshots_without_body_ids: tuple[ObstacleSnapshot, ...]
+    output_identity: OutputIdentity | None = None
 
     def __post_init__(self) -> None:
         version = _require_protocol_version(self.protocol_version)
@@ -461,6 +814,9 @@ class LidarScanRequest:
         logical_ids = tuple(snapshot.logical_id for snapshot in snapshots)
         if len(set(logical_ids)) != len(logical_ids):
             raise ValueError("complete obstacle snapshots must use unique logical_id values")
+        output_identity = _reconstruct_v2_output_identity(self.output_identity)
+        if output_identity is not None and topic != "lidar_link":
+            raise ValueError("v2 output identity is only valid for the Stage4 center lidar")
         object.__setattr__(self, "protocol_version", version)
         object.__setattr__(self, "job_id", job_id)
         object.__setattr__(self, "captured_monotonic_ns", captured_ns)
@@ -473,6 +829,7 @@ class LidarScanRequest:
         object.__setattr__(self, "world_mount_pose", mount)
         object.__setattr__(self, "optional_base_pose", base)
         object.__setattr__(self, "complete_obstacle_snapshots_without_body_ids", snapshots)
+        object.__setattr__(self, "output_identity", output_identity)
 
 
 @dataclass(frozen=True, slots=True)
@@ -767,6 +1124,7 @@ class _PendingLidarCapture:
     world_mount_pose: Pose
     optional_base_pose: Pose | None
     complete_obstacle_snapshots_without_body_ids: tuple[ObstacleSnapshot, ...]
+    output_identity: OutputIdentity | None = None
 
     def __post_init__(self) -> None:
         captured_ns = _require_uint64("captured_monotonic_ns", self.captured_monotonic_ns)
@@ -787,6 +1145,9 @@ class _PendingLidarCapture:
         logical_ids = tuple(snapshot.logical_id for snapshot in snapshots)
         if len(set(logical_ids)) != len(logical_ids):
             raise ValueError("complete obstacle snapshots must use unique logical_id values")
+        output_identity = _reconstruct_v2_output_identity(self.output_identity)
+        if output_identity is not None and topic != "lidar_link":
+            raise ValueError("v2 output identity is only valid for the Stage4 center lidar")
         object.__setattr__(self, "captured_monotonic_ns", captured_ns)
         object.__setattr__(self, "lifecycle_generation", generation)
         object.__setattr__(self, "pause_epoch", pause_epoch)
@@ -795,6 +1156,7 @@ class _PendingLidarCapture:
         object.__setattr__(self, "world_mount_pose", mount)
         object.__setattr__(self, "optional_base_pose", base)
         object.__setattr__(self, "complete_obstacle_snapshots_without_body_ids", snapshots)
+        object.__setattr__(self, "output_identity", output_identity)
 
     @property
     def identity(self) -> tuple[int, int, str, int]:
@@ -821,6 +1183,7 @@ class _PendingLidarCapture:
             self.world_mount_pose,
             self.optional_base_pose,
             self.complete_obstacle_snapshots_without_body_ids,
+            self.output_identity,
         )
 
 
@@ -1047,6 +1410,7 @@ class LidarScanService:
         world_mount_pose: Pose,
         optional_base_pose: Pose | None,
         complete_obstacle_snapshots_without_body_ids: tuple[ObstacleSnapshot, ...],
+        output_identity: OutputIdentity | None = None,
     ) -> bool:
         """非阻塞提交 capture；容量满时只拒绝最新值，不覆盖旧帧。"""
         if self._state != "ready":
@@ -1061,6 +1425,7 @@ class LidarScanService:
             world_mount_pose,
             optional_base_pose,
             complete_obstacle_snapshots_without_body_ids,
+            output_identity,
         )
         if self._in_flight is None:
             return self._send_capture(capture)
@@ -1232,15 +1597,12 @@ class LidarScanService:
                 "sensor_overrun",
                 "lidar job exceeded 100 ms capture-to-response budget",
             )
-        overrun = self._in_flight_overrun_reported
         self._in_flight = None
         self._in_flight_overrun_reported = False
 
         result: PreparedLidarFrame | None
         if stale:
             self._stale_count += 1
-            result = None
-        elif overrun:
             result = None
         elif type(response) is LidarScanFailure:
             self._failed_count += 1
@@ -1305,6 +1667,7 @@ class LidarWorkerStartupError(RuntimeError):
     ) -> None:
         super().__init__(detail)
         self.stable_error_code = stable_error_code
+        self.bounded_detail = detail
         self.startup_failure = startup_failure
         self.ready: None = None
 
@@ -1316,7 +1679,8 @@ class LidarWorkerHandle:
     process: multiprocessing.Process
     request_sender: Connection
     response_receiver: Connection
-    ready: LidarWorkerReady
+    ready: LidarWorkerReady | None
+    _stage4_shard_processes: tuple[multiprocessing.Process, ...] = ()
 
     def close(self, timeout_sec: float = 5.0) -> LidarWorkerStopped | None:
         """发送 Stop 并只把校验通过的 Stopped 信封视为正常退出。"""
@@ -1342,34 +1706,67 @@ class LidarWorkerHandle:
             self.process.join(max(0.0, deadline - time.monotonic()))
             if self.process.is_alive():
                 raise TimeoutError("lidar worker remained alive after Stopped ACK")
+            for shard in self._stage4_shard_processes:
+                shard.join(max(0.0, deadline - time.monotonic()))
+                if shard.is_alive():
+                    raise TimeoutError("Stage4 shard remained alive after Stopped ACK")
             self.response_receiver.close()
             return ack
         except BaseException as error:
-            try:
-                self.request_sender.close()
-            except BaseException:
-                pass
-            try:
-                _reap_owned_process(
-                    self.process,
-                    initial_join_timeout_sec=0.0,
+            _run_cleanup_actions(
+                (
+                    self.request_sender.close,
+                    lambda: _reap_owned_process(
+                        self.process,
+                        initial_join_timeout_sec=0.0,
+                    ),
+                    *(
+                        lambda shard=shard: _reap_owned_process(
+                            shard,
+                            initial_join_timeout_sec=0.0,
+                        )
+                        for shard in self._stage4_shard_processes
+                    ),
+                    self.response_receiver.close,
                 )
-            finally:
-                self.response_receiver.close()
+            )
             raise RuntimeError(
                 "lidar worker did not exit after normal shutdown"
             ) from error
 
     def force_close(self) -> None:
         """关闭 IPC 后仅终结本 handle 持有的 child；不等待成功信封。"""
-        self.request_sender.close()
-        try:
-            _reap_owned_process(
-                self.process,
-                initial_join_timeout_sec=0.0,
+        error = _run_cleanup_actions(
+            (
+                self.request_sender.close,
+                lambda: _reap_owned_process(
+                    self.process,
+                    initial_join_timeout_sec=0.0,
+                ),
+                *(
+                    lambda shard=shard: _reap_owned_process(
+                        shard,
+                        initial_join_timeout_sec=0.0,
+                    )
+                    for shard in self._stage4_shard_processes
+                ),
+                self.response_receiver.close,
             )
-        finally:
-            self.response_receiver.close()
+        )
+        if error is not None:
+            raise error
+
+
+def _run_cleanup_actions(actions: tuple[Callable[[], None], ...]) -> BaseException | None:
+    """完整遍历 cleanup 动作，并保留最先观察到的错误。"""
+    first_error = None
+    for action in actions:
+        try:
+            action()
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
+    return first_error
 
 
 def _bounded_exception_detail(stage: str, error: BaseException) -> str:
@@ -1396,19 +1793,75 @@ def _world_mount_pose(backend: PyBulletSensorBackend, scanner: MultiLineLidar) -
 def _prewarm_scanner(
     scanner: MultiLineLidar,
     backend: PyBulletSensorBackend,
-    codec: ProtoCodec,
+    encode_payload: Callable[[LidarPointCloud], bytes],
+    *,
+    expected_ray_count: int,
 ) -> tuple[str, int]:
     """执行一整帧生产射线、点构造和一次确定性编码。"""
-    if scanner.config.ray_count != 2880:
-        raise RuntimeError("worker preflight requires exactly 2880 rays")
+    if scanner.config.ray_count != expected_ray_count:
+        raise RuntimeError("worker preflight scanner has an unexpected ray count")
     started_ns = time.monotonic_ns()
     message = scanner._scan_frozen(0, _world_mount_pose(backend, scanner))
     if type(message) is not LidarPointCloud:
         raise RuntimeError("worker preflight expected a lidar point cloud")
-    payload = codec.encode(message)
+    payload = encode_payload(message)
     if type(payload) is not bytes or not payload:
         raise RuntimeError("worker preflight produced an invalid encoded payload")
     return hashlib.sha256(payload).hexdigest(), time.monotonic_ns() - started_ns
+
+
+def _encode_v2_lidar_payload(
+    codec: V2ProtoCodec,
+    message: LidarPointCloud,
+    identity: OutputIdentity,
+) -> bytes:
+    """在 worker 内把冻结点云和既有 session identity 确定性编码为唯一 raw bytes。"""
+    validated_identity = _validated_v2_lidar_identity(codec, identity)
+    if type(message) is not LidarPointCloud:
+        raise ValueError("message must be an exact LidarPointCloud")
+    if (message.frame_id, message.lidar_id) != ("lidar_link", 1):
+        raise ValueError("v2 worker payload must use the Stage4 center lidar")
+
+    # 扫描器已经生成严格校验过的企业点；直接填充 wire message，避免再造一整帧 v2 点对象。
+    encoded = pb.LidarPointCloud(
+        timebase_ns=message.timebase_ns,
+        frame_id=message.frame_id,
+        point_num=message.point_num,
+        lidar_id=message.lidar_id,
+        sequence=validated_identity.sequence,
+        world_generation=validated_identity.world_generation,
+        simulation_session_id=validated_identity.simulation_session_id,
+        descriptor_sha256=validated_identity.descriptor_sha256,
+    )
+    add_point = encoded.points.add
+    for point in message.points:
+        add_point(
+            offset_time_ns=point.offset_time_ns,
+            x=point.x,
+            y=point.y,
+            z=point.z,
+            reflectivity=point.reflectivity,
+            tag=point.tag,
+            line=point.line,
+        )
+    return encoded.SerializeToString(deterministic=True)
+
+
+def _validated_v2_lidar_identity(
+    codec: V2ProtoCodec,
+    identity: OutputIdentity,
+) -> OutputIdentity:
+    """复用中心 LiDAR 的 codec、会话和 descriptor 边界校验。"""
+    if not isinstance(codec, V2ProtoCodec):
+        raise ValueError("codec must be a V2ProtoCodec")
+    validated_identity = _reconstruct_v2_output_identity(identity)
+    if validated_identity is None:
+        raise ValueError("v2 lidar payload requires an output identity")
+    if validated_identity.world_generation == 0:
+        raise ValueError("world_generation must be positive")
+    if validated_identity.descriptor_sha256 != codec._descriptor.sha256:
+        raise ValueError("v2 descriptor SHA-256 mismatch")
+    return validated_identity
 
 
 @dataclass(slots=True)
@@ -1450,6 +1903,24 @@ class _WorkerSensorBackend(PyBulletSensorBackend):
         except BaseException as error:
             raise _WorkerRaycastError("worker native raycast failed") from error
 
+    def _ray_test_indexed_hits_ndarray(
+        self,
+        starts: object,
+        ends: object,
+        *,
+        collision_mask: int,
+        num_threads: int = 0,
+    ) -> tuple[tuple[int, RayHit], ...]:
+        try:
+            return super()._ray_test_indexed_hits_ndarray(
+                starts,
+                ends,
+                collision_mask=collision_mask,
+                num_threads=num_threads,
+            )
+        except BaseException as error:
+            raise _WorkerRaycastError("worker native raycast failed") from error
+
 
 @dataclass(slots=True)
 class _LiveWorkerBootstrap:
@@ -1458,9 +1929,11 @@ class _LiveWorkerBootstrap:
     client_id: int
     ready: LidarWorkerReady
     backend: PyBulletSensorBackend
-    front_scanner: MultiLineLidar
-    rear_scanner: MultiLineLidar
-    codec: ProtoCodec
+    # 保留旧双雷达测试钩子；Stage4 profile 只填充 center_scanner。
+    front_scanner: MultiLineLidar | None
+    rear_scanner: MultiLineLidar | None
+    center_scanner: MultiLineLidar | None
+    codec: ProtoCodec | V2ProtoCodec
     terrain_body_ids: tuple[int, ...]
     obstacle_records: dict[int, _WorkerObstacleRecord]
     scene_state_unknown: bool = False
@@ -1549,6 +2022,7 @@ def _bootstrap_live_worker(
     world_spec: object,
     *,
     forced_failure_phase: str | None = None,
+    prewarm_stage4: bool = True,
 ) -> _LiveWorkerBootstrap | LidarWorkerStartupFailure:
     """建立 child 的真实 DIRECT 世界；成功时不关闭 client，供后续请求复用。"""
     process_id = os.getpid()
@@ -1560,6 +2034,7 @@ def _bootstrap_live_worker(
             world_spec.experiment_config,
             world_spec.scene_document,
             world_spec.world_digest,
+            world_spec.profile,
         )
         import pybullet as p
 
@@ -1587,43 +2062,94 @@ def _bootstrap_live_worker(
             if snapshot.body_id is not None
         }
         codec = ProtoCodec()
-        front = MultiLineLidar(
-            backend,
-            validated_spec.scene_document.sensors.lidar,
-            validated_spec.scene_document.sensors.mounts.lidar_front,
-            frame_id="lidar_front",
-            lidar_id=1,
-        )
-        rear = MultiLineLidar(
-            backend,
-            validated_spec.scene_document.sensors.lidar,
-            validated_spec.scene_document.sensors.mounts.lidar_rear,
-            frame_id="lidar_rear",
-            lidar_id=2,
-        )
+        if validated_spec.profile == "stage3":
+            front = MultiLineLidar(
+                backend,
+                validated_spec.scene_document.sensors.lidar,
+                validated_spec.scene_document.sensors.mounts.lidar_front,
+                frame_id="lidar_front",
+                lidar_id=1,
+            )
+            rear = MultiLineLidar(
+                backend,
+                validated_spec.scene_document.sensors.lidar,
+                validated_spec.scene_document.sensors.mounts.lidar_rear,
+                frame_id="lidar_rear",
+                lidar_id=2,
+            )
+            center = None
 
-        phase = "front_preflight"
-        if forced_failure_phase == phase:
-            raise RuntimeError("forced front preflight failure")
-        front_hash, front_duration_ns = _prewarm_scanner(front, backend, codec)
+            phase = "front_preflight"
+            if forced_failure_phase == phase:
+                raise RuntimeError("forced front preflight failure")
+            front_hash, front_duration_ns = _prewarm_scanner(
+                front,
+                backend,
+                codec.encode,
+                expected_ray_count=2880,
+            )
 
-        phase = "rear_preflight"
-        if forced_failure_phase == phase:
-            raise RuntimeError("forced rear preflight failure")
-        rear_hash, rear_duration_ns = _prewarm_scanner(rear, backend, codec)
+            phase = "rear_preflight"
+            if forced_failure_phase == phase:
+                raise RuntimeError("forced rear preflight failure")
+            rear_hash, rear_duration_ns = _prewarm_scanner(
+                rear,
+                backend,
+                codec.encode,
+                expected_ray_count=2880,
+            )
+            prewarm_hashes = (
+                ("lidar_front", front_hash),
+                ("lidar_rear", rear_hash),
+            )
+            prewarm_duration_ns = max(front_duration_ns, rear_duration_ns)
+        else:
+            # 阶段四只创建唯一中心扫描器，避免旧前后雷达进入实时物理路径。
+            center = MultiLineLidar.stage4(backend, Stage4LidarProfile.realtime())
+            front = None
+            rear = None
+            descriptor = load_v2_descriptor()
+            codec = V2ProtoCodec(descriptor)
+            if prewarm_stage4:
+                prewarm_identity = OutputIdentity(
+                    "/sim/lidar/points",
+                    b"\x00" * 16,
+                    descriptor.sha256,
+                    1,
+                    0,
+                )
+                phase = "center_preflight"
+                if forced_failure_phase == phase:
+                    raise RuntimeError("forced center preflight failure")
+                center_hash, prewarm_duration_ns = _prewarm_scanner(
+                    center,
+                    backend,
+                    lambda message: _encode_v2_lidar_payload(
+                        codec,
+                        message,
+                        prewarm_identity,
+                    ),
+                    expected_ray_count=Stage4LidarProfile.realtime().ray_count,
+                )
+                prewarm_hashes = (("lidar_link", center_hash),)
+            else:
+                prewarm_hashes = ()
+                prewarm_duration_ns = 0
+        ready = None if validated_spec.profile == "stage4" and not prewarm_stage4 else LidarWorkerReady(
+            _PROTOCOL_VERSION,
+            process_id,
+            validated_spec.world_digest,
+            _WORKER_TOPICS_BY_PROFILE[validated_spec.profile],
+            prewarm_hashes,
+            prewarm_duration_ns,
+        )
         return _LiveWorkerBootstrap(
             client_id,
-            LidarWorkerReady(
-                _PROTOCOL_VERSION,
-                process_id,
-                validated_spec.world_digest,
-                _TOPICS,
-                (("lidar_front", front_hash), ("lidar_rear", rear_hash)),
-                max(front_duration_ns, rear_duration_ns),
-            ),
+            ready,
             backend,
             front,
             rear,
+            center,
             codec,
             tuple(world.scene.body_ids),
             initial_records,
@@ -1675,7 +2201,97 @@ def _reconstruct_scan_request(value: object) -> LidarScanRequest:
         value.world_mount_pose,
         value.optional_base_pose,
         value.complete_obstacle_snapshots_without_body_ids,
+        value.output_identity,
     )
+
+
+def _reconstruct_stage4_shard_result(
+    value: object,
+    *,
+    shard_id: int,
+    process_id: int,
+    assignment: tuple[int, int, int, int],
+    request: LidarScanRequest,
+) -> _Stage4ShardResult:
+    """在 coordinator 收到 pickle 后重建并核验私有 shard Result。"""
+    if type(value) is not _Stage4ShardResult or type(request) is not LidarScanRequest:
+        raise ValueError("invalid Stage4 shard result")
+    try:
+        result = _Stage4ShardResult(
+            value.shard_id, value.process_id, value.first, value.stop, value.stride,
+            value.count, value.examined_count, value.job_id, value.lifecycle_generation,
+            value.pause_epoch, value.topic, value.timestamp_ns, value.values,
+        )
+    except (AttributeError, ValueError) as error:
+        raise ValueError("invalid Stage4 shard result") from error
+    if (
+        (result.shard_id, result.process_id, result.first, result.stop, result.stride, result.count)
+        != (shard_id, process_id, *assignment)
+        or (result.job_id, result.lifecycle_generation, result.pause_epoch, result.topic, result.timestamp_ns)
+        != (request.job_id, request.lifecycle_generation, request.pause_epoch, request.topic, request.timestamp_ns)
+    ):
+        raise ValueError("Stage4 shard result identity mismatch")
+    if request.output_identity is None:
+        raise ValueError("Stage4 shard result requires output identity")
+    _require_stage4_indexed_values(
+        result.values,
+        result.first,
+        result.stop,
+        result.stride,
+    )
+    _require_stage4_firing_identity(
+        result.values,
+        world_generation=request.output_identity.world_generation,
+        sequence=request.output_identity.sequence,
+    )
+    return result
+
+
+def _reconstruct_stage4_shard_failure(
+    value: object,
+    *,
+    shard_id: int,
+    process_id: int,
+    assignment: tuple[int, int, int, int],
+    request: LidarScanRequest,
+) -> _Stage4ShardFailure:
+    """在 coordinator 收到 pickle 后重建并核验私有 shard Failure。"""
+    if type(value) is not _Stage4ShardFailure or type(request) is not LidarScanRequest:
+        raise ValueError("invalid Stage4 shard failure")
+    try:
+        failure = _Stage4ShardFailure(
+            value.shard_id, value.process_id, value.first, value.stop, value.stride,
+            value.count, value.job_id, value.lifecycle_generation, value.pause_epoch,
+            value.topic, value.timestamp_ns, value.stable_error_code, value.bounded_detail,
+        )
+    except (AttributeError, ValueError) as error:
+        raise ValueError("invalid Stage4 shard failure") from error
+    if (
+        (failure.shard_id, failure.process_id, failure.first, failure.stop, failure.stride, failure.count)
+        != (shard_id, process_id, *assignment)
+        or (failure.job_id, failure.lifecycle_generation, failure.pause_epoch, failure.topic, failure.timestamp_ns)
+        != (request.job_id, request.lifecycle_generation, request.pause_epoch, request.topic, request.timestamp_ns)
+    ):
+        raise ValueError("Stage4 shard failure identity mismatch")
+    return failure
+
+
+def _reconstruct_stage4_shard_stopped(
+    value: object,
+    *,
+    shard_id: int,
+    process_id: int,
+) -> _Stage4ShardStopped:
+    """在 coordinator 收到 pickle 后重建并核验私有 shard Stopped。"""
+    if type(value) is not _Stage4ShardStopped:
+        raise ValueError("invalid Stage4 shard Stopped")
+    try:
+        stopped = _Stage4ShardStopped(value.shard_id, value.process_id)
+    except (AttributeError, ValueError) as error:
+        raise ValueError("invalid Stage4 shard Stopped") from error
+    if (stopped.shard_id, stopped.process_id) != (shard_id, process_id):
+        raise ValueError("Stage4 shard Stopped identity mismatch")
+    return stopped
 
 
 def _scan_failure(
@@ -1845,7 +2461,19 @@ def _process_scan_request(
     """在 child 内用冻结位姿生成一次同源点云、俯视帧与编码 bytes。"""
     request = _reconstruct_scan_request(raw_request)
     started_ns = time.monotonic_ns()
-    scanner = live.front_scanner if request.topic == "lidar_front" else live.rear_scanner
+    scanner = {
+        "lidar_front": live.front_scanner,
+        "lidar_rear": live.rear_scanner,
+        "lidar_link": live.center_scanner,
+    }[request.topic]
+    if scanner is None:
+        return _scan_failure(
+            request,
+            "pointcloud_failed",
+            "profile",
+            RuntimeError("lidar request does not belong to the active worker profile"),
+            started_ns,
+        )
     try:
         _reconcile_obstacles(
             live,
@@ -1867,6 +2495,50 @@ def _process_scan_request(
             "scene reconcile",
             error,
             started_ns,
+        )
+    if (
+        request.topic == "lidar_link"
+        and request.output_identity is not None
+        and request.optional_base_pose is None
+    ):
+        try:
+            if type(live.codec) is not V2ProtoCodec:
+                raise RuntimeError("Stage3 worker cannot encode a v2 output identity")
+            identity = _validated_v2_lidar_identity(live.codec, request.output_identity)
+        except BaseException as error:
+            return _scan_failure(request, "codec_failed", "codec", error, started_ns)
+        try:
+            payload = scanner._scan_v2_payload_at_mount(
+                request.timestamp_ns,
+                request.world_mount_pose,
+                sequence=identity.sequence,
+                world_generation=identity.world_generation,
+                simulation_session_id=identity.simulation_session_id,
+                descriptor_sha256=identity.descriptor_sha256,
+            )
+        except _WorkerRaycastError as error:
+            return _scan_failure(request, "raycast_failed", "raycast", error, started_ns)
+        except _V2PayloadSerializationError as error:
+            return _scan_failure(request, "codec_failed", "codec", error, started_ns)
+        except BaseException as error:
+            return _scan_failure(request, "pointcloud_failed", "pointcloud", error, started_ns)
+        if type(payload) is not bytes or not payload:
+            return _scan_failure(
+                request,
+                "codec_failed",
+                "codec",
+                ValueError("codec must return nonempty exact bytes"),
+                started_ns,
+            )
+        return PreparedLidarPayload(
+            _PROTOCOL_VERSION,
+            request.job_id,
+            request.lifecycle_generation,
+            request.pause_epoch,
+            request.topic,
+            request.timestamp_ns,
+            payload,
+            time.monotonic_ns() - started_ns,
         )
     try:
         result = scanner._scan_frozen(
@@ -1894,7 +2566,21 @@ def _process_scan_request(
             started_ns,
         )
     try:
-        payload = live.codec.encode(message)
+        if request.output_identity is None:
+            if isinstance(live.codec, V2ProtoCodec):
+                raise RuntimeError("Stage4 worker request is missing its v2 output identity")
+            encode = getattr(live.codec, "encode", None)
+            if not callable(encode):
+                raise RuntimeError("worker codec must provide encode")
+            payload = encode(message)
+        else:
+            if type(live.codec) is not V2ProtoCodec:
+                raise RuntimeError("Stage3 worker cannot encode a v2 output identity")
+            payload = _encode_v2_lidar_payload(
+                live.codec,
+                message,
+                request.output_identity,
+            )
         if type(payload) is not bytes or not payload:
             raise ValueError("codec must return nonempty exact bytes")
     except BaseException as error:
@@ -1932,6 +2618,452 @@ def _process_scan_request(
         return _scan_failure(request, "pointcloud_failed", "pointcloud", error, started_ns)
 
 
+def _stage4_shard_values(
+    live: _LiveWorkerBootstrap,
+    spec: _Stage4ShardSpec,
+    mount: Pose,
+    *,
+    world_generation: int,
+    sequence: int,
+) -> tuple[tuple[int, tuple[int, float, float, float, int, int, int]], ...]:
+    """在独立 DIRECT 世界中执行所属交错 global ray index 的正式射线批次。"""
+    if live.center_scanner is None:
+        raise RuntimeError("Stage4 shard has no center scanner")
+    scanner = live.center_scanner
+    global_slots = range(spec.first, spec.stop, spec.stride)
+    shard_starts, shard_ends = scanner._stage4_world_rays_for_slots(
+        mount,
+        pattern_version=MID360_PATTERN_VERSION,
+        world_generation=world_generation,
+        sequence=sequence,
+        global_slots=global_slots,
+    )
+    if (
+        shard_starts.shape != (spec.count, 3)
+        or shard_ends.shape != (spec.count, 3)
+        or not shard_starts.flags.c_contiguous
+        or not shard_ends.flags.c_contiguous
+        or shard_starts.flags.writeable
+        or shard_ends.flags.writeable
+    ):
+        raise RuntimeError("Stage4 shard rays must be readonly C-order (2880, 3) arrays")
+    indexed_hits = live.backend._ray_test_indexed_hits_ndarray(
+        shard_starts,
+        shard_ends,
+        collision_mask=LIDAR_VISIBLE_GROUP,
+        num_threads=_stage4_realtime_shard_thread_count(spec.shard_id),
+    )
+    world_points = tuple(hit.hit_position for _index, hit in indexed_hits)
+    local_points = live.backend.inverse_transform_points_prevalidated(
+        mount,
+        world_points,
+    )
+    return tuple(
+        (spec.first + local_index * spec.stride, point_value)
+        for (local_index, hit), local_point in zip(indexed_hits, local_points, strict=True)
+        if (
+            point_value := scanner._stage4_point_values_from_hit(
+                spec.first + local_index * spec.stride,
+                hit,
+                local_point,
+                pattern_version=MID360_PATTERN_VERSION,
+                world_generation=world_generation,
+                sequence=sequence,
+            )
+        ) is not None
+    )
+
+
+def _stage4_shard_prewarm(
+    live: _LiveWorkerBootstrap,
+    spec: _Stage4ShardSpec,
+) -> _Stage4ShardPrewarm:
+    """用 shard 自己的正式 range/线程配额做一次真实启动预热。"""
+    if type(live.codec) is not V2ProtoCodec:
+        raise RuntimeError("Stage4 shard prewarm requires a v2 codec")
+    started_ns = time.monotonic_ns()
+    values = _stage4_shard_values(
+        live,
+        spec,
+        _world_mount_pose(live.backend, live.center_scanner),
+        world_generation=1,
+        sequence=0,
+    )
+    identity = OutputIdentity(
+        "/sim/lidar/points",
+        b"\x00" * 16,
+        live.codec._descriptor.sha256,
+        1,
+        0,
+    )
+    return _Stage4ShardPrewarm(
+        spec.shard_id,
+        os.getpid(),
+        spec.world_spec.world_digest,
+        spec.first,
+        spec.stop,
+        spec.stride,
+        spec.count,
+        spec.count,
+        0,
+        1,
+        0,
+        "lidar_link",
+        0,
+        identity,
+        values,
+        time.monotonic_ns() - started_ns,
+    )
+
+
+def _stage4_shard_scan(
+    live: _LiveWorkerBootstrap,
+    request: LidarScanRequest,
+    spec: _Stage4ShardSpec,
+) -> _Stage4ShardResult:
+    """在独立 DIRECT 世界中只处理所属交错 global ray index。"""
+    _reconcile_obstacles(live, request.complete_obstacle_snapshots_without_body_ids)
+    if request.output_identity is None:
+        raise ValueError("Stage4 shard request requires output_identity")
+    values = _stage4_shard_values(
+        live,
+        spec,
+        request.world_mount_pose,
+        world_generation=request.output_identity.world_generation,
+        sequence=request.output_identity.sequence,
+    )
+    return _Stage4ShardResult(
+        spec.shard_id,
+        os.getpid(),
+        spec.first,
+        spec.stop,
+        spec.stride,
+        spec.count,
+        spec.count,
+        request.job_id,
+        request.lifecycle_generation,
+        request.pause_epoch,
+        request.topic,
+        request.timestamp_ns,
+        values,
+    )
+
+
+def stage4_shard_entrypoint(
+    request_receiver: Connection,
+    response_sender: Connection,
+    spec: _Stage4ShardSpec,
+) -> None:
+    """parent-owned sibling shard：独立 DIRECT/world，绝不自行再 spawn。"""
+    result = _bootstrap_live_worker(spec.world_spec, prewarm_stage4=False)
+    if type(result) is LidarWorkerStartupFailure:
+        response_sender.send(result)
+        response_sender.close()
+        request_receiver.close()
+        raise SystemExit(1)
+    live = result
+    normal_stop = False
+    try:
+        try:
+            prewarm = _stage4_shard_prewarm(live, spec)
+        except BaseException as error:
+            response_sender.send(_startup_failure(os.getpid(), "center_preflight", error))
+            raise SystemExit(1)
+        gc.freeze()
+        gc.disable()
+        response_sender.send(
+            _Stage4ShardReady(
+                spec.shard_id, os.getpid(), spec.first, spec.stop, spec.stride,
+                spec.count, spec.world_spec.world_digest,
+            )
+        )
+        response_sender.send(prewarm)
+        while True:
+            raw_request = request_receiver.recv()
+            if type(raw_request) is LidarWorkerStop:
+                stop = LidarWorkerStop(raw_request.protocol_version, raw_request.process_id)
+                if stop.process_id != os.getpid():
+                    raise ValueError("Stage4 shard Stop used the wrong process id")
+                normal_stop = True
+                break
+            request = None
+            try:
+                request = _reconstruct_scan_request(raw_request)
+                response_sender.send(_stage4_shard_scan(live, request, spec))
+            except BaseException as error:
+                if request is None:
+                    raise
+                response_sender.send(
+                    _Stage4ShardFailure(
+                        spec.shard_id,
+                        os.getpid(),
+                        spec.first,
+                        spec.stop,
+                        spec.stride,
+                        spec.count,
+                        request.job_id,
+                        request.lifecycle_generation,
+                        request.pause_epoch,
+                        request.topic,
+                        request.timestamp_ns,
+                        "shard_scan_failed",
+                        _bounded_exception_detail("Stage4 shard scan", error),
+                    )
+                )
+                raise SystemExit(1) from error
+    finally:
+        request_receiver.close()
+        try:
+            _disconnect_direct_client(live.client_id)
+            if normal_stop:
+                response_sender.send(_Stage4ShardStopped(spec.shard_id, os.getpid()))
+        finally:
+            response_sender.close()
+
+
+def _stage4_payload_from_shards(
+    request: LidarScanRequest,
+    codec: V2ProtoCodec,
+    responses: tuple[
+        _Stage4ShardResult | _Stage4ShardPrewarm,
+        _Stage4ShardResult | _Stage4ShardPrewarm,
+    ],
+) -> PreparedLidarPayload:
+    """两 shard identity 全等后唯一一次构造并确定性编码中心 protobuf。"""
+    identity = _validated_v2_lidar_identity(codec, request.output_identity)
+    raw = tuple(
+        (
+            response.shard_id, response.first, response.stop, response.stride,
+            response.count, response.examined_count, response.values,
+        )
+        for response in responses
+    )
+    for response in responses:
+        if (
+            response.job_id,
+            response.lifecycle_generation,
+            response.pause_epoch,
+            response.topic,
+            response.timestamp_ns,
+        ) != (
+            request.job_id,
+            request.lifecycle_generation,
+            request.pause_epoch,
+            request.topic,
+            request.timestamp_ns,
+        ):
+            raise RuntimeError("Stage4 shard response identity mismatch")
+    values = _merge_stage4_shard_indexed_values(raw)
+    encoded = pb.LidarPointCloud(
+        timebase_ns=request.timestamp_ns,
+        frame_id="lidar_link",
+        lidar_id=1,
+        sequence=identity.sequence,
+        world_generation=identity.world_generation,
+        simulation_session_id=identity.simulation_session_id,
+        descriptor_sha256=identity.descriptor_sha256,
+    )
+    for value in values:
+        encoded.points.add(offset_time_ns=value[0], x=value[1], y=value[2], z=value[3], reflectivity=value[4], tag=value[5], line=value[6])
+    encoded.point_num = len(values)
+    return PreparedLidarPayload(
+        _PROTOCOL_VERSION, request.job_id, request.lifecycle_generation, request.pause_epoch,
+        request.topic, request.timestamp_ns, encoded.SerializeToString(deterministic=True), 0,
+    )
+
+
+def _stage4_prewarm_payload_from_shards(
+    codec: V2ProtoCodec,
+    partials: tuple[_Stage4ShardPrewarm, _Stage4ShardPrewarm],
+    shard_pids: tuple[int, int],
+    world_digest: str,
+) -> tuple[bytes, int]:
+    """验证两个真实 shard 预热 partial，并唯一合并编码 outer Ready 的 payload。"""
+    expected_identity = OutputIdentity(
+        "/sim/lidar/points", b"\x00" * 16, codec._descriptor.sha256, 1, 0
+    )
+    assignments = _stage4_realtime_shard_assignments()
+    max_duration_ns = 0
+    reconstructed_partials = []
+    try:
+        for shard_id, raw_partial in enumerate(partials):
+            if type(raw_partial) is not _Stage4ShardPrewarm:
+                raise ValueError("invalid Stage4 shard prewarm type")
+            partial = _Stage4ShardPrewarm(
+                raw_partial.shard_id,
+                raw_partial.process_id,
+                raw_partial.world_digest,
+                raw_partial.first,
+                raw_partial.stop,
+                raw_partial.stride,
+                raw_partial.count,
+                raw_partial.examined_count,
+                raw_partial.job_id,
+                raw_partial.lifecycle_generation,
+                raw_partial.pause_epoch,
+                raw_partial.topic,
+                raw_partial.timestamp_ns,
+                _reconstruct_v2_output_identity(raw_partial.output_identity),
+                raw_partial.values,
+                raw_partial.duration_ns,
+            )
+            first, stop, stride, count = assignments[shard_id]
+            if (
+                partial.shard_id,
+                partial.process_id,
+                partial.world_digest,
+                partial.first,
+                partial.stop,
+                partial.stride,
+                partial.count,
+                partial.examined_count,
+                partial.job_id,
+                partial.lifecycle_generation,
+                partial.pause_epoch,
+                partial.topic,
+                partial.timestamp_ns,
+                partial.output_identity,
+            ) != (
+                shard_id,
+                shard_pids[shard_id],
+                world_digest,
+                first,
+                stop,
+                stride,
+                count,
+                count,
+                0,
+                1,
+                0,
+                "lidar_link",
+                0,
+                expected_identity,
+            ):
+                raise ValueError("Stage4 shard prewarm identity mismatch")
+            _require_stage4_indexed_values(
+                partial.values,
+                partial.first,
+                partial.stop,
+                partial.stride,
+            )
+            _require_stage4_firing_identity(
+                partial.values,
+                world_generation=expected_identity.world_generation,
+                sequence=expected_identity.sequence,
+            )
+            reconstructed_partials.append(partial)
+            max_duration_ns = max(max_duration_ns, partial.duration_ns)
+    except (AttributeError, TypeError, ValueError, OverflowError) as error:
+        raise RuntimeError("Stage4 shard prewarm identity mismatch") from error
+    request = LidarScanRequest(
+        _PROTOCOL_VERSION, 0, 0, 1, 0, "lidar_link", "lidar_link", 1, 0,
+        Pose((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0)), None, (), expected_identity,
+    )
+    merge_started_ns = time.monotonic_ns()
+    payload = _stage4_payload_from_shards(request, codec, tuple(reconstructed_partials))
+    return payload.protobuf_payload, max_duration_ns + (time.monotonic_ns() - merge_started_ns)
+
+
+def stage4_coordinator_entrypoint(
+    request_receiver: Connection,
+    response_sender: Connection,
+    world_spec: LidarWorkerWorldSpec,
+    shard_senders: tuple[Connection, Connection],
+    shard_receivers: tuple[Connection, Connection],
+    shard_pids: tuple[int, int],
+) -> None:
+    """无 DIRECT 的 Stage4 coordinator；只验证/合并 sibling shard 结果。"""
+    try:
+        ready_messages = tuple(receiver.recv() for receiver in shard_receivers)
+        assignments = _stage4_realtime_shard_assignments()
+        for shard_id, message in enumerate(ready_messages):
+            if type(message) is not _Stage4ShardReady or (
+                message.shard_id, message.process_id, message.first, message.stop,
+                message.stride, message.count, message.world_digest
+            ) != (shard_id, shard_pids[shard_id], *assignments[shard_id], world_spec.world_digest):
+                raise RuntimeError("Stage4 shard startup identity mismatch")
+        codec = V2ProtoCodec(load_v2_descriptor())
+        prewarm_partials = tuple(receiver.recv() for receiver in shard_receivers)
+        prewarm_payload, prewarm_duration_ns = _stage4_prewarm_payload_from_shards(
+            codec,
+            prewarm_partials,
+            shard_pids,
+            world_spec.world_digest,
+        )
+        gc.collect()
+        gc.freeze()
+        gc.disable()
+        digest = hashlib.sha256(prewarm_payload).hexdigest()
+        response_sender.send(LidarWorkerReady(_PROTOCOL_VERSION, os.getpid(), world_spec.world_digest, ("lidar_link",), (("lidar_link", digest),), prewarm_duration_ns))
+        while True:
+            request = request_receiver.recv()
+            if type(request) is LidarWorkerStop:
+                stop = LidarWorkerStop(request.protocol_version, request.process_id)
+                if stop.process_id != os.getpid():
+                    raise ValueError("Stage4 coordinator Stop used the wrong process id")
+                shutdown_deadline = time.monotonic() + _PROCESS_ESCALATION_TIMEOUT_SEC
+                for shard_id, sender in enumerate(shard_senders):
+                    sender.send(LidarWorkerStop(_PROTOCOL_VERSION, shard_pids[shard_id]))
+                try:
+                    for shard_id, receiver in enumerate(shard_receivers):
+                        ready = receiver.poll(max(0.0, shutdown_deadline - time.monotonic()))
+                        if type(ready) is not bool or not ready:
+                            raise TimeoutError("Stage4 shard did not return a Stopped ACK")
+                        _reconstruct_stage4_shard_stopped(
+                            receiver.recv(),
+                            shard_id=shard_id,
+                            process_id=shard_pids[shard_id],
+                        )
+                except BaseException as error:
+                    raise RuntimeError("Stage4 shard returned an invalid Stopped ACK") from error
+                response_sender.send(LidarWorkerStopped(_PROTOCOL_VERSION, os.getpid()))
+                return
+            validated = _reconstruct_scan_request(request)
+            frame_started_ns = time.monotonic_ns()
+            frame_deadline_ns = validated.captured_monotonic_ns + _LIDAR_JOB_BUDGET_NS
+            try:
+                for sender in shard_senders:
+                    sender.send(validated)
+                responses = []
+                for shard_id, receiver in enumerate(shard_receivers):
+                    remaining_sec = max(0.0, (frame_deadline_ns - time.monotonic_ns()) / 1_000_000_000)
+                    ready = receiver.poll(remaining_sec)
+                    if type(ready) is not bool or not ready:
+                        raise TimeoutError("Stage4 shard frame response timed out")
+                    raw_response = receiver.recv()
+                    if type(raw_response) is _Stage4ShardFailure:
+                        _reconstruct_stage4_shard_failure(
+                            raw_response,
+                            shard_id=shard_id,
+                            process_id=shard_pids[shard_id],
+                            assignment=assignments[shard_id],
+                            request=validated,
+                        )
+                        raise RuntimeError("Stage4 shard scan failed")
+                    responses.append(
+                        _reconstruct_stage4_shard_result(
+                            raw_response,
+                            shard_id=shard_id,
+                            process_id=shard_pids[shard_id],
+                            assignment=assignments[shard_id],
+                            request=validated,
+                        )
+                    )
+                response_sender.send(_stage4_payload_from_shards(validated, codec, tuple(responses)))
+            except BaseException as error:
+                response_sender.send(
+                    _scan_failure(validated, "pointcloud_failed", "Stage4 shard frame", error, frame_started_ns)
+                )
+                return
+    finally:
+        request_receiver.close()
+        for sender in shard_senders:
+            sender.close()
+        for receiver in shard_receivers:
+            receiver.close()
+        response_sender.close()
+
+
 def lidar_worker_entrypoint(
     request_receiver: Connection,
     response_sender: Connection,
@@ -1940,6 +3072,9 @@ def lidar_worker_entrypoint(
     """spawn child 顶层入口：原子预热后在同一 IPC 管道串行处理扫描。"""
     result = _bootstrap_live_worker(world_spec)
     envelope = result if type(result) is LidarWorkerStartupFailure else result.ready
+    if type(result) is _LiveWorkerBootstrap and result.center_scanner is not None:
+        # 长寿命 PyBullet 世界已完成预热；移出逐帧代际扫描，避免 10 Hz 热路径出现 full-GC 尾峰。
+        gc.freeze()
     response_sender.send(envelope)
     if type(envelope) is LidarWorkerStartupFailure:
         response_sender.close()
@@ -2099,6 +3234,12 @@ def start_lidar_worker(
     if type(startup_timeout_sec) not in {int, float} or startup_timeout_sec <= 0:
         raise ValueError("startup_timeout_sec must be positive")
     context = multiprocessing.get_context("spawn")
+    if world_spec.profile == "stage4":
+        return _start_stage4_coordinator_worker(
+            context,
+            world_spec,
+            float(startup_timeout_sec),
+        )
     request_receiver, request_sender = context.Pipe(False)
     response_receiver, response_sender = context.Pipe(False)
     process = context.Process(
@@ -2127,3 +3268,86 @@ def start_lidar_worker(
         _close_failed_start(process, request_sender, response_receiver)
         raise
     return LidarWorkerHandle(process, request_sender, response_receiver, ready)
+
+
+def _start_stage4_coordinator_worker(
+    context: multiprocessing.context.BaseContext,
+    world_spec: LidarWorkerWorldSpec,
+    startup_timeout_sec: float,
+) -> LidarWorkerHandle:
+    """由 parent 同一 spawn context 创建 coordinator 与两个 sibling DIRECT shard。"""
+    outer_request_receiver, outer_request_sender = context.Pipe(False)
+    outer_response_receiver, outer_response_sender = context.Pipe(False)
+    shard_processes: list[multiprocessing.Process] = []
+    parent_endpoints: list[Connection] = [outer_request_sender, outer_response_receiver]
+    coordinator_senders: list[Connection] = []
+    coordinator_receivers: list[Connection] = []
+    child_endpoints: list[Connection] = [outer_request_receiver, outer_response_sender]
+    coordinator: multiprocessing.Process | None = None
+    coordinator_started = False
+    try:
+        for shard_id, (first, stop, stride, count) in enumerate(_stage4_realtime_shard_assignments()):
+            shard_request_receiver, coordinator_sender = context.Pipe(False)
+            coordinator_receiver, shard_response_sender = context.Pipe(False)
+            process = context.Process(
+                target=stage4_shard_entrypoint,
+                args=(
+                    shard_request_receiver,
+                    shard_response_sender,
+                    _Stage4ShardSpec(shard_id, first, stop, stride, count, world_spec),
+                ),
+                daemon=False,
+            )
+            coordinator_senders.append(coordinator_sender)
+            coordinator_receivers.append(coordinator_receiver)
+            child_endpoints.extend((shard_request_receiver, shard_response_sender))
+            process.start()
+            shard_processes.append(process)
+        coordinator = context.Process(
+            target=stage4_coordinator_entrypoint,
+            args=(
+                outer_request_receiver,
+                outer_response_sender,
+                world_spec,
+                tuple(coordinator_senders),
+                tuple(coordinator_receivers),
+                tuple(process.pid for process in shard_processes),
+            ),
+            daemon=False,
+        )
+        coordinator.start()
+        coordinator_started = True
+        for endpoint in child_endpoints:
+            endpoint.close()
+        for endpoint in coordinator_senders + coordinator_receivers:
+            endpoint.close()
+        ready = receive_worker_startup_envelope(
+            outer_response_receiver,
+            timeout_sec=startup_timeout_sec,
+            expected_process_id=coordinator.pid,
+            expected_world_digest=world_spec.world_digest,
+        )
+        return LidarWorkerHandle(
+            coordinator,
+            outer_request_sender,
+            outer_response_receiver,
+            ready,
+            tuple(shard_processes),
+        )
+    except BaseException as error:
+        cleanup_actions = [
+            endpoint.close
+            for endpoint in child_endpoints + parent_endpoints + coordinator_senders + coordinator_receivers
+        ]
+        cleanup_actions.extend(
+            lambda process=process: _reap_owned_process(process, initial_join_timeout_sec=0.0)
+            for process in reversed(shard_processes)
+        )
+        if coordinator_started and coordinator is not None:
+            cleanup_actions.append(
+                lambda: _reap_owned_process(coordinator, initial_join_timeout_sec=0.0)
+            )
+        _run_cleanup_actions(tuple(cleanup_actions))
+        if isinstance(error, LidarWorkerStartupError):
+            raise
+        raise startup_error_from_process_start(error) from error

@@ -1,8 +1,29 @@
 # PyBullet 3D 移动机器人仿真平台
 
-当前仓库正在按 `3d仿真平台需求规格.md` 分四阶段交付。阶段一、阶段二已由用户验收；阶段三已接入真实 eCAL、企业传感器、版本化场景文件和企业 Dashboard，当前状态为“开发方自动复验中”：阶段一、阶段二和阶段三 DIRECT 门禁已通过，schema v4 GUI 仍需可访问 X11 的环境复验；本次获授权的 post-fix 真实 eCAL 命令在正式测量前被 Codex 沙箱的 socket 权限阻断，P0 尚无有效结论；阶段四自动导航与避障尚未开始。
+当前仓库按 `3d仿真平台需求规格.md` 分四阶段交付。阶段一、阶段二已由用户验收；阶段三已接入真实 eCAL、企业传感器、版本化场景文件和企业 Dashboard。阶段四 A-E 已完成 v2 协议与真实 Phase-0、中心 LiDAR/三点 RTK runtime、C++ Command/Subscriber/Recorder、Replay/Export、可选 ROS/RViz2/Livox Viewer 2 以及联网 `.run` 安装验收。MID-360 Golf 采集与三维回放的 v2 acceptance 已通过；它使用独立离线入口，不改变实时 LiDAR 合同。实时命令、证据路径和残余风险见 [`docs/阶段四交付报告.md`](docs/阶段四交付报告.md)。
 
 各阶段证据见 [`docs/阶段一交付报告.md`](docs/阶段一交付报告.md)、[`docs/阶段二交付报告.md`](docs/阶段二交付报告.md) 和 [`docs/阶段三交付报告.md`](docs/阶段三交付报告.md)。
+
+阶段四 A 的协议边界、命令断线重连规则和跨语言 golden 检查见 [`docs/阶段四协议与命令权说明.md`](docs/阶段四协议与命令权说明.md)。
+
+## MID-360 Golf 映射与回放
+
+固定 `df_mid/golf_heightfield/seed=41/medium` 场景的正式入口为：
+
+```bash
+conda run -n slope-sim python scripts/run_mid360_golf_mapping.py \
+  --recorder <slope_sim_stage4_recorder> \
+  --exporter <slope_sim_stage4_export> \
+  --output-dir <new-empty-result-dir> --direct
+```
+
+它串行启动正式五 topic 会话、C++ Recorder、路线/地形/运动 acceptance 和独立双 OpenGL
+回放。传入 `--exporter` 后，只有 acceptance 成功的同一会话才额外生成
+`<output-dir>/export/lidar.lvx2`、逐帧 `.pcd/.ply` 和 `<output-dir>/export.json`；这些是
+Livox Viewer 2 与 CloudCompare/MeshLab 的输入，普通 `runSim` 不生成它们。最终同会话证据位于 `results/mid360-golf-mapping-release-qa-v3/`：其 acceptance 与
+`gui-qa-retry5/qa.json` 均绑定 simulation session
+`47a6ff48245c44d1aad22f7a2a1dce57`，覆盖双视图非空像素、播放/暂停、逐帧、定位、倍率、
+回退重建和正常关闭。历史 v1 GUI QA 与失败目录继续保留，不能替代该同会话证据。
 
 ## 阶段一已实现范围
 
@@ -40,6 +61,55 @@ python scripts/check_env.py
 
 SSH 或无桌面环境请使用 `direct`；只有存在 Ubuntu X11/桌面会话时才能使用 `--gui`。
 
+## 正式 runSim v2（release）
+
+安装后的正式入口为 `bin/runSim`（源码树中也可用根目录的 `./runSim` 做开发验证）。无参数
+会启动一个 PyBullet GUI、Dashboard、Python v2 Simulator 和唯一的 C++ `Command`；Dashboard 与
+键盘只通过本机认证 socket 续租目标，绝不直接发布 `/sim/wheel/command`。窗口失焦、socket
+关闭、目标超时、Command 退出或 runSim 退出都会归零。正式模式只使用五个 v2 topic：
+`/sim/wheel/command`、`/sim/wheel/state`、`/sim/lidar/points`、`/sim/rtk/state` 和
+`/sim/imu/attitude`。
+
+```bash
+# 默认 GUI/Dashboard v2 会话
+runSim
+
+# 指定实验配置；命令行参数覆盖 YAML，YAML 覆盖安全默认值
+runSim --config /absolute/path/to/experiment.yaml \
+  --robot-model df_mid --terrain-model golf_heightfield --golf-seed 41 \
+  --target-linear-velocity 2.0
+
+# 启动时采集 1.5 分钟并导出到指定目录；60、90、180 秒分别对应 1、1.5、3 分钟
+runSim --capture-duration-sec 90 --capture-output-dir /absolute/path/to/captures
+
+# 启动独立 ROS Bridge/RViz2 实时点云，或指定本机 Livox Viewer 2 后从 Dashboard 导入最新 LVX2
+runSim --open-ros-rviz --viewer-root /absolute/path/to/LivoxViewer2
+
+# 启动器与参数合同自检
+runSim --version
+runSim --help
+```
+
+release 自带 `etc/ecal/ecal.yaml` 与 localtime 插件时，启动器会自动设置所需 eCAL 环境；显式
+`ECAL_CONFIG_PATH`、`ECAL_DATA`、`ECAL_TIME_PLUGIN_PATH` 或相应 CLI 参数的优先级更高。预检若
+发现 eCAL、descriptor 或插件缺失，会在终端和 Dashboard 说明原因，不会回退到 local/v1。
+
+在 Dashboard 的“MID-360 采集”中选择 `1 分钟`、`1.5 分钟`、`3 分钟`或`不限`后点击“启用采集”；也可
+通过 `--capture-duration-sec 60|90|180` 在启动时直接开始限时采集。`--capture-output-dir` 覆盖默认输出目录。
+“结束采集”会在完整五 topic 边界停止 C++ Recorder，成功后运行同一 release 的 C++ Export，生成
+`session.mcap`、逐帧 PCD/PLY、`export/lidar.lvx2` 与导出回执。默认位置为
+`results/manual-mid360/capture-YYYYMMDD-HHMMSS/`；同秒冲突会追加稳定序号。Dashboard 同时保存
+`results/manual-mid360/last-successful-lvx2.json`，只记录最近一次成功导出的绝对 LVX2 路径；随后
+点击“导入 Livox Viewer”使用该已验证路径。若 Viewer 不在常见位置，以 `--viewer-root` 指向其安装根目录。
+导出 sidecar 的 `max_observed_range_m` 记录本次 MCAP 实际最远点。旧的 `runSim --lidar` 与
+`--lidar-debug-draw` 入口已移除。
+实时中心 MID-360 的固定量程为 45 m；离线重建、PCD/PLY/LVX2 回放覆盖 60 m，二者均保持既有
+射线数、10 Hz 节拍与点云质量。
+
+安装了 ROS/RViz 组件的 release 会在“v2 eCAL”页提供“打开实时点云”；`--open-ros-rviz` 可在启动时
+执行同一操作。它只启动该 release 的 ROS Bridge 和固定 `stage4_live.rviz`，关闭或重启只影响这两个
+显示进程，不会中断 Simulator、Command 或 Recorder；若缺少 `rviz2`、Bridge 或 profile，状态栏会给出恢复提示。
+
 ## 企业接口与场景文件
 
 `--interface-mode` 有三个严格模式：
@@ -48,7 +118,7 @@ SSH 或无桌面环境请使用 `direct`；只有存在 Ubuntu X11/桌面会话�
 - `local`：显式使用进程内 transport，适合键盘驾驶、DIRECT 调试和不启动 eCAL peer 的测试。
 - `auto`：优先创建 eCAL；只有 eCAL 绑定不可用时才降级到 local，并在 Dashboard 显示降级原因。
 
-六个固定话题为 `/sim/wheel/command`、`/sim/wheel/state`、`/sim/lidar/front/points`、`/sim/lidar/rear/points`、`/sim/rtk/state` 和 `/sim/imu/attitude`。轮子命令/状态目标频率为 100 Hz，前后点云、RTK 和 IMU 为 10 Hz。
+以下六个固定话题属于旧版兼容接口：`/sim/wheel/command`、`/sim/wheel/state`、`/sim/lidar/front/points`、`/sim/lidar/rear/points`、`/sim/rtk/state` 和 `/sim/imu/attitude`。轮子命令/状态目标频率为 100 Hz，前后点云、RTK 和 IMU 为 10 Hz；正式 `runSim` 使用上节的五 topic v2 合同，绝不同时发布旧前后 LiDAR topic。
 
 导出包含车型、场地、障碍物和传感器安装位的版本化场景：
 
@@ -103,12 +173,12 @@ python scripts/verify_ecal_roundtrip.py --runtime simulation --robot-model df_ba
 运行自动测试：
 
 ```bash
-python -m pytest -q -m "not ecal"
+python -m pytest -q -m "not ecal and not stage4_artifact"
 ```
 
-真实 eCAL 测试不包含在这条默认回归中，必须按上面的独立门禁和授权约束串行执行。
+真实 eCAL 和依赖指定阶段四构建制品的测试不包含在默认回归中，必须按对应独立门禁的环境变量、制品和授权约束执行。
 
-2026-07-30 当前工作区 fresh 结果：cadence/自动/手动/eCAL 进程聚焦组 `272 passed, 4 deselected`，transport/runtime/process 组合 `365 passed, 4 deselected`，阶段一 `12/12`、阶段二 `SUMMARY pass=19 fail=0`、阶段三 DIRECT `SUMMARY pass=21 fail=0`，全量非 eCAL `2209 passed, 4 deselected in 102.53s`。四个 deselect 均为真实 eCAL 标记用例，不表示这些外部门禁已经通过。
+当前默认回归结果以当次命令输出为准；各阶段的历史数值和外部门禁证据仅保留在对应交付报告。
 
 ## 自动 GUI 门禁
 
@@ -155,7 +225,7 @@ python main.py --config configs/stage2_obstacles_gui.yaml --gui --manual --inter
 
 真实 eCAL 人工验收时改用 `--interface-mode ecal`，并由外部 peer 发布 `WheelCommand`；该模式下键盘速度不会替代企业命令。GUI 手动工作流会把 PyBullet 主窗和 Dashboard 按当前主屏可用区域分为名义 `67:33`：Dashboard 宽度精确按 `33/100` 计算，Main 使用余宽。Dashboard 默认提供 15 个企业页面，其中 13 个为图表页；接触力、接触点数和打滑指标只在显式启用的开发者诊断中显示。
 
-Dashboard 的“障碍物”页可以随机追加静态、移动或混合障碍物。混合模式默认按 30% 生成移动障碍物，例如添加 10 个时得到 7 个静态和 3 个移动；相同场地、种子和参数会复现同一组逻辑布局。表格单选逻辑 ID 后可删除选中项，也可以清空全部。切换平面、斜面和高尔夫场地时，障碍物保留逻辑 ID、XY、路径进度和方向，并重新贴合目标地表。移动障碍物是运动学刚体，会沿直线往返并与车辆发生碰撞，但不会被车辆撞偏；自动导航、自动刹停和动态避障不在阶段二，属于阶段四。
+Dashboard 的“障碍物”页可以随机追加静态、移动或混合障碍物。混合模式默认按 30% 生成移动障碍物，例如添加 10 个时得到 7 个静态和 3 个移动；相同场地、种子和参数会复现同一组逻辑布局。表格单选逻辑 ID 后可删除选中项，也可以清空全部。切换平面、斜面和高尔夫场地时，障碍物保留逻辑 ID、XY、路径进度和方向，并重新贴合目标地表。移动障碍物是运动学刚体，会沿直线往返并与车辆发生碰撞，但不会被车辆撞偏；自动导航、自动刹停和动态避障均不在当前阶段四范围。
 
 任意一个 GUI 命令都可以作为初始组合；启动后可直接在 Dashboard 完成其余车型和场地的运行期评估。主动转向车需要同时给前进/后退和左/右命令才会形成转弯；原地只按左/右不会像差速车一样自转。
 

@@ -5,6 +5,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 import math
 from numbers import Real
+import re
 from threading import Condition, local
 import time
 from typing import Protocol, runtime_checkable
@@ -12,6 +13,10 @@ from typing import Protocol, runtime_checkable
 
 _UINT64_MAX = (1 << 64) - 1
 _TOPIC_QUALITY_STATES = frozenset({"active", "degraded", "error"})
+_PROTOCOL_STATES = frozenset(
+    {"not_checked", "waiting", "pending", "verified", "conflict"}
+)
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}\Z")
 TRANSPORT_STATES = frozenset(
     {"active", "waiting_peer", "degraded", "disconnected", "error"}
 )
@@ -118,6 +123,12 @@ class TransportTopicQuality:
     last_error_detail: str | None = None
     last_drop_detail: str | None = None
     peer_connected: bool | None = None
+    peer_count: int | None = None
+    protocol_state: str = "not_checked"
+    protocol_detail: str = ""
+    remote_type_names: tuple[str, ...] = ()
+    remote_encodings: tuple[str, ...] = ()
+    remote_descriptor_sha256: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         _require_nonempty_text("topic", self.topic)
@@ -142,10 +153,57 @@ class TransportTopicQuality:
         ):
             if value is not None and (not isinstance(value, str) or not value):
                 raise ValueError(f"{name} must be None or a nonempty string")
-        if self.peer_connected is not None and not isinstance(
-            self.peer_connected, bool
-        ):
+        if self.peer_connected is not None and type(self.peer_connected) is not bool:
             raise ValueError("peer_connected must be a bool or None")
+        if self.peer_count is not None:
+            if (
+                isinstance(self.peer_count, bool)
+                or not isinstance(self.peer_count, int)
+                or self.peer_count < 0
+            ):
+                raise ValueError("peer_count must be a nonnegative integer or None")
+            if self.peer_connected is not (self.peer_count > 0):
+                raise ValueError("peer_connected must agree with peer_count")
+        if self.protocol_state not in _PROTOCOL_STATES:
+            raise ValueError("invalid protocol_state")
+        if not isinstance(self.protocol_detail, str):
+            raise ValueError("protocol_detail must be a string")
+        if self.protocol_state == "conflict" and not self.protocol_detail:
+            raise ValueError("protocol conflict requires detail")
+        metadata_columns = (
+            self.remote_type_names,
+            self.remote_encodings,
+            self.remote_descriptor_sha256,
+        )
+        if any(not isinstance(column, tuple) for column in metadata_columns):
+            raise ValueError("remote metadata columns must be tuples")
+        if not (
+            len(self.remote_type_names)
+            == len(self.remote_encodings)
+            == len(self.remote_descriptor_sha256)
+        ):
+            raise ValueError("remote metadata columns must have equal length")
+        if any(not isinstance(name, str) or not name for name in self.remote_type_names):
+            raise ValueError("remote type names must be nonempty strings")
+        if any(not isinstance(value, str) or not value for value in self.remote_encodings):
+            raise ValueError("remote encodings must be nonempty strings")
+        if any(
+            not isinstance(digest, str) or _SHA256_HEX.fullmatch(digest) is None
+            for digest in self.remote_descriptor_sha256
+        ):
+            raise ValueError("remote descriptor digests must be lowercase SHA-256 hex")
+        if self.protocol_state == "waiting":
+            if self.peer_count != 0 or self.remote_type_names:
+                raise ValueError("waiting requires zero peers and no remote metadata")
+        if self.protocol_state == "pending" and (
+            self.peer_count is None or self.peer_count == 0
+        ):
+            raise ValueError("pending requires a positive exact peer count")
+        if self.protocol_state in {"verified", "conflict"}:
+            if self.peer_count is None or self.peer_count == 0:
+                raise ValueError("verified/conflict requires a positive peer count")
+            if self.peer_count != len(self.remote_type_names):
+                raise ValueError("verified/conflict metadata must match exact peer count")
 
 
 @dataclass(frozen=True)

@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "platform": {
+    "id": "ubuntu",
+    "version_id": "24.04",
+    "architecture": "amd64"
+  },
+  "packages": [
+    {
+      "name": "ros-jazzy-ament-cmake",
+      "version": "2.5.6-2noble.20260225.222913",
+      "architecture": "amd64"
+    },
+    {
+      "name": "ros-jazzy-rosidl-default-generators",
+      "version": "1.6.1-1noble.20260612.064900",
+      "architecture": "amd64"
+    },
+    {
+      "name": "ros-jazzy-rosidl-default-runtime",
+      "version": "1.6.1-1noble.20260615.090842",
+      "architecture": "amd64"
+    },
+    {
+      "name": "ros-jazzy-rosidl-typesupport-cpp",
+      "version": "3.2.3-1noble.20260612.051324",
+      "architecture": "amd64"
+    },
+    {
+      "name": "ros-jazzy-rosidl-typesupport-fastrtps-c",
+      "version": "3.6.4-1noble.20260612.051449",
+      "architecture": "amd64"
+    },
+    {
+      "name": "ros-jazzy-rosidl-typesupport-fastrtps-cpp",
+      "version": "3.6.4-1noble.20260612.051139",
+      "architecture": "amd64"
+    },
+    {
+      "name": "ros-jazzy-geometry-msgs",
+      "version": "5.3.8-1noble.20260615.110340",
+      "architecture": "amd64"
+    },
+    {
+      "name": "ros-jazzy-rclcpp",
+      "version": "28.1.21-1noble.20260615.133124",
+      "architecture": "amd64"
+    },
+    {
+      "name": "ros-jazzy-rosgraph-msgs",
+      "version": "2.0.4-1noble.20260615.103338",
+      "architecture": "amd64"
+    },
+    {
+      "name": "ros-jazzy-rviz2",
+      "version": "14.1.22-1noble.20260615.174609",
+      "architecture": "amd64"
+    },
+    {
+      "name": "ros-jazzy-sensor-msgs",
+      "version": "5.3.8-1noble.20260615.112429",
+      "architecture": "amd64"
+    },
+    {
+      "name": "ros-jazzy-tf2-msgs",
+      "version": "0.36.21-1noble.20260615.112712",
+      "architecture": "amd64"
+    },
+    {
+      "name": "ros-jazzy-tf2-ros",
+      "version": "0.36.21-1noble.20260615.145818",
+      "architecture": "amd64"
+    }
+  ]
+}

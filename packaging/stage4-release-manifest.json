@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "version": "4.0.1",
+  "runtime_setup": {
+    "entrypoint": "scripts/stage4_release_setup.py"
+  },
+  "ros_dependencies": [
+    {
+      "name": "ros2-apt-source",
+      "url": "http://packages.ros.org/ros2/ubuntu/pool/main/r/ros-apt-source/ros2-apt-source_1.2.0%7enoble_all.deb",
+      "sha256": "0804d9b13db770eb87019be414cd78378835228ad5fa801fc88758596dd8f7e5",
+      "filename": "ros2-apt-source_1.2.0~noble_all.deb",
+      "license": "Apache-2.0"
+    },
+    {
+      "name": "livox_ros_driver2",
+      "url": "https://github.com/Livox-SDK/livox_ros_driver2/archive/refs/tags/1.2.6.tar.gz",
+      "sha256": "185e2fec89c06bec1abf2e2ededc4be23fc6d5347cc88b992f84074bc3795c76",
+      "filename": "livox_ros_driver2-1.2.6.tar.gz",
+      "license": "MIT"
+    }
+  ],
+  "dependencies": [
+    {
+      "name": "micromamba",
+      "url": "https://github.com/mamba-org/micromamba-releases/releases/download/2.8.1-0/micromamba-linux-64",
+      "sha256": "9689782d863c05a1bf5d2d371ba527104e7a4eb4310c1637d8653b751aed9c82",
+      "filename": "micromamba-linux-64",
+      "license": "BSD-3-Clause"
+    },
+    {
+      "name": "abseil-cpp",
+      "url": "https://github.com/abseil/abseil-cpp/archive/76bb24329e8bf5f39704eb10d21b9a80befa7c81.tar.gz",
+      "sha256": "ed8f7d9f39139c449e79fd19765e23c96fdb774172d32d191323d3e3ea06e5ff",
+      "filename": "abseil-cpp-76bb24329e8bf5f39704eb10d21b9a80befa7c81.tar.gz",
+      "license": "Apache-2.0"
+    },
+    {
+      "name": "protobuf",
+      "url": "https://github.com/protocolbuffers/protobuf/releases/download/v33.6/protobuf-33.6.tar.gz",
+      "sha256": "16498d7dc7967e9b100632138babd4b86b61592beeccdd556f67539d9c231355",
+      "filename": "protobuf-33.6.tar.gz",
+      "license": "BSD-3-Clause"
+    },
+    {
+      "name": "protobuf-python",
+      "url": "https://files.pythonhosted.org/packages/16/92/d1e32e3e0d894fe00b15ce28ad4944ab692713f2e7f0a99787405e43533a/protobuf-6.33.6-cp39-abi3-manylinux2014_x86_64.whl",
+      "sha256": "e9db7e292e0ab79dd108d7f1a94fe31601ce1ee3f7b79e0692043423020b0593",
+      "filename": "protobuf-6.33.6-cp39-abi3-manylinux2014_x86_64.whl",
+      "license": "BSD-3-Clause"
+    },
+    {
+      "name": "ecal",
+      "url": "https://github.com/eclipse-ecal/ecal/releases/download/v6.1.1/ecal_6.1.1-noble_amd64.deb",
+      "sha256": "fe68188ecf48db98ac28e1917261769b2372418de0e1d92a9c74c79596c30e34",
+      "filename": "ecal_6.1.1-noble_amd64.deb",
+      "license": "Apache-2.0"
+    },
+    {
+      "name": "ecal-python",
+      "url": "https://github.com/eclipse-ecal/ecal/releases/download/v6.1.1/eclipse_ecal-6.1.1-cp310-cp310-manylinux_2_28_x86_64.whl",
+      "sha256": "57a23af7d83c077c04f01852db13f8cda7686a052d41659fafcbe6b3dbe9f6bc",
+      "filename": "eclipse_ecal-6.1.1-cp310-cp310-manylinux_2_28_x86_64.whl",
+      "license": "Apache-2.0"
+    },
+    {
+      "name": "mcap",
+      "url": "https://github.com/foxglove/mcap/archive/refs/tags/releases/cpp/v1.4.0.tar.gz",
+      "sha256": "64ff3e51119f37ffcfaf9deecbd987a7cb4d4d9035d74a3fd3773395a470fda1",
+      "filename": "mcap-cpp-v1.4.0.tar.gz",
+      "license": "Apache-2.0"
+    }
+  ]
+}

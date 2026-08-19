@@ -42,6 +42,8 @@
   <!-- 顶部安装板和命名挂点供后续前后雷达、双天线与 IMU 使用。 -->
   <link name="sensor_deck"><inertial><mass value="0.05"/><inertia ixx="0.0002" ixy="0" ixz="0" iyy="0.0002" iyz="0" izz="0.0002"/></inertial><visual><geometry><box size="0.46 0.20 0.035"/></geometry><material name="sensor_blue"/></visual></link>
   <joint name="sensor_deck_joint" type="fixed"><parent link="base_link"/><child link="sensor_deck"/><origin xyz="0 0 0.105"/></joint>
+  <link name="lidar_link"><inertial><mass value="0.01"/><inertia ixx="0.00001" ixy="0" ixz="0" iyy="0.00001" iyz="0" izz="0.00001"/></inertial><visual><geometry><cylinder radius="0.055" length="0.055"/></geometry><material name="sensor_blue"/></visual></link>
+  <joint name="lidar_link_joint" type="fixed"><parent link="base_link"/><child link="lidar_link"/><origin xyz="0 0 0.105"/></joint>
   <link name="lidar_front_mount"><inertial><mass value="0.01"/><inertia ixx="0.00001" ixy="0" ixz="0" iyy="0.00001" iyz="0" izz="0.00001"/></inertial><visual><geometry><box size="0.06 0.12 0.055"/></geometry><material name="sensor_blue"/></visual></link>
   <joint name="lidar_front_mount_joint" type="fixed"><parent link="base_link"/><child link="lidar_front_mount"/><origin xyz="0.34 0 0.105"/></joint>
   <link name="lidar_rear_mount"><inertial><mass value="0.01"/><inertia ixx="0.00001" ixy="0" ixz="0" iyy="0.00001" iyz="0" izz="0.00001"/></inertial><visual><geometry><box size="0.06 0.12 0.055"/></geometry><material name="sensor_blue"/></visual></link>

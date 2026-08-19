@@ -6,6 +6,9 @@ __pycache__/
 .ipynb_checkpoints/
 .codegraph/
 .superpowers/
+.codex/
+CMakeFiles/
+AMENT_IGNORE
 
 .env
 .venv/
@@ -14,6 +17,10 @@ venv/
 build/
 *.egg-info/
 
+results/*
+!results/logs/
+!results/figures/
+!results/stage4/
 results/logs/*
 !results/logs/.gitkeep
 results/figures/*

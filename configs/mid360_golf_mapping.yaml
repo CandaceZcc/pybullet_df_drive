@@ -1,0 +1,107 @@
+# MID-360 Golf 离线采集固定场景：df_mid、seed 41、6 个静态和 3 个移动障碍。
+schema_version: 1
+robot:
+  model: df_mid
+terrain:
+  terrain_model: golf_heightfield
+  slope_deg: 0.0
+  golf_seed: 41
+  golf_relief: medium
+obstacles:
+  - logical_id: 1
+    mode: static
+    geometry: {shape: box, half_extents: [0.18, 0.14, 0.40]}
+    position: [0.0, -3.75, 0.0]
+    orientation: [0.0, 0.0, 0.0, 1.0]
+    path: null
+  - logical_id: 2
+    mode: static
+    geometry: {shape: cylinder, half_extents: [0.16, 0.16, 0.45]}
+    position: [3.0, -1.25, 0.0]
+    orientation: [0.0, 0.0, 0.0, 1.0]
+    path: null
+  - logical_id: 3
+    mode: static
+    geometry: {shape: sphere, half_extents: [0.16, 0.16, 0.16]}
+    position: [-1.0, 1.25, 0.0]
+    orientation: [0.0, 0.0, 0.0, 1.0]
+    path: null
+  - logical_id: 4
+    mode: static
+    geometry: {shape: box, half_extents: [0.20, 0.14, 0.35]}
+    position: [4.0, 3.75, 0.0]
+    orientation: [0.0, 0.0, 0.0, 1.0]
+    path: null
+  - logical_id: 5
+    mode: static
+    geometry: {shape: cylinder, half_extents: [0.16, 0.16, 0.40]}
+    position: [0.0, -6.20, 0.0]
+    orientation: [0.0, 0.0, 0.0, 1.0]
+    path: null
+  - logical_id: 6
+    mode: static
+    geometry: {shape: sphere, half_extents: [0.16, 0.16, 0.16]}
+    position: [0.0, 6.20, 0.0]
+    orientation: [0.0, 0.0, 0.0, 1.0]
+    path: null
+  - logical_id: 7
+    mode: moving
+    geometry: {shape: box, half_extents: [0.16, 0.14, 0.35]}
+    position: [4.0, -3.75, 0.0]
+    orientation: [0.0, 0.0, 0.0, 1.0]
+    path:
+      start_xy: [4.0, -3.75]
+      end_xy: [5.0, -3.75]
+      speed: 0.25
+      progress: 0.0
+      direction: 1
+  - logical_id: 8
+    mode: moving
+    geometry: {shape: cylinder, half_extents: [0.16, 0.16, 0.40]}
+    position: [-0.5, -1.25, 0.0]
+    orientation: [0.0, 0.0, 0.0, 1.0]
+    path:
+      start_xy: [-0.5, -1.25]
+      end_xy: [0.7, -1.25]
+      speed: 0.22
+      progress: 0.0
+      direction: 1
+  - logical_id: 9
+    mode: moving
+    geometry: {shape: sphere, half_extents: [0.16, 0.16, 0.16]}
+    position: [-4.0, 3.75, 0.0]
+    orientation: [0.0, 0.0, 0.0, 1.0]
+    path:
+      start_xy: [-4.0, 3.75]
+      end_xy: [-2.8, 3.75]
+      speed: 0.20
+      progress: 0.0
+      direction: 1
+sensors:
+  lidar_front:
+    parent_link: lidar_front_mount
+    position: [0.0, 0.0, 0.0]
+    orientation: [0.0, 0.0, 0.0, 1.0]
+  lidar_rear:
+    parent_link: lidar_rear_mount
+    position: [0.0, 0.0, 0.0]
+    orientation: [0.0, 0.0, 1.0, 0.0]
+  rtk_primary:
+    parent_link: base_link
+    position: [-0.20, 0.0, 0.18]
+    orientation: [0.0, 0.0, 0.0, 1.0]
+  rtk_secondary:
+    parent_link: base_link
+    position: [0.20, 0.0, 0.18]
+    orientation: [0.0, 0.0, 0.0, 1.0]
+  imu:
+    parent_link: base_link
+    position: [0.0, 0.0, 0.08]
+    orientation: [0.0, 0.0, 0.0, 1.0]
+  lidar:
+    vertical_lines: 16
+    horizontal_samples: 180
+    horizontal_fov_deg: 180.0
+    vertical_fov_deg: [-15.0, 15.0]
+    min_range_m: 0.10
+    max_range_m: 30.0

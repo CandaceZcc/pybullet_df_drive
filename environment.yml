@@ -11,6 +11,9 @@ dependencies:
   - scipy
   - pyyaml
   - pyside6
+  - mcap
+  - pyqtgraph
+  - pyopengl
   - protobuf=6.33.6
   - grpcio-tools=1.76.0
   - packaging=26.2

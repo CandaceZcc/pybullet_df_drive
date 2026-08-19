@@ -860,8 +860,16 @@ class _PendingOperation:
     operation: str
     request: ObstacleGenerationRequest | None = None
     planned_specs: tuple[ObstacleSpec, ...] = ()
+    planning_initialized: bool = False
+    planning_modes: tuple[str, ...] = ()
+    planning_rng: random.Random | None = None
+    planning_next_logical_id: int = 0
+    planning_next_index: int = 0
+    planning_attempts: int = 0
     temporary_body_ids: list[int] | None = None
     next_temporary_index: int = 0
+    candidate_records: list[_ObstacleRecord] | None = None
+    next_candidate_index: int = 0
     clear_body_ids: tuple[int, ...] = ()
     next_clear_index: int = 0
     deleted_count: int = 0
@@ -1507,8 +1515,15 @@ class ObstacleManager:
             if self._pending is None or self._pending.temporary_body_ids is None
             else tuple(self._pending.temporary_body_ids)
         )
+        candidate_body_ids = (
+            ()
+            if self._pending is None or self._pending.candidate_records is None
+            else tuple(record.body_id for record in self._pending.candidate_records)
+        )
         return tuple(
-            dict.fromkeys((*temporary_body_ids, *self._cleanup_debt_body_ids))
+            dict.fromkeys(
+                (*temporary_body_ids, *candidate_body_ids, *self._cleanup_debt_body_ids)
+            )
         )
 
     def pending_specs(self) -> tuple[ObstacleSpec, ...]:
@@ -1593,11 +1608,17 @@ class ObstacleManager:
             if self._pending is None or self._pending.temporary_body_ids is None
             else tuple(self._pending.temporary_body_ids)
         )
+        candidate_body_ids = (
+            ()
+            if self._pending is None or self._pending.candidate_records is None
+            else tuple(record.body_id for record in self._pending.candidate_records)
+        )
         known_owned_body_ids = tuple(
             dict.fromkeys(
                 (
                     *(record.body_id for record in self._records),
                     *temporary_body_ids,
+                    *candidate_body_ids,
                     *self._cleanup_debt_body_ids,
                     *(int(body_id) for body_id in owned_body_ids if body_id >= 0),
                 )
@@ -1663,14 +1684,43 @@ class ObstacleManager:
         assert self._pending is not None
         pending = self._pending
         assert pending.request is not None
-        if not pending.planned_specs:
+        if not pending.planning_initialized:
             try:
-                pending.planned_specs = plan_obstacle_batch(
-                    self._settings,
-                    pending.request,
-                    self._terrain_sampler,
-                    existing_specs=tuple(record.spec for record in self._records),
+                self._initialize_add_planning(pending)
+            except Exception as exc:
+                self._pending = None
+                return ObstacleOperationResult(
+                    True,
+                    False,
+                    "add",
+                    message=_exception_reason(exc),
                 )
+        while pending.planning_next_index < len(pending.planning_modes):
+            mode = pending.planning_modes[pending.planning_next_index]
+            logical_id = pending.planning_next_logical_id + pending.planning_next_index
+            try:
+                candidate = _make_candidate_spec(
+                    logical_id=logical_id,
+                    mode=mode,
+                    request=pending.request,
+                    settings=self._settings,
+                    rng=pending.planning_rng,
+                    terrain_sampler=self._terrain_sampler,
+                )
+                pending.planning_attempts += 1
+                if candidate is not None and _candidate_is_valid(
+                    candidate,
+                    self._settings,
+                    (*(record.spec for record in self._records), *pending.planned_specs),
+                ):
+                    pending.planned_specs = (*pending.planned_specs, candidate)
+                    pending.planning_next_index += 1
+                    pending.planning_attempts = 0
+                elif pending.planning_attempts >= self._settings.max_candidate_attempts:
+                    raise ObstaclePlanningError(
+                        f"Unable to plan complete obstacle batch of {pending.request.count}; "
+                        f"candidate attempts exhausted while placing logical id {logical_id}"
+                    )
             except Exception as exc:
                 self._pending = None
                 return ObstacleOperationResult(
@@ -1721,11 +1771,17 @@ class ObstacleManager:
                 message=message,
             )
 
-        created_records: list[_ObstacleRecord] = []
+        if pending.candidate_records is None:
+            pending.candidate_records = []
+        created_records = pending.candidate_records
         try:
-            for spec in pending.planned_specs:
+            while pending.next_candidate_index < len(pending.planned_specs):
+                spec = pending.planned_specs[pending.next_candidate_index]
                 body_id = _create_obstacle_body(self._client_id, spec, temporary=False)
                 created_records.append(_ObstacleRecord(spec=spec, body_id=body_id))
+                pending.next_candidate_index += 1
+                if self._budget_exhausted(start_time):
+                    return ObstacleOperationResult(False, False, "add", message="pending")
         except Exception as exc:
             self._register_creation_error_debt(exc)
             cleanup_failures = _cleanup_records_strict(
@@ -1745,29 +1801,36 @@ class ObstacleManager:
                 )
             return ObstacleOperationResult(True, False, "add", message=message)
 
-        temporary_cleanup_failures = self._cleanup_pending_temporary_bodies()
-        if temporary_cleanup_failures:
-            created_cleanup_failures = _cleanup_records_strict(
-                self._client_id,
-                created_records,
-            )
-            if created_cleanup_failures:
-                self._register_cleanup_debt(created_cleanup_failures)
-            self._pending = None
-            cleanup_failures = (
-                *temporary_cleanup_failures,
-                *created_cleanup_failures,
-            )
-            return ObstacleOperationResult(
-                True,
-                False,
-                "add",
-                message=(
-                    "temporary candidate cleanup failed ("
-                    + _format_body_failures(cleanup_failures)
-                    + ")"
-                ),
-            )
+        while pending.temporary_body_ids:
+            body_id = pending.temporary_body_ids[0]
+            try:
+                _remove_committed_body_strict(self._client_id, body_id)
+            except Exception as exc:
+                cleanup_failures = [(body_id, exc)]
+                pending.temporary_body_ids.pop(0)
+                self._register_cleanup_debt(cleanup_failures)
+                cleanup_failures.extend(self._cleanup_pending_temporary_bodies())
+                created_cleanup_failures = _cleanup_records_strict(
+                    self._client_id,
+                    created_records,
+                )
+                if created_cleanup_failures:
+                    self._register_cleanup_debt(created_cleanup_failures)
+                self._pending = None
+                cleanup_failures.extend(created_cleanup_failures)
+                return ObstacleOperationResult(
+                    True,
+                    False,
+                    "add",
+                    message=(
+                        "temporary candidate cleanup failed ("
+                        + _format_body_failures(cleanup_failures)
+                        + ")"
+                    ),
+                )
+            pending.temporary_body_ids.pop(0)
+            if self._budget_exhausted(start_time):
+                return ObstacleOperationResult(False, False, "add", message="pending")
         self._publish_records((*self._records, *created_records))
         self._pending = None
         return ObstacleOperationResult(
@@ -1776,6 +1839,22 @@ class ObstacleManager:
             "add",
             published_count=len(created_records),
         )
+
+    def _initialize_add_planning(self, pending: _PendingOperation) -> None:
+        """初始化跨帧确定性规划状态，不在单次推进中规划整批。"""
+        assert pending.request is not None
+        request = pending.request
+        if request.count > self._settings.max_batch_obstacles:
+            raise ValueError(f"count must not exceed per-batch limit {self._settings.max_batch_obstacles}")
+        if len(self._records) + request.count > self._settings.max_scene_obstacles:
+            raise ValueError(f"scene obstacle count must not exceed {self._settings.max_scene_obstacles}")
+        pending.planning_modes = _modes_for_request(request)
+        pending.planning_rng = random.Random(request.seed)
+        pending.planning_next_logical_id = max(
+            (record.spec.logical_id for record in self._records),
+            default=0,
+        ) + 1
+        pending.planning_initialized = True
 
     def _advance_clear(self, start_time: float) -> ObstacleOperationResult:
         assert self._pending is not None

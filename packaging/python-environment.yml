@@ -1,14 +1,17 @@
 # 阶段四生产 Python runtime 的唯一人工 Conda 声明；项目/eCAL wheel 在 conda-pack 后安装。
 name: slope-sim-stage4-runtime
 channels:
-  - https://candace.tail39defd.ts.net:8443
   - conda-forge
 dependencies:
   - python=3.10
-  - protobuf=6.33.6
+  - pip
   - packaging
   - numpy
+  - pandas
   - matplotlib
   - pybullet
   - pyside6
+  - mcap
+  - pyqtgraph
+  - pyopengl
   - pyyaml

@@ -519,6 +519,69 @@ class PyBulletSensorBackend:
             )
         return self._indexed_hits_from_pybullet(results)
 
+    def _ray_test_indexed_hits_ndarray(
+        self,
+        starts: object,
+        ends: object,
+        *,
+        collision_mask: int,
+        num_threads: int = 0,
+    ) -> tuple[tuple[int, RayHit], ...]:
+        """读取 Stage4 scanner 已验证的 readonly float64 ndarray 射线批次。"""
+        mask = _require_collision_mask(collision_mask)
+        thread_count = _require_integral("num_threads", num_threads, minimum=0)
+        start_count = self._require_stage4_ndarray("starts", starts)
+        end_count = self._require_stage4_ndarray("ends", ends)
+        if start_count != end_count:
+            raise ValueError("starts and ends must have the same length")
+        if start_count > PYBULLET_MAX_RAY_BATCH_SIZE:
+            raise ValueError(
+                f"ray batch must contain at most {PYBULLET_MAX_RAY_BATCH_SIZE} rays"
+            )
+        if start_count == 0:
+            return ()
+
+        raw_results = p.rayTestBatch(
+            starts,
+            ends,
+            numThreads=thread_count,
+            collisionFilterMask=mask,
+            physicsClientId=self.client_id,
+        )
+        try:
+            results = tuple(raw_results)
+        except TypeError as exc:
+            raise RuntimeError("PyBullet rayTestBatch returned a non-sequence") from exc
+        if len(results) != start_count:
+            raise RuntimeError(
+                f"PyBullet rayTestBatch returned {len(results)} results "
+                f"for {start_count} rays"
+            )
+        return self._indexed_hits_from_pybullet(results)
+
+    @staticmethod
+    def _require_stage4_ndarray(name: str, points: object) -> int:
+        """避免在 Stage3 导入 NumPy，仅接受 Stage4 已冻结的二维 C 数组。"""
+        shape = getattr(points, "shape", None)
+        dtype = getattr(points, "dtype", None)
+        flags = getattr(points, "flags", None)
+        if (
+            type(shape) is not tuple
+            or len(shape) != 2
+            or type(shape[0]) is not int
+            or type(shape[1]) is not int
+            or shape[0] < 0
+            or shape[1] != 3
+            or str(dtype) != "float64"
+            or flags is None
+            or not flags.c_contiguous
+            or flags.writeable
+        ):
+            raise ValueError(
+                f"{name} must be a readonly C-contiguous float64 ndarray with shape (N, 3)"
+            )
+        return shape[0]
+
     @staticmethod
     def _require_ray_sequence(name: str, points: object) -> int:
         """在取长度或迭代前拒绝无序及可能无限的批量输入。"""

@@ -141,6 +141,11 @@ class WheelCommandMailbox:
             self._latest_query_time = normalized_now
             return decision
 
+    def latest_timestamp_ns(self) -> int | None:
+        """只读最新有效命令的 sender timestamp，不参与 safety query 时钟。"""
+        with self._lock:
+            return None if self._latest is None else self._latest.timestamp_ns
+
     def clear(self) -> None:
         """移除可执行命令并回到等待态，同时保留累计质量计数和频率历史。"""
         with self._lock:

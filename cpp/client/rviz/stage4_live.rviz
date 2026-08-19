@@ -1,0 +1,30 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Alpha: 1
+      Class: rviz_default_plugins/PointCloud2
+      Decay Time: 0.5
+      Enabled: true
+      Name: Live MID-360 points
+      Queue Size: 1
+      Selectable: true
+      Size (Pixels): 3
+      Style: Points
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /slope_sim/lidar/points
+      Use Fixed Frame: true
+  Global Options:
+    Background Color: 48; 48; 48
+    Fixed Frame: world
+    Frame Rate: 30
+  Name: root
+Window Geometry:
+  Height: 768
+  Width: 1280

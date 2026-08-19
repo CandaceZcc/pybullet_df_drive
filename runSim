@@ -1,0 +1,61 @@
+#!/usr/bin/env sh
+# 本地桌面启动入口：用既有 slope-sim 环境打开 PyBullet GUI 与控制 Dashboard。
+set -eu
+
+launcher_dir=$(CDPATH= cd -- "$(dirname -- "$(readlink -f -- "$0")")" && pwd)
+if [ -f "$launcher_dir/main.py" ]; then
+  root=$launcher_dir
+elif [ -f "$launcher_dir/../main.py" ]; then
+  root=$(CDPATH= cd -- "$launcher_dir/.." && pwd)
+else
+  printf '%s\n' 'runSim: cannot locate the release root.' >&2
+  exit 127
+fi
+
+if [ "${1-}" = "--version" ]; then
+  printf '%s\n' 'runSim 0.1.0'
+  exit 0
+fi
+
+cd "$root"
+
+# 已安装 release 自带 eCAL 数据与 localtime plugin 时直接使用；调用者显式
+# 设置的路径始终优先，便于诊断或接入受管 eCAL 环境。
+if [ -z "${ECAL_CONFIG_PATH:-}" ] && [ -z "${ECAL_DATA:-}" ] && [ -f "$root/etc/ecal/ecal.yaml" ]; then
+  export ECAL_DATA="$root/etc/ecal"
+fi
+if [ -z "${ECAL_TIME_PLUGIN_PATH:-}" ] && [ -f "$root/lib/libecaltime-localtime.so" ]; then
+  export ECAL_TIME_PLUGIN_PATH="$root/lib"
+fi
+
+has_interface_mode=0
+for argument in "$@"; do
+  case "$argument" in
+    --lidar|--lidar-debug-draw)
+      printf '%s\n' 'runSim: --lidar 已移除。请在 Dashboard 的 “MID-360 采集” 中选择时长后点击“启用采集”。' >&2
+      exit 2
+      ;;
+    --interface-mode|--interface-mode=*)
+      has_interface_mode=1
+      ;;
+  esac
+done
+
+# 正式入口默认走 v2 eCAL；local/auto 只允许作为显式 legacy 参数传递，
+# 由 Python 入口拒绝静默回退，不再插入一个相互矛盾的 local 参数。
+if [ -x "$root/runtime/bin/python" ]; then
+  if [ "$has_interface_mode" -eq 1 ]; then
+    exec "$root/runtime/bin/python" "$root/main.py" --gui --manual --v2-realtime "$@"
+  fi
+  exec "$root/runtime/bin/python" "$root/main.py" --gui --manual --v2-realtime --interface-mode ecal "$@"
+fi
+
+if ! command -v conda >/dev/null 2>&1; then
+  printf '%s\n' 'runSim: embedded runtime and conda are unavailable; install or initialize the slope-sim environment first.' >&2
+  exit 127
+fi
+
+if [ "$has_interface_mode" -eq 1 ]; then
+  exec conda run -n slope-sim python "$root/main.py" --gui --manual --v2-realtime "$@"
+fi
+exec conda run -n slope-sim python "$root/main.py" --gui --manual --v2-realtime --interface-mode ecal "$@"

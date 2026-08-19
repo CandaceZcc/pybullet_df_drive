@@ -425,8 +425,7 @@ class SimulationCoordinator:
             self.last_result = self._advance_active_action()
 
         self.obstacle_manager.update_moving(dt)
-        if self.interface_runtime is not None and self._manager_has_moving_obstacles():
-            self.interface_runtime.update_scene_document(self.logical_scene_document())
+        # 移动位姿由 v2 capture 在同一物理帧冻结；仅 body 集变化的事务才重建 worker。
         self._step_physics(self.client_id)
         return self.last_result
 
@@ -690,6 +689,7 @@ class SimulationCoordinator:
             if self.interface_runtime is not None:
                 if target.sensor_backend is None:
                     raise RuntimeError("interface scene rebuild has no sensor backend")
+                self._bind_runtime_obstacle_manager(target.obstacle_manager)
                 self.interface_runtime.commit_world_rebuild(
                     target.world.active_robot.robot,
                     target.sensor_backend,
@@ -705,6 +705,7 @@ class SimulationCoordinator:
                 if self.interface_runtime is not None:
                     if rollback.sensor_backend is None:
                         raise RuntimeError("interface scene rollback has no sensor backend")
+                    self._bind_runtime_obstacle_manager(rollback.obstacle_manager)
                     self.interface_runtime.commit_world_rebuild(
                         rollback.world.active_robot.robot,
                         rollback.sensor_backend,
@@ -849,6 +850,7 @@ class SimulationCoordinator:
             if self.interface_runtime is not None:
                 if rollback.sensor_backend is None:
                     raise RuntimeError("interface scene rollback has no sensor backend")
+                self._bind_runtime_obstacle_manager(rollback.obstacle_manager)
                 self.interface_runtime.commit_world_rebuild(
                     rollback.world.active_robot.robot,
                     rollback.sensor_backend,
@@ -926,6 +928,14 @@ class SimulationCoordinator:
             self.obstacle_manager.snapshot(include_body_id=True),
             self.logical_scene_document(),
         )
+
+    def _bind_runtime_obstacle_manager(self, obstacle_manager: ObstacleManager) -> None:
+        """v2 在首帧 capture 前切到事务目标 manager；旧 runtime 不需要额外绑定。"""
+        if self.interface_runtime is None:
+            return
+        bind_manager = getattr(self.interface_runtime, "bind_obstacle_manager", None)
+        if callable(bind_manager):
+            bind_manager(obstacle_manager)
 
     def _bind_obstacle_manager_to_current_robot(self) -> None:
         """让障碍物提交前始终读取当前车辆 AABB，避免车型/场地切换后引用旧车。"""

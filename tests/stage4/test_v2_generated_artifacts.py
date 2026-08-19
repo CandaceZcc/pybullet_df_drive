@@ -14,6 +14,7 @@ MODULE = ROOT / "slope_sim/interfaces/generated/slope_sim_interfaces_v2_pb2.py"
 DESCRIPTOR = ROOT / "slope_sim/interfaces/generated/slope_sim_interfaces_v2.desc"
 
 
+@pytest.mark.stage4_artifact
 def test_v2_generated_artifacts_are_reproducible_with_frozen_protoc(tmp_path) -> None:
     """独立 protoc 33.6 重生成的 descriptor 必须逐 byte 等于跟踪产物。"""
     required = (SCHEMA, GENERATOR, MODULE, DESCRIPTOR)

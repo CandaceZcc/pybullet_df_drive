@@ -55,6 +55,7 @@ class FakeResource:
     topic: str
     close_log: list[str]
     connected: bool = False
+    peer_count: int | None = None
     callback: object | None = None
     closed: bool = False
     close_count: int = 0
@@ -135,8 +136,13 @@ class FakeEcalBindings:
         self.sent.append((publisher.topic, bytes(payload)))
 
     @staticmethod
+    def peer_count(resource: FakeResource) -> int:
+        """测试端口保留 0/1/>1，避免把 Task 7 行为压回布尔值。"""
+        return int(resource.connected) if resource.peer_count is None else resource.peer_count
+
+    @staticmethod
     def is_peer_connected(resource: FakeResource) -> bool:
-        return resource.connected
+        return FakeEcalBindings.peer_count(resource) > 0
 
     @staticmethod
     def close(resource: FakeResource) -> None:
@@ -702,6 +708,31 @@ def test_transport_topic_quality_peer_state_is_optional_and_strictly_boolean():
     assert TransportTopicQuality("/connected", peer_connected=True).peer_connected is True
     with pytest.raises(ValueError, match="peer_connected"):
         TransportTopicQuality("/invalid", peer_connected=1)
+
+
+def test_transport_topic_quality_preserves_exact_discovery_count_per_topic():
+    """同名命令 peer 数量必须保留为整数，等待 metadata 验证时标记 pending。"""
+    bindings = FakeEcalBindings()
+    transport = EcalTransport(_config(), bindings=bindings, start_worker=False)
+    try:
+        command = _command_subscriber(bindings)
+        command.peer_count = 2
+        transport.poll_peer_state()
+        quality = {
+            item.topic: item for item in transport.snapshot().topic_quality
+        }[WHEEL_COMMAND_TOPIC]
+        assert (quality.peer_connected, quality.peer_count) == (True, 2)
+        assert quality.protocol_state == "pending"
+
+        command.peer_count = 0
+        transport.poll_peer_state()
+        quality = {
+            item.topic: item for item in transport.snapshot().topic_quality
+        }[WHEEL_COMMAND_TOPIC]
+        assert (quality.peer_connected, quality.peer_count) == (False, 0)
+        assert quality.protocol_state == "waiting"
+    finally:
+        transport.close()
 
 
 def test_simulation_role_reports_all_six_topic_peers_independently():
@@ -1661,12 +1692,12 @@ def test_blocked_discovery_does_not_stall_publisher_worker():
             self.release_discovery = Event()
             self.discovery_calls = 0
 
-        def is_peer_connected(self, resource: FakeResource) -> bool:
+        def peer_count(self, resource: FakeResource) -> int:
             self.discovery_calls += 1
             self.discovery_started.set()
             if not self.release_discovery.wait(timeout=2.0):
                 raise TimeoutError("test discovery was not released")
-            return resource.connected
+            return int(resource.connected)
 
     bindings = BlockingDiscoveryBindings()
     transport = EcalTransport(_config(), bindings=bindings, start_worker=True)
@@ -1721,12 +1752,12 @@ def test_close_waits_for_in_flight_discovery_before_closing_native_resources():
             self.release_discovery = Event()
             self.closed_seen_by_discovery: list[bool] = []
 
-        def is_peer_connected(self, resource: FakeResource) -> bool:
+        def peer_count(self, resource: FakeResource) -> int:
             self.discovery_started.set()
             if not self.release_discovery.wait(timeout=3.0):
                 raise TimeoutError("test discovery was not released")
             self.closed_seen_by_discovery.append(resource.closed)
-            return resource.connected
+            return int(resource.connected)
 
     bindings = BlockingDiscoveryBindings()
     transport = EcalTransport(_config(), bindings=bindings, start_worker=False)
@@ -1779,7 +1810,7 @@ def test_concurrent_discovery_polls_cannot_commit_older_observation_last():
             self.calls_by_thread: dict[int, int] = {}
             self.calls_lock = Lock()
 
-        def is_peer_connected(self, resource: FakeResource) -> bool:
+        def peer_count(self, resource: FakeResource) -> int:
             thread_id = get_ident()
             with self.calls_lock:
                 if self.first_thread_id is None:
@@ -1787,7 +1818,7 @@ def test_concurrent_discovery_polls_cannot_commit_older_observation_last():
                 call_count = self.calls_by_thread.get(thread_id, 0) + 1
                 self.calls_by_thread[thread_id] = call_count
                 is_old_poll = thread_id == self.first_thread_id
-            observed = resource.connected
+            observed = int(resource.connected)
             if is_old_poll and call_count == 6:
                 self.old_observation_ready.set()
                 if not self.release_old_observation.wait(timeout=3.0):
@@ -1845,8 +1876,8 @@ def test_stale_discovery_revision_cannot_roll_back_newer_connected_state():
     """较旧观察即使迟到提交，也不得断开当前 peer 或推进 generation。"""
     bindings = FakeEcalBindings()
     transport = EcalTransport(_config(), bindings=bindings, start_worker=False)
-    connected = {channel.topic: True for channel in transport._channels}
-    disconnected = {channel.topic: False for channel in transport._channels}
+    connected = {channel.topic: 1 for channel in transport._channels}
+    disconnected = {channel.topic: 0 for channel in transport._channels}
     try:
         with transport._condition:
             transport._apply_discovery_observation_locked(
