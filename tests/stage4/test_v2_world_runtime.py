@@ -710,6 +710,88 @@ def test_manual_demo_starts_v2_capture_from_current_protocol_snapshot(
     assert calls["started"] is True
 
 
+def test_manual_demo_reports_v2_capture_start_failure_without_exiting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Recorder 缺失时应在 Dashboard 报错，不能让完整仿真进程退出。"""
+    import slope_sim.manual_demo as manual_demo
+
+    failures: list[tuple[str, Path | None]] = []
+    dashboard = SimpleNamespace(
+        set_capture_failed=lambda detail, *, output_dir=None: failures.append(
+            (detail, output_dir)
+        )
+    )
+    monkeypatch.setattr(
+        manual_demo,
+        "_start_v2_capture",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("missing slope_sim_stage4_recorder")
+        ),
+    )
+
+    recorder, output_dir = manual_demo._start_v2_capture_or_report(
+        release_root=tmp_path / "release",
+        runtime=object(),
+        output_root=tmp_path / "captures",
+        dashboard=dashboard,
+    )
+
+    assert recorder is None
+    assert output_dir is None
+    assert failures == [("missing slope_sim_stage4_recorder", None)]
+
+
+def test_manual_demo_bounds_command_source_status_projection_to_dashboard_rate() -> None:
+    """owner/RC 文本只能按 Dashboard 频率写 Qt，不能跟随 240 Hz 物理循环。"""
+    import slope_sim.manual_demo as manual_demo
+
+    calls: list[tuple[str, object]] = []
+    source_snapshot = object()
+    rc_snapshot = object()
+    dashboard = SimpleNamespace(
+        update_control_owner=lambda value: calls.append(("owner", value)),
+        update_rc_status=lambda value, *, source_snapshot: calls.append(
+            ("rc", (value, source_snapshot))
+        ),
+    )
+    arbiter = SimpleNamespace(snapshot=lambda: source_snapshot)
+    rc_worker = SimpleNamespace(snapshot=lambda: rc_snapshot)
+
+    refreshed_at = manual_demo._refresh_command_source_status_if_due(
+        dashboard,
+        arbiter=arbiter,
+        rc_worker=rc_worker,
+        last_refresh_at=None,
+        now=10.0,
+        update_hz=5.0,
+    )
+    unchanged_at = manual_demo._refresh_command_source_status_if_due(
+        dashboard,
+        arbiter=arbiter,
+        rc_worker=rc_worker,
+        last_refresh_at=refreshed_at,
+        now=10.1,
+        update_hz=5.0,
+    )
+
+    assert refreshed_at == 10.0
+    assert unchanged_at == 10.0
+    assert calls == [
+        ("owner", source_snapshot),
+        ("rc", (rc_snapshot, source_snapshot)),
+    ]
+
+
+def test_manual_demo_pumps_dashboard_events_at_thirty_hz_for_240hz_physics() -> None:
+    """Qt 事件泵保持 30 Hz 响应，不得在每个 240 Hz 物理步重复执行。"""
+    import slope_sim.manual_demo as manual_demo
+
+    assert [
+        step for step in range(8) if manual_demo._dashboard_events_due(step)
+    ] == [0]
+
+
 def test_v2_manual_runtime_rebuild_and_obstacle_refresh_delegate_one_worker_transaction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

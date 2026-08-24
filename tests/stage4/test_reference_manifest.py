@@ -112,3 +112,21 @@ def test_release_manifest_pins_the_official_ros_bootstrap_and_livox_message_sour
 
     normalized = _load_run_builder()._manifest(RELEASE_MANIFEST)
     assert {record["name"] for record in normalized["ros_dependencies"]} == set(dependencies)
+
+
+@pytest.mark.stage4_artifact
+def test_release_manifest_pins_the_official_livox_viewer_linux_bundle() -> None:
+    """最终安装器从 Livox 官方 CDN 获取固定 Viewer，不把未知二进制混入 Git。"""
+    document = json.loads(RELEASE_MANIFEST.read_text(encoding="utf-8"))
+    dependencies = {record["name"]: record for record in document["dependencies"]}
+
+    assert dependencies["livox-viewer2-linux"] == {
+        "name": "livox-viewer2-linux",
+        "url": (
+            "https://terra-1-g.djicdn.com/65c028cd298f4669a7f0e40e50ba1131/"
+            "avia-2/Livox%20Viewer2%20Linux/Viewer2_2.6.0_Linux.zip"
+        ),
+        "sha256": "3a1e574d3d73ba0b36460c2a358d08f6c722ae0dc376395ba392ec0d533c7e31",
+        "filename": "Viewer2_2.6.0_Linux.zip",
+        "license": "Livox Viewer 2 proprietary binary",
+    }

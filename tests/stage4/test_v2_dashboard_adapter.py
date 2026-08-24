@@ -331,10 +331,65 @@ def test_v2_dashboard_current_frame_mode_clears_historical_points(qapp, monkeypa
         assert widget.cloud_display_mode.currentText() == "累计"
         assert widget.update_cloud_frame(frame) is True
         widget.cloud_display_mode.setCurrentText("当前帧")
+        assert "当前帧" in widget.cloud_status.text()
         assert widget.update_cloud_frame(empty) is True
         assert np.asarray(calls[-1]["pos"]).shape == (0, 3)
         assert "当前帧" in widget.cloud_status.text()
         assert "本帧=0" in widget.cloud_status.text()
+    finally:
+        widget.close()
+
+
+def test_v2_dashboard_exposes_a_one_click_current_frame_action(qapp, monkeypatch) -> None:
+    """窄侧栏中必须有明确的一键入口，不要求用户在下方下拉框里寻找当前帧模式。"""
+    adapter = _adapter_module()
+    receiver = import_module("slope_sim.interfaces.v2.dashboard_receiver")
+    descriptor, _snapshot = _snapshot_with_encoded_lidar()
+    widget = adapter.V2DashboardWidget(descriptor)
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(widget.cloud_scatter, "setData", lambda **kwargs: calls.append(kwargs))
+    frame = receiver.V2DashboardCloudFrame(
+        1_000_000_000, 12,
+        np.asarray(((1.0, 2.0, 3.0), (4.0, 5.0, 6.0)), dtype=np.float32),
+        np.asarray((100, 120), dtype=np.uint32), np.asarray((1, 2), dtype=np.uint8),
+    )
+    try:
+        assert widget.cloud_current_frame_button.text() == "查看当前帧"
+        widget.cloud_workbench.setChecked(True)
+        assert widget.update_cloud_frame(frame) is True
+        widget.cloud_current_frame_button.click()
+
+        assert widget.cloud_display_mode.currentText() == "当前帧"
+        assert np.array_equal(np.asarray(calls[-1]["pos"]), frame.positions)
+        assert "当前帧" in widget.cloud_status.text()
+    finally:
+        widget.close()
+
+
+def test_v2_dashboard_bounds_accumulated_render_input_before_opengl(qapp) -> None:
+    """累计模式必须在拼接前抽样，交给颜色计算和 OpenGL 的数组不得超过硬上限。"""
+    adapter = _adapter_module()
+    receiver = import_module("slope_sim.interfaces.v2.dashboard_receiver")
+    descriptor, _snapshot = _snapshot_with_encoded_lidar()
+    widget = adapter.V2DashboardWidget(descriptor)
+    points = np.arange(9_000, dtype=np.float32).reshape(3_000, 3)
+    reflectivity = np.full(3_000, 100, dtype=np.uint32)
+    tags = np.ones(3_000, dtype=np.uint8)
+    try:
+        for sequence in range(adapter._MAX_CLOUD_HISTORY_FRAMES):
+            widget._cloud_frames.append(receiver.V2DashboardCloudFrame(
+                sequence * 100_000_000,
+                sequence,
+                points,
+                reflectivity,
+                tags,
+            ))
+        positions, rendered_tags = widget._cloud_render_data()
+
+        assert len(positions) <= adapter._MAX_CLOUD_RENDER_POINTS
+        assert len(rendered_tags) == len(positions)
+        assert positions.dtype == np.float32
+        assert rendered_tags.dtype == np.uint8
     finally:
         widget.close()
 

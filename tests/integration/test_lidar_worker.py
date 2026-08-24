@@ -637,6 +637,51 @@ def test_stage4_shard_stop_validates_identity_disconnects_before_ack_and_exits_z
     assert disconnect_index < stopped_index
 
 
+def test_stage4_shard_stop_tolerates_parent_pipe_already_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """父进程已退出时，shard 的最终 Stopped 通知不得产生子进程 traceback。"""
+    import gc
+
+    module = _worker_module()
+    process_id = os.getpid()
+    live = module._LiveWorkerBootstrap(
+        7, None, SimpleNamespace(), None, None, object(), SimpleNamespace(), (), {}
+    )
+    spec = SimpleNamespace(
+        shard_id=0,
+        first=0,
+        start=0,
+        stop=5_760,
+        stride=2,
+        count=2_880,
+        world_spec=SimpleNamespace(world_digest="0" * 64),
+    )
+
+    class Receiver:
+        def recv(self) -> object:
+            return module.LidarWorkerStop(1, process_id)
+
+        def close(self) -> None:
+            pass
+
+    class Sender:
+        def send(self, value: object) -> None:
+            if type(value) is module._Stage4ShardStopped:
+                raise BrokenPipeError("parent pipe closed")
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(module, "_bootstrap_live_worker", lambda _spec, **_kwargs: live)
+    monkeypatch.setattr(module, "_stage4_shard_prewarm", lambda _live, _spec: object())
+    monkeypatch.setattr(module, "_disconnect_direct_client", lambda _client_id: None)
+    monkeypatch.setattr(gc, "freeze", lambda: None)
+    monkeypatch.setattr(gc, "disable", lambda: None)
+
+    module.stage4_shard_entrypoint(Receiver(), Sender(), spec)
+
+
 def test_stage4_coordinator_stop_uses_shard_pids_and_rejects_wrong_shard_ack(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

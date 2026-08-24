@@ -24,8 +24,7 @@ _PROXY_VARIABLES = (
 )
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 _DEFAULT_VIEWER_ROOT = (
-    _REPOSITORY_ROOT
-    / "results/stage4-lvx2-closeout/viewer/official-sample/bundle/Viewer2_2.6.0_Linux"
+    _REPOSITORY_ROOT / "share/slope-sim/livox-viewer/Viewer2_2.6.0_Linux"
 )
 _VIEWER_ROOT_ENV = "SLOPE_SIM_LIVOX_VIEWER_ROOT"
 _VIEWER_WINDOW_ARGS = ("-windowed", "-ResX=1600", "-ResY=900")

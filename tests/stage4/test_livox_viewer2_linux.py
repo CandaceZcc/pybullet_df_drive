@@ -8,6 +8,14 @@ import pytest
 from scripts import verify_livox_viewer2_linux as verifier
 
 
+def test_default_viewer_root_uses_the_installed_release_bundle() -> None:
+    """未覆盖环境变量时必须查找安装器固定的 Viewer 路径。"""
+    assert verifier._DEFAULT_VIEWER_ROOT == (
+        verifier._REPOSITORY_ROOT
+        / "share/slope-sim/livox-viewer/Viewer2_2.6.0_Linux"
+    )
+
+
 def test_isolated_viewer_command_preserves_x11_and_removes_proxy_environment(
     tmp_path: Path,
 ) -> None:

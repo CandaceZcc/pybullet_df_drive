@@ -302,8 +302,20 @@ def write_locked_dependency_index(staging, dependencies):
 
 def bootstrap_locked_system_tools(staging):
     # 只在干净机缺少 C++ 构建工具时申请系统权限；其余安装步骤保持调用者身份。
-    required_tools = ("python3", "cmake", "g++", "make")
-    required_packages = (*required_tools, "libssl-dev", "libyaml-cpp-dev")
+    required_tools = {
+        "python3": "python3",
+        "cmake": "cmake",
+        "g++": "g++",
+        "make": "make",
+        "bwrap": "bubblewrap",
+        "xdotool": "xdotool",
+    }
+    required_packages = (
+        *required_tools.values(),
+        "libxdo3",
+        "libssl-dev",
+        "libyaml-cpp-dev",
+    )
     missing_tools = [tool for tool in required_tools if shutil.which(tool) is None]
     missing_openssl = not Path("/usr/include/openssl/crypto.h").is_file()
     if (
@@ -347,7 +359,9 @@ def bootstrap_locked_system_tools(staging):
         or any(locked_tools[tool]["architecture"] != "amd64" for tool in required_packages)
     ):
         fail("locked system dependency file is invalid")
-    install_tools = [tool for tool in missing_tools if tool != "python3"]
+    install_tools = [required_tools[tool] for tool in missing_tools if tool != "python3"]
+    if "xdotool" in install_tools:
+        install_tools.append("libxdo3")
     if install_tools or missing_openssl:
         for package in ("libssl-dev", "libyaml-cpp-dev"):
             if package not in install_tools:
@@ -486,9 +500,35 @@ def current_target(root, release):
             temporary.unlink()
         raise
 
+def command_target(root, command_dir):
+    if command_dir is None:
+        return None
+    directory = Path(command_dir)
+    if not directory.is_absolute():
+        fail("command-dir must be absolute")
+    directory.mkdir(mode=0o755, parents=True, exist_ok=True)
+    if directory.is_symlink() or not directory.is_dir():
+        fail("command-dir must be a non-symlink directory")
+    target = directory / "runSim"
+    expected = root / "current" / "bin" / "runSim"
+    if os.path.lexists(target):
+        if not target.is_symlink() or os.readlink(target) != str(expected):
+            fail("runSim command path already exists and is unmanaged")
+        return target
+    return target
+
+def publish_command_target(root, target):
+    if target is None or os.path.lexists(target):
+        return
+    expected = root / "current" / "bin" / "runSim"
+    if expected.is_symlink() or not expected.is_file() or not os.access(expected, os.X_OK):
+        fail("installed runSim command is invalid")
+    target.symlink_to(expected)
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--install-root", required=True)
+    parser.add_argument("--command-dir")
     parser.add_argument("--with-ros", action="store_true")
     args = parser.parse_args()
     root = Path(args.install_root)
@@ -499,6 +539,7 @@ def main():
     selected_with_ros = args.with_ros
     payload = MANIFEST["payload"]
     root.mkdir(mode=0o755, parents=True, exist_ok=True)
+    command = command_target(root, args.command_dir)
     lock = (root / ".stage4-install.lock").open("a+")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -564,6 +605,7 @@ def main():
         if not complete:
             fail("same-version release differs, is damaged, or has option drift")
         current_target(root, release)
+        publish_command_target(root, command)
         return
     staging = staging_root / (MANIFEST["version"] + "-" + str(os.getpid()))
     if staging.exists() or staging.is_symlink():
@@ -593,6 +635,7 @@ def main():
         (staging / "install-state.json").write_text(install_state_content, encoding="utf-8")
         os.replace(staging, release)
         current_target(root, release)
+        publish_command_target(root, command)
     except BaseException:
         if staging.exists() or staging.is_symlink():
             shutil.rmtree(staging)
@@ -630,8 +673,11 @@ def main() -> int:
         raise ValueError("project payload file conflicts with locked download")
     if not args.output.is_absolute() or args.output.exists() or not args.output.parent.is_dir():
         raise ValueError("output must be a new absolute path below an existing directory")
-    expected_name = f"slope-sim-stage4-{manifest['version']}-ubuntu24.04-amd64.run"
-    if args.output.name != expected_name:
+    expected_names = {
+        f"slope-sim-stage4-{manifest['version']}-ubuntu24.04-amd64.run",
+        "runSim.run",
+    }
+    if args.output.name not in expected_names:
         raise ValueError("output filename does not match release version")
     body = "#!/bin/sh\n# 阶段四单文件安装器：内嵌项目 payload 与锁定下载 manifest。\n"
     body += "if ! command -v python3 >/dev/null 2>&1; then\n"

@@ -2828,7 +2828,13 @@ def stage4_shard_entrypoint(
         try:
             _disconnect_direct_client(live.client_id)
             if normal_stop:
-                response_sender.send(_Stage4ShardStopped(spec.shard_id, os.getpid()))
+                try:
+                    response_sender.send(
+                        _Stage4ShardStopped(spec.shard_id, os.getpid())
+                    )
+                except (BrokenPipeError, EOFError, OSError):
+                    # parent 已退出时没有 Stopped 的接收者；shard 仍应正常收尾。
+                    pass
         finally:
             response_sender.close()
 

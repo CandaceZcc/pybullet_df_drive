@@ -18,8 +18,10 @@ from slope_sim.interfaces.v2.runsim_session import (
 _FRAME_HEADER = 0x0F
 _FRAME_BYTES = 25
 _CHANNELS = 16
-_CHANNEL_MIN = 282
-_CHANNEL_MAX = 1722
+_CHANNEL_INPUT_MIN = 282
+_CHANNEL_INPUT_MAX = 1772
+_CHANNEL_CALIBRATION_MIN = 282
+_CHANNEL_CALIBRATION_MAX = 1722
 
 
 def pyserial_opener(
@@ -88,7 +90,10 @@ class SbusFrameParser:
             return None
         bits = int.from_bytes(frame[1:23], "little")
         channels = tuple((bits >> (11 * index)) & 0x07FF for index in range(_CHANNELS))
-        if any(value < _CHANNEL_MIN or value > _CHANNEL_MAX for value in channels):
+        if any(
+            value < _CHANNEL_INPUT_MIN or value > _CHANNEL_INPUT_MAX
+            for value in channels
+        ):
             return None
         return channels
 
@@ -339,7 +344,9 @@ class RcCommandGate:
         timeout_sec: float = 0.1,
         deadzone: float = 0.05,
     ) -> None:
-        if not (_CHANNEL_MIN <= unlock_low < unlock_high <= _CHANNEL_MAX):
+        if not (
+            _CHANNEL_INPUT_MIN <= unlock_low < unlock_high <= _CHANNEL_INPUT_MAX
+        ):
             raise ValueError("unlock thresholds must be ordered RC channel values")
         if timeout_sec <= 0.0 or not 0.0 <= deadzone < 1.0:
             raise ValueError("timeout_sec and deadzone must be valid")
@@ -356,7 +363,11 @@ class RcCommandGate:
     def observe(self, channels: tuple[int, ...], *, now: float) -> RcCommand:
         if not isinstance(channels, tuple) or len(channels) != _CHANNELS:
             return self.fault("invalid_channels")
-        if any(type(value) is not int or not _CHANNEL_MIN <= value <= _CHANNEL_MAX for value in channels):
+        if any(
+            type(value) is not int
+            or not _CHANNEL_INPUT_MIN <= value <= _CHANNEL_INPUT_MAX
+            for value in channels
+        ):
             return self.fault("channel_out_of_range")
         self._last_frame_at = float(now)
         arm = channels[5]
@@ -401,7 +412,13 @@ class RcCommandGate:
         return self._last
 
     def _normalized(self, value: int) -> float:
-        scaled = 2.0 * (value - _CHANNEL_MIN) / (_CHANNEL_MAX - _CHANNEL_MIN) - 1.0
+        # 接收实机端点余量，但保持既有校准手感；超出校准端点时由末行限幅。
+        scaled = (
+            2.0
+            * (value - _CHANNEL_CALIBRATION_MIN)
+            / (_CHANNEL_CALIBRATION_MAX - _CHANNEL_CALIBRATION_MIN)
+            - 1.0
+        )
         if abs(scaled) <= self._deadzone:
             return 0.0
         return max(-1.0, min(1.0, scaled))
@@ -462,17 +479,16 @@ class SerialRcWorker:
                 frames = self._parser.feed(payload)
             except ValueError as error:
                 return self._submit_fault("serial_payload_invalid", observed_at, error)
-            if self._parser.discarded_frame_count != discarded_before:
-                command = self._gate.fault("parser_desynchronized")
-                self._failure_reason = command.reason
-            elif frames:
-                command = self._gate.decision(now=observed_at)
+            if frames:
                 for channels in frames:
                     self._last_channels = channels
                     self._last_frame_at = observed_at
                     self._frame_times.append(observed_at)
                     command = self._gate.observe(channels, now=observed_at)
                 self._failure_reason = None if command.active else command.reason
+            elif self._parser.discarded_frame_count != discarded_before:
+                command = self._gate.fault("parser_desynchronized")
+                self._failure_reason = command.reason
             else:
                 command = self._gate.decision(now=observed_at)
                 self._failure_reason = None if command.active else command.reason

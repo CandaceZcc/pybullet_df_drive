@@ -81,6 +81,48 @@ def test_rc_gate_accepts_the_observed_two_position_switch_range() -> None:
     assert command.linear_velocity_m_s == 3.0
 
 
+@pytest.mark.parametrize(
+    ("channel_3", "expected_linear_velocity"),
+    ((282, -3.0), (1772, 3.0)),
+)
+def test_rc_worker_keeps_driving_at_observed_channel_3_endpoints(
+    channel_3: int,
+    expected_linear_velocity: float,
+) -> None:
+    """实机 CH3 到达机械端点时仍是有效帧，不能被 parser 故障停车。"""
+    module = import_module("slope_sim.serial_rc")
+    locked = _frame((1002, 1002, channel_3, 1002, 1002, 448) + (1002,) * 10)
+    unlocked = _frame((1002, 1002, channel_3, 1002, 1002, 1002) + (1002,) * 10)
+
+    class Reader:
+        def __init__(self):
+            self.payloads = iter((locked, unlocked, unlocked))
+
+        def read(self, _size):
+            return next(self.payloads, b"")
+
+        def close(self):
+            return None
+
+    worker = module.SerialRcWorker(
+        Path("/dev/serial/by-id/usb-FTDI"),
+        reader=Reader(),
+        command_sink=lambda _command, _now: None,
+        start_worker=False,
+    )
+
+    worker.process_once(now=0.0)
+    command = worker.process_once(now=0.01)
+    renewed = worker.process_once(now=0.02)
+    snapshot = worker.snapshot(now=0.02)
+    worker.close()
+
+    assert command.active is True
+    assert command.linear_velocity_m_s == expected_linear_velocity
+    assert renewed == command
+    assert snapshot.failure_reason is None
+
+
 def test_rc_port_qualification_requires_twenty_valid_frames_and_rejects_ambiguity(
     tmp_path: Path,
 ) -> None:
@@ -173,6 +215,110 @@ def test_rc_worker_forwards_only_gated_commands_and_stops_on_parser_fault() -> N
     assert sent[2][0].reason == "parser_desynchronized"
     assert snapshot.path.name == "usb-FTDI"
     assert snapshot.last_channels is not None and snapshot.last_channels[5] == 1002
+
+
+def test_rc_worker_preserves_unlock_when_resync_batch_contains_a_valid_frame() -> None:
+    """同批坏候选后的有效帧仍须续租，不能把流重同步升级为永久失锁。"""
+    module = import_module("slope_sim.serial_rc")
+    locked = _frame((1000, 1000, 1722, 1000, 1000, 448) + (1000,) * 10)
+    unlocked = _frame((1000, 1000, 1722, 1000, 1000, 1002) + (1000,) * 10)
+    malformed = b"\x0f" + b"\xff" * 24
+    sent = []
+
+    class Reader:
+        def __init__(self):
+            self.payloads = iter((locked, unlocked, malformed + unlocked))
+
+        def read(self, _size):
+            return next(self.payloads, b"")
+
+        def close(self):
+            return None
+
+    worker = module.SerialRcWorker(
+        Path("/dev/serial/by-id/usb-FTDI"),
+        reader=Reader(),
+        command_sink=lambda command, now: sent.append((command, now)),
+        start_worker=False,
+    )
+
+    worker.process_once(now=0.0)
+    worker.process_once(now=0.01)
+    command = worker.process_once(now=0.02)
+    worker.close()
+
+    assert command.active is True
+    assert command.unlocked is True
+    assert command.reason == "active"
+    assert sent[2][0] == command
+
+
+def test_rc_worker_uses_a_valid_frame_after_a_scheduler_delay_before_timing_out() -> None:
+    """线程延迟后若已读到新鲜有效帧，不得先清除既有解锁授权。"""
+    module = import_module("slope_sim.serial_rc")
+    locked = _frame((1000, 1000, 1722, 1000, 1000, 448) + (1000,) * 10)
+    unlocked = _frame((1000, 1000, 1722, 1000, 1000, 1002) + (1000,) * 10)
+
+    class Reader:
+        def __init__(self):
+            self.payloads = iter((locked, unlocked, unlocked))
+
+        def read(self, _size):
+            return next(self.payloads, b"")
+
+        def close(self):
+            return None
+
+    worker = module.SerialRcWorker(
+        Path("/dev/serial/by-id/usb-FTDI"),
+        reader=Reader(),
+        command_sink=lambda _command, _now: None,
+        start_worker=False,
+    )
+
+    worker.process_once(now=0.0)
+    assert worker.process_once(now=0.01).active is True
+    command = worker.process_once(now=0.25)
+    worker.close()
+
+    assert command.active is True
+    assert command.unlocked is True
+    assert command.reason == "active"
+
+
+def test_rc_worker_requires_a_new_unlock_edge_after_a_real_empty_read_timeout() -> None:
+    """真实空读超过 100 ms 后必须失锁，恢复时保持高位不能自行复活。"""
+    module = import_module("slope_sim.serial_rc")
+    locked = _frame((1000, 1000, 1722, 1000, 1000, 448) + (1000,) * 10)
+    unlocked = _frame((1000, 1000, 1722, 1000, 1000, 1002) + (1000,) * 10)
+
+    class Reader:
+        def __init__(self):
+            self.payloads = iter((locked, unlocked, b"", unlocked))
+
+        def read(self, _size):
+            return next(self.payloads, b"")
+
+        def close(self):
+            return None
+
+    worker = module.SerialRcWorker(
+        Path("/dev/serial/by-id/usb-FTDI"),
+        reader=Reader(),
+        command_sink=lambda _command, _now: None,
+        start_worker=False,
+    )
+
+    worker.process_once(now=0.0)
+    assert worker.process_once(now=0.01).active is True
+    timed_out = worker.process_once(now=0.12)
+    recovered_high = worker.process_once(now=0.13)
+    worker.close()
+
+    assert timed_out.reason == "frame_timeout"
+    assert timed_out.active is False
+    assert recovered_high.reason == "awaiting_unlock_edge"
+    assert recovered_high.active is False
 
 
 def test_rc_worker_counts_each_watchdog_timeout_transition_once() -> None:

@@ -2,7 +2,7 @@
 
 ## 摘要
 
-本项目以 PyBullet 建立轮式移动机器人的可交互物理世界，提供四种底盘、三类地形、运行期场景切换与企业接口。桌面会话由 PyBullet 主窗口承担物理观察和键盘输入，Qt Dashboard 承担状态显示、配置、采集和会话控制。阶段四采用五 topic 的 eCAL v2 实时协议，并以单个 C++ Command 进程作为 `/sim/wheel/command` 的唯一发布者。
+本项目以 PyBullet 建立轮式移动机器人的可交互物理世界，提供四种底盘、三类地形、运行期场景切换、SBUS 遥控器和企业接口。桌面会话由 PyBullet 主窗口承担物理观察和键盘输入，Qt Dashboard 承担状态显示、配置、采集和会话控制。正式版采用五 topic 的 eCAL v2 实时协议，并以单个 C++ Command 进程作为 `/sim/wheel/command` 的唯一发布者。
 
 阶段一至四的实现范围、历史证据和边界记录在 [阶段四交付报告](docs/阶段四交付报告.md)。协议、命令权和跨语言 golden 检查见 [阶段四协议与命令权说明](docs/阶段四协议与命令权说明.md)。
 
@@ -98,22 +98,32 @@ export SLOPE_SIM_V2_RUNTIME_ROOT="$PWD/build/stage5-acceptance-runtime"
 
 该变量只指定当前源码会话使用的 `Command`、`ecal.yaml` 和 localtime 插件，不生成或替代发行安装包。未设置时，源码入口保持原有行为；已安装 release 仍直接使用自身运行根。
 
-### release 安装
+### `runSim.run` 安装
 
-发布包是单文件 Ubuntu `.run` 安装器，安装时校验锁定下载和嵌入文件摘要。将已交付的安装器保存为本地文件后执行：
+最终发布包为 Ubuntu 24.04 amd64 单文件安装器 `runSim.run`。安装过程需要联网下载锁定依赖，所有下载和内嵌文件均校验 SHA-256；Livox Viewer 2 使用 Livox 官方 Linux 2.6.0 包，并安装到 release 内的固定路径。Viewer 是 Livox 的专有二进制，本仓库不提交其 ZIP，安装器只保存官方 URL、版本与摘要。
 
 ```bash
-chmod +x slope-sim-stage4-<version>-ubuntu24.04-amd64.run
-./slope-sim-stage4-<version>-ubuntu24.04-amd64.run --help
-./slope-sim-stage4-<version>-ubuntu24.04-amd64.run --prefix /absolute/path/to/slope-sim-stage4
-/absolute/path/to/slope-sim-stage4/bin/runSim --version
+chmod +x runSim.run
+mkdir -p "$HOME/.local/bin"
+./runSim.run \
+  --install-root "$HOME/.local/share/runSim" \
+  --command-dir "$HOME/.local/bin"
+
+# Ubuntu 默认通常已包含此目录；若 command -v runSim 没有输出，再执行：
+export PATH="$HOME/.local/bin:$PATH"
+grep -qxF 'export PATH="$HOME/.local/bin:$PATH"' "$HOME/.zshrc" 2>/dev/null || \
+  printf '%s\n' 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.zshrc"
+
+runSim --version
+runSim --help
+runSim
 
 # 可选真实 SBUS 遥控器：仅接受稳定 by-id 路径，并在启动前完成 20 帧资格检查
-/absolute/path/to/slope-sim-stage4/bin/runSim \
+runSim \
   --rc-port /dev/serial/by-id/usb-<device>
 ```
 
-安装器 manifest 记录构建时的 Git commit。涉及 C++ Command、协议或 runtime 的修复，先提交对应源码，再构建、安装并运行 v2 GUI 验收；不要用未提交工作树生成正式安装器。
+`--command-dir` 只会创建它管理的 `runSim` 软链接；如果目标已有普通文件或其他链接，安装会拒绝覆盖。安装器 manifest 记录构建时 Git commit。`--with-ros` 仅在需要 ROS 2 bridge/RViz2 时使用，Livox Viewer 2 本身已包含在普通安装中。
 
 ## 运行
 
@@ -141,21 +151,28 @@ conda run -n slope-sim python main.py \
 
 Dashboard 的折线图默认不创建；需要观察时，从标签栏右上角“图表（按需）”逐项勾选，取消勾选会同时释放该图的绘图对象和历史缓存。使用 SBUS 遥控器时，先将 CH6 拨到低位再拨到高位完成安全解锁，然后在控制源中选择“遥控器”；如果串口、帧或解锁状态未就绪，Dashboard 会自动退回“键盘”，避免两个输入源同时表现为不可用。
 
+“LiDAR 点云”页提供“累计”和“当前帧”两种模式，也可直接点击“查看当前帧”。累计模式会在进入 OpenGL 前按时间顺序等步长采样，渲染输入最多 80,000 点，避免长时间驾驶时反复拼接百万级点阵拖慢 GUI；采集和导出仍使用完整原始帧，不受显示采样影响。
+
 ### 正式 release v2 会话
 
-新 `.run` 安装完成后，从安装根目录调用：
+新 `.run` 安装完成后直接调用：
 
 ```bash
-/absolute/path/to/slope-sim-stage4/bin/runSim
+runSim
 
 # 固定车型、地形和初始速度
-/absolute/path/to/slope-sim-stage4/bin/runSim \
+runSim \
   --robot-model df_mid --terrain-model golf_heightfield --golf-seed 41 \
   --golf-relief medium --target-linear-velocity 2.0
 
 # 启动后立即记录 90 秒，再导出同一会话的点云文件
-/absolute/path/to/slope-sim-stage4/bin/runSim \
+runSim \
   --capture-duration-sec 90 --capture-output-dir /absolute/path/to/captures
+
+# 阶段五控制链观测复验
+runSim --no-dashboard --developer-diagnostics \
+  --robot-model df_mid --terrain-model slope --slope-deg 8 \
+  --target-linear-velocity 1.5
 ```
 
 `runSim` 无参数等价于 GUI、手动、v2 实时和 `ecal` 模式。安装包中的 eCAL 配置与 localtime 插件会自动载入；显式设置 `ECAL_CONFIG_PATH`、`ECAL_DATA`、`ECAL_TIME_PLUGIN_PATH` 或相应 CLI 参数可覆盖默认值。
@@ -180,8 +197,9 @@ Dashboard 的折线图默认不创建；需要观察时，从标签栏右上角�
 1. 在已安装的新 release 中执行 `bin/runSim`，确认两个 GUI 同时启动，终端未出现 `BrokenPipeError` 或 Command 退出信息。
 2. 用键盘短暂前进、转向和停车；确认 Dashboard 的 v2 状态页持续刷新。
 3. 在“MID-360 采集”页选择 1 分钟，点击“启用采集”，观察采集状态变化；提前点击“结束采集”。
-4. 确认输出目录存在 `session.mcap`、`export/lidar.lvx2`、PCD/PLY 与成功回执；在配置了 Livox Viewer 2 时点击“导入 Livox Viewer”。
-5. 使用 `bin/runSim --version` 和 `bin/runSim --help` 复核安装入口及参数合同。
+4. 确认输出目录存在 `session.mcap`、`export/lidar.lvx2`、PCD/PLY 与成功回执；点击“导入 Livox Viewer”，确认不再报告 launcher missing。
+5. 在 LiDAR 页切换累计显示并点击“查看当前帧”，确认 GUI 连续响应且采集文件点数不因显示限流而减少。
+6. 使用 `runSim --version` 和 `runSim --help` 复核安装入口及参数合同。
 
 完整 v2 验收以新建、已安装的 release 为准。安装器的 manifest 必须记录包含修复的 commit，不能以未提交工作树生成最终包。
 
@@ -202,6 +220,15 @@ conda run -n slope-sim python -m pytest -q -m "not ecal and not stage4_artifact"
 ```
 
 真实 eCAL、GUI 和发布制品门禁依赖对应的桌面、eCAL socket 与 release 环境。它们的历史结果和运行条件记录在交付报告。
+
+### 命令行测试编写规则
+
+- 每条验收命令必须能从仓库根目录直接复制执行；明确 Conda 环境、必要环境变量、输入文件和输出目录，不能依赖未说明的当前 shell 状态。
+- 自动测试必须有界：使用固定帧数、`--duration-sec`、测试超时或可预测的进程退出条件；日志和采集输出写入一个明确目录，不生成无界或时间戳构建树。
+- 在命令旁写清预期退出码和可机器判断的结果，例如帧率下限、100 ms watchdog、文件 SHA、JSON 字段或“不出现周期归零”；不能只写“观察是否正常”。
+- GUI、真实 eCAL、USB 串口、ROS 和 Livox Viewer 属于外部门禁，必须单独标注环境条件。串口只使用 `/dev/serial/by-id/...`，不得回退到易漂移的 `/dev/ttyUSB*`。
+- 实质性故障修复按聚焦测试 RED→最小实现 GREEN→直接相关回归执行；正式里程碑最后只运行一次完整回归。命令、测试名、结果和跳过原因都应保留在交付记录中。
+- 安装包验收必须针对新安装的 release，至少检查 `runSim --version`、`runSim --help`、manifest doctor、正式 v2 启动与正常退出；源码工作树通过不等于安装包通过。
 
 ## 目录
 

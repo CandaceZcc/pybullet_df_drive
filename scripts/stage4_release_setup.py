@@ -5,12 +5,14 @@ import argparse
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
+import zipfile
 
 
 _HEX = re.compile(r"[0-9a-f]{64}")
@@ -28,6 +30,10 @@ _REQUIRED_ECAL_SUBMODULES = frozenset(
     }
 )
 _CMAKE_BUILD_JOBS = "1"
+_LIVOX_VIEWER_DEPENDENCY = "livox-viewer2-linux"
+_LIVOX_VIEWER_DIRECTORY = "Viewer2_2.6.0_Linux"
+_LIVOX_VIEWER_MAX_FILES = 128
+_LIVOX_VIEWER_MAX_BYTES = 512 * 1024 * 1024
 
 
 def _require_release_directory(path: Path, *, label: str) -> Path:
@@ -206,6 +212,67 @@ def _locked_dependency_path(
         return None
     filename = matches[0]["filename"].removeprefix("dependencies/")
     return dependencies_dir / filename
+
+
+def _install_locked_livox_viewer(
+    release_root: Path,
+    dependencies_dir: Path,
+    dependencies: list[dict[str, str]],
+) -> Path | None:
+    """安全解包锁定的官方 Viewer，并固定到 release 内的运行时路径。"""
+    bundle = _locked_dependency_path(dependencies_dir, dependencies, _LIVOX_VIEWER_DEPENDENCY)
+    if bundle is None:
+        return None
+    destination = release_root / "share" / "slope-sim" / "livox-viewer"
+    viewer_root = destination / _LIVOX_VIEWER_DIRECTORY
+    if bundle.is_symlink() or not bundle.is_file() or bundle.suffix != ".zip":
+        raise ValueError("locked Livox Viewer bundle is invalid")
+    if destination.exists() or destination.is_symlink():
+        raise ValueError("release Livox Viewer directory already exists")
+    try:
+        with zipfile.ZipFile(bundle) as archive:
+            members = archive.infolist()
+            total_bytes = sum(member.file_size for member in members)
+            if (
+                not members
+                or len(members) > _LIVOX_VIEWER_MAX_FILES
+                or total_bytes > _LIVOX_VIEWER_MAX_BYTES
+            ):
+                raise ValueError
+            for member in members:
+                relative = PurePosixPath(member.filename)
+                mode = (member.external_attr >> 16) & 0xFFFF
+                file_type = stat.S_IFMT(mode)
+                if (
+                    relative.is_absolute()
+                    or not relative.parts
+                    or relative.parts[0] != _LIVOX_VIEWER_DIRECTORY
+                    or any(part in {"", ".", ".."} for part in relative.parts)
+                    or (not member.is_dir() and file_type and not stat.S_ISREG(mode))
+                ):
+                    raise ValueError
+            destination.mkdir(mode=0o755, parents=True, exist_ok=False)
+            for member in members:
+                target = destination.joinpath(*PurePosixPath(member.filename).parts)
+                if member.is_dir():
+                    target.mkdir(mode=0o755, parents=True, exist_ok=True)
+                    continue
+                target.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+                with archive.open(member) as source, target.open("xb") as output:
+                    shutil.copyfileobj(source, output)
+                target.chmod(0o644)
+    except (OSError, RuntimeError, ValueError, zipfile.BadZipFile, zipfile.LargeZipFile):
+        if destination.exists() and not destination.is_symlink():
+            shutil.rmtree(destination)
+        raise ValueError("locked Livox Viewer bundle is invalid") from None
+    launcher = viewer_root / "LivoxViewer2.sh"
+    binary = viewer_root / "LivoxViewer2" / "Binaries" / "Linux" / "LivoxViewer2"
+    if any(path.is_symlink() or not path.is_file() for path in (launcher, binary)):
+        shutil.rmtree(destination)
+        raise ValueError("locked Livox Viewer bundle is invalid")
+    launcher.chmod(0o755)
+    binary.chmod(0o755)
+    return viewer_root
 
 
 def _build_cmake_target(cmake: str, build_directory: Path, *, environment: dict[str, str] | None = None) -> None:
@@ -776,6 +843,7 @@ def build_cpp_tools(
         # 通用 CMake fixture 不含项目 payload；真实 `.run` 由 payload 合同保证此文件存在。
         if (release_root / "runSim").exists():
             _install_run_sim_launcher(release_root)
+        _install_locked_livox_viewer(release_root, dependencies_dir, locked_dependencies)
     finally:
         if build_root.exists() or build_root.is_symlink():
             shutil.rmtree(build_root)

@@ -16,6 +16,28 @@ def _runtime_observation_cadence_type():
     return importlib.import_module("slope_sim.realtime").RuntimeObservationCadence
 
 
+def _control_path_diagnostics_type():
+    """延迟读取开发期控制链观测器，保留明确 RED。"""
+    return importlib.import_module("slope_sim.realtime").ControlPathDiagnostics
+
+
+def test_control_path_diagnostics_reports_bounded_interval_maxima_once_per_period() -> None:
+    """开发诊断须汇总主循环与发送耗时，且每个周期只输出一次。"""
+    diagnostics = _control_path_diagnostics_type()(period_sec=1.0)
+    diagnostics.record_loop(now=10.0)
+    diagnostics.record_send(elapsed_sec=0.002)
+    diagnostics.record_loop(now=10.012)
+    diagnostics.record_send(elapsed_sec=0.008)
+
+    assert diagnostics.sample_if_due(now=10.9) is None
+    sample = diagnostics.sample_if_due(now=11.0)
+    assert sample is not None
+    assert sample.loop_count == 2
+    assert sample.max_loop_gap_sec == pytest.approx(0.012)
+    assert sample.max_send_elapsed_sec == pytest.approx(0.008)
+    assert diagnostics.sample_if_due(now=11.1) is None
+
+
 def test_runtime_observation_cadence_rebases_after_slow_poll() -> None:
     """下一次 discovery 必须从慢 poll 完成时起算，而不是追赶旧期限。"""
     clock = [10.0]

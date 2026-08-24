@@ -35,7 +35,7 @@ from slope_sim.manual_capture import ManualCaptureRecorder, ManualCaptureSession
 from slope_sim.manual_control import ManualCommand, ManualControlSettings, command_from_keyboard
 from slope_sim.manual_mid360_reconstruction import reconstruction_worker_entrypoint
 from slope_sim.metrics import compute_tracking_metrics
-from slope_sim.realtime import DeadlinePacer, RuntimeObservationCadence
+from slope_sim.realtime import ControlPathDiagnostics, DeadlinePacer, RuntimeObservationCadence
 from slope_sim.runtime_actions import (
     AddObstaclesAction,
     ClearObstaclesAction,
@@ -84,6 +84,13 @@ def manual_step_limit(duration_limit_sec: float | None, time_step: float) -> int
     if duration_limit_sec <= 0:
         raise ValueError("duration_limit_sec must be positive")
     return max(1, int(duration_limit_sec / time_step))
+
+
+def _dashboard_events_due(iteration: int) -> bool:
+    """240 Hz 主循环每八轮泵一次 Qt，暂停态也由独立 iteration 推进。"""
+    if type(iteration) is not int or iteration < 0:
+        raise ValueError("dashboard event iteration must be a nonnegative int")
+    return iteration % 8 == 0
 
 
 
@@ -183,6 +190,34 @@ def _update_resource_dashboard(
         return False
     update(snapshot)
     return True
+
+
+def _refresh_command_source_status_if_due(
+    dashboard: object,
+    *,
+    arbiter: object | None,
+    rc_worker: object | None,
+    last_refresh_at: float | None,
+    now: float,
+    update_hz: float,
+) -> float | None:
+    """按 Dashboard 节拍投影 owner/RC 文本，控制线程本身不降频。"""
+    if not should_refresh_dashboard(last_refresh_at, now, update_hz):
+        return last_refresh_at
+    source_snapshot = None
+    if arbiter is not None:
+        snapshot = getattr(arbiter, "snapshot", None)
+        update_owner = getattr(dashboard, "update_control_owner", None)
+        if callable(snapshot):
+            source_snapshot = snapshot()
+        if callable(update_owner):
+            update_owner(source_snapshot)
+    if rc_worker is not None:
+        snapshot = getattr(rc_worker, "snapshot", None)
+        update_rc_status = getattr(dashboard, "update_rc_status", None)
+        if callable(snapshot) and callable(update_rc_status):
+            update_rc_status(snapshot(), source_snapshot=source_snapshot)
+    return now
 
 
 def _resource_scalar_metrics(
@@ -308,6 +343,25 @@ def _start_v2_capture(*, release_root: Path, runtime: V2ManualWorldRuntime, outp
         recorder.close()
         raise
     return recorder, output_dirs.published_dir
+
+
+def _start_v2_capture_or_report(
+    *,
+    release_root: Path,
+    runtime: V2ManualWorldRuntime,
+    output_root: Path,
+    dashboard: object,
+) -> tuple[object | None, Path | None]:
+    """隔离 Recorder 启动故障，避免一次采集失败终止实时仿真。"""
+    try:
+        return _start_v2_capture(
+            release_root=release_root,
+            runtime=runtime,
+            output_root=output_root,
+        )
+    except Exception as error:
+        dashboard.set_capture_failed(str(error) or type(error).__name__)
+        return None, None
 
 
 def merge_manual_commands(dashboard_command: DashboardCommand, keyboard_command: ManualCommand) -> DashboardCommand:
@@ -828,14 +882,26 @@ def run_manual_demo(
         observation_cadence = RuntimeObservationCadence(
             monotonic=runtime_monotonic,
         )
+        control_path_diagnostics = (
+            ControlPathDiagnostics()
+            if config.developer_diagnostics_enabled and v2_manual_runtime is not None
+            else None
+        )
         last_v2_dashboard_refresh_at: float | None = None
+        last_command_source_status_refresh_at: float | None = None
+        dashboard_event_iteration = 0
         pacer.start()
         while (
             (max_steps is None or step < max_steps)
             and (manual_deadline is None or runtime_monotonic() < manual_deadline)
         ):
             if dashboard is not None:
-                dashboard.process_events()
+                if (
+                    v2_manual_runtime is None
+                    or _dashboard_events_due(dashboard_event_iteration)
+                ):
+                    dashboard.process_events()
+                dashboard_event_iteration += 1
                 if resource_monitor is not None:
                     resource_children: dict[str, int] = {}
                     if v2_command_pid is not None:
@@ -862,11 +928,16 @@ def run_manual_demo(
                             **({"采集目录": capture_output_dir} if capture_output_dir is not None else {}),
                         },
                     )
-                if v2_command_arbiter is not None:
-                    update_control_owner = getattr(dashboard, "update_control_owner", None)
-                    snapshot = getattr(v2_command_arbiter, "snapshot", None)
-                    if callable(update_control_owner) and callable(snapshot):
-                        update_control_owner(snapshot())
+                last_command_source_status_refresh_at = (
+                    _refresh_command_source_status_if_due(
+                        dashboard,
+                        arbiter=v2_command_arbiter,
+                        rc_worker=rc_worker,
+                        last_refresh_at=last_command_source_status_refresh_at,
+                        now=runtime_monotonic(),
+                        update_hz=config.dashboard_update_hz,
+                    )
+                )
                 if v2_dashboard is not None and v2_manual_runtime is not None:
                     if v2_dashboard_receiver is not None:
                         _refreshed, last_v2_dashboard_refresh_at = _refresh_v2_dashboard_if_due(
@@ -890,18 +961,6 @@ def run_manual_demo(
                             if snapshot is not None:
                                 dashboard.update_v2_chart_snapshot(snapshot)
                             last_v2_dashboard_refresh_at = runtime_monotonic()
-                if rc_worker is not None and dashboard is not None:
-                    snapshot = getattr(rc_worker, "snapshot", None)
-                    update_rc_status = getattr(dashboard, "update_rc_status", None)
-                    if callable(snapshot) and callable(update_rc_status):
-                        update_rc_status(
-                            snapshot(),
-                            source_snapshot=(
-                                v2_command_arbiter.snapshot()
-                                if v2_command_arbiter is not None
-                                else None
-                            ),
-                        )
                 while viewer_import_results:
                     viewer_success, viewer_detail = viewer_import_results.popleft()
                     dashboard.set_capture_viewer_result(
@@ -964,19 +1023,21 @@ def run_manual_demo(
                         and v2_capture_recorder is None
                         and not v2_capture_exporting
                     ):
-                        v2_capture_recorder, capture_output_dir = _start_v2_capture(
+                        v2_capture_recorder, capture_output_dir = _start_v2_capture_or_report(
                             release_root=v2_capture_release_root,
                             runtime=v2_manual_runtime,
                             output_root=capture_root,
+                            dashboard=dashboard,
                         )
-                        dashboard.set_capture_recording(
-                            duration_limit_sec=capture_request.duration_limit_sec
-                        )
-                        v2_capture_stop_deadline = (
-                            None
-                            if capture_request.duration_limit_sec is None
-                            else runtime_monotonic() + capture_request.duration_limit_sec
-                        )
+                        if v2_capture_recorder is not None:
+                            dashboard.set_capture_recording(
+                                duration_limit_sec=capture_request.duration_limit_sec
+                            )
+                            v2_capture_stop_deadline = (
+                                None
+                                if capture_request.duration_limit_sec is None
+                                else runtime_monotonic() + capture_request.duration_limit_sec
+                            )
                     elif (
                         capture_request.kind == "stop"
                         and v2_capture_recorder is not None
@@ -1149,6 +1210,8 @@ def run_manual_demo(
             interface_snapshot_due = False
             interface_snapshot_wall_time = runtime_monotonic()
             if v2_manual_runtime is not None:
+                if control_path_diagnostics is not None:
+                    control_path_diagnostics.record_loop(now=runtime_monotonic())
                 if command.paused:
                     _renew_v2_command_target(
                         v2_command_client,
@@ -1170,6 +1233,7 @@ def run_manual_demo(
                     _interface_snapshot_due,
                     interface_snapshot_wall_time,
                 ) = observation_cadence.poll_if_due(v2_manual_runtime)
+                send_started_at = runtime_monotonic()
                 _renew_v2_command_target(
                     v2_command_client,
                     linear_velocity,
@@ -1178,6 +1242,21 @@ def run_manual_demo(
                     arbiter=v2_command_arbiter,
                     source=limited_command.control_source,
                 )
+                if control_path_diagnostics is not None:
+                    # 调用两次 monotonic 仅存在于显式 developer diagnostics 路径。
+                    control_path_diagnostics.record_send(
+                        elapsed_sec=runtime_monotonic() - send_started_at,
+                    )
+                    sample = control_path_diagnostics.sample_if_due(now=runtime_monotonic())
+                    if sample is not None:
+                        print(
+                            "v2-control-diagnostics "
+                            f"loop_count={sample.loop_count} "
+                            f"max_loop_gap_ms={sample.max_loop_gap_sec * 1000.0:.3f} "
+                            f"max_send_ms={sample.max_send_elapsed_sec * 1000.0:.3f}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
                 v2_decision = v2_manual_runtime.command_decision(
                     now=interface_snapshot_wall_time,
                 )
@@ -1257,18 +1336,6 @@ def run_manual_demo(
                     config.time_step,
                     wall_time=interface_snapshot_wall_time,
                 )
-                if rc_worker is not None and dashboard is not None:
-                    snapshot = getattr(rc_worker, "snapshot", None)
-                    update_rc_status = getattr(dashboard, "update_rc_status", None)
-                    if callable(snapshot) and callable(update_rc_status):
-                        update_rc_status(
-                            snapshot(),
-                            source_snapshot=(
-                                v2_command_arbiter.snapshot()
-                                if v2_command_arbiter is not None
-                                else None
-                            ),
-                        )
             elif interface_session is not None:
                 interface_session.runtime.after_physics_step(config.time_step)
 

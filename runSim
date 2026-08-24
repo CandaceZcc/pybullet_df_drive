@@ -13,7 +13,7 @@ else
 fi
 
 if [ "${1-}" = "--version" ]; then
-  printf '%s\n' 'runSim 0.1.0'
+  printf '%s\n' 'runSim 5.0.0'
   exit 0
 fi
 

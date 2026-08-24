@@ -360,6 +360,180 @@ def test_interactive_command_accepts_authenticated_target_and_stops_when_peer_di
 
 
 @pytest.mark.stage4_artifact
+def test_interactive_command_keeps_continuous_target_active_under_240hz_socket_renewal(
+    tmp_path: Path,
+) -> None:
+    """持续 240 Hz socket 续租时，C++ 100 Hz 发布不得在非零命令之间插入安全零速。"""
+    _require_real_ecal_interactive()
+    from scripts.verify_stage4_v2_phase0 import initialize_phase0_core
+    from slope_sim.interfaces.v2.descriptor import load_v2_descriptor
+    from slope_sim.interfaces.v2.ecal_raw import EcalRawBindings
+
+    command = _command_binary()
+    root = Path(__file__).resolve().parents[2]
+    descriptor = (root / "slope_sim/interfaces/generated/slope_sim_interfaces_v2.desc").read_bytes()
+    descriptor_path = tmp_path / "v2.desc"
+    descriptor_path.write_bytes(descriptor)
+    payload = tmp_path / "identity.bin"
+    _write_identity_payload(payload, descriptor)
+    socket_dir = tmp_path / "socket"
+    socket_path = socket_dir / "command.sock"
+    launch_record = socket_dir / "command.launch.lock"
+    result = tmp_path / "result.json"
+    token = "c" * 64
+    frames: list[pb.WheelCommand] = []
+    bindings = EcalRawBindings()
+    core = bindings._core
+    subscriber = None
+    process = None
+    initialize_phase0_core(core, f"runsim-command-240hz-peer-{os.getpid()}")
+
+    try:
+        subscriber = bindings.create_subscriber(
+            "/sim/wheel/command",
+            "slope_sim.interfaces.v2.WheelCommand",
+            load_v2_descriptor(),
+            lambda frame: frames.append(pb.WheelCommand.FromString(frame.payload)),
+        )
+        process = subprocess.Popen(
+            _interactive_arguments(
+                command, descriptor_path, payload, result, launch_record,
+                duration_ms=1500, deadline_ms=2000,
+            ),
+            preexec_fn=_launch_record_writer(socket_dir, launch_record, token),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        deadline = time.monotonic() + 2.0
+        while (not socket_path.exists() or subscriber.get_publisher_count() != 1) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert socket_path.exists(), process.stderr.read()
+        assert subscriber.get_publisher_count() == 1
+        target = _ndjson(
+            {"kind": "target", "token": token, "linear_velocity_m_s": 1.5, "angular_velocity_rad_s": 0.0}
+        )
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.connect(str(socket_path))
+            next_send = time.monotonic()
+            end = next_send + 1.0
+            while next_send < end:
+                client.sendall(target)
+                next_send += 1.0 / 240.0
+                time.sleep(max(0.0, next_send - time.monotonic()))
+        stdout, stderr = process.communicate(timeout=3)
+    finally:
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.communicate()
+        if subscriber is not None:
+            _close_subscriber(subscriber)
+        core.finalize()
+
+    assert process.returncode == 0, f"stdout={stdout}\nstderr={stderr}"
+    nonzero = [any(abs(value) > 0.0 for value in frame.drive_wheel_speed_rad_s) for frame in frames]
+    assert any(nonzero), "C++ Command did not publish the sustained target"
+    first_active = nonzero.index(True)
+    last_active = len(nonzero) - 1 - nonzero[::-1].index(True)
+    assert all(nonzero[first_active:last_active + 1]), "C++ inserted a safe stop during continuous socket renewal"
+
+
+@pytest.mark.stage4_artifact
+def test_interactive_command_240hz_renewal_keeps_python_ecal_mailbox_active(tmp_path: Path) -> None:
+    """持续 socket 续租经真实 eCAL 到达 Python mailbox 时，100 ms watchdog 不得超时。"""
+    _require_real_ecal_interactive()
+    from slope_sim.interfaces.v2.descriptor import load_v2_descriptor
+    from slope_sim.interfaces.v2.runtime_protocol import V2RuntimeProtocol
+    from slope_sim.interfaces.v2.transport import create_v2_ecal_transport
+    from slope_sim.model_registry import get_robot_model
+
+    command = _command_binary()
+    root = Path(__file__).resolve().parents[2]
+    descriptor_bytes = (root / "slope_sim/interfaces/generated/slope_sim_interfaces_v2.desc").read_bytes()
+    descriptor_path = tmp_path / "v2.desc"
+    descriptor_path.write_bytes(descriptor_bytes)
+    payload = tmp_path / "identity.bin"
+    _write_identity_payload(payload, descriptor_bytes)
+    socket_dir = tmp_path / "socket"
+    socket_path = socket_dir / "command.sock"
+    launch_record = socket_dir / "command.launch.lock"
+    result = tmp_path / "result.json"
+    token = "d" * 64
+    descriptor = load_v2_descriptor()
+    transport = create_v2_ecal_transport(
+        descriptor=descriptor,
+        participant_name=f"runsim-command-mailbox-peer-{os.getpid()}",
+    )
+    protocol = V2RuntimeProtocol(
+        get_robot_model("df_mid"),
+        transport=transport,
+        descriptor=descriptor,
+        session_id_factory=lambda: b"s" * 16,
+    )
+    subscription = None
+    process = None
+    try:
+        subscription = transport.subscribe(
+            "/sim/wheel/command",
+            "slope_sim.interfaces.v2.WheelCommand",
+            lambda payload, received_at: protocol.accept_payload(payload, received_at=received_at),
+        )
+        process = subprocess.Popen(
+            _interactive_arguments(
+                command, descriptor_path, payload, result, launch_record,
+                duration_ms=1500, deadline_ms=2000,
+            ),
+            preexec_fn=_launch_record_writer(socket_dir, launch_record, token),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        deadline = time.monotonic() + 2.0
+        while not socket_path.exists() and time.monotonic() < deadline:
+            protocol.refresh_transport()
+            time.sleep(0.01)
+        assert socket_path.exists(), process.stderr.read()
+        while (
+            protocol.refresh_transport().topic_quality[0].protocol_state != "verified"
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        assert protocol.snapshot().command_protocol_state == "verified"
+        while transport.snapshot().received_count == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert transport.snapshot().received_count > 0, "Python transport did not receive C++ safe-stop frames"
+        target = _ndjson(
+            {"kind": "target", "token": token, "linear_velocity_m_s": 1.5, "angular_velocity_rad_s": 0.0}
+        )
+        timed_out_after_active = False
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.connect(str(socket_path))
+            next_send = time.monotonic()
+            end = next_send + 1.0
+            active_seen = False
+            while next_send < end:
+                protocol.refresh_transport()
+                client.sendall(target)
+                decision = protocol.mailbox.decision(now=time.monotonic())
+                active_seen = active_seen or not decision.waiting
+                timed_out_after_active = timed_out_after_active or (active_seen and decision.timed_out)
+                next_send += 1.0 / 240.0
+                time.sleep(max(0.0, next_send - time.monotonic()))
+        stdout, stderr = process.communicate(timeout=3)
+    finally:
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.communicate()
+        if subscription is not None:
+            subscription.close()
+        transport.close()
+
+    assert process.returncode == 0, f"stdout={stdout}\nstderr={stderr}"
+    assert active_seen, "Python mailbox never accepted the C++ command frames"
+    assert not timed_out_after_active, "Python mailbox timed out during continuous C++ command frames"
+
+
+@pytest.mark.stage4_artifact
 def test_interactive_command_accepts_subscriber_after_socket_server_starts(tmp_path: Path) -> None:
     """Python world 在 Command socket 就绪后才订阅时，Command 仍保持安全零速并可连接。"""
     _require_real_ecal_interactive()

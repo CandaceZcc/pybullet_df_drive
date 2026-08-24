@@ -44,6 +44,7 @@ _EVIDENCE_SECTIONS = (
 )
 _PREVIEW_MAX_HZ = 5.0
 _MAX_CLOUD_HISTORY_FRAMES = 512
+_MAX_CLOUD_RENDER_POINTS = 80_000
 _CLOUD_CAMERA_PRESETS = {
     "透视": {"distance": 24.0, "elevation": 26.0, "azimuth": 45.0},
     "俯视": {"distance": 24.0, "elevation": 90.0, "azimuth": 0.0},
@@ -472,6 +473,7 @@ class V2DashboardWidget(QWidget):
         self.cloud_color_mode.addItems(("语义", "距离", "高度"))
         self.cloud_display_mode = QComboBox(self.cloud_workbench)
         self.cloud_display_mode.addItems(("累计", "当前帧"))
+        self.cloud_current_frame_button = QPushButton("查看当前帧", self.cloud_workbench)
         self.cloud_camera_preset = QComboBox(self.cloud_workbench)
         self.cloud_camera_preset.addItems(tuple(_CLOUD_CAMERA_PRESETS))
         self.cloud_reset_view_button = QPushButton("重置视角", self.cloud_workbench)
@@ -488,6 +490,7 @@ class V2DashboardWidget(QWidget):
         cloud_controls.addRow("着色", self.cloud_color_mode)
         cloud_controls.addRow("显示", self.cloud_display_mode)
         cloud_controls.addRow("视角", self.cloud_camera_preset)
+        controls.addWidget(self.cloud_current_frame_button)
         controls.addLayout(cloud_controls)
         controls.addWidget(self.cloud_reset_view_button)
         controls.addWidget(self.cloud_fit_view_button)
@@ -502,7 +505,8 @@ class V2DashboardWidget(QWidget):
         workbench_layout.addWidget(self.cloud_controls)
         self.cloud_point_size_slider.valueChanged.connect(self._set_cloud_point_size)
         self.cloud_color_mode.currentTextChanged.connect(lambda _value: self._render_cloud())
-        self.cloud_display_mode.currentTextChanged.connect(lambda _value: self._render_cloud())
+        self.cloud_display_mode.currentTextChanged.connect(self._change_cloud_display_mode)
+        self.cloud_current_frame_button.clicked.connect(self._show_current_cloud_frame)
         self.cloud_camera_preset.currentTextChanged.connect(self._set_cloud_camera_preset)
         self.cloud_reset_view_button.clicked.connect(self._reset_cloud_view)
         self.cloud_fit_view_button.clicked.connect(self._fit_cloud_view)
@@ -527,17 +531,34 @@ class V2DashboardWidget(QWidget):
         self.cloud_view.setCameraPosition(**_CLOUD_CAMERA_PRESETS[preset])
 
     def _cloud_render_data(self) -> tuple[np.ndarray, np.ndarray]:
-        """按当前显示模式从有界 world 帧缓存构造散点输入。"""
+        """按显示模式先跨帧等距抽样，再构造有界散点输入。"""
         if self.cloud_display_mode.currentText() == "当前帧":
             frame = self._last_cloud_frame
             if frame is None:
                 return np.empty((0, 3), dtype=np.float32), np.empty(0, dtype=np.uint8)
-            return frame.positions, frame.tags
-        if not self._cloud_frames:
+            frames = (frame,)
+        else:
+            frames = tuple(self._cloud_frames)
+        total_points = sum(len(item.positions) for item in frames)
+        if total_points == 0:
             return np.empty((0, 3), dtype=np.float32), np.empty(0, dtype=np.uint8)
+        step = max(
+            1,
+            (total_points + _MAX_CLOUD_RENDER_POINTS - 1)
+            // _MAX_CLOUD_RENDER_POINTS,
+        )
+        position_chunks: list[np.ndarray] = []
+        tag_chunks: list[np.ndarray] = []
+        offset = 0
+        for item in frames:
+            first = (-offset) % step
+            if first < len(item.positions):
+                position_chunks.append(item.positions[first::step])
+                tag_chunks.append(item.tags[first::step])
+            offset += len(item.positions)
         return (
-            np.concatenate([item.positions for item in self._cloud_frames], axis=0),
-            np.concatenate([item.tags for item in self._cloud_frames], axis=0),
+            np.concatenate(position_chunks, axis=0),
+            np.concatenate(tag_chunks, axis=0),
         )
 
     def _render_cloud(self) -> None:
@@ -546,10 +567,6 @@ class V2DashboardWidget(QWidget):
             return
         assert self.cloud_scatter is not None and self.cloud_vehicle_marker is not None
         positions, tags = self._cloud_render_data()
-        max_render_points = 80_000
-        if len(positions) > max_render_points:
-            step = (len(positions) + max_render_points - 1) // max_render_points
-            positions, tags = positions[::step], tags[::step]
         self.cloud_scatter.setData(
             pos=positions,
             color=self._cloud_colors(positions, tags),
@@ -563,6 +580,47 @@ class V2DashboardWidget(QWidget):
             forward = np.asarray(frame.vehicle_forward, dtype=np.float32)
             marker = np.asarray((origin, origin + forward * 1.5), dtype=np.float32)
         self.cloud_vehicle_marker.setData(pos=marker, color=(0.96, 0.96, 0.96, 1.0), width=3.0)
+
+    def _show_current_cloud_frame(self) -> None:
+        """从窄侧栏的一键入口切到持续更新的当前帧视图。"""
+        already_current = self.cloud_display_mode.currentText() == "当前帧"
+        self.cloud_display_mode.setCurrentText("当前帧")
+        if already_current:
+            self._change_cloud_display_mode("当前帧")
+
+    def _change_cloud_display_mode(self, _mode: str) -> None:
+        """显示模式切换后在同一 GUI 事件内同步点云与状态文字。"""
+        self._render_cloud()
+        self._update_cloud_status()
+
+    def _update_cloud_status(self) -> None:
+        """按当前模式显示最新帧与实际进入显示窗口的点数。"""
+        frame = self._last_cloud_frame
+        if frame is None:
+            self.cloud_status.setText("等待已验证的 LiDAR/RTK/IMU 同刻数据")
+            return
+        window_ns = self.cloud_window_slider.value() * 100_000_000
+        display_count = (
+            len(frame.positions)
+            if self.cloud_display_mode.currentText() == "当前帧"
+            else sum(len(item.positions) for item in self._cloud_frames)
+        )
+        render_step = max(
+            1,
+            (display_count + _MAX_CLOUD_RENDER_POINTS - 1)
+            // _MAX_CLOUD_RENDER_POINTS,
+        )
+        rendered_count = (display_count + render_step - 1) // render_step
+        self.cloud_status.setText(
+            "%s | seq=%d | 本帧=%d | 时间窗=%0.1fs | 显示=%d"
+            % (
+                self.cloud_display_mode.currentText(),
+                frame.sequence,
+                len(frame.positions),
+                window_ns / 1_000_000_000,
+                rendered_count,
+            )
+        )
 
     def _fit_cloud_view(self) -> None:
         """使当前显示点范围居中，空帧时回到可重现的默认透视。"""
@@ -602,22 +660,9 @@ class V2DashboardWidget(QWidget):
             self._cloud_frames.popleft()
         while len(self._cloud_frames) > _MAX_CLOUD_HISTORY_FRAMES:
             self._cloud_frames.popleft()
-        if self.cloud_display_mode.currentText() == "当前帧":
-            display_count = len(frame.positions)
-        else:
-            display_count = sum(len(item.positions) for item in self._cloud_frames)
         if self.cloud_workbench.isChecked():
             self._render_cloud()
-        self.cloud_status.setText(
-            "%s | seq=%d | 本帧=%d | 时间窗=%0.1fs | 显示=%d"
-            % (
-                self.cloud_display_mode.currentText(),
-                frame.sequence,
-                len(frame.positions),
-                window_ns / 1_000_000_000,
-                display_count,
-            )
-        )
+        self._update_cloud_status()
         self.cloud_diagnostics.appendPlainText(
             "LiDAR seq=%d: accepted %d world points" % (frame.sequence, len(frame.positions))
         )

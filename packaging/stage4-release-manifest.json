@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "version": "4.0.1",
+  "version": "5.0.0",
   "runtime_setup": {
     "entrypoint": "scripts/stage4_release_setup.py"
   },
@@ -69,6 +69,13 @@
       "sha256": "64ff3e51119f37ffcfaf9deecbd987a7cb4d4d9035d74a3fd3773395a470fda1",
       "filename": "mcap-cpp-v1.4.0.tar.gz",
       "license": "Apache-2.0"
+    },
+    {
+      "name": "livox-viewer2-linux",
+      "url": "https://terra-1-g.djicdn.com/65c028cd298f4669a7f0e40e50ba1131/avia-2/Livox%20Viewer2%20Linux/Viewer2_2.6.0_Linux.zip",
+      "sha256": "3a1e574d3d73ba0b36460c2a358d08f6c722ae0dc376395ba392ec0d533c7e31",
+      "filename": "Viewer2_2.6.0_Linux.zip",
+      "license": "Livox Viewer 2 proprietary binary"
     }
   ]
 }

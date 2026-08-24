@@ -22,13 +22,13 @@ class _Server(socketserver.TCPServer):
     allow_reuse_address = True
 
 
-def test_formal_stage4_release_manifest_locks_the_seven_delivery_dependencies() -> None:
-    """正式 manifest 必须声明单机 `.run` 所需的七项锁定下载与 setup 入口。"""
+def test_formal_release_manifest_locks_the_eight_delivery_dependencies() -> None:
+    """正式 manifest 必须声明单机 `.run` 所需的八项锁定下载与 setup 入口。"""
     module = __import__("scripts.build_stage4_run", fromlist=["_manifest"])
 
     manifest = module._manifest(RELEASE_MANIFEST)
 
-    assert manifest["version"] == "4.0.1"
+    assert manifest["version"] == "5.0.0"
     assert "with_ros" not in manifest
     assert manifest["payload"] is None
     assert manifest["runtime_setup"] == {"entrypoint": "scripts/stage4_release_setup.py"}
@@ -41,6 +41,7 @@ def test_formal_stage4_release_manifest_locks_the_seven_delivery_dependencies() 
         "ecal",
         "ecal-python",
         "mcap",
+        "livox-viewer2-linux",
     }
     assert dependencies["micromamba"]["sha256"] == "9689782d863c05a1bf5d2d371ba527104e7a4eb4310c1637d8653b751aed9c82"
     assert dependencies["abseil-cpp"] == {
@@ -55,6 +56,7 @@ def test_formal_stage4_release_manifest_locks_the_seven_delivery_dependencies() 
     assert dependencies["protobuf"]["sha256"] == "16498d7dc7967e9b100632138babd4b86b61592beeccdd556f67539d9c231355"
     assert dependencies["protobuf-python"]["sha256"] == "e9db7e292e0ab79dd108d7f1a94fe31601ce1ee3f7b79e0692043423020b0593"
     assert dependencies["mcap"]["sha256"] == "64ff3e51119f37ffcfaf9deecbd987a7cb4d4d9035d74a3fd3773395a470fda1"
+    assert dependencies["livox-viewer2-linux"]["sha256"] == "3a1e574d3d73ba0b36460c2a358d08f6c722ae0dc376395ba392ec0d533c7e31"
 
 
 def test_formal_release_python_runtime_has_no_private_channel_dependency() -> None:
@@ -88,6 +90,31 @@ def test_formal_release_python_runtime_locks_pip_for_embedded_wheels() -> None:
     assert "  - pip\n" in environment
     assert "- name: pip\n" in conda_lock
     assert "/pip-" in explicit_lock
+
+
+def test_formal_system_lock_includes_the_viewer_sandbox() -> None:
+    """Livox Viewer 的隔离启动和导入依赖必须由正式安装器锁定。"""
+    document = json.loads(
+        (ROOT / "packaging/locks/ubuntu24-system-dependencies.lock").read_text(
+            encoding="utf-8"
+        )
+    )
+    packages = {package["name"]: package for package in document["apt_packages"]}
+    assert packages["bubblewrap"] == {
+        "name": "bubblewrap",
+        "version": "0.9.0-1ubuntu0.1",
+        "architecture": "amd64",
+    }
+    assert packages["xdotool"] == {
+        "name": "xdotool",
+        "version": "1:3.20160805.1-5build1",
+        "architecture": "amd64",
+    }
+    assert packages["libxdo3"] == {
+        "name": "libxdo3",
+        "version": "1:3.20160805.1-5build1",
+        "architecture": "amd64",
+    }
 
 
 def test_run_installer_uses_embedded_project_payload_without_network_payload(tmp_path: Path) -> None:
@@ -135,6 +162,76 @@ def test_run_installer_uses_embedded_project_payload_without_network_payload(tmp
     release_manifest = json.loads((release / "manifest.json").read_text(encoding="utf-8"))
     assert len(release_manifest["payload_sha256"]) == 64
     assert "runtime.bin" not in release_manifest["files"]
+
+
+def test_run_installer_can_publish_a_bare_runsim_command(tmp_path: Path) -> None:
+    """显式命令目录必须得到跟随 current 的稳定 runSim 入口。"""
+    project_payload = tmp_path / "project-payload"
+    launcher = project_payload / "bin" / "runSim"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text("#!/bin/sh\necho installed-runsim\n", encoding="utf-8")
+    launcher.chmod(0o755)
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps({"schema_version": 1, "version": "5.0.0"}),
+        encoding="utf-8",
+    )
+    installer = tmp_path / "runSim.run"
+    subprocess.run(
+        [
+            sys.executable,
+            str(BUILDER),
+            "--manifest",
+            str(manifest_path),
+            "--project-payload",
+            str(project_payload),
+            "--output",
+            str(installer),
+        ],
+        check=True,
+    )
+    install_root = tmp_path / "install"
+    command_dir = tmp_path / "bin"
+
+    installed = subprocess.run(
+        [
+            str(installer),
+            "--install-root",
+            str(install_root),
+            "--command-dir",
+            str(command_dir),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert installed.returncode == 0, installed.stderr
+    command = command_dir / "runSim"
+    assert command.is_symlink()
+    assert command.resolve() == install_root / "releases" / "5.0.0" / "bin" / "runSim"
+    invoked = subprocess.run(
+        [str(command)], check=False, capture_output=True, text=True
+    )
+    assert invoked.returncode == 0
+    assert invoked.stdout == "installed-runsim\n"
+    command.unlink()
+    command.write_text("do not overwrite\n", encoding="utf-8")
+    rejected = subprocess.run(
+        [
+            str(installer),
+            "--install-root",
+            str(install_root),
+            "--command-dir",
+            str(command_dir),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert rejected.returncode == 1
+    assert rejected.stderr == "error: runSim command path already exists and is unmanaged\n"
+    assert command.read_text(encoding="utf-8") == "do not overwrite\n"
 
 
 def test_run_installer_downloads_verified_payload_into_versioned_release(tmp_path: Path) -> None:
@@ -412,6 +509,9 @@ def test_run_installer_bootstraps_locked_system_tools_before_runtime_setup(tmp_p
                     {"name": "cmake", "version": "3.28.3-1build7", "architecture": "amd64"},
                     {"name": "g++", "version": "4:13.2.0-7ubuntu1", "architecture": "amd64"},
                     {"name": "make", "version": "4.3-4.1build2", "architecture": "amd64"},
+                    {"name": "bubblewrap", "version": "0.9.0-1ubuntu0.1", "architecture": "amd64"},
+                    {"name": "xdotool", "version": "1:3.20160805.1-5build1", "architecture": "amd64"},
+                    {"name": "libxdo3", "version": "1:3.20160805.1-5build1", "architecture": "amd64"},
                     {"name": "libssl-dev", "version": "3.0.13-0ubuntu3.12", "architecture": "amd64"},
                     {"name": "libyaml-cpp-dev", "version": "0.8.0+dfsg-6build1", "architecture": "amd64"},
                 ],
@@ -480,7 +580,7 @@ def test_run_installer_bootstraps_locked_system_tools_before_runtime_setup(tmp_p
         "apt-get update",
         "apt-get install --yes python3",
         "apt-get update",
-        "apt-get install --yes cmake g++ make libssl-dev libyaml-cpp-dev",
+        "apt-get install --yes cmake g++ make bubblewrap xdotool libxdo3 libssl-dev libyaml-cpp-dev",
     ]
 
 

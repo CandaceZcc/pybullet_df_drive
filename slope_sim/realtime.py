@@ -50,6 +50,57 @@ class PacingStatistics:
     total_yield_requested_sec: float
 
 
+@dataclass(frozen=True, slots=True)
+class ControlPathSample:
+    """开发期开关下的有界控制链节拍快照。"""
+
+    loop_count: int
+    max_loop_gap_sec: float
+    max_send_elapsed_sec: float
+
+
+class ControlPathDiagnostics:
+    """汇总 GUI 主循环与 Command socket 续租耗时，不在默认路径创建或输出。"""
+
+    def __init__(self, period_sec: Real = 1.0) -> None:
+        self._period_sec = _finite_number("period_sec", period_sec, allow_zero=False)
+        self._next_sample_at: float | None = None
+        self._last_loop_at: float | None = None
+        self._loop_count = 0
+        self._max_loop_gap_sec = 0.0
+        self._max_send_elapsed_sec = 0.0
+
+    def record_loop(self, *, now: Real) -> None:
+        observed_at = _finite_number("now", now, allow_zero=True)
+        if self._last_loop_at is not None:
+            self._max_loop_gap_sec = max(self._max_loop_gap_sec, observed_at - self._last_loop_at)
+        self._last_loop_at = observed_at
+        self._loop_count += 1
+        if self._next_sample_at is None:
+            self._next_sample_at = observed_at + self._period_sec
+
+    def record_send(self, *, elapsed_sec: Real) -> None:
+        self._max_send_elapsed_sec = max(
+            self._max_send_elapsed_sec,
+            _finite_number("elapsed_sec", elapsed_sec, allow_zero=True),
+        )
+
+    def sample_if_due(self, *, now: Real) -> ControlPathSample | None:
+        observed_at = _finite_number("now", now, allow_zero=True)
+        if self._next_sample_at is None or observed_at < self._next_sample_at:
+            return None
+        sample = ControlPathSample(
+            loop_count=self._loop_count,
+            max_loop_gap_sec=self._max_loop_gap_sec,
+            max_send_elapsed_sec=self._max_send_elapsed_sec,
+        )
+        self._next_sample_at = observed_at + self._period_sec
+        self._loop_count = 0
+        self._max_loop_gap_sec = 0.0
+        self._max_send_elapsed_sec = 0.0
+        return sample
+
+
 class RuntimeObservationCadence:
     """以低频推进 discovery，同时为每个物理帧返回新墙钟。"""
 

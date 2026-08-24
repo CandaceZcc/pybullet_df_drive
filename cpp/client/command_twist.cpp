@@ -9,7 +9,8 @@
 namespace slope_sim::client::v2 {
 namespace {
 
-constexpr float kMaxLinearVelocityMps = 1.2F;
+// 与 runsim_session.py 的正式 socket 合同一致，避免合法 GUI/RC 目标被 Command 静默归零。
+constexpr float kMaxLinearVelocityMps = 3.0F;
 constexpr float kMaxAngularVelocityRadS = 1.2F;
 constexpr float kWheelRadiusM = 0.10F;
 constexpr float kWheelTrackM = 0.50F;

@@ -95,7 +95,7 @@ int main() {
   ScopedDirectory directory;
   const std::string token(64U, 'a');
   const InteractiveAuthentication authentication{
-      getpid(), geteuid(), directory.path() + "/command.sock", token};
+      getpid(), geteuid(), getppid(), directory.path() + "/command.sock", token};
   InteractiveSocketServer server(authentication);
   const int client = Connect(authentication.socket_path.string());
   try {

@@ -32,9 +32,15 @@ int main() {
   Require(active.steering_wheel_speed_rad_s[0] == active.steering_wheel_speed_rad_s[1],
           "active steering speeds differ");
 
+  const auto high_speed = MotionForTwist(RobotCommandShape::kDifferential, 1.5F, 0.0F);
+  Require(std::abs(high_speed.drive_wheel_speed_rad_s[0] - 15.0F) < 1e-6F,
+          "Python contract high-speed target was rejected or converted incorrectly");
+  Require(std::abs(high_speed.drive_wheel_speed_rad_s[1] - 15.0F) < 1e-6F,
+          "Python contract high-speed target was rejected or converted incorrectly");
+
   bool rejected = false;
   try {
-    (void)MotionForTwist(RobotCommandShape::kDifferential, 1.21F, 0.0F);
+    (void)MotionForTwist(RobotCommandShape::kDifferential, 3.01F, 0.0F);
   } catch (const std::invalid_argument&) {
     rejected = true;
   }

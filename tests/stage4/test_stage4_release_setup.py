@@ -6,8 +6,12 @@ import hashlib
 import io
 from pathlib import Path
 import subprocess
+import stat
 import sys
 import tarfile
+import zipfile
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -29,6 +33,133 @@ def test_release_setup_installs_payload_run_sim_into_release_bin(tmp_path: Path)
     installed = release / "bin" / "runSim"
     assert installed.read_text(encoding="utf-8") == source.read_text(encoding="utf-8")
     assert installed.stat().st_mode & 0o111
+
+
+def test_release_setup_installs_the_locked_official_livox_viewer_bundle(
+    tmp_path: Path,
+) -> None:
+    """官方 Viewer ZIP 必须进入固定 release 路径并恢复启动权限。"""
+    module = __import__("scripts.stage4_release_setup", fromlist=["_install_locked_livox_viewer"])
+    release = tmp_path / "release"
+    dependencies = release / "dependencies"
+    dependencies.mkdir(parents=True)
+    archive = dependencies / "Viewer2_2.6.0_Linux.zip"
+    with zipfile.ZipFile(archive, "w") as output:
+        output.writestr("Viewer2_2.6.0_Linux/LivoxViewer2.sh", "#!/bin/sh\n")
+        output.writestr(
+            "Viewer2_2.6.0_Linux/LivoxViewer2/Binaries/Linux/LivoxViewer2",
+            "viewer binary\n",
+        )
+    locked = [{
+        "name": "livox-viewer2-linux",
+        "license": "Livox Viewer 2 proprietary binary",
+        "filename": "dependencies/Viewer2_2.6.0_Linux.zip",
+        "sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
+    }]
+
+    installed = module._install_locked_livox_viewer(release, dependencies, locked)
+
+    assert installed == (
+        release / "share" / "slope-sim" / "livox-viewer" / "Viewer2_2.6.0_Linux"
+    )
+    assert (installed / "LivoxViewer2.sh").stat().st_mode & 0o111
+    assert (
+        installed / "LivoxViewer2" / "Binaries" / "Linux" / "LivoxViewer2"
+    ).stat().st_mode & 0o111
+
+
+@pytest.mark.parametrize("unsafe_name", [
+    "../escape",
+    "Viewer2_2.6.0_Linux/../escape",
+])
+def test_release_setup_rejects_livox_viewer_zip_path_escape(
+    tmp_path: Path, unsafe_name: str,
+) -> None:
+    """Viewer ZIP 的绝对根外成员不得写出固定 release 目录。"""
+    module = __import__("scripts.stage4_release_setup", fromlist=["_install_locked_livox_viewer"])
+    release = tmp_path / "release"
+    dependencies = release / "dependencies"
+    dependencies.mkdir(parents=True)
+    archive = dependencies / "Viewer2_2.6.0_Linux.zip"
+    with zipfile.ZipFile(archive, "w") as output:
+        output.writestr(unsafe_name, "escape")
+    locked = [{
+        "name": "livox-viewer2-linux",
+        "filename": "dependencies/Viewer2_2.6.0_Linux.zip",
+    }]
+
+    with pytest.raises(ValueError, match="locked Livox Viewer bundle is invalid"):
+        module._install_locked_livox_viewer(release, dependencies, locked)
+
+    assert not (release / "share" / "slope-sim" / "livox-viewer").exists()
+    assert not (release / "share" / "slope-sim" / "escape").exists()
+
+
+def test_release_setup_rejects_livox_viewer_zip_symlink(tmp_path: Path) -> None:
+    """Viewer ZIP 不能借 POSIX 符号链接绕过目标路径检查。"""
+    module = __import__("scripts.stage4_release_setup", fromlist=["_install_locked_livox_viewer"])
+    release = tmp_path / "release"
+    dependencies = release / "dependencies"
+    dependencies.mkdir(parents=True)
+    archive = dependencies / "Viewer2_2.6.0_Linux.zip"
+    link = zipfile.ZipInfo("Viewer2_2.6.0_Linux/LivoxViewer2.sh")
+    link.create_system = 3
+    link.external_attr = (stat.S_IFLNK | 0o777) << 16
+    with zipfile.ZipFile(archive, "w") as output:
+        output.writestr(link, "/tmp/escape")
+    locked = [{
+        "name": "livox-viewer2-linux",
+        "filename": "dependencies/Viewer2_2.6.0_Linux.zip",
+    }]
+
+    with pytest.raises(ValueError, match="locked Livox Viewer bundle is invalid"):
+        module._install_locked_livox_viewer(release, dependencies, locked)
+
+
+def test_release_setup_rejects_duplicate_livox_viewer_zip_members(tmp_path: Path) -> None:
+    """重复成员不能靠后写入覆盖已验证的 Viewer 文件。"""
+    module = __import__("scripts.stage4_release_setup", fromlist=["_install_locked_livox_viewer"])
+    release = tmp_path / "release"
+    dependencies = release / "dependencies"
+    dependencies.mkdir(parents=True)
+    archive = dependencies / "Viewer2_2.6.0_Linux.zip"
+    with zipfile.ZipFile(archive, "w") as output:
+        output.writestr("Viewer2_2.6.0_Linux/LivoxViewer2.sh", "first")
+        with pytest.warns(UserWarning, match="Duplicate name"):
+            output.writestr("Viewer2_2.6.0_Linux/LivoxViewer2.sh", "second")
+    locked = [{
+        "name": "livox-viewer2-linux",
+        "filename": "dependencies/Viewer2_2.6.0_Linux.zip",
+    }]
+
+    with pytest.raises(ValueError, match="locked Livox Viewer bundle is invalid"):
+        module._install_locked_livox_viewer(release, dependencies, locked)
+
+
+@pytest.mark.parametrize("limit_name", ["_LIVOX_VIEWER_MAX_FILES", "_LIVOX_VIEWER_MAX_BYTES"])
+def test_release_setup_rejects_livox_viewer_zip_over_bounds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, limit_name: str,
+) -> None:
+    """Viewer ZIP 的成员数或声明解压体积超过上限时必须 fail closed。"""
+    module = __import__("scripts.stage4_release_setup", fromlist=["_install_locked_livox_viewer"])
+    release = tmp_path / "release"
+    dependencies = release / "dependencies"
+    dependencies.mkdir(parents=True)
+    archive = dependencies / "Viewer2_2.6.0_Linux.zip"
+    with zipfile.ZipFile(archive, "w") as output:
+        output.writestr("Viewer2_2.6.0_Linux/LivoxViewer2.sh", "#!/bin/sh\n")
+        output.writestr(
+            "Viewer2_2.6.0_Linux/LivoxViewer2/Binaries/Linux/LivoxViewer2",
+            "viewer binary\n",
+        )
+    monkeypatch.setattr(module, limit_name, 1)
+    locked = [{
+        "name": "livox-viewer2-linux",
+        "filename": "dependencies/Viewer2_2.6.0_Linux.zip",
+    }]
+
+    with pytest.raises(ValueError, match="locked Livox Viewer bundle is invalid"):
+        module._install_locked_livox_viewer(release, dependencies, locked)
 
 
 def test_release_setup_installs_locked_ecal_configuration(tmp_path: Path) -> None:
