@@ -246,6 +246,57 @@ def test_release_setup_bypasses_the_slow_proxy_only_for_locked_conda_runtime(
     assert environment["NO_PROXY"] == "localhost,127.0.0.1,conda.anaconda.org"
 
 
+def test_release_setup_runs_locked_micromamba_with_supported_basename(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Conda post-link 脚本必须看到标准 micromamba 可执行文件名。"""
+    module = __import__("scripts.stage4_release_setup", fromlist=["_create_locked_python_runtime"])
+    release = tmp_path / "release"
+    locked_micromamba = release / "dependencies" / "micromamba-linux-64"
+    lock = release / "packaging" / "locks" / "python-linux-64.lock"
+    build_root = release / ".stage4-build"
+    locked_micromamba.parent.mkdir(parents=True)
+    locked_micromamba.write_bytes(b"locked micromamba\n")
+    locked_micromamba.chmod(0o755)
+    lock.parent.mkdir(parents=True)
+    lock.write_text("https://conda.anaconda.org/conda-forge/linux-64/example.conda#digest\n", encoding="utf-8")
+    captured: dict[str, object] = {}
+
+    def fake_run(command, **kwargs):
+        if "env" in kwargs:
+            captured["command"] = command
+            captured["environment"] = kwargs["env"]
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    monkeypatch.setattr(module, "_locked_runtime_python", lambda runtime: runtime / "bin" / "python")
+    monkeypatch.setattr(module, "_install_locked_python_wheels", lambda *args: None)
+
+    module._create_locked_python_runtime(
+        release,
+        locked_micromamba.parent,
+        [
+            {
+                "name": "micromamba",
+                "filename": "dependencies/micromamba-linux-64",
+                "license": "BSD-3-Clause",
+                "sha256": "0" * 64,
+            }
+        ],
+        build_root,
+    )
+
+    runner = build_root / "micromamba"
+    command = captured["command"]
+    environment = captured["environment"]
+    assert isinstance(command, list)
+    assert isinstance(environment, dict)
+    assert command[0] == str(runner)
+    assert environment["MAMBA_EXE"] == str(runner)
+    assert runner.read_bytes() == locked_micromamba.read_bytes()
+    assert runner.stat().st_mode & 0o111
+
+
 def test_release_setup_probes_mapping_runtime_imports(tmp_path: Path, monkeypatch) -> None:
     """锁定 Python 创建后必须验证 MCAP 与双 OpenGL 回放依赖可导入。"""
     module = __import__("scripts.stage4_release_setup", fromlist=["_create_locked_python_runtime"])

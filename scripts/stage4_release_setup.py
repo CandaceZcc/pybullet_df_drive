@@ -399,6 +399,13 @@ def _create_locked_python_runtime(
     runtime = release_root / "runtime"
     if runtime.exists() or runtime.is_symlink():
         raise ValueError("locked Python runtime already exists")
+    build_root.mkdir(mode=0o755, parents=True, exist_ok=True)
+    micromamba_runner = build_root / "micromamba"
+    if micromamba_runner.exists() or micromamba_runner.is_symlink():
+        raise ValueError("micromamba build runner already exists")
+    # Conda 的 post-link 脚本只接受 mamba/micromamba 作为 MAMBA_EXE basename。
+    shutil.copy2(micromamba, micromamba_runner, follow_symlinks=False)
+    micromamba_runner.chmod(0o755)
     # Conda 官方源在目标机直连可用；不继承慢速全局代理，其他安装下载仍保留其原环境。
     environment = os.environ.copy()
     for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
@@ -407,9 +414,10 @@ def _create_locked_python_runtime(
     if "conda.anaconda.org" not in no_proxy:
         no_proxy.append("conda.anaconda.org")
     environment["NO_PROXY"] = ",".join(no_proxy)
+    environment["MAMBA_EXE"] = str(micromamba_runner)
     subprocess.run(
         [
-            str(micromamba),
+            str(micromamba_runner),
             "create",
             "--no-rc",
             "--no-env",
