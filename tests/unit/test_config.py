@@ -64,6 +64,20 @@ def test_stage1_uses_real_physics_and_rejects_legacy_kinematic_mode():
         ExperimentConfig(drive_model="kinematic")
 
 
+def test_experiment_yaml_defaults_to_the_requested_manual_speed_profile():
+    """默认入口以 1.5 m/s 前进、1.0 rad/s 转向启动。"""
+    config = load_config(Path("configs/experiment.yaml"))
+
+    assert config.target_linear_velocity == 1.5
+    assert config.target_angular_velocity == 1.0
+
+
+def test_telemetry_log_rate_defaults_to_20hz_and_accepts_full_diagnostics_rate():
+    """日常 CSV 为低频采样；240 Hz 必须由诊断配置显式请求。"""
+    assert ExperimentConfig().telemetry_log_hz == 20.0
+    assert ExperimentConfig(telemetry_log_hz=240.0).telemetry_log_hz == 240.0
+
+
 def test_gui_config_defaults_to_front_camera_following():
     config = ExperimentConfig(mode="gui")
 

@@ -2,6 +2,19 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
+
+
+def test_command_exposes_only_its_supervised_child_pid_for_resource_monitoring() -> None:
+    """资源页可观察 Command，但不需要触碰认证 session 或 socket。"""
+    from slope_sim.interfaces.v2.runsim_v2_command import RunSimV2Command
+
+    command = RunSimV2Command(
+        SimpleNamespace(process=SimpleNamespace(pid=7123)),
+        SimpleNamespace(),
+    )
+
+    assert command.process_pid == 7123
 
 
 def test_command_builder_writes_matching_template_and_bounded_interactive_argv(

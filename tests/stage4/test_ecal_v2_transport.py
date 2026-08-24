@@ -1,5 +1,6 @@
 """阶段四 A Task 11：v2 raw eCAL transport 的有界发送与协议门禁。"""
 from dataclasses import dataclass
+from importlib import import_module
 from threading import Event, Thread
 import time
 import pytest
@@ -148,6 +149,36 @@ def test_v2_transport_sends_exact_raw_bytes(descriptor) -> None:
         )
         transport.wait_idle(timeout_sec=1.0)
         assert bindings.sent_payloads == [payload]
+    finally:
+        transport.close()
+
+
+def test_v2_dashboard_transport_subscribes_to_all_five_v2_topics(descriptor) -> None:
+    """Dashboard 必须是独立 eCAL participant，并订阅而非发布全部五个 topic。"""
+    module = require_wished_module("slope_sim.interfaces.v2.transport")
+    bindings = FakeRawV2Bindings()
+    transport = module.create_v2_ecal_transport(
+        descriptor=descriptor,
+        participant_name="slope-sim-v2-dashboard",
+        role="dashboard",
+        bindings=bindings,
+    )
+    try:
+        contracts = import_module("slope_sim.interfaces.v2.topics").V2_TOPICS
+        for contract in contracts:
+            transport.subscribe(contract.topic, contract.type_name, lambda *_args: None)
+        subscribers = {
+            resource.topic
+            for resource in bindings.resources
+            if resource.direction == "subscriber"
+        }
+        publishers = {
+            resource.topic
+            for resource in bindings.resources
+            if resource.direction == "publisher"
+        }
+        assert subscribers == {contract.topic for contract in contracts}
+        assert publishers == set()
     finally:
         transport.close()
 

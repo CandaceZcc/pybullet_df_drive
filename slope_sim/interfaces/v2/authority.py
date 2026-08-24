@@ -118,8 +118,8 @@ class CommandAuthority:
 
             owner = (command.source_id, command.source_session_id)
             if self._owner is None:
-                if command.sequence != 0:
-                    return CommandAcceptance(False, "first command sequence must be zero")
+                # metadata pending 期间的帧必须 fail-closed 丢弃；首个 verified 帧可
+                # 能已经不是发布者的 sequence 0，仍应成为该连续流的基准。
                 if commit() is not True:
                     return CommandAcceptance(False, "mailbox commit rejected")
                 self._owner = owner

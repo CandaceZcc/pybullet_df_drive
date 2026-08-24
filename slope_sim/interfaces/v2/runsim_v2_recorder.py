@@ -1,6 +1,7 @@
 """runSim v2：Dashboard 对唯一 C++ Recorder 的受认证编排。"""
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 import os
 from datetime import datetime
@@ -17,6 +18,14 @@ import time
 _MID360_PATTERN_VERSION = "livox-mid360-800000-v1"
 _MID360_PATTERN_SHA256 = "4077e0b68a68e40ba8a5da17d4aff5ba86ea4fb557a4f8b594e4de1ebbeb20ca"
 _RECORDER_DEADLINE_MS = 21_600_000
+
+
+@dataclass(frozen=True, slots=True)
+class CaptureOutputDirectories:
+    """同一输出根中的暂存与最终采集目录。"""
+
+    staging_dir: Path
+    published_dir: Path
 
 
 def _terminate_process_group(process: subprocess.Popen[object]) -> None:
@@ -43,7 +52,7 @@ def create_capture_output_dir(output_root: Path, *, now: datetime | None = None)
     timestamp = (datetime.now() if now is None else now).strftime("%Y%m%d-%H%M%S")
     base = f"capture-{timestamp}"
     for suffix in range(10_000):
-        name = base if suffix == 0 else f"{base}-{suffix}"
+        name = base if suffix == 0 else f"{base}-{suffix:02d}"
         candidate = output_root / name
         try:
             candidate.mkdir()
@@ -51,6 +60,139 @@ def create_capture_output_dir(output_root: Path, *, now: datetime | None = None)
         except FileExistsError:
             continue
     raise RuntimeError("capture output directory suffix space is exhausted")
+
+
+def prepare_capture_output_dirs(
+    output_root: Path, *, now: datetime | None = None,
+) -> CaptureOutputDirectories:
+    """预留最终目录名，但只创建隐藏暂存目录以隔离未完成采集。"""
+    if not isinstance(output_root, Path) or not output_root.is_absolute():
+        raise ValueError("output_root must be an absolute Path")
+    output_root.mkdir(mode=0o755, parents=True, exist_ok=True)
+    timestamp = (datetime.now() if now is None else now).strftime("%Y%m%d-%H%M%S")
+    base = f"capture-{timestamp}"
+    for suffix in range(10_000):
+        name = base if suffix == 0 else f"{base}-{suffix:02d}"
+        published = output_root / name
+        staging = output_root / f".{name}.tmp"
+        if published.exists():
+            continue
+        try:
+            staging.mkdir()
+        except FileExistsError:
+            continue
+        return CaptureOutputDirectories(staging, published)
+    raise RuntimeError("capture output directory suffix space is exhausted")
+
+
+def _capture_artifact_paths(output_dir: Path) -> tuple[str, ...]:
+    """确认导出器交付完整的原始、转换和回执文件。"""
+    required = (
+        "session.mcap",
+        "recorder.result.json",
+        "export.result.json",
+        "export/lidar.lvx2",
+    )
+    missing = [name for name in required if not (output_dir / name).is_file()]
+    pcd = tuple(sorted(output_dir.glob("export/**/*.pcd")))
+    ply = tuple(sorted(output_dir.glob("export/**/*.ply")))
+    if missing or not pcd or not ply:
+        detail = ", ".join([*missing, "PCD" if not pcd else "", "PLY" if not ply else ""])
+        raise RuntimeError(f"capture export is incomplete: {detail.strip(', ')}")
+    return (
+        *(str(path.relative_to(output_dir)) for path in pcd),
+        *(str(path.relative_to(output_dir)) for path in ply),
+        "export/lidar.lvx2",
+        "export.result.json",
+        "recorder.result.json",
+        "session.mcap",
+    )
+
+
+def _write_capture_manifest(output_dir: Path, artifacts: tuple[str, ...]) -> Path:
+    """在暂存目录内原子写入完成清单，改名前不对 Dashboard 可见。"""
+    target = output_dir / "capture.manifest.json"
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".capture.manifest.", suffix=".tmp", dir=output_dir,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
+            json.dump({"status": "complete", "artifacts": list(artifacts)}, stream, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(target)
+        return target
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _rebind_published_recorder_result(paths: CaptureOutputDirectories) -> None:
+    """暂存目录改名前，将 C++ 回执绑定到即将公开的 MCAP 绝对路径。"""
+    result_path = paths.staging_dir / "recorder.result.json"
+    try:
+        document = json.loads(result_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise RuntimeError("capture Recorder receipt is invalid") from error
+    staging_mcap = paths.staging_dir / "session.mcap"
+    published_mcap = paths.published_dir / "session.mcap"
+    if not isinstance(document, dict) or document.get("mcap") != str(staging_mcap):
+        raise RuntimeError("capture Recorder receipt does not bind its staged MCAP")
+    document["mcap"] = str(published_mcap)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".recorder.result.", suffix=".tmp", dir=paths.staging_dir,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
+            json.dump(document, stream, separators=(",", ":"))
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(result_path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def mark_capture_output_incomplete(output_dir: Path, reason: str) -> Path:
+    """为暂存失败保留有界诊断；它绝不更新最近成功导出。"""
+    if not isinstance(output_dir, Path) or not output_dir.is_dir():
+        raise ValueError("output_dir must be an existing directory")
+    if not isinstance(reason, str) or not reason:
+        raise ValueError("reason must be a nonempty string")
+    target = output_dir / "capture.incomplete.json"
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".capture.incomplete.", suffix=".tmp", dir=output_dir,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
+            json.dump({"status": "incomplete", "reason": reason}, stream, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(target)
+        return target
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def publish_capture_output(paths: CaptureOutputDirectories) -> Path:
+    """校验暂存采集后原子改名发布，最终目录绝不包含半成品。"""
+    if type(paths) is not CaptureOutputDirectories:
+        raise ValueError("paths must be CaptureOutputDirectories")
+    if (
+        not paths.staging_dir.is_dir()
+        or paths.published_dir.exists()
+        or paths.staging_dir.parent != paths.published_dir.parent
+    ):
+        raise ValueError("capture output directories are invalid")
+    artifacts = _capture_artifact_paths(paths.staging_dir)
+    _rebind_published_recorder_result(paths)
+    _write_capture_manifest(paths.staging_dir, artifacts)
+    paths.staging_dir.replace(paths.published_dir)
+    return paths.published_dir
 
 
 def write_latest_successful_lvx2_path(output_root: Path, lvx2_path: Path) -> Path:
@@ -101,12 +243,16 @@ class RunSimV2Recorder:
         control_token: bytes,
         control_dir: Path,
         output_dir: Path,
+        published_output_dir: Path | None = None,
     ) -> None:
         self._process = process
         self._control_socket = control_socket
         self._control_token = control_token
         self._control_dir = control_dir
         self._output_dir = output_dir
+        self._published_output_dir = (
+            output_dir if published_output_dir is None else published_output_dir
+        )
 
     @classmethod
     def launch(
@@ -116,6 +262,7 @@ class RunSimV2Recorder:
         snapshot: object,
         scene_id: str,
         output_dir: Path,
+        published_output_dir: Path | None = None,
     ) -> "RunSimV2Recorder":
         """从安装 release 启动唯一 Recorder，并等待其认证 socket 就绪。"""
         executable = release_root / "bin" / "slope_sim_stage4_recorder"
@@ -153,6 +300,7 @@ class RunSimV2Recorder:
                 control_token=token,
                 control_dir=control_dir,
                 output_dir=output_dir,
+                published_output_dir=published_output_dir,
             )
         except BaseException:
             if process is not None and process.poll() is None:
@@ -206,21 +354,34 @@ class RunSimV2Recorder:
         descriptor_set = release_root / "slope_sim/interfaces/generated/slope_sim_interfaces_v2.desc"
         if not executable.is_file() or not executable.stat().st_mode & 0o111:
             raise RuntimeError(f"runSim v2 Export executable is unavailable: {executable}")
-        subprocess.run(
-            build_export_argv(
-                executable=executable,
-                descriptor_set=descriptor_set,
-                mcap_path=mcap_path,
-                output_dir=self._output_dir,
-            ),
-            check=True,
-        )
-        lvx2 = self._output_dir / "export" / "lidar.lvx2"
-        result = self._output_dir / "export.result.json"
-        if not lvx2.is_file() or not result.is_file():
-            raise RuntimeError("runSim v2 Export did not publish LVX2 and result")
-        write_latest_successful_lvx2_path(self._output_dir.parent, lvx2)
-        return lvx2, result
+        try:
+            subprocess.run(
+                build_export_argv(
+                    executable=executable,
+                    descriptor_set=descriptor_set,
+                    mcap_path=mcap_path,
+                    output_dir=self._output_dir,
+                ),
+                check=True,
+            )
+            staging_lvx2 = self._output_dir / "export" / "lidar.lvx2"
+            staging_result = self._output_dir / "export.result.json"
+            if not staging_lvx2.is_file() or not staging_result.is_file():
+                raise RuntimeError("runSim v2 Export did not publish LVX2 and result")
+            if self._published_output_dir != self._output_dir:
+                publish_capture_output(
+                    CaptureOutputDirectories(self._output_dir, self._published_output_dir)
+                )
+            lvx2 = self._published_output_dir / "export" / "lidar.lvx2"
+            result = self._published_output_dir / "export.result.json"
+            write_latest_successful_lvx2_path(self._published_output_dir.parent, lvx2)
+            return lvx2, result
+        except Exception as error:
+            if self._published_output_dir != self._output_dir and self._output_dir.is_dir():
+                mark_capture_output_incomplete(
+                    self._output_dir, str(error) or type(error).__name__,
+                )
+            raise
 
     def _send(self, kind: str) -> None:
         if kind not in {"start", "stop"}:

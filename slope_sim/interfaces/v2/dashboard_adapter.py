@@ -6,18 +6,24 @@ import json
 from pathlib import Path
 import time
 from typing import Callable
+from collections import deque
 
+import numpy as np
+from pyqtgraph import Vector
+import pyqtgraph.opengl as gl
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QPainterPath, QPen
 from PySide6.QtWidgets import (
     QFormLayout,
+    QComboBox,
     QGroupBox,
     QGraphicsScene,
     QGraphicsView,
-    QHBoxLayout,
     QLabel,
     QPlainTextEdit,
     QPushButton,
+    QSizePolicy,
+    QSlider,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -37,6 +43,19 @@ _EVIDENCE_SECTIONS = (
     "recorder", "replay", "export", "viewer_startup", "viewer_display",
 )
 _PREVIEW_MAX_HZ = 5.0
+_MAX_CLOUD_HISTORY_FRAMES = 512
+_CLOUD_CAMERA_PRESETS = {
+    "透视": {"distance": 24.0, "elevation": 26.0, "azimuth": 45.0},
+    "俯视": {"distance": 24.0, "elevation": 90.0, "azimuth": 0.0},
+    "侧视": {"distance": 24.0, "elevation": 0.0, "azimuth": 0.0},
+}
+_TOPIC_LABELS = {
+    "/sim/wheel/command": "轮子命令",
+    "/sim/wheel/state": "轮子状态",
+    "/sim/lidar/points": "MID-360 实时点云",
+    "/sim/rtk/state": "RTK 定位",
+    "/sim/imu/attitude": "IMU 姿态",
+}
 _RECORDER_TOPICS = tuple(contract.topic for contract in V2_TOPICS)
 _REPLAY_TOPICS = tuple(
     f"/replay{contract.topic}"
@@ -213,6 +232,7 @@ class V2DashboardWidget(QWidget):
         *,
         offline_viewer_launcher: Callable[[Path], None] | None = None,
         live_viewer_launcher: Callable[[], Callable[[], None]] | None = None,
+        render_gl: bool = True,
     ) -> None:
         if type(descriptor) is not DescriptorIdentity:
             raise ValueError("descriptor must be an exact DescriptorIdentity")
@@ -220,92 +240,154 @@ class V2DashboardWidget(QWidget):
             raise ValueError("offline_viewer_launcher must be callable")
         if live_viewer_launcher is not None and not callable(live_viewer_launcher):
             raise ValueError("live_viewer_launcher must be callable")
+        if type(render_gl) is not bool:
+            raise ValueError("render_gl must be a bool")
         super().__init__()
         self._descriptor = descriptor
         self._offline_viewer_launcher = offline_viewer_launcher
         # 仅保存受信 launcher 交回的关闭句柄；完整点云始终不进入 Dashboard。
         self._live_viewer_launcher = live_viewer_launcher
+        self._cloud_gl_available = render_gl
         self._live_viewer_close: Callable[[], None] | None = None
         self._offline_viewer_lvx2: Path | None = None
         self._last_store_revision: tuple[object, ...] | None = None
         self._last_preview_identity: tuple[object, ...] | None = None
         self._preview_rtk: object | None = None
         self._preview_next_render_at = 0.0
-        self.setWindowTitle("Slope Sim Stage 4 Dashboard")
-        self.setMinimumWidth(800)
+        self._cloud_frames: deque[object] = deque()
+        self._last_cloud_frame: object | None = None
+        self._last_cloud_sequence: int | None = None
+        self._last_receiver_diagnostics: tuple[str, ...] = ()
+        self._last_render_dropped_count = 0
+        self.setWindowTitle("Slope Sim Stage 5 Dashboard")
+        # 父级 Dashboard 在无显示器/窄侧栏下可能只有几百像素；宽度必须由父级决定。
+        self.setMinimumWidth(0)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
 
         layout = QVBoxLayout(self)
-        title = QLabel("Stage 4 v2 Telemetry Evidence", self)
+        self._dashboard_panels_detached = False
+        self.interface_panel = QWidget(self)
+        interface_layout = QVBoxLayout(self.interface_panel)
+        self.lidar_panel = QWidget(self)
+        lidar_layout = QVBoxLayout(self.lidar_panel)
+
+        title = QLabel("Stage 4 v2 Telemetry Evidence", self.interface_panel)
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(title)
-        self.identity_value = QLabel("session=-- | descriptor=-- | world=-- | model=-- | lidar_link | MID-360 simulation", self)
+        interface_layout.addWidget(title)
+        self.identity_value = QLabel("session=-- | descriptor=-- | world=-- | model=-- | lidar_link | MID-360 simulation", self.interface_panel)
         self.identity_value.setWordWrap(True)
-        layout.addWidget(self.identity_value)
+        interface_layout.addWidget(self.identity_value)
         status_fields = QFormLayout()
-        self.ecal_status_value = QLabel("等待 eCAL v2 初始化", self)
+        self.ecal_status_value = QLabel("等待 eCAL v2 初始化", self.interface_panel)
         self.ecal_status_value.setWordWrap(True)
         status_fields.addRow("eCAL 状态", self.ecal_status_value)
-        layout.addLayout(status_fields)
-        self.topic_table = QTableWidget(len(V2_TOPICS), 11, self)
+        interface_layout.addLayout(status_fields)
+        rejection_group = QGroupBox("命令拒绝诊断", self.interface_panel)
+        rejection_fields = QFormLayout(rejection_group)
+        self.authority_rejection_value = QLabel("simulator authority: 累计 0", rejection_group)
+        self.observer_rejection_value = QLabel("dashboard observer: 累计 0", rejection_group)
+        self.authority_rejection_value.setWordWrap(True)
+        self.observer_rejection_value.setWordWrap(True)
+        rejection_fields.addRow("Simulator authority", self.authority_rejection_value)
+        rejection_fields.addRow("Dashboard observer", self.observer_rejection_value)
+        interface_layout.addWidget(rejection_group)
+        self.topic_table = QTableWidget(len(V2_TOPICS), 11, self.interface_panel)
         self.topic_table.setHorizontalHeaderLabels((
             "Topic", "Target Hz", "Actual Hz", "Peers/State", "Errors",
             "Transport Drops", "Sequence Gaps", "Latest Sequence", "Age", "Points", "Action",
         ))
         self.topic_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.topic_table.setMinimumHeight(180)
-        layout.addWidget(self.topic_table)
-        viewer_actions = QHBoxLayout()
-        self.live_viewer_button = QPushButton("打开实时点云", self)
+        # 保留表格对象供自动化合同覆盖；人工界面改用可滚动的逐话题状态卡片。
+        self.topic_table.hide()
+        interface_layout.addWidget(self.topic_table)
+        self.topic_cards: dict[str, dict[str, QLabel]] = {}
+        cards = QWidget(self.interface_panel)
+        cards_layout = QVBoxLayout(cards)
+        cards_layout.setContentsMargins(0, 0, 0, 0)
+        for contract in V2_TOPICS:
+            group = QGroupBox(_TOPIC_LABELS[contract.topic], cards)
+            fields = QFormLayout(group)
+            labels = {
+                "name": QLabel(_TOPIC_LABELS[contract.topic], group),
+                "state": QLabel("-- / not_checked", group),
+                "target": QLabel(f"{contract.rate_hz} Hz", group),
+                "actual": QLabel("--", group),
+                "sequence": QLabel("--", group),
+                "age": QLabel("--", group),
+                "errors": QLabel("0 / 0 / 0", group),
+                "action": QLabel("检查 eCAL 初始化、配置路径和 descriptor", group),
+            }
+            labels["action"].setWordWrap(True)
+            fields.addRow("话题", labels["name"])
+            fields.addRow("状态", labels["state"])
+            fields.addRow("目标频率", labels["target"])
+            fields.addRow("实际频率", labels["actual"])
+            fields.addRow("最近序列 / 帧年龄", labels["sequence"])
+            fields.addRow("错误 / 丢帧 / 缺序", labels["errors"])
+            fields.addRow("恢复操作", labels["action"])
+            cards_layout.addWidget(group)
+            self.topic_cards[contract.topic] = labels
+        interface_layout.addWidget(cards)
+        viewer_actions = QVBoxLayout()
+        self.live_viewer_button = QPushButton("打开实时点云", self.interface_panel)
         self.live_viewer_button.setEnabled(live_viewer_launcher is not None)
-        self.live_viewer_close_button = QPushButton("关闭实时点云", self)
+        self.live_viewer_close_button = QPushButton("关闭实时点云", self.interface_panel)
         self.live_viewer_close_button.setEnabled(False)
         self.live_viewer_status = QLabel(
             "已配置，点击打开实时点云" if live_viewer_launcher is not None else "未配置/连接未验证",
-            self,
+            self.interface_panel,
         )
-        self.offline_viewer_button = QPushButton("Launch Livox Viewer 2", self)
+        self.live_viewer_status.setWordWrap(True)
+        self.offline_viewer_button = QPushButton("Launch Livox Viewer 2", self.interface_panel)
         self.offline_viewer_button.setEnabled(False)
-        self.offline_viewer_status = QLabel("未配置/连接未验证", self)
+        self.offline_viewer_status = QLabel("未配置/连接未验证", self.interface_panel)
+        self.offline_viewer_status.setWordWrap(True)
         self.live_viewer_button.clicked.connect(self._launch_live_viewer)
         self.live_viewer_close_button.clicked.connect(self._close_live_viewer)
         self.offline_viewer_button.clicked.connect(self._launch_offline_viewer)
         viewer_actions.addWidget(self.live_viewer_button)
         viewer_actions.addWidget(self.live_viewer_close_button)
         viewer_actions.addWidget(self.live_viewer_status)
-        viewer_actions.addWidget(self.offline_viewer_button)
-        viewer_actions.addWidget(self.offline_viewer_status)
-        layout.addLayout(viewer_actions)
-        self.offline_evidence_title = QLabel("离线已验证证据，非实时状态", self)
-        layout.addWidget(self.offline_evidence_title)
+        interface_layout.addLayout(viewer_actions)
+        self.offline_evidence_group = QGroupBox("离线采集验收", self.interface_panel)
+        offline_evidence_layout = QVBoxLayout(self.offline_evidence_group)
+        self.offline_evidence_title = QLabel("离线已验证证据，非实时状态", self.offline_evidence_group)
+        offline_evidence_layout.addWidget(self.offline_evidence_title)
+        offline_evidence_layout.addWidget(self.offline_viewer_button)
+        offline_evidence_layout.addWidget(self.offline_viewer_status)
         evidence_fields = QFormLayout()
         self.offline_evidence_values = {
-            name: QLabel("未提供 verifier evidence", self)
+            name: QLabel("未提供 verifier evidence", self.offline_evidence_group)
             for name in _EVIDENCE_SECTIONS
         }
         for name, label in self.offline_evidence_values.items():
             label.setWordWrap(True)
             evidence_fields.addRow(name, label)
-        layout.addLayout(evidence_fields)
-        self.offline_evidence_detail = QPlainTextEdit(self)
+        offline_evidence_layout.addLayout(evidence_fields)
+        self.offline_evidence_detail = QPlainTextEdit(self.offline_evidence_group)
         self.offline_evidence_detail.setReadOnly(True)
-        self.offline_evidence_detail.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.offline_evidence_detail.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
         self.offline_evidence_detail.setMinimumHeight(96)
         self.offline_evidence_detail.setMaximumHeight(160)
         self.offline_evidence_detail.setPlainText("未提供 verifier evidence")
-        layout.addWidget(self.offline_evidence_detail)
+        offline_evidence_layout.addWidget(self.offline_evidence_detail)
+        self.offline_evidence_group.setVisible(False)
+        interface_layout.addWidget(self.offline_evidence_group)
         fields = QFormLayout()
-        self.wheel_value = QLabel("--", self)
-        self.lidar_value = QLabel("--", self)
-        self.rtk_value = QLabel("--", self)
-        self.imu_value = QLabel("--", self)
+        self.wheel_value = QLabel("--", self.interface_panel)
+        self.lidar_value = QLabel("--", self.interface_panel)
+        self.rtk_value = QLabel("--", self.interface_panel)
+        self.imu_value = QLabel("--", self.interface_panel)
         self.lidar_value.setWordWrap(True)
         self.rtk_value.setWordWrap(True)
         fields.addRow("Wheel state", self.wheel_value)
         fields.addRow("Central LiDAR", self.lidar_value)
         fields.addRow("RTK L/C/R", self.rtk_value)
         fields.addRow("IMU", self.imu_value)
-        layout.addLayout(fields)
-        self.sampled_preview_group = QGroupBox("轻量空间预览，非验收证据", self)
+        interface_layout.addLayout(fields)
+        self._create_cloud_workbench(lidar_layout, self.lidar_panel)
+        self.sampled_preview_group = QGroupBox("轻量空间预览，非验收证据", self.lidar_panel)
         self.sampled_preview_group.setCheckable(True)
         self.sampled_preview_group.setChecked(False)
         preview_layout = QVBoxLayout(self.sampled_preview_group)
@@ -316,7 +398,289 @@ class V2DashboardWidget(QWidget):
         preview_layout.addWidget(self.top_view)
         self.sampled_preview_group.toggled.connect(self._set_preview_enabled)
         self.top_view.setVisible(False)
-        layout.addWidget(self.sampled_preview_group)
+        lidar_layout.addWidget(self.sampled_preview_group)
+        layout.addWidget(self.interface_panel)
+        layout.addWidget(self.lidar_panel)
+
+    def take_dashboard_panels(self) -> tuple[QWidget, QWidget]:
+        """交给外层 Dashboard 管理状态页与 LiDAR 页，仍共用一个快照控制器。"""
+        if self._dashboard_panels_detached:
+            raise RuntimeError("v2 dashboard panels are already attached")
+        layout = self.layout()
+        if layout is None:
+            raise RuntimeError("v2 dashboard root layout is unavailable")
+        for panel in (self.interface_panel, self.lidar_panel):
+            layout.removeWidget(panel)
+            panel.setParent(None)
+        self._dashboard_panels_detached = True
+        return self.interface_panel, self.lidar_panel
+
+    def _create_cloud_workbench(self, layout: QVBoxLayout, parent: QWidget) -> None:
+        """创建由 GUI 线程独占的 OpenGL 工作台；eCAL worker 不直接操作这些对象。"""
+        self.cloud_workbench = QGroupBox("MID-360 实时点云工作台", parent)
+        self.cloud_workbench.setCheckable(True)
+        self.cloud_workbench.setChecked(False)
+        self.cloud_workbench.setMaximumHeight(34)
+        workbench_layout = QVBoxLayout(self.cloud_workbench)
+        if not self._cloud_gl_available:
+            self.cloud_view = None
+            self.cloud_grid = None
+            self.cloud_axis = None
+            self.cloud_scatter = None
+            self.cloud_vehicle_marker = None
+            workbench_layout.addWidget(
+                QLabel("offscreen 截图不渲染 OpenGL 点云；真实 X11 工作台可用", self.cloud_workbench),
+            )
+        else:
+            self.cloud_view = gl.GLViewWidget(self.cloud_workbench)
+            self.cloud_view.setMinimumHeight(360)
+            self.cloud_view.setCameraPosition(distance=24.0, elevation=26.0, azimuth=45.0)
+            self.cloud_grid = gl.GLGridItem()
+            self.cloud_grid.setSize(40.0, 40.0)
+            self.cloud_grid.setSpacing(1.0, 1.0)
+            self.cloud_axis = gl.GLAxisItem()
+            self.cloud_axis.setSize(2.0, 2.0, 2.0)
+            self.cloud_scatter = gl.GLScatterPlotItem(
+                pos=np.empty((0, 3), dtype=np.float32),
+                color=np.empty((0, 4), dtype=np.float32),
+                size=3.0,
+                pxMode=True,
+            )
+            self.cloud_vehicle_marker = gl.GLLinePlotItem(
+                pos=np.empty((0, 3), dtype=np.float32),
+                color=(0.96, 0.96, 0.96, 1.0),
+                width=3.0,
+                antialias=True,
+            )
+            self.cloud_view.addItem(self.cloud_grid)
+            self.cloud_view.addItem(self.cloud_axis)
+            self.cloud_view.addItem(self.cloud_scatter)
+            self.cloud_view.addItem(self.cloud_vehicle_marker)
+            self.cloud_view.setVisible(False)
+            workbench_layout.addWidget(self.cloud_view, stretch=1)
+
+        self.cloud_controls = QWidget(self.cloud_workbench)
+        controls = QVBoxLayout(self.cloud_controls)
+        controls.setContentsMargins(0, 0, 0, 0)
+        self.cloud_window_slider = QSlider(Qt.Orientation.Horizontal, self.cloud_workbench)
+        self.cloud_window_slider.setRange(1, 50)
+        self.cloud_window_slider.setValue(15)
+        self.cloud_point_size_slider = QSlider(Qt.Orientation.Horizontal, self.cloud_workbench)
+        self.cloud_point_size_slider.setRange(1, 12)
+        self.cloud_point_size_slider.setValue(3)
+        self.cloud_color_mode = QComboBox(self.cloud_workbench)
+        self.cloud_color_mode.addItems(("语义", "距离", "高度"))
+        self.cloud_display_mode = QComboBox(self.cloud_workbench)
+        self.cloud_display_mode.addItems(("累计", "当前帧"))
+        self.cloud_camera_preset = QComboBox(self.cloud_workbench)
+        self.cloud_camera_preset.addItems(tuple(_CLOUD_CAMERA_PRESETS))
+        self.cloud_reset_view_button = QPushButton("重置视角", self.cloud_workbench)
+        self.cloud_fit_view_button = QPushButton("适配点云视角", self.cloud_workbench)
+        self.cloud_status = QLabel("等待已验证的 LiDAR/RTK/IMU 同刻数据", self.cloud_workbench)
+        self.cloud_status.setWordWrap(True)
+        self.cloud_transport_status = QLabel("render_drop=0 | lidar_receiver_errors=0", self.cloud_workbench)
+        self.cloud_transport_status.setWordWrap(True)
+        self.cloud_command_observer_status = QLabel("wheel_command_observer_errors=0", self.cloud_workbench)
+        self.cloud_command_observer_status.setWordWrap(True)
+        cloud_controls = QFormLayout()
+        cloud_controls.addRow("时间窗", self.cloud_window_slider)
+        cloud_controls.addRow("点大小", self.cloud_point_size_slider)
+        cloud_controls.addRow("着色", self.cloud_color_mode)
+        cloud_controls.addRow("显示", self.cloud_display_mode)
+        cloud_controls.addRow("视角", self.cloud_camera_preset)
+        controls.addLayout(cloud_controls)
+        controls.addWidget(self.cloud_reset_view_button)
+        controls.addWidget(self.cloud_fit_view_button)
+        controls.addWidget(self.cloud_status)
+        controls.addWidget(self.cloud_transport_status)
+        controls.addWidget(self.cloud_command_observer_status)
+        self.cloud_diagnostics = QPlainTextEdit(self.cloud_workbench)
+        self.cloud_diagnostics.setReadOnly(True)
+        self.cloud_diagnostics.document().setMaximumBlockCount(2_000)
+        self.cloud_diagnostics.setPlainText("eCAL 点云工作台已初始化")
+        controls.addWidget(self.cloud_diagnostics, stretch=1)
+        workbench_layout.addWidget(self.cloud_controls)
+        self.cloud_point_size_slider.valueChanged.connect(self._set_cloud_point_size)
+        self.cloud_color_mode.currentTextChanged.connect(lambda _value: self._render_cloud())
+        self.cloud_display_mode.currentTextChanged.connect(lambda _value: self._render_cloud())
+        self.cloud_camera_preset.currentTextChanged.connect(self._set_cloud_camera_preset)
+        self.cloud_reset_view_button.clicked.connect(self._reset_cloud_view)
+        self.cloud_fit_view_button.clicked.connect(self._fit_cloud_view)
+        self.cloud_workbench.toggled.connect(self._set_cloud_workbench_open)
+        layout.addWidget(self.cloud_workbench)
+
+    def _set_cloud_point_size(self, size: int) -> None:
+        if not self._cloud_gl_available:
+            return
+        assert self.cloud_scatter is not None
+        self.cloud_scatter.setData(size=float(size))
+
+    def _reset_cloud_view(self) -> None:
+        self.cloud_camera_preset.setCurrentText("透视")
+        self._set_cloud_camera_preset("透视")
+
+    def _set_cloud_camera_preset(self, preset: str) -> None:
+        """用固定预设恢复可比较的 OpenGL 观察方向。"""
+        if not self._cloud_gl_available:
+            return
+        assert self.cloud_view is not None
+        self.cloud_view.setCameraPosition(**_CLOUD_CAMERA_PRESETS[preset])
+
+    def _cloud_render_data(self) -> tuple[np.ndarray, np.ndarray]:
+        """按当前显示模式从有界 world 帧缓存构造散点输入。"""
+        if self.cloud_display_mode.currentText() == "当前帧":
+            frame = self._last_cloud_frame
+            if frame is None:
+                return np.empty((0, 3), dtype=np.float32), np.empty(0, dtype=np.uint8)
+            return frame.positions, frame.tags
+        if not self._cloud_frames:
+            return np.empty((0, 3), dtype=np.float32), np.empty(0, dtype=np.uint8)
+        return (
+            np.concatenate([item.positions for item in self._cloud_frames], axis=0),
+            np.concatenate([item.tags for item in self._cloud_frames], axis=0),
+        )
+
+    def _render_cloud(self) -> None:
+        """重绘当前或累计 world 点，并同步车辆的平面前向标记。"""
+        if not self._cloud_gl_available:
+            return
+        assert self.cloud_scatter is not None and self.cloud_vehicle_marker is not None
+        positions, tags = self._cloud_render_data()
+        max_render_points = 80_000
+        if len(positions) > max_render_points:
+            step = (len(positions) + max_render_points - 1) // max_render_points
+            positions, tags = positions[::step], tags[::step]
+        self.cloud_scatter.setData(
+            pos=positions,
+            color=self._cloud_colors(positions, tags),
+            size=float(self.cloud_point_size_slider.value()),
+        )
+        frame = self._last_cloud_frame
+        if frame is None:
+            marker = np.empty((0, 3), dtype=np.float32)
+        else:
+            origin = np.asarray(frame.vehicle_position, dtype=np.float32)
+            forward = np.asarray(frame.vehicle_forward, dtype=np.float32)
+            marker = np.asarray((origin, origin + forward * 1.5), dtype=np.float32)
+        self.cloud_vehicle_marker.setData(pos=marker, color=(0.96, 0.96, 0.96, 1.0), width=3.0)
+
+    def _fit_cloud_view(self) -> None:
+        """使当前显示点范围居中，空帧时回到可重现的默认透视。"""
+        if not self._cloud_gl_available:
+            return
+        assert self.cloud_view is not None
+        positions, _tags = self._cloud_render_data()
+        if not len(positions):
+            self._reset_cloud_view()
+            return
+        lower, upper = positions.min(axis=0), positions.max(axis=0)
+        distance = max(6.0, float(np.linalg.norm(upper - lower)) * 2.2)
+        self.cloud_view.setCameraPosition(pos=Vector(positions.mean(axis=0)), distance=distance)
+
+    def _set_cloud_workbench_open(self, opened: bool) -> None:
+        """默认折叠工作台，避免不查看 3D 时挤压采集与遥测布局。"""
+        self.cloud_workbench.setMaximumHeight(900 if opened else 34)
+        if self.cloud_view is not None:
+            self.cloud_view.setVisible(opened)
+        if opened:
+            self._render_cloud()
+
+    def update_cloud_frame(self, frame: object) -> bool:
+        """在 GUI 线程累积 worker 已转换的 world 点，绝不接收 raw eCAL payload。"""
+        from slope_sim.interfaces.v2.dashboard_receiver import V2DashboardCloudFrame
+
+        if type(frame) is not V2DashboardCloudFrame:
+            raise ValueError("cloud frame must be an exact V2DashboardCloudFrame")
+        if frame.sequence == self._last_cloud_sequence:
+            return False
+        self._last_cloud_sequence = frame.sequence
+        self._cloud_frames.append(frame)
+        self._last_cloud_frame = frame
+        window_ns = self.cloud_window_slider.value() * 100_000_000
+        cutoff = frame.timestamp_ns - window_ns
+        while self._cloud_frames and self._cloud_frames[0].timestamp_ns < cutoff:
+            self._cloud_frames.popleft()
+        while len(self._cloud_frames) > _MAX_CLOUD_HISTORY_FRAMES:
+            self._cloud_frames.popleft()
+        if self.cloud_display_mode.currentText() == "当前帧":
+            display_count = len(frame.positions)
+        else:
+            display_count = sum(len(item.positions) for item in self._cloud_frames)
+        if self.cloud_workbench.isChecked():
+            self._render_cloud()
+        self.cloud_status.setText(
+            "%s | seq=%d | 本帧=%d | 时间窗=%0.1fs | 显示=%d"
+            % (
+                self.cloud_display_mode.currentText(),
+                frame.sequence,
+                len(frame.positions),
+                window_ns / 1_000_000_000,
+                display_count,
+            )
+        )
+        self.cloud_diagnostics.appendPlainText(
+            "LiDAR seq=%d: accepted %d world points" % (frame.sequence, len(frame.positions))
+        )
+        return True
+
+    def update_receiver_diagnostics(
+        self,
+        *,
+        render_dropped_count: int,
+        diagnostics: tuple[str, ...],
+    ) -> bool:
+        """把 receiver 的有界拒绝记录和显示队列丢帧投影到 GUI 终端。"""
+        if type(render_dropped_count) is not int or render_dropped_count < 0:
+            raise ValueError("render_dropped_count must be a nonnegative int")
+        if (
+            not isinstance(diagnostics, tuple)
+            or any(not isinstance(item, str) or not item for item in diagnostics)
+        ):
+            raise ValueError("diagnostics must be a tuple of nonempty strings")
+        if (
+            render_dropped_count == self._last_render_dropped_count
+            and diagnostics == self._last_receiver_diagnostics
+        ):
+            return False
+        lidar_diagnostics = tuple(
+            detail for detail in diagnostics if detail.startswith("/sim/lidar/points:")
+        )
+        command_diagnostics = tuple(
+            detail for detail in diagnostics if detail.startswith("/sim/wheel/command:")
+        )
+        self.cloud_transport_status.setText(
+            "render_drop=%d | lidar_receiver_errors=%d"
+            % (render_dropped_count, len(lidar_diagnostics))
+        )
+        self.cloud_command_observer_status.setText(
+            "wheel_command_observer_errors=%d" % len(command_diagnostics)
+        )
+        previous = self._last_receiver_diagnostics
+        new_lines = diagnostics[len(previous):] if diagnostics[:len(previous)] == previous else diagnostics
+        if render_dropped_count != self._last_render_dropped_count:
+            self.cloud_diagnostics.appendPlainText(
+                "receiver render_drop=%d" % render_dropped_count
+            )
+        for detail in new_lines:
+            self.cloud_diagnostics.appendPlainText("receiver: %s" % detail)
+        self._last_render_dropped_count = render_dropped_count
+        self._last_receiver_diagnostics = diagnostics
+        return True
+
+    def _cloud_colors(self, positions: np.ndarray, tags: np.ndarray) -> np.ndarray:
+        mode = self.cloud_color_mode.currentText()
+        if mode == "语义":
+            palette = np.asarray(((0.35, 0.72, 0.30, 0.85), (0.85, 0.76, 0.22, 0.95),
+                                  (0.90, 0.26, 0.18, 0.95), (0.60, 0.28, 0.78, 0.95)), dtype=np.float32)
+            return palette[np.minimum(tags, len(palette) - 1)]
+        if mode == "距离":
+            distance = np.linalg.norm(positions, axis=1)
+            scale = np.clip(distance / 30.0, 0.0, 1.0)
+            return np.column_stack((scale, 0.85 - 0.55 * scale, 1.0 - scale, np.full(len(scale), 0.9))).astype(np.float32)
+        height = positions[:, 2] if len(positions) else np.empty(0, dtype=np.float32)
+        lower, upper = (float(height.min()), float(height.max())) if len(height) else (0.0, 1.0)
+        scale = np.zeros_like(height) if upper <= lower else (height - lower) / (upper - lower)
+        return np.column_stack((scale, 0.25 + 0.65 * scale, 1.0 - scale, np.full(len(scale), 0.9))).astype(np.float32)
 
     def _launch_live_viewer(self) -> None:
         """只经受信回调启动独立显示链；其失败不能影响 Simulator 或 eCAL。"""
@@ -340,6 +704,15 @@ class V2DashboardWidget(QWidget):
     def launch_live_viewer(self) -> None:
         """供正式 CLI 自动打开显示链，复用与 Dashboard 按钮完全相同的边界。"""
         self._launch_live_viewer()
+
+    def shutdown(self) -> None:
+        """主动回收独立显示链，不依赖嵌入 QWidget 是否接收 close event。"""
+        self._close_live_viewer()
+
+    def closeEvent(self, event: object) -> None:  # noqa: N802 - Qt 固定回调名
+        """父 Dashboard 释放嵌入 widget 时，不能遗留独立 Bridge/RViz2 进程组。"""
+        self.shutdown()
+        super().closeEvent(event)  # type: ignore[arg-type]
 
     def _close_live_viewer(self) -> None:
         """关闭独立显示链并允许重启；不向核心仿真、Command 或 Recorder 发信号。"""
@@ -395,6 +768,26 @@ class V2DashboardWidget(QWidget):
             None if snapshot.rtk is None else snapshot.rtk.sequence,
             None if snapshot.imu is None else snapshot.imu.sequence,
             snapshot.topic_observations,
+            snapshot.authority_rejections,
+            snapshot.observer_rejections,
+        )
+
+    @staticmethod
+    def _rejection_text(domain: str, rejections: tuple[object, ...]) -> str:
+        """格式化有界拒绝诊断；仅展示快照中的标量，不读取任何 raw 数据。"""
+        if not rejections:
+            return f"{domain}: 累计 0"
+        latest = rejections[-1]
+        source = "--" if latest.source_id is None else latest.source_id
+        sequence = "--" if latest.sequence is None else str(latest.sequence)
+        session = (
+            "--" if latest.simulation_session_id is None
+            else latest.simulation_session_id.hex()[:12]
+        )
+        world = "--" if latest.world_generation is None else str(latest.world_generation)
+        return (
+            f"{domain}: 累计 {len(rejections)} | source={source} | seq={sequence} | "
+            f"session={session} | world={world} | {latest.reason}"
         )
 
     @classmethod
@@ -483,6 +876,7 @@ class V2DashboardWidget(QWidget):
         startup = evidence["viewer_startup"]
         display = evidence["viewer_display"]
         self._offline_viewer_lvx2 = Path(export["lvx2"]["path"])
+        self.offline_evidence_group.setVisible(True)
         if self._offline_viewer_launcher is not None:
             self.offline_viewer_button.setEnabled(True)
             self.offline_viewer_status.setText("已验证 LVX2，点击启动")
@@ -558,6 +952,12 @@ class V2DashboardWidget(QWidget):
         now = time.monotonic() if observed_now is None else observed_now
         observations = {item.topic: item for item in snapshot.topic_observations}
         self.ecal_status_value.setText(self._ecal_status(snapshot.topic_observations))
+        self.authority_rejection_value.setText(
+            self._rejection_text("simulator authority", snapshot.authority_rejections)
+        )
+        self.observer_rejection_value.setText(
+            self._rejection_text("dashboard observer", snapshot.observer_rejections)
+        )
         for row, contract in enumerate(V2_TOPICS):
             observation = observations.get(contract.topic)
             age = (
@@ -570,21 +970,38 @@ class V2DashboardWidget(QWidget):
             if contract.topic == "/sim/lidar/points" and snapshot.lidar_sequence is not None:
                 latest_sequence = snapshot.lidar_sequence
                 point_count = snapshot.lidar_point_count
+            target_text = str(contract.rate_hz)
+            actual_text = "--" if observation is None or observation.actual_hz is None else f"{observation.actual_hz:.1f}"
+            state_text = "-- / not_checked" if observation is None else "%s / %s" % (
+                "--" if observation.peer_count is None else observation.peer_count,
+                observation.protocol_state,
+            )
+            errors_text = "0" if observation is None else str(observation.error_count)
+            drops_text = "0" if observation is None else str(observation.dropped_count)
+            gaps_text = "0" if observation is None else str(observation.sequence_gap_count)
+            sequence_text = "--" if latest_sequence is None else str(latest_sequence)
+            age_text = "--" if age is None else f"{max(age, 0.0):.2f}s"
+            points_text = "--" if point_count is None else str(point_count)
+            action_text = self._topic_action(observation, contract.topic)
+            card = self.topic_cards[contract.topic]
+            card["state"].setText(state_text)
+            card["target"].setText(f"{target_text} Hz")
+            card["actual"].setText("--" if actual_text == "--" else f"{actual_text} Hz")
+            card["sequence"].setText(f"{sequence_text} / {age_text}")
+            card["errors"].setText(f"{errors_text} / {drops_text} / {gaps_text}")
+            card["action"].setText(action_text)
             cells = (
                 contract.topic,
-                str(contract.rate_hz),
-                "--" if observation is None or observation.actual_hz is None else f"{observation.actual_hz:.1f}",
-                "--/not_checked" if observation is None else "%s/%s" % (
-                    "--" if observation.peer_count is None else observation.peer_count,
-                    observation.protocol_state,
-                ),
-                "0" if observation is None else str(observation.error_count),
-                "0" if observation is None else str(observation.dropped_count),
-                "0" if observation is None else str(observation.sequence_gap_count),
-                "--" if latest_sequence is None else str(latest_sequence),
-                "--" if age is None else f"{max(age, 0.0):.2f}s",
-                "--" if point_count is None else str(point_count),
-                self._topic_action(observation, contract.topic),
+                target_text,
+                actual_text,
+                "--/not_checked" if observation is None else state_text.replace(" / ", "/"),
+                errors_text,
+                drops_text,
+                gaps_text,
+                sequence_text,
+                age_text,
+                points_text,
+                action_text,
             )
             for column, value in enumerate(cells):
                 self.topic_table.setItem(row, column, QTableWidgetItem(value))

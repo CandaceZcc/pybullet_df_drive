@@ -16,6 +16,20 @@ from slope_sim.model_registry import RobotModelSpec
 
 
 @dataclass(frozen=True)
+class CommandIngressResult:
+    """单次 command ingress 的完整结果，供诊断链路而非物理线程使用。"""
+
+    accepted: bool
+    reason: str
+    source_id: str | None
+    source_session_id: bytes | None
+    sequence: int | None
+    simulation_session_id: bytes | None
+    world_generation: int | None
+    received_at: float
+
+
+@dataclass(frozen=True)
 class V2RuntimeSnapshot:
     """控制器在单一生命周期时刻组合出的不可变协议状态。"""
 
@@ -62,6 +76,7 @@ class V2RuntimeProtocol:
         if session_id_factory is not None and not callable(session_id_factory):
             raise ValueError("session_id_factory must be callable or None")
         self._model = model
+        self._timeout_sec = timeout_sec
         self._transport = transport
         # 编排层可为 Recorder/Simulator 提供同一会话身份；默认仍由 ProtocolSession 随机生成。
         self._session = (
@@ -177,13 +192,33 @@ class V2RuntimeProtocol:
                 self._mailbox.capture_generation(),
             )
 
-    def accept_decoded_command(
+    @staticmethod
+    def _ingress_result(
+        command: object,
+        *,
+        accepted: bool,
+        reason: str,
+        received_at: float,
+    ) -> CommandIngressResult:
+        """仅提取已解码 command 的诊断标量，拒绝路径不保留 payload。"""
+        return CommandIngressResult(
+            accepted=accepted,
+            reason=reason,
+            source_id=getattr(command, "source_id", None),
+            source_session_id=getattr(command, "source_session_id", None),
+            sequence=getattr(command, "sequence", None),
+            simulation_session_id=getattr(command, "simulation_session_id", None),
+            world_generation=getattr(command, "world_generation", None),
+            received_at=float(received_at),
+        )
+
+    def accept_decoded_command_result(
         self,
         command: object,
         *,
         received_at: float,
         ingress: IngressToken,
-    ) -> bool:
+    ) -> CommandIngressResult:
         """仅让 verified 的当前 ingress 通过 authority 原子写入 mailbox 并认领。"""
         with self._condition:
             if (
@@ -195,7 +230,10 @@ class V2RuntimeProtocol:
                 or ingress.subscription_token != self._subscription_token
                 or ingress.mailbox_generation != self._mailbox.capture_generation()
             ):
-                return False
+                return self._ingress_result(
+                    command, accepted=False, reason="command ingress is no longer current",
+                    received_at=received_at,
+                )
             try:
                 transition = self._authority.accept(
                     command,
@@ -211,20 +249,42 @@ class V2RuntimeProtocol:
                 raise
             if transition.clear_mailbox:
                 self._mailbox.clear()
-            return transition.accepted
+            return self._ingress_result(
+                command, accepted=transition.accepted, reason=transition.reason,
+                received_at=received_at,
+            )
 
-    def accept_payload(self, payload: bytes, *, received_at: float) -> bool:
-        """在锁外解码 raw command，再用捕获 token 回锁阻止迟到提交。"""
+    def accept_decoded_command(
+        self,
+        command: object,
+        *,
+        received_at: float,
+        ingress: IngressToken,
+    ) -> bool:
+        """兼容既有布尔调用方；详细结果由专用诊断入口提供。"""
+        return self.accept_decoded_command_result(
+            command, received_at=received_at, ingress=ingress,
+        ).accepted
+
+    def accept_payload_result(self, payload: bytes, *, received_at: float) -> CommandIngressResult:
+        """解码 raw command 并返回可投影到 Dashboard 的有界拒绝原因。"""
         ingress = self.capture_ingress()
         try:
             command = self._codec.decode_wheel_command(payload)
-        except (TypeError, ValueError):
-            return False
-        return self.accept_decoded_command(
+        except (TypeError, ValueError) as error:
+            return self._ingress_result(
+                None, accepted=False, reason=f"{type(error).__name__}: {error}",
+                received_at=received_at,
+            )
+        return self.accept_decoded_command_result(
             command,
             received_at=received_at,
             ingress=ingress,
         )
+
+    def accept_payload(self, payload: bytes, *, received_at: float) -> bool:
+        """在锁外解码 raw command，再用捕获 token 回锁阻止迟到提交。"""
+        return self.accept_payload_result(payload, received_at=received_at).accepted
 
     def prepare_world_rebuild(self) -> None:
         """先失效 callback token，再准备 authority/world 重建事务。"""
@@ -275,10 +335,18 @@ class V2RuntimeProtocol:
                 raise RuntimeError("v2 runtime protocol is unavailable")
             return tuple(self._session.reserve_output(topic) for topic in topics)
 
-    def commit_world_rebuild(self) -> int:
-        """提交已准备的 world；仅此路径推进 world generation 并重置序号。"""
+    def commit_world_rebuild(self, *, model: RobotModelSpec | None = None) -> int:
+        """提交 world，并在同一临界区切换新的机器人轮子合同。"""
+        if model is not None and not isinstance(model, RobotModelSpec):
+            raise ValueError("model must be a RobotModelSpec or None")
         with self._condition:
-            return self._authority.commit_world_rebuild()
+            generation = self._authority.commit_world_rebuild()
+            if model is not None and model != self._model:
+                self._model = model
+                self._mailbox = WheelCommandMailbox(
+                    model, timeout_sec=self._timeout_sec
+                )
+            return generation
 
     def close(self) -> None:
         """先关闭 controller 入口，再在锁外释放可能回调的 transport。"""

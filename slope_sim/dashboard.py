@@ -33,6 +33,7 @@ from slope_sim.obstacles import (
     ObstacleSnapshot,
 )
 from slope_sim.pointcloud_export import export_lidar_point_clouds
+from slope_sim.resource_monitor import ResourceSnapshot
 from slope_sim.runtime_actions import (
     AddObstaclesAction,
     ClearObstaclesAction,
@@ -107,7 +108,7 @@ SMOOTHED_TELEMETRY_FIELDS = frozenset(
 DASHBOARD_WINDOW_TITLE = "3D仿真Dashboard"
 DASHBOARD_LAYOUT_REPORT_ENV = "SLOPE_SIM_DASHBOARD_LAYOUT_REPORT_PATH"
 DASHBOARD_LAYOUT_REPORT_VERSION = 4
-DASHBOARD_CONTENT_TAB_LABELS = frozenset({"接口状态", "障碍物"})
+DASHBOARD_CONTENT_TAB_LABELS = frozenset({"接口状态", "障碍物", "v2 eCAL"})
 DASHBOARD_REQUIRED_CRITICAL_CONTROLS = (
     "暂停",
     "复位车辆",
@@ -310,7 +311,7 @@ DASHBOARD_VERY_COMPACT_TICK_FONT_SIZE = 6
 
 def wait_for_dashboard_frame_extents(
     *,
-    frame_extents_getter: Callable[[], FrameExtents],
+    frame_extents_getter: Callable[[], FrameExtents | None],
     process_events: Callable[[], None],
     window_manager_expected: bool,
     timeout_sec: float = 1.0,
@@ -326,8 +327,15 @@ def wait_for_dashboard_frame_extents(
     while True:
         process_events()
         current = frame_extents_getter()
+        if current is None:
+            previous = None
+            remaining = deadline - clock()
+            if remaining <= 0.0:
+                raise WindowLayoutError("Dashboard frame extents did not stabilize")
+            sleeper(min(poll_interval_sec, remaining))
+            continue
         if not isinstance(current, FrameExtents):
-            raise TypeError("frame_extents_getter must return FrameExtents")
+            raise TypeError("frame_extents_getter must return FrameExtents or None")
         if current == previous and any(
             (current.left, current.right, current.top, current.bottom)
         ):
@@ -473,6 +481,7 @@ class DashboardCommand:
     camera_follow_enabled: bool = False
     camera_follow_view: str = "front"
     paused: bool = False
+    control_source: str = "keyboard"
 
 
 @dataclass
@@ -559,6 +568,7 @@ class TelemetryDashboard:
         camera_follow_enabled: bool = True,
         camera_follow_view: str = "front",
         interface_config: InterfaceConfig | None = None,
+        interface_enabled: bool = False,
         developer_diagnostics_enabled: bool = False,
         show_lidar_tools: bool = True,
         v2_dashboard_enabled: bool = False,
@@ -572,6 +582,8 @@ class TelemetryDashboard:
             raise ValueError("interface_config must be an InterfaceConfig")
         if not isinstance(developer_diagnostics_enabled, bool):
             raise ValueError("developer_diagnostics_enabled must be a bool")
+        if not isinstance(interface_enabled, bool):
+            raise ValueError("interface_enabled must be a bool")
         if not isinstance(show_lidar_tools, bool):
             raise ValueError("show_lidar_tools must be a bool")
         if not isinstance(v2_dashboard_enabled, bool):
@@ -583,6 +595,7 @@ class TelemetryDashboard:
         self.QtGui = QtGui
         self.QtWidgets = QtWidgets
         self.interface_config = interface_config
+        self.interface_enabled = interface_enabled
         self.developer_diagnostics_enabled = developer_diagnostics_enabled
         self.show_lidar_tools = show_lidar_tools
         self.v2_dashboard_enabled = v2_dashboard_enabled
@@ -597,7 +610,10 @@ class TelemetryDashboard:
         self._pending_capture_actions: deque[ManualCaptureAction] = deque()
         self._capture_state = ManualCaptureUiState.IDLE
         self._capture_start_pending = False
+        self._capture_mcap_path: Path | None = None
         self._capture_lvx2_path: Path | None = None
+        self._capture_compressed_path: Path | None = None
+        self._capture_compression_pending = False
         self._structure_busy = False
         self._switch_busy = False
         self._last_obstacle_refresh_time: float | None = None
@@ -614,6 +630,7 @@ class TelemetryDashboard:
         self._latest_lidar_clouds: dict[str, LidarPointCloud | None] = {"front": None, "rear": None}
         self._lidar_view_enabled = True
         self._last_update_time: float | None = None
+        self._actual_update_hz: float | None = None
         self._last_plot_update_time: float | None = None
         self._smoothed_telemetry: RobotTelemetry | None = None
         self._interface_status: InterfaceStatusSnapshot | None = None
@@ -639,6 +656,10 @@ class TelemetryDashboard:
         self.no_steering_texts: dict[str, object] = {}
         self.plot_layouts: dict[str, object] = {}
         self.plot_buttons: list[object] = []
+        self.plot_actions: dict[str, object] = {}
+        self.plot_selector_button = None
+        self.plot_selector_menu = None
+        self._plot_spec_by_label: dict[str, object] = {}
         self.interface_plot_specs = interface_chart_specs(get_robot_model(robot_model))
         self._interface_line_keys: set[str] = set()
         self.lidar_collection = None
@@ -656,8 +677,13 @@ class TelemetryDashboard:
         self.diagnostic_control_scroll = None
         self.diagnostic_control_content = None
         self.diagnostic_control_groups: list[object] = []
+        self.resource_labels: dict[str, object] = {}
+        self.resource_layout = None
         self.linear_spin = None
         self.angular_spin = None
+        self.control_source_combo = None
+        self.control_owner_label = None
+        self.rc_status_label = None
         self.camera_follow_checkbox = None
         self.camera_view_combo = None
         self.direction_buttons: list[object] = []
@@ -665,6 +691,7 @@ class TelemetryDashboard:
         self.capture_start_button = None
         self.capture_stop_button = None
         self.capture_viewer_button = None
+        self.capture_compress_button = None
         self.capture_status_label = None
         self.capture_path_label = None
         self.v2_dashboard_widget = None
@@ -773,7 +800,7 @@ class TelemetryDashboard:
             golf_seed=golf_seed,
             golf_relief=golf_relief,
         )
-        if not self.show_lidar_tools and not self.v2_dashboard_enabled:
+        if not self.interface_enabled and not self.v2_dashboard_enabled:
             self._show_realtime_interface_inactive()
         self.window_layout.addWidget(self.control_scroll, stretch=DASHBOARD_CONTROL_AREA_STRETCH)
         self._disable_spinbox_wheel_adjustment()
@@ -801,7 +828,7 @@ class TelemetryDashboard:
             spinbox.installEventFilter(self._spinbox_wheel_filter)
 
     def attach_v2_dashboard_widget(self, widget: object) -> None:
-        """将 v2 不可变快照视图嵌入手动控制窗口，替代旧前后 LiDAR 页面。"""
+        """把正式 v2 状态与 MID-360 工作台分别嵌入对应的顶层页面。"""
         from slope_sim.interfaces.v2.dashboard_adapter import V2DashboardWidget
 
         if type(widget) is not V2DashboardWidget:
@@ -812,22 +839,46 @@ class TelemetryDashboard:
             raise ValueError("v2 dashboard widget requires v2_dashboard_enabled")
         if self.v2_dashboard_widget is not None:
             raise RuntimeError("v2 dashboard widget is already attached")
-        page = self.QtWidgets.QWidget(self.tabs)
-        layout = self.QtWidgets.QVBoxLayout(page)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(widget)
-        self.tabs.addTab(page, "v2 eCAL")
+        take_panels = getattr(widget, "take_dashboard_panels", None)
+        if not callable(take_panels):
+            raise ValueError("v2 dashboard widget must provide take_dashboard_panels")
+        interface_panel, lidar_panel = take_panels()
+
+        def scroll_page(panel: object) -> object:
+            page = self.QtWidgets.QWidget(self.tabs)
+            layout = self.QtWidgets.QVBoxLayout(page)
+            layout.setContentsMargins(0, 0, 0, 0)
+            scroll = self.QtWidgets.QScrollArea(page)
+            scroll.setWidgetResizable(True)
+            scroll.setHorizontalScrollBarPolicy(self.QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            scroll.setVerticalScrollBarPolicy(self.QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+            scroll.setFrameShape(self.QtWidgets.QFrame.Shape.NoFrame)
+            scroll.setWidget(panel)
+            layout.addWidget(scroll)
+            return page
+
+        legacy_index = self.tabs.indexOf(self.interface_status_tab)
+        if legacy_index >= 0:
+            self.tabs.removeTab(legacy_index)
+        interface_index = self.tabs.insertTab(0, scroll_page(interface_panel), "接口状态")
+        obstacle_index = next(
+            index
+            for index in range(self.tabs.count())
+            if self.tabs.tabText(index) == "障碍物"
+        )
+        self.tabs.insertTab(obstacle_index + 1, scroll_page(lidar_panel), "LiDAR点云")
+        self.tabs.setCurrentIndex(interface_index)
         self.v2_dashboard_widget = widget
 
     def _show_realtime_interface_inactive(self) -> None:
-        """普通流畅启动未构造实时接口，明确区分“未启用”和“等待数据”。"""
+        """无通信启动明确标记为“已禁用”，不能伪装为网络故障或等待数据。"""
         self.transport_mode_label.setText("已关闭（流畅手动模式）")
-        self.ecal_status_label.setText("未启用")
+        self.ecal_status_label.setText("已禁用")
         self.transport_detail_label.setText(
             "正常 runSim 为保持流畅已关闭实时接口；MID-360 在结束采集后离线重建。"
         )
         for row in self.interface_rows.values():
-            row.state_label.setText("未启用")
+            row.state_label.setText("已禁用")
             row.target_label.setText("--")
             row.actual_label.setText("--")
             row.timestamp_label.setText("--")
@@ -838,6 +889,7 @@ class TelemetryDashboard:
     def _add_interface_status_tab(self, tabs: object) -> None:
         """创建六话题企业状态页，所有值均由不可变快照更新。"""
         interface_tab = self.QtWidgets.QWidget()
+        self.interface_status_tab = interface_tab
         interface_layout = self.QtWidgets.QVBoxLayout(interface_tab)
         interface_layout.setContentsMargins(4, 4, 4, 4)
 
@@ -1020,14 +1072,24 @@ class TelemetryDashboard:
         self.reset_button.clicked.connect(self.request_reset)
         grid.addWidget(self.reset_button, 2, 0, 1, 3)
 
+        linear_limit = 2.0
+        angular_limit = 4.0
+        if self.v2_dashboard_enabled:
+            from slope_sim.interfaces.v2.runsim_session import (
+                MAX_ANGULAR_VELOCITY_RAD_S,
+                MAX_LINEAR_VELOCITY_M_S,
+            )
+
+            linear_limit = MAX_LINEAR_VELOCITY_M_S
+            angular_limit = MAX_ANGULAR_VELOCITY_RAD_S
         self.linear_spin = self.QtWidgets.QDoubleSpinBox()
-        self.linear_spin.setRange(0.0, 2.0)
+        self.linear_spin.setRange(0.0, linear_limit)
         self.linear_spin.setSingleStep(0.05)
         self.linear_spin.setSuffix(" m/s")
         self.linear_spin.setValue(max_linear_speed)
         self.linear_spin.setMinimumWidth(DASHBOARD_CONTROL_SPINBOX_WIDTH)
         self.angular_spin = self.QtWidgets.QDoubleSpinBox()
-        self.angular_spin.setRange(0.0, 4.0)
+        self.angular_spin.setRange(0.0, angular_limit)
         self.angular_spin.setSingleStep(0.05)
         self.angular_spin.setSuffix(" rad/s")
         self.angular_spin.setValue(max_angular_speed)
@@ -1037,18 +1099,33 @@ class TelemetryDashboard:
         grid.addWidget(self.QtWidgets.QLabel("角速度"), 4, 0)
         grid.addWidget(self.angular_spin, 4, 1, 1, 2)
 
+        self.control_source_combo = self.QtWidgets.QComboBox()
+        for label, source in (("键盘", "keyboard"), ("遥控器", "rc"), ("外部命令", "external")):
+            self.control_source_combo.addItem(label, source)
+        grid.addWidget(self.QtWidgets.QLabel("控制源"), 5, 0)
+        grid.addWidget(self.control_source_combo, 5, 1, 1, 2)
+        self.control_owner_label = self.QtWidgets.QLabel("当前所有者：键盘（等待接管）")
+        self.control_owner_label.setWordWrap(True)
+        grid.addWidget(self.control_owner_label, 6, 0, 1, 3)
+        self.control_source_combo.currentIndexChanged.connect(
+            self._control_source_selection_changed
+        )
+        self.rc_status_label = self.QtWidgets.QLabel("遥控器：未启用")
+        self.rc_status_label.setWordWrap(True)
+        grid.addWidget(self.rc_status_label, 7, 0, 1, 3)
+
         keyboard_hint = self.QtWidgets.QLabel(
-            "驾驶：↑↓ 前后，←→ 转向，Space 暂停，Q/Esc 退出"
+            "驾驶：↑↓ 前后，←→ 转向，Space 暂停；退出请用本窗口“退出”按钮或关闭窗口"
         )
         keyboard_hint.setWordWrap(True)
-        grid.addWidget(keyboard_hint, 5, 0, 1, 3)
-        quit_row = 6
+        grid.addWidget(keyboard_hint, 8, 0, 1, 3)
+        quit_row = 9
         if self.show_lidar_tools:
             self.lidar_view_checkbox = self.QtWidgets.QCheckBox("显示实时 LiDAR 点云")
             self.lidar_view_checkbox.setChecked(self._lidar_view_enabled)
             self.lidar_view_checkbox.setToolTip("只切换点云显示；传感器采集和接口发布保持运行")
             self.lidar_view_checkbox.toggled.connect(self._set_lidar_view_enabled)
-            grid.addWidget(self.lidar_view_checkbox, 6, 0, 1, 3)
+            grid.addWidget(self.lidar_view_checkbox, 9, 0, 1, 3)
             self.lidar_open_button = self.QtWidgets.QPushButton("打开实时点云")
             self._configure_button(
                 self.lidar_open_button,
@@ -1056,7 +1133,7 @@ class TelemetryDashboard:
                 self.QtWidgets.QStyle.StandardPixmap.SP_DesktopIcon,
             )
             self.lidar_open_button.clicked.connect(self.show_lidar_point_cloud)
-            grid.addWidget(self.lidar_open_button, 7, 0, 1, 3)
+            grid.addWidget(self.lidar_open_button, 10, 0, 1, 3)
             self.lidar_export_button = self.QtWidgets.QPushButton("导出当前点云")
             self._configure_button(
                 self.lidar_export_button,
@@ -1064,14 +1141,14 @@ class TelemetryDashboard:
                 self.QtWidgets.QStyle.StandardPixmap.SP_DialogSaveButton,
             )
             self.lidar_export_button.clicked.connect(self._export_current_lidar_point_clouds)
-            grid.addWidget(self.lidar_export_button, 8, 0, 1, 3)
+            grid.addWidget(self.lidar_export_button, 11, 0, 1, 3)
             self.lidar_status_label = self.QtWidgets.QLabel("点云：等待前/后雷达帧")
             self.lidar_status_label.setWordWrap(True)
             self.lidar_status_label.setTextInteractionFlags(
                 self.QtCore.Qt.TextSelectableByMouse
             )
-            grid.addWidget(self.lidar_status_label, 9, 0, 1, 3)
-            quit_row = 10
+            grid.addWidget(self.lidar_status_label, 12, 0, 1, 3)
+            quit_row = 13
 
         self.quit_button = self.QtWidgets.QPushButton("退出")
         self._configure_button(
@@ -1306,9 +1383,17 @@ class TelemetryDashboard:
             self.QtWidgets.QStyle.StandardPixmap.SP_DialogOpenButton,
         )
         self.capture_viewer_button.clicked.connect(self.request_livox_viewer_import)
+        self.capture_compress_button = self.QtWidgets.QPushButton("压缩 MCAP（离线）")
+        self._configure_button(
+            self.capture_compress_button,
+            "以 Zstandard 生成独立压缩副本；原始 MCAP 保留不变",
+            self.QtWidgets.QStyle.StandardPixmap.SP_DriveFDIcon,
+        )
+        self.capture_compress_button.clicked.connect(self.request_capture_compression)
         layout.addWidget(self.capture_start_button, 3, 0, 1, 2)
         layout.addWidget(self.capture_stop_button, 4, 0, 1, 2)
         layout.addWidget(self.capture_viewer_button, 5, 0, 1, 2)
+        layout.addWidget(self.capture_compress_button, 6, 0, 1, 2)
         self._refresh_capture_controls()
         return group
 
@@ -1374,6 +1459,12 @@ class TelemetryDashboard:
         diagnostic_layout.setContentsMargins(4, 4, 4, 4)
         diagnostic_layout.setSpacing(6)
 
+        resource_group = self.QtWidgets.QGroupBox("资源状态（1 Hz）")
+        self.resource_layout = self.QtWidgets.QFormLayout(resource_group)
+        resource_hint = self.QtWidgets.QLabel("等待资源采样")
+        resource_hint.setWordWrap(True)
+        self.resource_layout.addRow(resource_hint)
+
         camera_group = self.QtWidgets.QGroupBox("相机")
         camera_layout = self.QtWidgets.QGridLayout(camera_group)
         camera_layout.setColumnStretch(1, 1)
@@ -1391,7 +1482,7 @@ class TelemetryDashboard:
         self.camera_follow_checkbox.toggled.connect(self._update_camera_follow_state)
         self._update_camera_follow_state()
 
-        self.diagnostic_control_groups = [camera_group]
+        self.diagnostic_control_groups = [resource_group, camera_group]
         for group in self.diagnostic_control_groups:
             diagnostic_layout.addWidget(group)
         diagnostic_layout.addStretch(1)
@@ -1424,12 +1515,12 @@ class TelemetryDashboard:
         tabs.addTab(obstacle_tab, "障碍物")
 
     def _add_plot_tabs(self, tabs: object) -> None:
-        """按冻结顺序把十二个折线页和 LiDAR 页直接加入顶层标签栏。"""
-        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
-        from matplotlib.figure import Figure
-
+        """只登记折线图；用户在下拉菜单勾选后才创建 Matplotlib 资源。"""
         legacy_specs = dashboard_plot_specs()
         self.plot_specs = [*legacy_specs, *self.interface_plot_specs]
+        self._plot_spec_by_label = {
+            spec.tab_label: spec for spec in self.plot_specs
+        }
         self.plot_figures = {}
         self.plot_canvases = {}
         self.plot_axes = {}
@@ -1438,12 +1529,134 @@ class TelemetryDashboard:
         self.plot_texts = {}
         self.plot_layouts = {}
         self.plot_buttons = []
-        for spec in (*legacy_specs, *self.interface_plot_specs[:4]):
-            self._add_line_plot_tab(tabs, spec, Figure=Figure, FigureCanvas=FigureCanvas)
+        self.plot_actions = {}
+        self.plot_selector_button = self.QtWidgets.QToolButton()
+        self.plot_selector_button.setText("图表（按需）")
+        self.plot_selector_button.setPopupMode(
+            self.QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup
+        )
+        self.plot_selector_menu = self.QtWidgets.QMenu(self.plot_selector_button)
+        self.plot_selector_button.setMenu(self.plot_selector_menu)
+        for spec in self.plot_specs:
+            action = self.plot_selector_menu.addAction(spec.tab_label)
+            action.setCheckable(True)
+            action.setChecked(False)
+            action.toggled.connect(
+                lambda checked, label=spec.tab_label: self._set_plot_enabled(
+                    label, checked
+                )
+            )
+            self.plot_actions[spec.tab_label] = action
+        tabs.setCornerWidget(
+            self.plot_selector_button,
+            self.QtCore.Qt.Corner.TopRightCorner,
+        )
         if self.show_lidar_tools:
+            from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+            from matplotlib.figure import Figure
+
             self._add_lidar_plot_tab(tabs, Figure=Figure, FigureCanvas=FigureCanvas)
-        for spec in self.interface_plot_specs[4:]:
-            self._add_line_plot_tab(tabs, spec, Figure=Figure, FigureCanvas=FigureCanvas)
+        self._set_steering_tab_state(self._interface_robot_model)
+
+    def _set_plot_enabled(self, tab_label: str, enabled: bool) -> None:
+        """按勾选状态创建或释放单张折线图，未启用图表不保留后台缓存。"""
+        if tab_label not in self._plot_spec_by_label:
+            raise ValueError(f"unknown dashboard plot: {tab_label}")
+        if enabled:
+            if tab_label in self.plot_canvases:
+                return
+            from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+            from matplotlib.figure import Figure
+
+            self._add_line_plot_tab(
+                self.tabs,
+                self._plot_spec_by_label[tab_label],
+                Figure=Figure,
+                FigureCanvas=FigureCanvas,
+            )
+            self.tabs.setCurrentWidget(self.plot_canvases[tab_label].parentWidget())
+            # 延迟创建发生在窗口已经定型之后，必须立即套用当前紧凑布局。
+            self._update_layout_for_size(self.window.width(), self.window.height())
+            self._apply_plot_series(tab_label)
+            self.plot_canvases[tab_label].draw()
+            self._plot_rendered_revisions[tab_label] = self._plot_data_revisions[
+                tab_label
+            ]
+            self._plot_dirty_tabs.discard(tab_label)
+            return
+        self._release_plot_tab(tab_label)
+
+    def _release_plot_tab(self, tab_label: str) -> None:
+        """释放取消勾选图表的 Qt/Matplotlib 对象及其回调。"""
+        canvas = self.plot_canvases.pop(tab_label, None)
+        if canvas is None:
+            return
+        plot_tab = canvas.parentWidget()
+        index = self.tabs.indexOf(plot_tab)
+        if index >= 0:
+            self.tabs.removeTab(index)
+        retained_connections = []
+        for registered_canvas, event_name, callback_id in self._mpl_connections:
+            if registered_canvas is canvas:
+                registered_canvas.mpl_disconnect(callback_id)
+            else:
+                retained_connections.append(
+                    (registered_canvas, event_name, callback_id)
+                )
+        self._mpl_connections = retained_connections
+        spec = self._plot_spec_by_label[tab_label]
+        for line_spec in spec.lines:
+            self.plot_lines.pop(line_spec.key, None)
+            self._interface_line_keys.discard(line_spec.key)
+        self.plot_buttons = [
+            button for button in self.plot_buttons
+            if not plot_tab.isAncestorOf(button)
+        ]
+        self.plot_figures.pop(tab_label, None)
+        self.plot_axes.pop(tab_label, None)
+        self.plot_legends.pop(tab_label, None)
+        self.plot_layouts.pop(tab_label, None)
+        self.no_steering_texts.pop(tab_label, None)
+        self.plot_texts.pop(f"{tab_label}:status", None)
+        self._plot_data_revisions.pop(tab_label, None)
+        self._plot_rendered_revisions.pop(tab_label, None)
+        self._plot_next_draw_time.pop(tab_label, None)
+        self._plot_draw_started_at.pop(tab_label, None)
+        self._plot_dirty_tabs.discard(tab_label)
+        figure = getattr(canvas, "figure", None)
+        if figure is not None:
+            figure.clear()
+            figure.set_canvas(None)
+        canvas.close()
+        canvas.figure = None
+        canvas.deleteLater()
+        plot_tab.deleteLater()
+        legacy_labels = {spec.tab_label for spec in dashboard_plot_specs()}
+        interface_labels = {
+            spec.tab_label for spec in self.interface_plot_specs
+        }
+        if not legacy_labels.intersection(self.plot_canvases):
+            self.plot_buffer.clear()
+        if not interface_labels.intersection(self.plot_canvases):
+            self.interface_plot_buffer.clear()
+
+    def _set_steering_tab_state(self, robot_model: str) -> None:
+        """差速车型没有转向关节，禁用对应图表选项。"""
+        applicable = bool(get_robot_model(robot_model).steering_joint_names)
+        for label in ("转向命令", "转向反馈"):
+            action = self.plot_actions.get(label)
+            if action is not None:
+                if not applicable and action.isChecked():
+                    action.setChecked(False)
+                action.setEnabled(applicable)
+                action.setToolTip("" if applicable else "不适用于差速车型")
+            canvas = self.plot_canvases.get(label)
+            if canvas is not None:
+                index = self.tabs.indexOf(canvas.parentWidget())
+                self.tabs.setTabEnabled(index, applicable)
+                self.tabs.setTabToolTip(
+                    index, "" if applicable else "不适用于差速车型"
+                )
 
     def _register_plot_canvas(
         self,
@@ -1527,7 +1740,7 @@ class TelemetryDashboard:
             text_artist = axis.text(
                 0.5,
                 0.5,
-                "当前车型无转向数据" if not spec.lines else "",
+                "不适用于差速车型" if not spec.lines else "",
                 transform=axis.transAxes,
                 ha="center",
                 va="center",
@@ -1702,15 +1915,17 @@ class TelemetryDashboard:
         return int(value)
 
     def _control_keys(self) -> set[int]:
-        """Dashboard 需要接管的驾驶/退出按键。"""
+        """Dashboard 需要接管的驾驶按键。"""
         return {
             self._normalize_key(self.QtCore.Qt.Key_Up),
             self._normalize_key(self.QtCore.Qt.Key_Down),
             self._normalize_key(self.QtCore.Qt.Key_Left),
             self._normalize_key(self.QtCore.Qt.Key_Right),
+            self._normalize_key(self.QtCore.Qt.Key_W),
+            self._normalize_key(self.QtCore.Qt.Key_S),
+            self._normalize_key(self.QtCore.Qt.Key_A),
+            self._normalize_key(self.QtCore.Qt.Key_D),
             self._normalize_key(self.QtCore.Qt.Key_Space),
-            self._normalize_key(self.QtCore.Qt.Key_Q),
-            self._normalize_key(self.QtCore.Qt.Key_Escape),
         }
 
     def _handle_tab_cycle(self, event: object) -> bool:
@@ -1731,10 +1946,7 @@ class TelemetryDashboard:
         key_code = self._normalize_key(key)
         if key_code not in self._control_keys():
             return False
-        if key_code in {self._normalize_key(self.QtCore.Qt.Key_Q), self._normalize_key(self.QtCore.Qt.Key_Escape)}:
-            self.request_exit()
-        else:
-            self._pressed_keys.add(key_code)
+        self._pressed_keys.add(key_code)
         return True
 
     def _handle_key_release(self, key: object) -> bool:
@@ -1912,13 +2124,19 @@ class TelemetryDashboard:
         self.window.move(preliminary.x, preliminary.y)
         self.app.processEvents()
 
-        def frame_extents() -> FrameExtents:
+        def frame_extents() -> FrameExtents | None:
             margins = handle.frameMargins()
-            return FrameExtents(
+            values = (
                 margins.left(),
                 margins.right(),
                 margins.top(),
                 margins.bottom(),
+            )
+            # Qt 在 X11 装饰尚未建立时以 -1 表示未知边距。
+            if any(value < 0 for value in values):
+                return None
+            return FrameExtents(
+                *values,
             )
 
         window_manager_expected = (
@@ -1978,6 +2196,11 @@ class TelemetryDashboard:
         self.capture_viewer_button.setEnabled(
             self._capture_state is ManualCaptureUiState.COMPLETED
             and self._capture_lvx2_path is not None
+        )
+        self.capture_compress_button.setEnabled(
+            self._capture_state is ManualCaptureUiState.COMPLETED
+            and self._capture_mcap_path is not None
+            and not self._capture_compression_pending
         )
 
     def _refresh_structure_controls(self) -> None:
@@ -2049,10 +2272,55 @@ class TelemetryDashboard:
         ):
             raise ValueError("completed capture paths must be absolute Paths")
         self._capture_state = ManualCaptureUiState.COMPLETED
+        self._capture_mcap_path = mcap_path
         self._capture_lvx2_path = lvx2_path
+        self._capture_compressed_path = None
+        self._capture_compression_pending = False
         self.capture_status_label.setText("状态：采集完成，LVX2 已验证")
         self.capture_path_label.setText(f"MCAP：{mcap_path}\nLVX2：{lvx2_path}")
         self._refresh_structure_controls()
+        self._refresh_capture_controls()
+
+    def request_capture_compression(self) -> None:
+        """请求主循环在线程中压缩已关闭的 MCAP，不阻塞 Qt。"""
+        if (
+            self._capture_state is not ManualCaptureUiState.COMPLETED
+            or self._capture_mcap_path is None
+            or self._capture_compression_pending
+        ):
+            return
+        self._pending_capture_actions.append(
+            ManualCaptureAction.compress_mcap(self._capture_mcap_path)
+        )
+        self._capture_compression_pending = True
+        self.capture_status_label.setText("状态：正在离线压缩 MCAP，原始文件保留")
+        self._refresh_capture_controls()
+
+    def set_capture_compression_result(
+        self,
+        *,
+        success: bool,
+        compressed_path: Path | None,
+        detail: str,
+    ) -> None:
+        """回显离线压缩结果；失败不影响已完成会话和 Viewer 重试。"""
+        if type(success) is not bool or not isinstance(detail, str) or not detail:
+            raise ValueError("compression result requires success and detail")
+        if compressed_path is not None and (
+            not isinstance(compressed_path, Path) or not compressed_path.is_absolute()
+        ):
+            raise ValueError("compressed_path must be an absolute Path or None")
+        self._capture_compression_pending = False
+        if self._capture_state is not ManualCaptureUiState.COMPLETED:
+            return
+        if success and compressed_path is not None:
+            self._capture_compressed_path = compressed_path
+            self.capture_status_label.setText(f"状态：MCAP 已完成 Zstandard 离线压缩（{detail}）")
+            self.capture_path_label.setText(
+                f"MCAP：{self._capture_mcap_path}\n压缩：{compressed_path}\nLVX2：{self._capture_lvx2_path}"
+            )
+        else:
+            self.capture_status_label.setText(f"状态：MCAP 压缩失败，可重试：{detail}")
         self._refresh_capture_controls()
 
     def set_capture_failed(self, detail: str, *, output_dir: Path | None = None) -> None:
@@ -2062,7 +2330,10 @@ class TelemetryDashboard:
             raise ValueError("output_dir must be an absolute Path or None")
         self._capture_state = ManualCaptureUiState.FAILED
         self._capture_start_pending = False
+        self._capture_mcap_path = None
         self._capture_lvx2_path = None
+        self._capture_compressed_path = None
+        self._capture_compression_pending = False
         self.capture_status_label.setText(f"状态：失败：{detail}")
         self.capture_path_label.setText(
             "输出：--" if output_dir is None else f"输出目录：{output_dir}"
@@ -2091,6 +2362,83 @@ class TelemetryDashboard:
             "状态：Livox Viewer 已打开文件" if success else f"状态：导入失败，可重试：{detail}"
         )
         self._refresh_capture_controls()
+
+    def update_rc_status(self, snapshot: object, *, source_snapshot: object | None = None) -> None:
+        """显示 RC by-id、频率、年龄、原始通道、归一化命令和故障。"""
+        if self.rc_status_label is None:
+            return
+        path = getattr(snapshot, "path", None)
+        command = getattr(snapshot, "command", None)
+        channels = getattr(snapshot, "last_channels", None)
+        source = getattr(source_snapshot, "active_source", None)
+        reason = getattr(snapshot, "failure_reason", None)
+        text = (
+            f"遥控器：{path or '未启用'} | {getattr(snapshot, 'actual_hz', None) or 0.0:.1f} Hz "
+            f"| age {getattr(snapshot, 'last_frame_age_sec', None) or 0.0:.3f}s\n"
+            f"ch1/ch3/ch6={channels[0]}/{channels[2]}/{channels[5]} "
+            f"v/w={getattr(command, 'linear_velocity_m_s', 0.0):.2f}/"
+            f"{getattr(command, 'angular_velocity_rad_s', 0.0):.2f} "
+            f"unlock={'是' if getattr(command, 'unlocked', False) else '否'} "
+            f"source={source or '无'} fault={reason or getattr(command, 'reason', '无')}"
+            if isinstance(channels, tuple) and len(channels) == 16 and command is not None
+            else "遥控器：等待有效 SBUS 帧"
+        )
+        fell_back_to_keyboard = False
+        if (
+            command is not None
+            and not getattr(command, "active", False)
+            and self.control_source_combo is not None
+            and self.control_source_combo.currentData() == "rc"
+        ):
+            keyboard_index = self.control_source_combo.findData("keyboard")
+            if keyboard_index >= 0:
+                self.control_source_combo.setCurrentIndex(keyboard_index)
+                fell_back_to_keyboard = True
+        if fell_back_to_keyboard:
+            text += "；遥控器未就绪，已退回键盘（先将 CH6 拨到低位再拨到高位）"
+        self.rc_status_label.setText(text)
+
+    def set_rc_available(self, available: bool) -> None:
+        """仅在串口 worker 已启动时保留遥控器控制源，避免无输入的假接管。"""
+        if type(available) is not bool:
+            raise ValueError("rc availability must be a bool")
+        if available or self.control_source_combo is None:
+            return
+        rc_index = self.control_source_combo.findData("rc")
+        if rc_index >= 0:
+            self.control_source_combo.removeItem(rc_index)
+        if self.rc_status_label is not None:
+            self.rc_status_label.setText("遥控器：未启用（请使用 --rc-port 启动）")
+        if self.control_owner_label is not None:
+            self.control_owner_label.setText("当前所有者：键盘（遥控器未启用）")
+
+    def _control_source_selection_changed(self, _index: int) -> None:
+        """在下一次仲裁快照到达前，明确所选 source 仍未获得实际控制权。"""
+        if self.control_owner_label is None or self.control_source_combo is None:
+            return
+        source = str(self.control_source_combo.currentData())
+        label = {"keyboard": "键盘", "rc": "遥控器", "external": "外部命令"}.get(source, source)
+        self.control_owner_label.setText(f"当前所有者：{label}（等待接管）")
+
+    def update_control_owner(self, source_snapshot: object | None) -> None:
+        """用 Command 仲裁器快照投影实际 owner，避免 GUI 选择状态伪称已接管。"""
+        if self.control_owner_label is None:
+            return
+        source = getattr(source_snapshot, "active_source", None)
+        label = {"keyboard": "键盘", "rc": "遥控器", "external": "外部命令"}.get(source)
+        if label is not None:
+            self.control_owner_label.setText(f"当前所有者：{label}")
+            return
+        selected = (
+            "键盘"
+            if self.control_source_combo is None
+            else {"keyboard": "键盘", "rc": "遥控器", "external": "外部命令"}.get(
+                str(self.control_source_combo.currentData()), "未知"
+            )
+        )
+        reason = getattr(source_snapshot, "failure_reason", None)
+        detail = f"；故障：{reason}" if isinstance(reason, str) and reason else ""
+        self.control_owner_label.setText(f"当前所有者：无（已选择：{selected}{detail}）")
 
     def request_exit(self) -> None:
         self._should_exit = True
@@ -2330,6 +2678,7 @@ class TelemetryDashboard:
         """车辆重载后清空旧车的平滑状态、刷新节流和曲线数据。"""
         self._smoothed_telemetry = None
         self._last_update_time = None
+        self._actual_update_hz = None
         self._last_plot_update_time = None
         self._latest_interface_snapshot = None
         self._interface_status = None
@@ -2647,11 +2996,15 @@ class TelemetryDashboard:
                 or rendered_data_revision != current_data_revision
             ):
                 return None
-        plot_button_widgets = {
-            button.text(): button
-            for button in page.findChildren(self.QtWidgets.QPushButton)
-            if button.isVisibleTo(page)
-        }
+        plot_button_widgets = (
+            {
+                button.text(): button
+                for button in page.findChildren(self.QtWidgets.QPushButton)
+                if button.isVisibleTo(page)
+            }
+            if page_kind == "plot"
+            else {}
+        )
         plot_buttons = {
             name: self._widget_global_rect(button)
             for name, button in plot_button_widgets.items()
@@ -2685,7 +3038,7 @@ class TelemetryDashboard:
             content_widget_rects = {}
 
         tab_scroll_button_rects = self._tab_scroll_button_rects()
-        if set(tab_scroll_button_rects) != {"left", "right"}:
+        if set(tab_scroll_button_rects) not in (set(), {"left", "right"}):
             return None
         tab_qt_text = self._tab_qt_text_rect(tab_index)
         plot_button_qt_texts = {
@@ -2826,6 +3179,11 @@ class TelemetryDashboard:
             camera_follow_enabled = self.camera_follow_checkbox.isChecked()
             camera_follow_view = str(self.camera_view_combo.currentData())
         paused = self._paused or self._normalize_key(self.QtCore.Qt.Key_Space) in keys
+        control_source = (
+            "keyboard"
+            if self.control_source_combo is None
+            else str(self.control_source_combo.currentData())
+        )
         if paused:
             return DashboardCommand(
                 0.0,
@@ -2835,16 +3193,39 @@ class TelemetryDashboard:
                 structural_action=structural_action,
                 camera_follow_enabled=camera_follow_enabled,
                 camera_follow_view=camera_follow_view,
+                control_source=control_source,
+            )
+        if control_source != "keyboard":
+            return DashboardCommand(
+                0.0,
+                0.0,
+                should_exit=self._should_exit,
+                structural_action=structural_action,
+                camera_follow_enabled=camera_follow_enabled,
+                camera_follow_view=camera_follow_view,
+                control_source=control_source,
             )
         linear = 0.0
         angular = 0.0
-        if self._normalize_key(self.QtCore.Qt.Key_Up) in keys:
+        if (
+            self._normalize_key(self.QtCore.Qt.Key_Up) in keys
+            or self._normalize_key(self.QtCore.Qt.Key_W) in keys
+        ):
             linear += self.linear_spin.value()
-        if self._normalize_key(self.QtCore.Qt.Key_Down) in keys:
+        if (
+            self._normalize_key(self.QtCore.Qt.Key_Down) in keys
+            or self._normalize_key(self.QtCore.Qt.Key_S) in keys
+        ):
             linear -= self.linear_spin.value()
-        if self._normalize_key(self.QtCore.Qt.Key_Left) in keys:
+        if (
+            self._normalize_key(self.QtCore.Qt.Key_Left) in keys
+            or self._normalize_key(self.QtCore.Qt.Key_A) in keys
+        ):
             angular += self.angular_spin.value()
-        if self._normalize_key(self.QtCore.Qt.Key_Right) in keys:
+        if (
+            self._normalize_key(self.QtCore.Qt.Key_Right) in keys
+            or self._normalize_key(self.QtCore.Qt.Key_D) in keys
+        ):
             angular -= self.angular_spin.value()
         return DashboardCommand(
             linear,
@@ -2854,6 +3235,7 @@ class TelemetryDashboard:
             structural_action=structural_action,
             camera_follow_enabled=camera_follow_enabled,
             camera_follow_view=camera_follow_view,
+            control_source=control_source,
         )
 
     def update(self, telemetry: RobotTelemetry) -> bool:
@@ -2862,7 +3244,10 @@ class TelemetryDashboard:
         plot_updated = self._maybe_update_plots(telemetry, now)
         if not should_refresh_dashboard(self._last_update_time, now, self.update_hz):
             return plot_updated
+        previous_update_time = self._last_update_time
         self._last_update_time = now
+        if previous_update_time is not None and now > previous_update_time:
+            self._actual_update_hz = 1.0 / (now - previous_update_time)
         if not self.developer_diagnostics_enabled:
             return True
         display_telemetry = smooth_telemetry(self._smoothed_telemetry, telemetry, self.smoothing_alpha)
@@ -2870,6 +3255,39 @@ class TelemetryDashboard:
         for name, value in dashboard_rows(display_telemetry):
             self.labels[name].setText(value)
         return True
+
+    @property
+    def actual_update_hz(self) -> float | None:
+        """返回最近两次实际 UI 刷新的频率，不把配置目标当成观测值。"""
+        return self._actual_update_hz
+
+    def update_resource_status(self, snapshot: ResourceSnapshot) -> None:
+        """渲染资源采样器的只读 1 Hz 快照，Qt 线程不自行读取系统状态。"""
+        if type(snapshot) is not ResourceSnapshot:
+            raise ValueError("snapshot must be an exact ResourceSnapshot")
+        if self.resource_layout is None:
+            return
+        for process in snapshot.processes:
+            label = self.resource_labels.get(process.name)
+            if label is None:
+                label = self.QtWidgets.QLabel()
+                label.setWordWrap(True)
+                label.setTextInteractionFlags(self.QtCore.Qt.TextSelectableByMouse)
+                self.resource_labels[process.name] = label
+                self.resource_layout.addRow(process.name, label)
+            cpu = "--" if process.cpu_percent is None else f"{process.cpu_percent:.1f}%"
+            rss_mib = process.rss_bytes / (1024.0 * 1024.0)
+            label.setText(
+                f"pid={process.pid} | CPU {cpu} | RSS {rss_mib:.1f} MiB | {process.state}"
+            )
+        for name, value in snapshot.metrics:
+            label = self.resource_labels.get(name)
+            if label is None:
+                label = self.QtWidgets.QLabel()
+                label.setWordWrap(True)
+                self.resource_labels[name] = label
+                self.resource_layout.addRow(name, label)
+            label.setText(value)
 
     def update_interface_status(self, snapshot: InterfaceStatusSnapshot) -> None:
         """Qt 线程只渲染不可变快照，不访问 PyBullet、eCAL 或传输工厂。"""
@@ -2946,8 +3364,13 @@ class TelemetryDashboard:
         self.interface_plot_specs = interface_chart_specs(get_robot_model(robot_model))
         legacy_specs = dashboard_plot_specs()
         self.plot_specs = [*legacy_specs, *self.interface_plot_specs]
+        self._plot_spec_by_label = {
+            spec.tab_label: spec for spec in self.plot_specs
+        }
         for spec in self.interface_plot_specs:
-            axis = self.plot_axes[spec.tab_label]
+            axis = self.plot_axes.get(spec.tab_label)
+            if axis is None:
+                continue
             old_legend = self.plot_legends.pop(spec.tab_label, None)
             if old_legend is not None:
                 old_legend.remove()
@@ -2964,11 +3387,12 @@ class TelemetryDashboard:
             )
             if spec.tab_label in self.no_steering_texts:
                 self.no_steering_texts[spec.tab_label].set_text(
-                    "" if spec.lines else "当前车型无转向数据"
+                    "" if spec.lines else "不适用于差速车型"
                 )
         self._interface_robot_model = robot_model
+        self._set_steering_tab_state(robot_model)
 
-    def _reset_interface_generation(self, snapshot: InterfaceDashboardSnapshot) -> None:
+    def _reset_interface_generation(self, snapshot: InterfaceDashboardSnapshot | object) -> None:
         """代际切换时原子丢弃旧业务、质量基线和 LiDAR 最后帧。"""
         self.interface_plot_buffer.clear()
         self._latest_lidar_views = {"front": None, "rear": None}
@@ -2976,7 +3400,12 @@ class TelemetryDashboard:
         self._last_interface_status_update_time = None
         if snapshot.robot_model != self._interface_robot_model:
             self._rebuild_interface_line_artists(snapshot.robot_model)
-        self._interface_generation = snapshot.generation
+        generation = getattr(snapshot, "generation", None)
+        if generation is None:
+            generation = getattr(snapshot, "world_generation", None)
+        if type(generation) is not int:
+            raise ValueError("interface snapshot has no generation")
+        self._interface_generation = generation
         self._mark_plot_data_changed(
             {spec.tab_label for spec in self.interface_plot_specs} | {"LiDAR点云"}
         )
@@ -3034,14 +3463,47 @@ class TelemetryDashboard:
             self._last_interface_status_update_time = now
         space = self._normalize_key(self.QtCore.Qt.Key_Space)
         paused = self._paused or space in self._pressed_keys
-        changed = self.interface_plot_buffer.append(snapshot, paused=paused)
-        self._mark_plot_data_changed(changed)
+        interface_labels = {
+            spec.tab_label for spec in self.interface_plot_specs
+        }
+        if interface_labels.intersection(self.plot_canvases):
+            changed = self.interface_plot_buffer.append(snapshot, paused=paused)
+            self._mark_plot_data_changed(changed)
         if not paused and self._capture_latest_lidar_views(snapshot):
             self._mark_plot_data_changed(("LiDAR点云",))
         self._request_current_plot_draw(now)
 
+    def update_v2_chart_snapshot(self, snapshot: object) -> None:
+        """将 eCAL receiver 的 v2 快照直接写入企业图表缓存。"""
+        from slope_sim.interfaces.v2.dashboard_snapshot import V2DashboardSnapshot
+
+        if type(snapshot) is not V2DashboardSnapshot:
+            raise ValueError("snapshot must be an exact V2DashboardSnapshot")
+        if snapshot.robot_model == "unknown":
+            return
+        now = time.monotonic()
+        if (
+            snapshot.world_generation != self._interface_generation
+            or snapshot.robot_model != self._interface_robot_model
+        ):
+            self._reset_interface_generation(snapshot)
+        space = self._normalize_key(self.QtCore.Qt.Key_Space)
+        paused = self._paused or space in self._pressed_keys
+        interface_labels = {
+            spec.tab_label for spec in self.interface_plot_specs
+        }
+        if interface_labels.intersection(self.plot_canvases):
+            changed = self.interface_plot_buffer.append_v2(snapshot, paused=paused)
+            self._mark_plot_data_changed(changed)
+        self._request_current_plot_draw(now)
+
     def _maybe_update_plots(self, telemetry: RobotTelemetry, now: float) -> bool:
         """按独立频率更新曲线，避免每个物理步都重绘。"""
+        legacy_labels = {
+            spec.tab_label for spec in dashboard_plot_specs()
+        }
+        if not legacy_labels.intersection(self.plot_canvases):
+            return self._request_current_plot_draw(now)
         if not should_refresh_dashboard(self._last_plot_update_time, now, self.plot_update_hz):
             return self._request_current_plot_draw(now)
         self.plot_buffer.append(telemetry)
@@ -3265,6 +3727,17 @@ class TelemetryDashboard:
         self.lidar_range_ring = None
         self.lidar_front_time_text = None
         self.lidar_rear_time_text = None
+
+        v2_dashboard_widget = getattr(self, "v2_dashboard_widget", None)
+        if v2_dashboard_widget is not None:
+            try:
+                shutdown = getattr(v2_dashboard_widget, "shutdown", None)
+                if callable(shutdown):
+                    shutdown()
+                v2_dashboard_widget.close()
+            except Exception:
+                pass
+            self.v2_dashboard_widget = None
 
         try:
             self.window.close()

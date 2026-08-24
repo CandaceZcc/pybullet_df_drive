@@ -18,6 +18,7 @@ from slope_sim.interfaces.v2.models import (
     RtkStateV2,
 )
 from slope_sim.interfaces.v2.topics import V2_BY_TOPIC, V2_TOPICS
+from slope_sim.lidar_pointcloud import LIDAR_SCAN_PERIOD_NS, mid360_offset_time_ns
 from slope_sim.mapping_replay import RecoveredPoseNode, recover_pose_node
 
 
@@ -29,6 +30,7 @@ _IMU_TOPIC = "/sim/imu/attitude"
 _RESULT_KEYS = frozenset(
     {"clean_shutdown", "mcap", "recorded_count", "role", "topics"}
 )
+_INTERACTIVE_RESULT_KEYS = _RESULT_KEYS | frozenset({"exportable"})
 _MANIFEST_KEYS = frozenset(
     {
         "simulation_session_id",
@@ -44,9 +46,8 @@ _PATTERN_SHA256 = bytes.fromhex(
     "4077e0b68a68e40ba8a5da17d4aff5ba86ea4fb557a4f8b594e4de1ebbeb20ca"
 )
 _LIDAR_FRAME_PERIOD_NS = 100_000_000
-_LIDAR_FIRING_INTERVAL_NS = 5_000
-_LIDAR_LAST_FIRING_NS = 99_995_000
-_LIDAR_SLOT_COUNT = 20_000
+_LIDAR_SLOT_COUNT = 5_760
+_LIDAR_LAST_FIRING_NS = mid360_offset_time_ns(_LIDAR_SLOT_COUNT - 1)
 _UINT64_MAX = (1 << 64) - 1
 
 
@@ -237,21 +238,28 @@ def _validate_lidar_cloud(cloud: LidarPointCloudV2) -> None:
     if cloud.frame_id != "lidar_link" or cloud.lidar_id != 1:
         raise MappingMcapError("LiDAR frame_id/lidar_id must be lidar_link/1")
     if cloud.point_num > _LIDAR_SLOT_COUNT:
-        raise MappingMcapError("LiDAR frame exceeds the frozen 20,000 firing slots")
+        raise MappingMcapError("LiDAR frame exceeds the frozen 5,760 firing slots")
     previous_offset = -1
     for point in cloud.points:
         offset = point.offset_time_ns
         if (
-            offset % _LIDAR_FIRING_INTERVAL_NS != 0
-            or offset > _LIDAR_LAST_FIRING_NS
+            not _is_realtime_mid360_offset(offset)
             or offset <= previous_offset
         ):
             raise MappingMcapError(
-                "LiDAR offsets must be strictly increasing 5 us firing slots"
+                "LiDAR offsets must be strictly increasing realtime MID-360 firing slots"
             )
         if cloud.timebase_ns > _UINT64_MAX - offset:
             raise MappingMcapError("LiDAR absolute point timestamp exceeds uint64")
         previous_offset = offset
+
+
+def _is_realtime_mid360_offset(offset: int) -> bool:
+    """只接受正式 5,760 slot 均分 100 ms 帧得到的时间偏移。"""
+    if not 0 <= offset <= _LIDAR_LAST_FIRING_NS:
+        return False
+    slot = (offset * _LIDAR_SLOT_COUNT + LIDAR_SCAN_PERIOD_NS - 1) // LIDAR_SCAN_PERIOD_NS
+    return slot < _LIDAR_SLOT_COUNT and mid360_offset_time_ns(slot) == offset
 
 
 def _require_payload_identity(model: object, identity: MappingSessionIdentity) -> None:
@@ -270,13 +278,13 @@ def _update_topic_progress(
     progress: dict[str, tuple[int, int | None]],
 ) -> None:
     expected_sequence, previous_timestamp = progress[topic]
-    if sequence != expected_sequence:
-        raise MappingMcapError(f"{topic} sequence must start at 0 and remain continuous")
+    # 交互录制从用户触发的边界截取活跃会话；五条原始流都可能省略窗口外或丢失帧。
     if previous_timestamp is not None:
-        period_ns = 1_000_000_000 // V2_BY_TOPIC[topic].rate_hz
-        if timestamp_ns != previous_timestamp + period_ns:
-            raise MappingMcapError(f"{topic} timestamps must follow its frozen cadence")
-    progress[topic] = (expected_sequence + 1, timestamp_ns)
+        if sequence <= expected_sequence or timestamp_ns <= previous_timestamp:
+            raise MappingMcapError(f"{topic} sequence/time must strictly advance")
+        progress[topic] = (sequence, timestamp_ns)
+        return
+    progress[topic] = (sequence, timestamp_ns)
 
 
 def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -296,12 +304,19 @@ def _read_recorder_result(path: Path, mcap_path: Path) -> dict[str, object]:
         )
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise MappingMcapError("Recorder result is not valid UTF-8 JSON") from error
-    if not isinstance(document, dict) or set(document) != _RESULT_KEYS:
+    if not isinstance(document, dict) or set(document) not in {
+        _RESULT_KEYS,
+        _INTERACTIVE_RESULT_KEYS,
+    }:
         raise MappingMcapError("Recorder result must be a JSON object")
     if (
         document.get("clean_shutdown") is not True
         or document.get("role") != "recorder"
         or document.get("mcap") != str(mcap_path)
+        or (
+            "exportable" in document
+            and document.get("exportable") is not True
+        )
     ):
         raise MappingMcapError("Recorder result does not bind a clean MCAP session")
     recorded_count = document.get("recorded_count")

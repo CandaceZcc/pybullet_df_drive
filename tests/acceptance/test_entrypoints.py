@@ -138,6 +138,16 @@ def test_manual_mode_runs_until_quit_unless_duration_is_explicit(tmp_path: Path,
     assert calls[-1][1] == 2.0
 
 
+def test_main_rejects_rc_port_outside_formal_v2_manual_mode(tmp_path: Path, capsys):
+    config_path = tmp_path / "local.yaml"
+    config_path.write_text("mode: direct\ninterface_mode: local\n", encoding="utf-8")
+
+    assert main_module.main(
+        ["--config", str(config_path), "--rc-port", "/dev/serial/by-id/usb-test"]
+    ) == 2
+    assert "--rc-port requires formal v2 manual interface" in capsys.readouterr().err
+
+
 def test_main_reports_obstacle_event_log_when_present(tmp_path: Path, monkeypatch, capsys):
     """CLI 输出要包含独立障碍物事件日志路径，方便 GUI 验收后定位结构操作。"""
     monkeypatch.setattr(

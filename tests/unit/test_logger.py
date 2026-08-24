@@ -116,6 +116,19 @@ def test_csv_logger_writes_robot_state_rows(tmp_path: Path):
     assert frame.iloc[0]["terrain_type"] == "slope"
 
 
+def test_csv_logger_samples_telemetry_at_the_configured_rate(tmp_path: Path):
+    """降低落盘频率不能改变物理状态；只保留到期的遥测行。"""
+    logger = CsvSimulationLogger(tmp_path, prefix="sampled", rate_hz=20.0)
+    state = RobotState(t=0.0)
+
+    logger.record(state, 0.0, 0.0, 0.0, 0.0)
+    logger.record(state.__class__(t=0.01), 0.0, 0.0, 0.0, 0.0)
+    logger.record(state.__class__(t=0.05), 0.0, 0.0, 0.0, 0.0)
+    path = logger.close()
+
+    assert pd.read_csv(path)["t"].tolist() == [0.0, 0.05]
+
+
 def test_obstacle_event_logger_writes_stable_jsonl_fields_and_flushes(tmp_path: Path):
     """障碍物事件必须写独立 JSONL，避免把结构事件混入遥测 CSV。"""
     logger = logger_module.ObstacleEventLogger(tmp_path, prefix="obstacles")

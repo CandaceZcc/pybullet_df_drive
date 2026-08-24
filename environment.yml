@@ -1,4 +1,4 @@
-# Conda 仿真环境依赖配置。
+# 源码开发环境：包含仿真运行、协议生成与 pytest，不包含 Notebook 分析依赖。
 name: slope-sim
 channels:
   - conda-forge
@@ -8,18 +8,16 @@ dependencies:
   - numpy
   - matplotlib
   - pandas
-  - scipy
   - pyyaml
   - pyside6
   - mcap
   - pyqtgraph
   - pyopengl
-  - protobuf=6.33.6
-  - grpcio-tools=1.76.0
+  - pyserial
   - packaging=26.2
   - pip
   - pytest
-  - jupyterlab
-  - ipykernel
   - pip:
+      - grpcio-tools==1.76.0
+      - protobuf==6.33.6
       - eclipse-ecal==6.1.1

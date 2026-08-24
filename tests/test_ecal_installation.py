@@ -33,12 +33,28 @@ def test_environment_pins_one_ecal_compatible_protobuf_toolchain() -> None:
     environment = yaml.safe_load((ROOT / "environment.yml").read_text(encoding="utf-8"))
     dependencies = _flatten_conda_and_pip_dependencies(environment["dependencies"])
 
-    assert "protobuf=6.33.6" in dependencies
-    assert "grpcio-tools=1.76.0" in dependencies
+    assert "protobuf==6.33.6" in dependencies
+    assert "grpcio-tools==1.76.0" in dependencies
     assert "packaging=26.2" in dependencies
     assert "pip" in dependencies
     assert "eclipse-ecal==6.1.1" in dependencies
     assert not any(item.startswith("ecal=") for item in dependencies)
+
+
+def test_source_development_and_analysis_environments_are_separate() -> None:
+    """源码开发保留运行/测试链，Notebook 与 SciPy 只进入独立分析环境。"""
+    development = yaml.safe_load((ROOT / "environment.yml").read_text(encoding="utf-8"))
+    analysis = yaml.safe_load((ROOT / "environment-analysis.yml").read_text(encoding="utf-8"))
+    development_dependencies = _flatten_conda_and_pip_dependencies(development["dependencies"])
+    analysis_dependencies = _flatten_conda_and_pip_dependencies(analysis["dependencies"])
+
+    assert development["name"] == "slope-sim"
+    assert "pytest" in development_dependencies
+    assert "jupyterlab" not in development_dependencies
+    assert "ipykernel" not in development_dependencies
+    assert "scipy" not in development_dependencies
+    assert {"jupyterlab", "ipykernel", "scipy", "pandas", "mcap"} <= set(analysis_dependencies)
+    assert analysis["name"] == "slope-sim-analysis"
 
 
 def test_pyproject_uses_the_same_runtime_generator_and_ecal_versions() -> None:

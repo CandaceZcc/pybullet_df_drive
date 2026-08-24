@@ -31,6 +31,14 @@ class RunSimV2Command:
         session_id = bytes.fromhex(self._supervisor.session.server_authentication["session_id"])
         return lambda: session_id
 
+    @property
+    def process_pid(self) -> int:
+        """返回受 supervisor 管理的唯一 C++ Command 子进程 PID。"""
+        pid = self._supervisor.process.pid
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            raise RuntimeError("runSim v2 Command has an invalid process PID")
+        return pid
+
     @classmethod
     def launch(cls, *, release_root: Path, robot_model: str) -> "RunSimV2Command":
         """仅从安装 release 启动 C++ Command，禁止开发期 fallback。"""

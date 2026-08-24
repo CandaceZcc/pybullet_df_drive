@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import ast
-from dataclasses import fields, is_dataclass
+from dataclasses import fields, is_dataclass, replace
 from enum import IntEnum
 from functools import lru_cache
 import hashlib
@@ -717,7 +717,7 @@ def test_stage4_coordinator_stop_uses_shard_pids_and_rejects_wrong_shard_ack(
 def test_stage4_coordinator_bounds_shard_timeout_or_exception_to_one_whole_frame_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """两个 shard 共用一帧 100ms deadline，超时只产生一个完整帧 failure。"""
+    """超时只失败当前整帧；排空迟到结果后下一帧仍须保持身份同步。"""
     module = _worker_module()
     descriptor = importlib.import_module("slope_sim.interfaces.v2.descriptor").load_v2_descriptor()
     identity = importlib.import_module("slope_sim.interfaces.v2.session").OutputIdentity(
@@ -727,6 +727,11 @@ def test_stage4_coordinator_bounds_shard_timeout_or_exception_to_one_whole_frame
         1, 7, time.monotonic_ns(), 1, 0, "lidar_link", "lidar_link", 1,
         700_000_000, Pose((0.0, 0.0, 0.8), (0.0, 0.0, 0.0, 1.0)), None, (), identity,
     )
+    next_identity = replace(identity, sequence=8)
+    next_request = module.LidarScanRequest(
+        1, 8, time.monotonic_ns(), 1, 0, "lidar_link", "lidar_link", 1,
+        800_000_000, Pose((0.0, 0.0, 0.8), (0.0, 0.0, 0.0, 1.0)), None, (), next_identity,
+    )
     world_spec = SimpleNamespace(world_digest="0" * 64)
     assignments = module._stage4_realtime_shard_assignments()
     shard_pids = (os.getpid() + 20, os.getpid() + 21)
@@ -735,7 +740,7 @@ def test_stage4_coordinator_bounds_shard_timeout_or_exception_to_one_whole_frame
 
     class RequestReceiver:
         def __init__(self) -> None:
-            self.values = [request, module.LidarWorkerStop(1, os.getpid())]
+            self.values = [request, next_request, module.LidarWorkerStop(1, os.getpid())]
 
         def recv(self) -> object:
             return self.values.pop(0)
@@ -758,6 +763,18 @@ def test_stage4_coordinator_bounds_shard_timeout_or_exception_to_one_whole_frame
                     shard_id, shard_pids[shard_id], first, stop, stride, count, world_spec.world_digest
                 ),
                 object(),
+                module._Stage4ShardResult(
+                    shard_id, shard_pids[shard_id], first, stop, stride, count, count,
+                    request.job_id, request.lifecycle_generation, request.pause_epoch,
+                    request.topic, request.timestamp_ns, (),
+                ),
+                module._Stage4ShardResult(
+                    shard_id, shard_pids[shard_id], first, stop, stride, count, count,
+                    next_request.job_id, next_request.lifecycle_generation,
+                    next_request.pause_epoch, next_request.topic,
+                    next_request.timestamp_ns, (),
+                ),
+                module._Stage4ShardStopped(shard_id, shard_pids[shard_id]),
             ]
             self.poll_count = 0
             self.shard_id = shard_id
@@ -765,15 +782,11 @@ def test_stage4_coordinator_bounds_shard_timeout_or_exception_to_one_whole_frame
         def poll(self, timeout: float) -> bool:
             assert timeout >= 0.0
             self.poll_count += 1
-            # 第一帧严格走 100 ms timeout；随后 Stop 必须仍能完成正常握手。
+            # 第一帧严格走 100 ms timeout；迟到结果排空后下一帧与 Stop 均正常。
             return self.poll_count > 1 or self.shard_id == 1
 
         def recv(self) -> object:
-            if self.values:
-                return self.values.pop(0)
-            if self.poll_count > 1 or self.shard_id == 1:
-                return module._Stage4ShardStopped(self.shard_id, shard_pids[self.shard_id])
-            raise RuntimeError("unexpected direct shard recv")
+            return self.values.pop(0)
 
         def close(self) -> None:
             return None
@@ -802,7 +815,8 @@ def test_stage4_coordinator_bounds_shard_timeout_or_exception_to_one_whole_frame
         failures[0].job_id, failures[0].lifecycle_generation, failures[0].pause_epoch,
         failures[0].topic, failures[0].timestamp_ns,
     ) == (7, 1, 0, "lidar_link", 700_000_000)
-    assert not merged
+    assert len(merged) == 1
+    assert merged[0][0] == next_request
     assert outer[-1] == module.LidarWorkerStopped(1, os.getpid())
 
 
@@ -860,6 +874,91 @@ def test_stage4_shard_runtime_exception_sends_exact_typed_failure(
     ) == (0, process_id, 0, 5_760, 2, 2_880, 9, 1, 0, "lidar_link", 900_000_000)
     assert "\n" not in failure.bounded_detail and "traceback" not in failure.bounded_detail.lower()
     assert not any(type(value) in {module._Stage4ShardResult, module._Stage4ShardStopped, module.LidarWorkerStartupFailure} for value in sent)
+
+
+def test_stage4_coordinator_preserves_shard_failure_detail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """coordinator 的 whole-frame failure 必须保留 shard 的首个受限错误详情。"""
+    module = _worker_module()
+    descriptor = importlib.import_module("slope_sim.interfaces.v2.descriptor").load_v2_descriptor()
+    identity = importlib.import_module("slope_sim.interfaces.v2.session").OutputIdentity(
+        "/sim/lidar/points", b"\x01" * 16, descriptor.sha256, 1, 7
+    )
+    request = module.LidarScanRequest(
+        1, 7, time.monotonic_ns(), 1, 0, "lidar_link", "lidar_link", 1,
+        700_000_000, Pose((0.0, 0.0, 0.8), (0.0, 0.0, 0.0, 1.0)), None, (), identity,
+    )
+    world_spec = SimpleNamespace(world_digest="0" * 64)
+    assignments = module._stage4_realtime_shard_assignments()
+    shard_pids = (os.getpid() + 20, os.getpid() + 21)
+    outer: list[object] = []
+
+    class RequestReceiver:
+        def recv(self) -> object:
+            return request
+
+        def close(self) -> None:
+            return None
+
+    class ShardSender:
+        def send(self, _value: object) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    class ShardReceiver:
+        def __init__(self, shard_id: int) -> None:
+            first, stop, stride, count = assignments[shard_id]
+            runtime_value = (
+                module._Stage4ShardFailure(
+                    shard_id, shard_pids[shard_id], first, stop, stride, count,
+                    request.job_id, request.lifecycle_generation, request.pause_epoch,
+                    request.topic, request.timestamp_ns, "shard_scan_failed",
+                    "Stage4 shard scan: RuntimeError: rayTestBatch failed",
+                )
+                if shard_id == 0 else object()
+            )
+            self.values = [
+                module._Stage4ShardReady(
+                    shard_id, shard_pids[shard_id], first, stop, stride, count,
+                    world_spec.world_digest,
+                ),
+                object(),
+                runtime_value,
+            ]
+
+        def recv(self) -> object:
+            return self.values.pop(0)
+
+        def poll(self, _timeout: float) -> bool:
+            return True
+
+        def close(self) -> None:
+            return None
+
+    class OuterSender:
+        def send(self, value: object) -> None:
+            outer.append(value)
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(module, "V2ProtoCodec", lambda _descriptor: object())
+    monkeypatch.setattr(module, "load_v2_descriptor", lambda: object())
+    monkeypatch.setattr(module, "_stage4_prewarm_payload_from_shards", lambda *_args: (b"x", 1))
+    monkeypatch.setattr(module.gc, "collect", lambda: None)
+    monkeypatch.setattr(module.gc, "freeze", lambda: None)
+    monkeypatch.setattr(module.gc, "disable", lambda: None)
+
+    module.stage4_coordinator_entrypoint(
+        RequestReceiver(), OuterSender(), world_spec,
+        (ShardSender(), ShardSender()), (ShardReceiver(0), ShardReceiver(1)), shard_pids,
+    )
+
+    failure = next(value for value in outer if type(value) is module.LidarScanFailure)
+    assert "rayTestBatch failed" in failure.bounded_detail
 
 
 def test_stage4_coordinator_reconstructs_and_rejects_invalid_shard_result() -> None:
@@ -1416,7 +1515,7 @@ def test_stage4_partial_start_cleanup_preserves_original_error(
         )
 
     assert captured.value.stable_error_code == "worker_start_failed"
-    assert captured.value.bounded_detail == "process start failed: OSError"
+    assert captured.value.bounded_detail == "process start failed: OSError: start failed"
     assert captured.value.__cause__ is start_error
     assert set(reaped) == set(expected_reaped)
     assert len(reaped) == len(expected_reaped)
@@ -2104,6 +2203,51 @@ def test_stage4_shard_freezes_prewarmed_heap_before_ready(
     assert events[0] == ("send", module.LidarWorkerStartupFailure)
 
 
+def test_stage4_shard_treats_parent_pipe_eof_as_a_normal_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """父 coordinator 退出并关闭请求管道时，shard 不得打印未处理 EOF 栈。"""
+    import gc
+
+    module = _worker_module()
+    process_id = os.getpid()
+    events: list[object] = []
+    live = SimpleNamespace(client_id=7)
+    spec = SimpleNamespace(
+        shard_id=0,
+        first=0,
+        stop=5_760,
+        stride=2,
+        count=2_880,
+        world_spec=SimpleNamespace(world_digest="0" * 64),
+    )
+
+    class RequestReceiver:
+        def recv(self) -> object:
+            raise EOFError("coordinator closed request pipe")
+
+        def close(self) -> None:
+            events.append("request_closed")
+
+    class ResponseSender:
+        def send(self, value: object) -> None:
+            events.append(("send", type(value)))
+
+        def close(self) -> None:
+            events.append("response_closed")
+
+    monkeypatch.setattr(module, "_bootstrap_live_worker", lambda _spec, **_kwargs: live)
+    monkeypatch.setattr(module, "_stage4_shard_prewarm", lambda _live, _spec: object())
+    monkeypatch.setattr(module, "_disconnect_direct_client", lambda client_id: events.append(("disconnect", client_id)))
+    monkeypatch.setattr(gc, "freeze", lambda: None)
+    monkeypatch.setattr(gc, "disable", lambda: None)
+
+    module.stage4_shard_entrypoint(RequestReceiver(), ResponseSender(), spec)
+
+    assert ("disconnect", 7) in events
+    assert ("send", module._Stage4ShardStopped) in events
+
+
 def test_stage4_shard_prewarm_uses_its_assignment_and_active_thread_quota(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2265,6 +2409,75 @@ def test_stage4_shard_prewarm_failure_sends_no_ready_and_disconnects_direct(
     assert ("send", module._Stage4ShardReady) not in events
     assert "freeze" not in events and "disable" not in events
     assert ("disconnect", 7) in events
+
+
+def test_stage4_coordinator_treats_parent_pipe_eof_as_a_normal_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """父 runtime 关闭请求管道时，coordinator 必须收束 sibling 而非抛 EOF。"""
+    module = _worker_module()
+    process_id = os.getpid()
+    events: list[object] = []
+    world_spec = SimpleNamespace(world_digest="0" * 64)
+    assignments = module._stage4_realtime_shard_assignments()
+
+    class RequestReceiver:
+        def recv(self) -> object:
+            raise EOFError("runtime closed request pipe")
+
+        def close(self) -> None:
+            events.append("request_closed")
+
+    class OuterSender:
+        def send(self, value: object) -> None:
+            events.append(("outer_send", type(value)))
+
+        def close(self) -> None:
+            events.append("outer_closed")
+
+    class ShardSender:
+        def send(self, _value: object) -> None:
+            raise AssertionError("EOF shutdown must close shard pipes, not send Stop")
+
+        def close(self) -> None:
+            events.append("shard_sender_closed")
+
+    class ShardReceiver:
+        def __init__(self, shard_id: int) -> None:
+            first, stop, stride, count = assignments[shard_id]
+            self.values = [
+                module._Stage4ShardReady(
+                    shard_id, process_id + shard_id, first, stop, stride, count,
+                    world_spec.world_digest,
+                ),
+                object(),
+            ]
+
+        def recv(self) -> object:
+            return self.values.pop(0)
+
+        def close(self) -> None:
+            events.append("shard_receiver_closed")
+
+    monkeypatch.setattr(module, "load_v2_descriptor", lambda: object())
+    monkeypatch.setattr(module, "V2ProtoCodec", lambda _descriptor: object())
+    monkeypatch.setattr(module, "_stage4_prewarm_payload_from_shards", lambda *_args: (b"prewarm", 1))
+    monkeypatch.setattr(module.gc, "collect", lambda: None)
+    monkeypatch.setattr(module.gc, "freeze", lambda: None)
+    monkeypatch.setattr(module.gc, "disable", lambda: None)
+
+    module.stage4_coordinator_entrypoint(
+        RequestReceiver(),
+        OuterSender(),
+        world_spec,
+        (ShardSender(), ShardSender()),
+        (ShardReceiver(0), ShardReceiver(1)),
+        (process_id, process_id + 1),
+    )
+
+    assert events.count("shard_sender_closed") == 2
+    assert events.count("shard_receiver_closed") == 2
+    assert "outer_closed" in events
 
 
 def test_stage4_coordinator_ready_uses_merged_shard_prewarm_payload(
@@ -6143,15 +6356,20 @@ def test_handle_normal_close_rejects_already_exited_worker_without_ack() -> None
 
 
 def test_exception_detail_is_single_line_and_bounded_by_utf8_bytes() -> None:
-    """多字节异常类名也必须生成至多 512 bytes 的合法单行 detail。"""
+    """异常消息需保留诊断，同时生成至多 512 bytes 的合法单行 detail。"""
     module = _worker_module()
     error_type = type("多字节\n异常" * 100, (RuntimeError,), {})
 
+    diagnostic = module._bounded_exception_detail(
+        "Stage4 shard scan",
+        RuntimeError("ray batch\nrejected"),
+    )
     detail = module._bounded_exception_detail(
         "front\npreflight",
-        error_type("ignored exception payload"),
+        error_type("bounded payload"),
     )
 
+    assert diagnostic == "Stage4 shard scan failed: RuntimeError: ray batch rejected"
     assert "\n" not in detail
     assert "\r" not in detail
     assert len(detail.encode("utf-8")) <= 512

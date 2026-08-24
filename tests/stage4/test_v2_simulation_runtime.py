@@ -189,6 +189,66 @@ def test_v2_simulator_runtime_routes_verified_command_to_existing_authority() ->
     assert runtime.command_decision(now=1.0).waiting is False
 
 
+def test_v2_simulator_runtime_projects_authority_rejection_with_command_identity() -> None:
+    """authority 拒绝必须以独立诊断域保留原始身份和原因。"""
+    descriptor = import_module("slope_sim.interfaces.v2.descriptor").load_v2_descriptor()
+    controller_type = import_module("slope_sim.interfaces.v2.runtime_protocol").V2RuntimeProtocol
+    snapshot_type = import_module(
+        "slope_sim.interfaces.v2.dashboard_snapshot"
+    ).V2DashboardSnapshotStore
+    frames = import_module("slope_sim.interfaces.v2.sensor_frames")
+    runtime_type = import_module("slope_sim.interfaces.v2.simulation_runtime").V2SimulatorRuntime
+    controller_transport = FakeControllerTransport()
+    controller_transport.set_command_verified()
+    controller = controller_type(
+        get_robot_model("df_mid"), transport=controller_transport, descriptor=descriptor
+    )
+    dashboard = snapshot_type(robot_model="df_mid")
+    runtime = runtime_type(
+        controller=controller,
+        wheel_feedback_reader=lambda timestamp_ns: WheelState(timestamp_ns, (0.0, 0.0), ()),
+        sensor_frames=frames.V2SensorFrameFactory(controller, CenterLidar(), Stage4Truth()),
+        output_publisher=frames.V2OutputFramePublisher(RecordingTransport(), descriptor),
+        wheel_state_factory=frames.V2WheelStateFactory(controller, "df_mid"),
+        dashboard_snapshot_store=dashboard,
+    )
+    runtime.refresh_transport()
+    for frame in range(24):
+        runtime.after_physics_step(Fraction(1, 240), wall_time=frame / 240.0)
+    identity = controller.snapshot()
+    command = import_module("slope_sim.interfaces.v2.models").WheelCommandV2(
+        timestamp_ns=10_000_000,
+        drive_wheel_speed_rad_s=(1.0, -1.0),
+        steering_wheel_speed_rad_s=(),
+        sequence=1,
+        world_generation=identity.world_generation + 1,
+        command_generation=identity.command_generation,
+        source_id="manual.tool-1",
+        source_session_id=b"m" * 16,
+        robot_model="df_mid",
+        simulation_session_id=identity.simulation_session_id,
+        descriptor_sha256=descriptor.sha256,
+    )
+    payload = import_module("slope_sim.interfaces.v2.codec").V2ProtoCodec(descriptor).encode(command).payload
+
+    assert runtime.accept_command_payload(payload, received_at=2.5) is False
+
+    snapshot = dashboard.snapshot()
+    assert snapshot is not None
+    assert len(snapshot.authority_rejections) == 1
+    rejection = snapshot.authority_rejections[0]
+    assert rejection.topic == "/sim/wheel/command"
+    assert rejection.source_id == "manual.tool-1"
+    assert rejection.sequence == 1
+    assert rejection.simulation_session_id == identity.simulation_session_id
+    assert rejection.world_generation == identity.world_generation + 1
+    assert rejection.reason == "world generation does not match"
+    assert rejection.received_at == 2.5
+    assert snapshot.observer_rejections == ()
+    assert snapshot.topic_observation("/sim/wheel/command").authority_error_count == 1
+    assert snapshot.topic_observation("/sim/wheel/command").observer_error_count == 0
+
+
 def test_v2_dashboard_accepts_delayed_command_after_newer_physics_query() -> None:
     """延迟 raw callback 的观测时间不能回拨物理线程已推进的 mailbox query 时钟。"""
     descriptor = import_module("slope_sim.interfaces.v2.descriptor").load_v2_descriptor()

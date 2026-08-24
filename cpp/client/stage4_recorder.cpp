@@ -299,6 +299,35 @@ bool MatchesIdentity(const ParsedFrame& frame, const McapSessionIdentity& identi
       frame.world_generation == identity.world_generation;
 }
 
+template <std::size_t Size>
+std::string Hex(const std::array<std::byte, Size>& bytes) {
+  static constexpr char kDigits[] = "0123456789abcdef";
+  std::string value;
+  value.reserve(Size * 2);
+  for (const std::byte byte : bytes) {
+    const unsigned int number = std::to_integer<unsigned int>(byte);
+    value.push_back(kDigits[number >> 4]);
+    value.push_back(kDigits[number & 0x0f]);
+  }
+  return value;
+}
+
+std::string IdentityMismatchReason(
+    const TopicContract& contract,
+    const ParsedFrame& actual,
+    const McapSessionIdentity& expected,
+    const eCAL::STopicId& publisher) {
+  // 保留一次有界发布端证据，供拒绝收据区分旧 producer 与身份传播错误。
+  constexpr std::size_t kMaximumPublisherHostLength = 128;
+  return std::string(contract.topic) + " identity does not match recorder plan: expected_session=" +
+      Hex(expected.simulation_session_id) + " expected_world=" + std::to_string(expected.world_generation) +
+      " actual_session=" + Hex(actual.simulation_session_id) +
+      " actual_world=" + std::to_string(actual.world_generation) +
+      " publisher_entity=" + std::to_string(publisher.topic_id.entity_id) +
+      " publisher_process=" + std::to_string(publisher.topic_id.process_id) +
+      " publisher_host=" + publisher.topic_id.host_name.substr(0, kMaximumPublisherHostLength);
+}
+
 /// Recorder 专用 Unix socket：只接受同 uid 编排器的一次 start/stop/status 控制消息。
 class InteractiveRecorderSocket final {
  public:
@@ -514,7 +543,7 @@ int RunRecorder(const RecorderPlan& plan) {
         subscribers[index]->SetReceiveCallback(
             [&digest, &plan, &session, &receipts, &receipt_mutex, &latch_fault, &interactive_window,
              &last_command_monotonic_ns, receipt, index](
-                const eCAL::STopicId&, const eCAL::SDataTypeInformation& type_info,
+                const eCAL::STopicId& publisher, const eCAL::SDataTypeInformation& type_info,
                 const eCAL::SReceiveCallbackData& data) {
               // eCAL callback 的 buffer 只在回调期间有效，先复制再执行任何验证或排队。
               if (data.buffer_size > 0 && data.buffer == nullptr) {
@@ -541,17 +570,10 @@ int RunRecorder(const RecorderPlan& plan) {
                 const ParsedFrame parsed = ParseValidatedFrame(*receipt->contract, raw);
                 if (!MatchesIdentity(parsed, plan.identity)) {
                   ++receipt->rejected_count;
-                  latch_fault(std::string(receipt->contract->topic) + " identity does not match recorder plan");
+                  latch_fault(IdentityMismatchReason(*receipt->contract, parsed, plan.identity, publisher));
                   return;
                 }
                 std::lock_guard<std::mutex> lock(receipt_mutex);
-                // 录制窗口不能用重复帧填充：每个冻结 topic 只接受连续 sequence。
-                if (receipt->next_sequence.has_value() && parsed.sequence != *receipt->next_sequence) {
-                  ++receipt->rejected_count;
-                  latch_fault(std::string(receipt->contract->topic) + " sequence is not continuous");
-                  return;
-                }
-                receipt->next_sequence = static_cast<std::uint64_t>(parsed.sequence) + 1;
                 if (index == 0) {
                   last_command_monotonic_ns.store(static_cast<std::uint64_t>(
                       std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -563,7 +585,8 @@ int RunRecorder(const RecorderPlan& plan) {
                       receipt->contract->topic, std::move(payload), parsed.sequence,
                       parsed.timestamp_ns, parsed.timestamp_ns});
                   if (interactive_window->state() == InteractiveRecorderWindow::State::kSafeStopRequired) {
-                    latch_fault("interactive Recorder boundary is invalid");
+                    latch_fault("interactive Recorder boundary is invalid: " +
+                                interactive_window->failure_reason());
                     return;
                   }
                 } else {
@@ -578,6 +601,19 @@ int RunRecorder(const RecorderPlan& plan) {
                     latch_fault("interactive Recorder committed an unknown topic");
                     return;
                   }
+                  // 固定离线窗口需要逐帧连续；交互窗口外的回调会被有意
+                  // 丢弃，因此只让实际导出的帧建立 sequence 基线。
+                  const bool sequence_reversed_or_duplicated =
+                      target->next_sequence.has_value() && frame.sequence < *target->next_sequence;
+                  const bool sequence_gap_in_fixed_window =
+                      !plan.interactive && target->next_sequence.has_value() &&
+                      frame.sequence != *target->next_sequence;
+                  if (sequence_reversed_or_duplicated || sequence_gap_in_fixed_window) {
+                    ++target->rejected_count;
+                    latch_fault(std::string(target->contract->topic) + " sequence is not continuous");
+                    return;
+                  }
+                  const std::uint64_t next_sequence = static_cast<std::uint64_t>(frame.sequence) + 1;
                   const RecorderEnqueueResult result = session.Enqueue(std::move(frame));
                   if (result != RecorderEnqueueResult::kAccepted) {
                     latch_fault(std::string(target->contract->topic) +
@@ -586,6 +622,7 @@ int RunRecorder(const RecorderPlan& plan) {
                              : " Recorder session is not recording"));
                     return;
                   }
+                  target->next_sequence = next_sequence;
                   ++target->accepted_count;
                 }
               } catch (const std::exception& error) {

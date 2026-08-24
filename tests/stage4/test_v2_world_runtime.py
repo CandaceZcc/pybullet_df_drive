@@ -67,6 +67,36 @@ class _Service:
         self.closed = True
 
 
+def test_stage4_lidar_worker_protocol_version_is_independent_of_world_generation() -> None:
+    """场景重建后的 generation 不能被误作 LiDAR IPC 协议版本。"""
+    from slope_sim.interfaces.v2.world_runtime import start_stage4_lidar_service
+
+    config = ExperimentConfig(mode="gui", interface_enabled=True)
+    document = initial_scene_document(config)
+    captured: dict[str, object] = {}
+
+    def start_worker(world_spec: object, *, startup_timeout_sec: float) -> object:
+        captured["world_spec"] = world_spec
+        captured["startup_timeout_sec"] = startup_timeout_sec
+        return object()
+
+    def make_service(handle: object, *, lifecycle_generation: int) -> _Service:
+        captured["handle"] = handle
+        captured["lifecycle_generation"] = lifecycle_generation
+        return _Service()
+
+    start_stage4_lidar_service(
+        config,
+        document,
+        world_generation=2,
+        worker_starter=start_worker,
+        service_factory=make_service,
+    )
+
+    assert captured["world_spec"].protocol_version == 1
+    assert captured["lifecycle_generation"] == 2
+
+
 def test_moving_obstacle_frame_keeps_v2_worker_generation_and_freezes_latest_snapshot() -> None:
     """移动位姿只进入 capture 快照，不能逐物理帧重建异步 worker。"""
     from slope_sim.coordinator import SimulationCoordinator
@@ -312,6 +342,7 @@ def test_manual_demo_ecal_branch_injects_v2_runtime_into_existing_gui_coordinato
     import slope_sim.manual_demo as manual_demo
 
     client_id = 47
+    canonical_document = object()
     robot = SimpleNamespace(robot_id=73)
     world = SimpleNamespace(
         scene=SimpleNamespace(body_ids=(101,)),
@@ -353,6 +384,9 @@ def test_manual_demo_ecal_branch_injects_v2_runtime_into_existing_gui_coordinato
     class FakeV2Dashboard:
         def refresh_from_store(self, store: object) -> None:
             calls.setdefault("v2_refreshes", []).append(store)
+
+        def update_cloud_frame(self, _frame: object) -> None:
+            calls["v2_cloud_updates"] = calls.get("v2_cloud_updates", 0) + 1
 
         def launch_live_viewer(self) -> None:
             calls["live_viewer_opened"] = True
@@ -435,6 +469,12 @@ def test_manual_demo_ecal_branch_injects_v2_runtime_into_existing_gui_coordinato
     monkeypatch.setattr(manual_demo.p, "readUserDebugParameter", lambda _slider: 0.0)
     monkeypatch.setattr(manual_demo.p, "getKeyboardEvents", lambda: {})
     monkeypatch.setattr(manual_demo, "build_world_from_scene_document", lambda *_args: (world, SimpleNamespace(snapshot=lambda **_kwargs: ("obstacle",))))
+    monkeypatch.setattr(
+        manual_demo,
+        "_logical_document_for_world",
+        lambda *_args: canonical_document,
+        raising=False,
+    )
     monkeypatch.setattr(manual_demo, "PyBulletSensorBackend", FakeSensorBackend)
     monkeypatch.setattr(manual_demo, "V2ManualWorldRuntime", FakeV2ManualWorldRuntime)
     monkeypatch.setattr(manual_demo, "TelemetryDashboard", FakeDashboard)
@@ -443,6 +483,38 @@ def test_manual_demo_ecal_branch_injects_v2_runtime_into_existing_gui_coordinato
         manual_demo,
         "_create_v2_dashboard_widget",
         lambda _runtime, **_kwargs: v2_dashboard,
+    )
+    receiver_store = object()
+    receiver_cloud = object()
+
+    class FakeObserver:
+        def set_diagnostic_callback(self, callback: object) -> None:
+            calls["observer_diagnostic_callback"] = callback
+
+        def start(self) -> None:
+            calls["observer_started"] = True
+
+        def close(self) -> None:
+            calls["observer_closed"] = True
+
+    class FakeReceiver:
+        snapshot_store = receiver_store
+
+        def cloud_frame(self) -> object:
+            return receiver_cloud
+
+        def record_transport_error(self, _topic: str, _detail: str) -> None:
+            return None
+
+        def close(self) -> None:
+            calls["receiver_closed"] = True
+
+    receiver = FakeReceiver()
+    observer = FakeObserver()
+    monkeypatch.setattr(
+        manual_demo,
+        "_create_v2_dashboard_receiver",
+        lambda _descriptor: (observer, receiver),
     )
     monkeypatch.setattr(manual_demo, "SimulationCoordinator", FakeCoordinator)
     monkeypatch.setattr(manual_demo, "create_interface_session", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("v1 interface session must not be created")))
@@ -482,6 +554,7 @@ def test_manual_demo_ecal_branch_injects_v2_runtime_into_existing_gui_coordinato
     coordinator_args, coordinator_kwargs = calls["coordinator"]
     assert calls["backend"] == (client_id, robot.robot_id)
     assert runtime["config"] is config
+    assert runtime["scene_document"] is canonical_document
     assert runtime["robot"] is robot
     assert runtime["session_id_factory"] is session_id_factory
     assert coordinator_args[:4] == (client_id, config, world, runtime["obstacle_manager"])
@@ -493,10 +566,12 @@ def test_manual_demo_ecal_branch_injects_v2_runtime_into_existing_gui_coordinato
     assert calls["capture_duration_requested"] == 90
     assert calls["capture_duration_index"] == 2
     assert calls["capture_start_requested"] is True
-    assert calls["v2_refreshes"] == [
-        coordinator_kwargs["interface_runtime"].dashboard_snapshot_store
-    ]
+    assert calls["observer_started"] is True
+    assert calls["v2_refreshes"] == [receiver_store]
+    assert calls["v2_cloud_updates"] == 1
     assert calls["dashboard_closed"] is True
+    assert calls["receiver_closed"] is True
+    assert calls["observer_closed"] is True
     assert calls["v2_closed"] is True
     assert calls["command_client_closed"] is True
     assert calls["disconnect"] == client_id
@@ -515,6 +590,59 @@ def test_manual_demo_renews_v2_target_only_through_authenticated_client() -> Non
     manual_demo._renew_v2_command_target(Client(), 0.6, -0.2, now=12.5)
 
     assert sent == [(0.6, -0.2, 12.5)]
+
+
+def test_manual_demo_external_selection_does_not_submit_local_keyboard_value() -> None:
+    """切到 external 只撤销本地目标，不能把 GUI 键盘数值交给 external。"""
+    import slope_sim.manual_demo as manual_demo
+
+    calls: list[tuple[str, float, float, float] | tuple[str]] = []
+
+    class Arbiter:
+        @staticmethod
+        def snapshot():
+            return type("Snapshot", (), {"active_source": None})()
+
+        @staticmethod
+        def select_source(source: str, *, now: float) -> None:
+            calls.append((source, 0.0, 0.0, now))
+
+        @staticmethod
+        def submit_external(linear: float, angular: float, *, now: float) -> None:
+            calls.append(("external", linear, angular, now))
+
+    manual_demo._renew_v2_command_target(
+        None, 0.6, -0.2, now=12.5, arbiter=Arbiter(), source="external"
+    )
+
+    assert calls == [("external", 0.0, 0.0, 12.5)]
+
+
+def test_manual_demo_syncs_current_v2_generation_after_a_scene_commit() -> None:
+    """障碍物提交后的下一次 Command 帧必须携带新的 world/command generation。"""
+    import slope_sim.manual_demo as manual_demo
+
+    calls: list[tuple[int, int, str, float]] = []
+
+    class Client:
+        @staticmethod
+        def sync_generation(
+            world_generation: int,
+            command_generation: int,
+            *,
+            robot_model: str,
+            now: float,
+        ) -> None:
+            calls.append((world_generation, command_generation, robot_model, now))
+
+    snapshot = type("Snapshot", (), {"world_generation": 2, "command_generation": 2})()
+    runtime = type("Runtime", (), {"protocol_snapshot": staticmethod(lambda: snapshot)})()
+
+    manual_demo._sync_v2_command_generation(
+        Client(), runtime, robot_model="df_mid", now=12.5
+    )
+
+    assert calls == [(2, 2, "df_mid", 12.5)]
 
 
 def test_v2_manual_runtime_exposes_one_atomic_protocol_snapshot() -> None:
@@ -554,9 +682,14 @@ def test_manual_demo_starts_v2_capture_from_current_protocol_snapshot(
         calls.update(kwargs)
         return Recorder()
 
+    published_dir = tmp_path / "capture-20260819-143012"
+    staging_dir = tmp_path / ".capture-20260819-143012.tmp"
     monkeypatch.setattr(
-        "slope_sim.interfaces.v2.runsim_v2_recorder.create_capture_output_dir",
-        lambda _root: tmp_path / "capture-20260819-143012",
+        "slope_sim.interfaces.v2.runsim_v2_recorder.prepare_capture_output_dirs",
+        lambda _root: SimpleNamespace(
+            staging_dir=staging_dir,
+            published_dir=published_dir,
+        ),
     )
     monkeypatch.setattr(
         "slope_sim.interfaces.v2.runsim_v2_recorder.RunSimV2Recorder.launch", launch,
@@ -569,10 +702,11 @@ def test_manual_demo_starts_v2_capture_from_current_protocol_snapshot(
     )
 
     assert isinstance(recorder, Recorder)
-    assert output_dir == tmp_path / "capture-20260819-143012"
+    assert output_dir == published_dir
     assert calls["snapshot"] is snapshot
     assert calls["scene_id"] == output_dir.name
-    assert calls["output_dir"] == output_dir
+    assert calls["output_dir"] == staging_dir
+    assert calls["published_output_dir"] == published_dir
     assert calls["started"] is True
 
 
@@ -610,8 +744,8 @@ def test_v2_manual_runtime_rebuild_and_obstacle_refresh_delegate_one_worker_tran
         def prepare_world_rebuild(self) -> None:
             events.append(("prepare",))
 
-        def commit_world_rebuild(self, scene_document: object) -> None:
-            events.append(("commit", scene_document))
+        def commit_world_rebuild(self, scene_document: object, *, model: object) -> None:
+            events.append(("commit", scene_document, model))
             self.scene_document = scene_document
 
         def update_scene_document(self, scene_document: object) -> None:
@@ -633,7 +767,7 @@ def test_v2_manual_runtime_rebuild_and_obstacle_refresh_delegate_one_worker_tran
 
     assert events == [
         ("prepare",),
-        ("commit", document),
+        ("commit", document, FakeRobot.model_spec),
         ("bind", (11,), ("new-obstacle",)),
         ("invalidate_generation", changed_document),
     ]
@@ -715,8 +849,9 @@ def test_v2_manual_runtime_replaces_dashboard_store_after_world_generation_chang
         pass
 
     class FakeWorldRuntime:
-        def commit_world_rebuild(self, committed: object) -> None:
+        def commit_world_rebuild(self, committed: object, *, model: object) -> None:
             assert committed is document
+            assert model is FakeRobot.model_spec
 
     monkeypatch.setattr(world_runtime_module, "DifferentialDriveRobot", FakeRobot)
     monkeypatch.setattr(world_runtime_module, "PyBulletSensorBackend", FakeBackend)

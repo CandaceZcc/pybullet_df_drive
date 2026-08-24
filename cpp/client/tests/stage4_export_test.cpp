@@ -692,8 +692,15 @@ int main(int argc, char* argv[]) {
     std::string_view second_frame;
     std::string_view expected_error;
   };
-  const std::array<TwoScanCase, 7> two_scan_cases{{
-      {"sequence-gap", 120, 122, 8'000'000'000, 8'100'000'000, false, 7, 7, false, 42, 42, "lidar_link", "lidar_link", "LiDAR scan sequence or timebase is not strictly continuous"},
+  const fs::path sequence_gap_recording = directory / "sequence-gap.mcap";
+  write_two_scan_fixture(sequence_gap_recording, 120, 122, 8'000'000'000, 8'100'000'000,
+                         identity.descriptor_sha256, identity.descriptor_sha256, 7, 7, kSessionId, kSessionId,
+                         42, 42, "lidar_link", "lidar_link");
+  Require(RunExport(root, sequence_gap_recording, directory / "sequence-gap-output",
+                    directory / "sequence-gap-result.json").exit_code == 0,
+          "export rejected a forward LiDAR sequence gap");
+
+  const std::array<TwoScanCase, 6> two_scan_cases{{
       {"sequence-backwards", 122, 121, 8'200'000'000, 8'300'000'000, false, 7, 7, false, 42, 42, "lidar_link", "lidar_link", "LiDAR scan sequence or timebase is not strictly continuous"},
       {"timebase-equal", 123, 124, 8'400'000'000, 8'400'000'000, false, 7, 7, false, 42, 42, "lidar_link", "lidar_link", "LiDAR scan sequence or timebase is not strictly continuous"},
       {"timebase-backwards", 125, 126, 8'600'000'000, 8'500'000'000, false, 7, 7, false, 42, 42, "lidar_link", "lidar_link", "LiDAR scan sequence or timebase is not strictly continuous"},

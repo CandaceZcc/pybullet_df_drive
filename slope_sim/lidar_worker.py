@@ -1771,10 +1771,14 @@ def _run_cleanup_actions(actions: tuple[Callable[[], None], ...]) -> BaseExcepti
 
 def _bounded_exception_detail(stage: str, error: BaseException) -> str:
     """把内部错误压缩为稳定单行诊断，绝不发送 traceback。"""
-    detail = f"{stage} failed: {type(error).__name__}".replace("\r", " ").replace(
-        "\n",
-        " ",
-    )
+    try:
+        message = str(error)
+    except BaseException:
+        message = ""
+    suffix = f": {message}" if message else ""
+    detail = f"{stage} failed: {type(error).__name__}{suffix}".replace(
+        "\r", " "
+    ).replace("\n", " ")
     encoded = detail.encode("utf-8", errors="replace")
     if len(encoded) <= 512:
         return encoded.decode("utf-8")
@@ -2300,6 +2304,8 @@ def _scan_failure(
     stage: str,
     error: BaseException,
     started_ns: int,
+    *,
+    bounded_detail: str | None = None,
 ) -> LidarScanFailure:
     return LidarScanFailure(
         _PROTOCOL_VERSION,
@@ -2309,7 +2315,9 @@ def _scan_failure(
         request.topic,
         request.timestamp_ns,
         error_code,
-        _bounded_exception_detail(stage, error),
+        _bounded_exception_detail(stage, error)
+        if bounded_detail is None
+        else bounded_detail,
         time.monotonic_ns() - started_ns,
     )
 
@@ -2779,7 +2787,11 @@ def stage4_shard_entrypoint(
         )
         response_sender.send(prewarm)
         while True:
-            raw_request = request_receiver.recv()
+            try:
+                raw_request = request_receiver.recv()
+            except EOFError:
+                normal_stop = True
+                break
             if type(raw_request) is LidarWorkerStop:
                 stop = LidarWorkerStop(raw_request.protocol_version, raw_request.process_id)
                 if stop.process_id != os.getpid():
@@ -2996,7 +3008,10 @@ def stage4_coordinator_entrypoint(
         digest = hashlib.sha256(prewarm_payload).hexdigest()
         response_sender.send(LidarWorkerReady(_PROTOCOL_VERSION, os.getpid(), world_spec.world_digest, ("lidar_link",), (("lidar_link", digest),), prewarm_duration_ns))
         while True:
-            request = request_receiver.recv()
+            try:
+                request = request_receiver.recv()
+            except EOFError:
+                return
             if type(request) is LidarWorkerStop:
                 stop = LidarWorkerStop(request.protocol_version, request.process_id)
                 if stop.process_id != os.getpid():
@@ -3021,6 +3036,7 @@ def stage4_coordinator_entrypoint(
             validated = _reconstruct_scan_request(request)
             frame_started_ns = time.monotonic_ns()
             frame_deadline_ns = validated.captured_monotonic_ns + _LIDAR_JOB_BUDGET_NS
+            shard_failure_detail: str | None = None
             try:
                 for sender in shard_senders:
                     sender.send(validated)
@@ -3032,13 +3048,14 @@ def stage4_coordinator_entrypoint(
                         raise TimeoutError("Stage4 shard frame response timed out")
                     raw_response = receiver.recv()
                     if type(raw_response) is _Stage4ShardFailure:
-                        _reconstruct_stage4_shard_failure(
+                        failure = _reconstruct_stage4_shard_failure(
                             raw_response,
                             shard_id=shard_id,
                             process_id=shard_pids[shard_id],
                             assignment=assignments[shard_id],
                             request=validated,
                         )
+                        shard_failure_detail = failure.bounded_detail
                         raise RuntimeError("Stage4 shard scan failed")
                     responses.append(
                         _reconstruct_stage4_shard_result(
@@ -3052,14 +3069,48 @@ def stage4_coordinator_entrypoint(
                 response_sender.send(_stage4_payload_from_shards(validated, codec, tuple(responses)))
             except TimeoutError as error:
                 response_sender.send(
-                    _scan_failure(validated, "pointcloud_failed", "Stage4 shard frame", error, frame_started_ns)
+                    _scan_failure(
+                        validated,
+                        "pointcloud_failed",
+                        "Stage4 shard frame",
+                        error,
+                        frame_started_ns,
+                    )
                 )
-                # 单帧失败已显式回传；coordinator 必须保留 Stop 握手，不能让
-                # 父端在回收仍运行的 shard 时提前关闭它们的 response pipe。
+                # 超时帧的迟到结果仍在各自 pipe 中；必须按当前 identity 排空，
+                # 否则下一帧会把旧结果误判为自己的响应并终止整个服务。
+                try:
+                    for shard_id in range(len(responses), len(shard_receivers)):
+                        raw_response = shard_receivers[shard_id].recv()
+                        if type(raw_response) is _Stage4ShardFailure:
+                            _reconstruct_stage4_shard_failure(
+                                raw_response,
+                                shard_id=shard_id,
+                                process_id=shard_pids[shard_id],
+                                assignment=assignments[shard_id],
+                                request=validated,
+                            )
+                            return
+                        _reconstruct_stage4_shard_result(
+                            raw_response,
+                            shard_id=shard_id,
+                            process_id=shard_pids[shard_id],
+                            assignment=assignments[shard_id],
+                            request=validated,
+                        )
+                except BaseException:
+                    return
                 continue
             except BaseException as error:
                 response_sender.send(
-                    _scan_failure(validated, "pointcloud_failed", "Stage4 shard frame", error, frame_started_ns)
+                    _scan_failure(
+                        validated,
+                        "pointcloud_failed",
+                        "Stage4 shard frame",
+                        error,
+                        frame_started_ns,
+                        bounded_detail=shard_failure_detail,
+                    )
                 )
                 return
     finally:

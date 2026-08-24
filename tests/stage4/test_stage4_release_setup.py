@@ -46,6 +46,21 @@ def test_release_setup_installs_locked_ecal_configuration(tmp_path: Path) -> Non
     assert (release / "etc" / "ecal" / "ecal.yaml").read_text(encoding="utf-8") == "ecal:\n"
 
 
+def test_release_setup_ros_bridge_launcher_exposes_release_libraries(tmp_path: Path) -> None:
+    """Bridge wrapper 必须让 ROS 动态加载器找到 release 内 Livox 类型支持库。"""
+    module = __import__("scripts.stage4_release_setup", fromlist=["_install_ros_bridge_launcher"])
+    release = tmp_path / "release"
+    bridge = release / "bin" / "slope_sim_stage4_ros2_bridge"
+    bridge.parent.mkdir(parents=True)
+    bridge.write_text("binary", encoding="utf-8")
+    bridge.chmod(0o755)
+
+    module._install_ros_bridge_launcher(release)
+
+    launcher = bridge.read_text(encoding="utf-8")
+    assert 'export LD_LIBRARY_PATH="$release_root/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"' in launcher
+
+
 def test_stage4_runtime_lock_covers_import_time_pandas_dependency() -> None:
     """生产 runtime 的唯一环境声明和显式 lock 都必须包含 pandas。"""
     environment = (ROOT / "packaging" / "python-environment.yml").read_text(encoding="utf-8")
@@ -311,6 +326,7 @@ def test_ros_release_installs_a_bridge_launcher_that_loads_jazzy(tmp_path: Path)
         "#include <iostream>\n"
         "int main(int argc, char** argv) {\n"
         "  std::cout << \"ROS_DISTRO=\" << (std::getenv(\"ROS_DISTRO\") ?: \"\")\n"
+        "            << \" livox_runtime=\" << (std::getenv(\"SLOPE_SIM_LIVOX_RUNTIME\") ?: \"\")\n"
         "            << \" arg=\" << (argc > 1 ? argv[1] : \"\") << \"\\n\";\n"
         "}\n",
         encoding="utf-8",
@@ -342,6 +358,9 @@ def test_ros_release_installs_a_bridge_launcher_that_loads_jazzy(tmp_path: Path)
         ),
         encoding="utf-8",
     )
+    local_setup = release / "share" / "livox_ros_driver2" / "local_setup.sh"
+    local_setup.parent.mkdir(parents=True)
+    local_setup.write_text("export SLOPE_SIM_LIVOX_RUNTIME=ready\n", encoding="utf-8")
 
     completed = subprocess.run(
         [
@@ -373,7 +392,7 @@ def test_ros_release_installs_a_bridge_launcher_that_loads_jazzy(tmp_path: Path)
         env=environment,
     )
     assert launched.returncode == 0, launched.stderr
-    assert launched.stdout == "ROS_DISTRO=jazzy arg=--fixture-argument\n"
+    assert launched.stdout == "ROS_DISTRO=jazzy livox_runtime=ready arg=--fixture-argument\n"
 
 
 def test_release_setup_materializes_internal_runtime_file_links(tmp_path: Path) -> None:

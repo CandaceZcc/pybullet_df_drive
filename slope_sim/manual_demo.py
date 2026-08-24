@@ -16,15 +16,21 @@ import pybullet as p
 from slope_sim.config import ExperimentConfig
 from slope_sim.coordinator import (
     SimulationCoordinator,
+    _logical_document_for_world,
     build_world_from_scene_document,
     load_manual_robot,
     reload_manual_robot,
 )
-from slope_sim.dashboard import DashboardCommand, TelemetryDashboard
+from slope_sim.dashboard import DashboardCommand, TelemetryDashboard, should_refresh_dashboard
 from slope_sim.diagnostics import compute_diagnostic_summary, write_diagnostic_summary
 from slope_sim.interfaces.config import InterfaceConfig
+from slope_sim.interfaces.v2.runsim_session import (
+    MAX_ANGULAR_VELOCITY_RAD_S,
+    MAX_LINEAR_VELOCITY_M_S,
+)
 from slope_sim.interfaces.v2.world_runtime import V2ManualWorldRuntime
 from slope_sim.logger import CsvSimulationLogger, ObstacleEventLogger
+from slope_sim.resource_monitor import ResourceMonitor
 from slope_sim.manual_capture import ManualCaptureRecorder, ManualCaptureSession
 from slope_sim.manual_control import ManualCommand, ManualControlSettings, command_from_keyboard
 from slope_sim.manual_mid360_reconstruction import reconstruction_worker_entrypoint
@@ -96,14 +102,155 @@ def _create_v2_dashboard_widget(
     )
 
 
+def _refresh_v2_dashboard_from_receiver(
+    widget: object,
+    receiver: object,
+    *,
+    chart_sink: object | None = None,
+) -> bool:
+    """GUI 线程只渲染 eCAL receiver 已校验的 snapshot 与 world 点云。"""
+    refresh = getattr(widget, "refresh_from_store", None)
+    cloud_frame = getattr(receiver, "cloud_frame", None)
+    update_cloud = getattr(widget, "update_cloud_frame", None)
+    store = getattr(receiver, "snapshot_store", None)
+    if not callable(refresh) or not callable(cloud_frame) or not callable(update_cloud):
+        raise ValueError("v2 Dashboard receiver/widget contract is incomplete")
+    if store is None:
+        raise ValueError("v2 Dashboard receiver has no snapshot_store")
+    refreshed = bool(refresh(store))
+    if chart_sink is not None:
+        update_chart = getattr(chart_sink, "update_v2_chart_snapshot", None)
+        snapshot = getattr(store, "snapshot", None)
+        if callable(update_chart):
+            if not callable(snapshot):
+                raise ValueError("v2 Dashboard receiver store has no snapshot")
+            current = snapshot()
+            if current is not None:
+                update_chart(current)
+    frame = cloud_frame()
+    if frame is not None:
+        update_cloud(frame)
+    update_diagnostics = getattr(widget, "update_receiver_diagnostics", None)
+    render_dropped_count = getattr(receiver, "render_dropped_count", None)
+    diagnostics = getattr(receiver, "diagnostics", None)
+    if (
+        callable(update_diagnostics)
+        and type(render_dropped_count) is int
+        and isinstance(diagnostics, tuple)
+    ):
+        update_diagnostics(
+            render_dropped_count=render_dropped_count,
+            diagnostics=diagnostics,
+        )
+    return refreshed
+
+
+def _refresh_v2_dashboard_if_due(
+    widget: object,
+    receiver: object,
+    *,
+    chart_sink: object | None,
+    last_refresh_at: float | None,
+    now: float,
+    update_hz: float,
+) -> tuple[bool, float | None]:
+    """以独立 UI 节拍拉取 v2 快照，不能跟随物理循环重复复制。"""
+    if not should_refresh_dashboard(last_refresh_at, now, update_hz):
+        return False, last_refresh_at
+    _refresh_v2_dashboard_from_receiver(widget, receiver, chart_sink=chart_sink)
+    return True, now
+
+
+def _update_resource_dashboard(
+    dashboard: object,
+    monitor: object,
+    *,
+    children: dict[str, int],
+    metrics: dict[str, str] | Callable[[], dict[str, str]],
+    storage_paths: dict[str, Path],
+) -> bool:
+    """仅把到期的资源快照转交 Qt；采样与系统读取始终留在主循环边界。"""
+    sample = getattr(monitor, "sample", None)
+    update = getattr(dashboard, "update_resource_status", None)
+    if not callable(sample) or not callable(update):
+        raise ValueError("resource monitor/dashboard contract is incomplete")
+    snapshot = sample(
+        children=children,
+        metrics=metrics,
+        storage_paths=storage_paths,
+    )
+    if snapshot is None:
+        return False
+    update(snapshot)
+    return True
+
+
+def _resource_scalar_metrics(
+    *,
+    pacer: object,
+    dashboard: object,
+    rc_snapshot: object | None,
+) -> dict[str, str]:
+    """整理已有只读统计；未运行的可选组件不显示虚构的健康指标。"""
+    statistics = getattr(pacer, "statistics", None)
+    overrun_count = getattr(statistics, "overrun_count", None)
+    metrics = {"物理超期": str(overrun_count) if isinstance(overrun_count, int) else "--"}
+    actual_update_hz = getattr(dashboard, "actual_update_hz", None)
+    if isinstance(actual_update_hz, (int, float)) and not isinstance(actual_update_hz, bool):
+        metrics["Dashboard 刷新"] = f"{actual_update_hz:.1f} Hz"
+    if rc_snapshot is None:
+        return metrics
+    actual_hz = getattr(rc_snapshot, "actual_hz", None)
+    if isinstance(actual_hz, (int, float)) and not isinstance(actual_hz, bool):
+        metrics["串口帧率"] = f"{actual_hz:.1f} Hz"
+    frame_age_sec = getattr(rc_snapshot, "last_frame_age_sec", None)
+    if isinstance(frame_age_sec, (int, float)) and not isinstance(frame_age_sec, bool):
+        metrics["串口帧年龄"] = f"{frame_age_sec * 1_000.0:.0f} ms"
+    watchdog_timeout_count = getattr(rc_snapshot, "watchdog_timeout_count", None)
+    if isinstance(watchdog_timeout_count, int) and not isinstance(watchdog_timeout_count, bool):
+        metrics["串口 watchdog"] = str(watchdog_timeout_count)
+    return metrics
+
+
+def _create_v2_dashboard_receiver(descriptor: object) -> tuple[object, object]:
+    """创建附着既有 eCAL core 的 Dashboard 接收链，暂不启动 worker。"""
+    from slope_sim.interfaces.v2.dashboard_receiver import (
+        V2DashboardEcalReceiver,
+        V2DashboardRawObserverTransport,
+    )
+
+    observer = V2DashboardRawObserverTransport(descriptor, start_worker=False)
+    receiver = V2DashboardEcalReceiver(descriptor, transport=observer)
+    observer.set_diagnostic_callback(receiver.record_transport_error)
+    return observer, receiver
+
+
 def _renew_v2_command_target(
     command_client: object | None,
     linear_velocity: float,
     angular_velocity: float,
     *,
     now: float,
+    arbiter: object | None = None,
+    source: str = "keyboard",
 ) -> None:
     """GUI 仅经已认证本机 socket 续租目标，不能直接发布 WheelCommand。"""
+    if arbiter is not None:
+        snapshot = getattr(arbiter, "snapshot", None)
+        select_source = getattr(arbiter, "select_source", None)
+        if not callable(snapshot) or not callable(select_source):
+            raise ValueError("v2_command_arbiter must provide snapshot and select_source")
+        if getattr(snapshot(), "active_source", None) != source:
+            select_source(source, now=now)
+        if source != "keyboard":
+            return
+        submit = getattr(arbiter, "submit_keyboard", None)
+        if not callable(submit):
+            raise ValueError("v2_command_arbiter is missing the selected source submitter")
+        submit(linear_velocity, angular_velocity, now=now)
+        return
+    if source != "keyboard":
+        return
     if command_client is None:
         return
     send_target = getattr(command_client, "send_target", None)
@@ -112,26 +259,55 @@ def _renew_v2_command_target(
     send_target(linear_velocity, angular_velocity, now=now)
 
 
+def _sync_v2_command_generation(
+    command_client: object | None,
+    runtime: V2ManualWorldRuntime,
+    *,
+    robot_model: str,
+    now: float,
+) -> None:
+    """world 提交后同步 C++ Command 的新身份和车型，禁止形状漂移。"""
+    if command_client is None:
+        return
+    snapshot = runtime.protocol_snapshot()
+    world_generation = getattr(snapshot, "world_generation", None)
+    command_generation = getattr(snapshot, "command_generation", None)
+    if type(world_generation) is not int or world_generation <= 0:
+        raise ValueError("v2 runtime snapshot has invalid world_generation")
+    if type(command_generation) is not int or command_generation <= 0:
+        raise ValueError("v2 runtime snapshot has invalid command_generation")
+    synchronize = getattr(command_client, "sync_generation", None)
+    if not callable(synchronize):
+        raise ValueError("v2_command_client must provide sync_generation")
+    synchronize(
+        world_generation,
+        command_generation,
+        robot_model=robot_model,
+        now=now,
+    )
+
+
 def _start_v2_capture(*, release_root: Path, runtime: V2ManualWorldRuntime, output_root: Path) -> tuple[object, Path]:
     """以当前 v2 session/world 启动唯一 C++ Recorder，并请求完整边界开始。"""
     from slope_sim.interfaces.v2.runsim_v2_recorder import (
         RunSimV2Recorder,
-        create_capture_output_dir,
+        prepare_capture_output_dirs,
     )
 
-    output_dir = create_capture_output_dir(output_root)
+    output_dirs = prepare_capture_output_dirs(output_root)
     recorder = RunSimV2Recorder.launch(
         release_root=release_root,
         snapshot=runtime.protocol_snapshot(),
-        scene_id=output_dir.name,
-        output_dir=output_dir,
+        scene_id=output_dirs.published_dir.name,
+        output_dir=output_dirs.staging_dir,
+        published_output_dir=output_dirs.published_dir,
     )
     try:
         recorder.start()
     except BaseException:
         recorder.close()
         raise
-    return recorder, output_dir
+    return recorder, output_dirs.published_dir
 
 
 def merge_manual_commands(dashboard_command: DashboardCommand, keyboard_command: ManualCommand) -> DashboardCommand:
@@ -145,6 +321,7 @@ def merge_manual_commands(dashboard_command: DashboardCommand, keyboard_command:
             structural_action=dashboard_command.structural_action,
             camera_follow_enabled=dashboard_command.camera_follow_enabled,
             camera_follow_view=dashboard_command.camera_follow_view,
+            control_source=dashboard_command.control_source,
         )
     dashboard_has_safe_stop_action = is_safe_stop_action(dashboard_command.structural_action)
     if dashboard_has_safe_stop_action:
@@ -156,6 +333,7 @@ def merge_manual_commands(dashboard_command: DashboardCommand, keyboard_command:
             structural_action=dashboard_command.structural_action,
             camera_follow_enabled=dashboard_command.camera_follow_enabled,
             camera_follow_view=dashboard_command.camera_follow_view,
+            control_source=dashboard_command.control_source,
         )
     dashboard_has_motion = abs(dashboard_command.linear_velocity) > 1e-12 or abs(dashboard_command.angular_velocity) > 1e-12
     if dashboard_command.paused:
@@ -167,6 +345,17 @@ def merge_manual_commands(dashboard_command: DashboardCommand, keyboard_command:
             structural_action=dashboard_command.structural_action,
             camera_follow_enabled=dashboard_command.camera_follow_enabled,
             camera_follow_view=dashboard_command.camera_follow_view,
+            control_source=dashboard_command.control_source,
+        )
+    if dashboard_command.control_source != "keyboard":
+        return DashboardCommand(
+            0.0,
+            0.0,
+            should_exit=dashboard_command.should_exit,
+            structural_action=dashboard_command.structural_action,
+            camera_follow_enabled=dashboard_command.camera_follow_enabled,
+            camera_follow_view=dashboard_command.camera_follow_view,
+            control_source=dashboard_command.control_source,
         )
     if dashboard_has_motion or dashboard_command.should_exit:
         return dashboard_command
@@ -181,6 +370,7 @@ def merge_manual_commands(dashboard_command: DashboardCommand, keyboard_command:
         structural_action=dashboard_command.structural_action,
         camera_follow_enabled=dashboard_command.camera_follow_enabled,
         camera_follow_view=dashboard_command.camera_follow_view,
+        control_source=dashboard_command.control_source,
     )
 
 
@@ -211,6 +401,7 @@ def limit_manual_command_step(
             structural_action=target_command.structural_action,
             camera_follow_enabled=target_command.camera_follow_enabled,
             camera_follow_view=target_command.camera_follow_view,
+            control_source=target_command.control_source,
         )
     return DashboardCommand(
         _step_toward(previous_command.linear_velocity, target_command.linear_velocity, linear_acceleration_limit * dt),
@@ -220,6 +411,7 @@ def limit_manual_command_step(
         structural_action=target_command.structural_action,
         camera_follow_enabled=target_command.camera_follow_enabled,
         camera_follow_view=target_command.camera_follow_view,
+        control_source=target_command.control_source,
     )
 
 
@@ -353,6 +545,10 @@ def run_manual_demo(
     sleep: Callable[[float], None] | None = None,
     v2_session_id_factory: Callable[[], bytes] | None = None,
     v2_command_client: object | None = None,
+    v2_command_shutdown: Callable[[], None] | None = None,
+    v2_command_arbiter: object | None = None,
+    v2_command_pid: int | None = None,
+    rc_worker: object | None = None,
     v2_capture_release_root: Path | None = None,
     v2_capture_output_root: Path | None = None,
     v2_viewer_root: Path | None = None,
@@ -368,6 +564,10 @@ def run_manual_demo(
         raise ValueError("v2_viewer_root must be an absolute Path")
     if v2_capture_duration_sec not in (None, 60, 90, 180):
         raise ValueError("v2_capture_duration_sec must be 60, 90, or 180 seconds")
+    if v2_command_pid is not None and (
+        isinstance(v2_command_pid, bool) or not isinstance(v2_command_pid, int) or v2_command_pid <= 0
+    ):
+        raise ValueError("v2_command_pid must be a positive int or None")
     capture_root = (
         (config.log_dir.parent / "manual-mid360").resolve()
         if v2_capture_output_root is None
@@ -400,6 +600,8 @@ def run_manual_demo(
     v2_dashboard: object | None = None
     interface_session: InterfaceSession | None = None
     v2_manual_runtime: V2ManualWorldRuntime | None = None
+    v2_dashboard_receiver: object | None = None
+    v2_dashboard_observer: object | None = None
     interface_log_paths = None
     log_path: Path | None = None
     event_log_path: Path | None = None
@@ -409,10 +611,12 @@ def run_manual_demo(
     capture_receiver = None
     capture_output_dir: Path | None = None
     viewer_import_results: deque[tuple[bool, str]] = deque()
+    compression_results: deque[tuple[bool, Path | None, str]] = deque()
     v2_capture_recorder: object | None = None
     v2_capture_exporting = False
     v2_capture_results: deque[tuple[bool, Path | None, Path | None, str]] = deque()
     v2_capture_stop_deadline: float | None = None
+    resource_monitor: ResourceMonitor | None = None
     try:
         claim_token = os.environ.get(PYBULLET_WINDOW_TOKEN_ENV)
         claim_kwargs = {} if claim_token is None else {"claim_token": claim_token}
@@ -430,6 +634,12 @@ def run_manual_demo(
             document,
         )
         if config.interface_enabled and config.interface_mode == "ecal":
+            # 障碍物恢复会按当前地形重采样高度和姿态；v2 worker 必须接收已提交物理世界的规范文档。
+            runtime_document = _logical_document_for_world(
+                world,
+                obstacle_manager,
+                document.sensors,
+            )
             # 正式 runSim v2 只复用这个 GUI client；worker 只做异步中心 LiDAR 复制世界。
             sensor_backend = PyBulletSensorBackend(client_id, world.active_robot.robot.robot_id)
             sensor_backend.bind_scene(
@@ -438,7 +648,7 @@ def run_manual_demo(
             )
             v2_manual_runtime = V2ManualWorldRuntime(
                 config=config,
-                scene_document=document,
+                scene_document=runtime_document,
                 robot=world.active_robot.robot,
                 sensor_backend=sensor_backend,
                 obstacle_manager=obstacle_manager,
@@ -479,7 +689,11 @@ def run_manual_demo(
         manual_prefix = (
             f"manual_{terrain.terrain_model}_{active_robot.robot_model}_{terrain.slope_deg:g}"
         )
-        logger = CsvSimulationLogger(config.log_dir, prefix=manual_prefix)
+        logger = CsvSimulationLogger(
+            config.log_dir,
+            prefix=manual_prefix,
+            rate_hz=config.telemetry_log_hz,
+        )
         obstacle_event_logger = ObstacleEventLogger(config.log_dir, prefix=f"{manual_prefix}_obstacles")
 
         linear_slider = None
@@ -491,7 +705,7 @@ def run_manual_demo(
             try:
                 dashboard = TelemetryDashboard(
                     max_linear_speed=config.target_linear_velocity,
-                    max_angular_speed=0.8,
+                    max_angular_speed=config.target_angular_velocity,
                     update_hz=config.dashboard_update_hz,
                     smoothing_alpha=config.dashboard_smoothing_alpha,
                     robot_model=active_robot.robot_model,
@@ -507,12 +721,18 @@ def run_manual_demo(
                     camera_follow_enabled=config.camera_follow_enabled,
                     camera_follow_view=config.camera_follow_view,
                     interface_config=interface_config,
+                    interface_enabled=config.interface_enabled,
                     developer_diagnostics_enabled=config.developer_diagnostics_enabled,
                     show_lidar_tools=v2_manual_runtime is None,
                     v2_dashboard_enabled=v2_manual_runtime is not None,
                 )
             except Exception as exc:
                 raise RuntimeError(f"dashboard construction failed: {exc}") from exc
+            set_rc_available = getattr(dashboard, "set_rc_available", None)
+            if callable(set_rc_available):
+                set_rc_available(rc_worker is not None)
+            if config.developer_diagnostics_enabled:
+                resource_monitor = ResourceMonitor(monotonic=runtime_monotonic)
             if layout.dashboard is None:
                 raise WindowLayoutError(
                     "dashboard layout is unavailable while Dashboard is enabled"
@@ -531,6 +751,14 @@ def run_manual_demo(
                     live_viewer_launcher = build_live_viewer_launcher(
                         v2_capture_release_root
                     )
+                # eCAL core 已由 simulator transport 初始化；Dashboard 只能附着只读 observer。
+                (
+                    v2_dashboard_observer,
+                    v2_dashboard_receiver,
+                ) = _create_v2_dashboard_receiver(
+                    v2_manual_runtime.descriptor,
+                )
+                v2_dashboard_observer.start()
                 v2_dashboard = _create_v2_dashboard_widget(
                     v2_manual_runtime,
                     live_viewer_launcher=live_viewer_launcher,
@@ -564,10 +792,19 @@ def run_manual_demo(
 
         if dashboard is None:
             # 仅 Dashboard 明确禁用时保留 PyBullet 自带调参滑条。
-            linear_slider = p.addUserDebugParameter("max linear speed [m/s]", 0.0, 1.2, config.target_linear_velocity)
-            angular_slider = p.addUserDebugParameter("max angular speed [rad/s]", 0.0, 2.0, 0.8)
+            linear_slider = p.addUserDebugParameter(
+                "max linear speed [m/s]", 0.0, MAX_LINEAR_VELOCITY_M_S, config.target_linear_velocity
+            )
+            angular_slider = p.addUserDebugParameter(
+                "max angular speed [rad/s]", 0.0, MAX_ANGULAR_VELOCITY_RAD_S, config.target_angular_velocity
+            )
 
         max_steps = manual_step_limit(duration_limit_sec, config.time_step)
+        manual_deadline = (
+            None
+            if duration_limit_sec is None
+            else runtime_monotonic() + duration_limit_sec
+        )
         step = 0
         out_of_bounds_latched = False
         # Dashboard 不可用时，持续沿用配置相机状态，不能被命令默认值覆盖。
@@ -591,19 +828,92 @@ def run_manual_demo(
         observation_cadence = RuntimeObservationCadence(
             monotonic=runtime_monotonic,
         )
+        last_v2_dashboard_refresh_at: float | None = None
         pacer.start()
-        while max_steps is None or step < max_steps:
+        while (
+            (max_steps is None or step < max_steps)
+            and (manual_deadline is None or runtime_monotonic() < manual_deadline)
+        ):
             if dashboard is not None:
                 dashboard.process_events()
-                if v2_dashboard is not None and v2_manual_runtime is not None:
-                    v2_dashboard.refresh_from_store(
-                        v2_manual_runtime.dashboard_snapshot_store
+                if resource_monitor is not None:
+                    resource_children: dict[str, int] = {}
+                    if v2_command_pid is not None:
+                        resource_children["Command"] = v2_command_pid
+                    capture_pid = None if capture_process is None else capture_process.pid
+                    if isinstance(capture_pid, int) and not isinstance(capture_pid, bool) and capture_pid > 0:
+                        resource_children["离线重建"] = capture_pid
+                    _update_resource_dashboard(
+                        dashboard,
+                        resource_monitor,
+                        children=resource_children,
+                        metrics=lambda: _resource_scalar_metrics(
+                            pacer=pacer,
+                            dashboard=dashboard,
+                            rc_snapshot=(
+                                rc_worker.snapshot()
+                                if rc_worker is not None
+                                and callable(getattr(rc_worker, "snapshot", None))
+                                else None
+                            ),
+                        ),
+                        storage_paths={
+                            **({"CSV 日志": logger.path} if logger is not None else {}),
+                            **({"采集目录": capture_output_dir} if capture_output_dir is not None else {}),
+                        },
                     )
+                if v2_command_arbiter is not None:
+                    update_control_owner = getattr(dashboard, "update_control_owner", None)
+                    snapshot = getattr(v2_command_arbiter, "snapshot", None)
+                    if callable(update_control_owner) and callable(snapshot):
+                        update_control_owner(snapshot())
+                if v2_dashboard is not None and v2_manual_runtime is not None:
+                    if v2_dashboard_receiver is not None:
+                        _refreshed, last_v2_dashboard_refresh_at = _refresh_v2_dashboard_if_due(
+                            v2_dashboard,
+                            v2_dashboard_receiver,
+                            chart_sink=dashboard,
+                            last_refresh_at=last_v2_dashboard_refresh_at,
+                            now=runtime_monotonic(),
+                            update_hz=config.dashboard_update_hz,
+                        )
+                    else:
+                        if should_refresh_dashboard(
+                            last_v2_dashboard_refresh_at,
+                            runtime_monotonic(),
+                            config.dashboard_update_hz,
+                        ):
+                            v2_dashboard.refresh_from_store(
+                                v2_manual_runtime.dashboard_snapshot_store
+                            )
+                            snapshot = v2_manual_runtime.dashboard_snapshot_store.snapshot()
+                            if snapshot is not None:
+                                dashboard.update_v2_chart_snapshot(snapshot)
+                            last_v2_dashboard_refresh_at = runtime_monotonic()
+                if rc_worker is not None and dashboard is not None:
+                    snapshot = getattr(rc_worker, "snapshot", None)
+                    update_rc_status = getattr(dashboard, "update_rc_status", None)
+                    if callable(snapshot) and callable(update_rc_status):
+                        update_rc_status(
+                            snapshot(),
+                            source_snapshot=(
+                                v2_command_arbiter.snapshot()
+                                if v2_command_arbiter is not None
+                                else None
+                            ),
+                        )
                 while viewer_import_results:
                     viewer_success, viewer_detail = viewer_import_results.popleft()
                     dashboard.set_capture_viewer_result(
                         success=viewer_success,
                         detail=viewer_detail,
+                    )
+                while compression_results:
+                    compression_success, compressed_path, compression_detail = compression_results.popleft()
+                    dashboard.set_capture_compression_result(
+                        success=compression_success,
+                        compressed_path=compressed_path,
+                        detail=compression_detail,
                     )
                 while v2_capture_results:
                     capture_success, mcap_path, lvx2_path, detail = v2_capture_results.popleft()
@@ -747,13 +1057,43 @@ def run_manual_demo(
                             name="livox-viewer-import",
                             daemon=True,
                         ).start()
+                    elif capture_request.kind == "compress_mcap" and capture_request.mcap_path is not None:
+                        def compress_mcap(path: Path = capture_request.mcap_path) -> None:
+                            try:
+                                from slope_sim.mcap_compression import compress_mcap_zstd
+
+                                result = compress_mcap_zstd(path)
+                                compression_results.append(
+                                    (
+                                        True,
+                                        result.output_path,
+                                        f"{result.source_bytes / 1024.0:.1f} KiB → "
+                                        f"{result.output_bytes / 1024.0:.1f} KiB",
+                                    )
+                                )
+                            except Exception as error:
+                                compression_results.append(
+                                    (False, None, str(error) or type(error).__name__)
+                                )
+
+                        threading.Thread(
+                            target=compress_mcap,
+                            name="mcap-zstd-compression",
+                            daemon=True,
+                        ).start()
                 command = dashboard.current_command()
                 # Dashboard 窗口和 PyBullet 窗口谁拿到焦点，都能用物理方向键控制。
                 settings = ManualControlSettings(
                     max_linear_speed=dashboard.linear_spin.value(),
                     max_angular_speed=dashboard.angular_spin.value(),
                 )
-                keyboard_command = command_from_keyboard(p.getKeyboardEvents(), settings)
+                # Dashboard 的下拉框取消键会被 PyBullet 捕获；退出只接受 Dashboard
+                # 明确请求，避免切换控制源时把 Esc/Q 误当作关闭仿真。
+                keyboard_command = command_from_keyboard(
+                    p.getKeyboardEvents(),
+                    settings,
+                    False,
+                )
                 command = merge_manual_commands(command, keyboard_command)
                 camera_follow_enabled = command.camera_follow_enabled
                 camera_follow_view = command.camera_follow_view
@@ -791,6 +1131,7 @@ def run_manual_demo(
                 structural_action=structural_action,
                 camera_follow_enabled=camera_follow_enabled,
                 camera_follow_view=camera_follow_view,
+                control_source=command.control_source,
             )
             if out_of_bounds_latched or safe_stop_requested:
                 limited_command = target_command
@@ -814,6 +1155,8 @@ def run_manual_demo(
                         0.0,
                         0.0,
                         now=runtime_monotonic(),
+                        arbiter=v2_command_arbiter,
+                        source=command.control_source,
                     )
                     observation_cadence.poll_if_due(v2_manual_runtime)
                     manual_paused = True
@@ -832,6 +1175,8 @@ def run_manual_demo(
                     linear_velocity,
                     angular_velocity,
                     now=interface_snapshot_wall_time,
+                    arbiter=v2_command_arbiter,
+                    source=limited_command.control_source,
                 )
                 v2_decision = v2_manual_runtime.command_decision(
                     now=interface_snapshot_wall_time,
@@ -912,10 +1257,18 @@ def run_manual_demo(
                     config.time_step,
                     wall_time=interface_snapshot_wall_time,
                 )
-                if v2_dashboard is not None:
-                    v2_dashboard.refresh_from_store(
-                        v2_manual_runtime.dashboard_snapshot_store
-                    )
+                if rc_worker is not None and dashboard is not None:
+                    snapshot = getattr(rc_worker, "snapshot", None)
+                    update_rc_status = getattr(dashboard, "update_rc_status", None)
+                    if callable(snapshot) and callable(update_rc_status):
+                        update_rc_status(
+                            snapshot(),
+                            source_snapshot=(
+                                v2_command_arbiter.snapshot()
+                                if v2_command_arbiter is not None
+                                else None
+                            ),
+                        )
             elif interface_session is not None:
                 interface_session.runtime.after_physics_step(config.time_step)
 
@@ -954,6 +1307,13 @@ def run_manual_demo(
                 )
             if result is not None and result is not handled_result:
                 handled_result = result
+                if result.state_changed and v2_manual_runtime is not None:
+                    _sync_v2_command_generation(
+                        v2_command_client,
+                        v2_manual_runtime,
+                        robot_model=result.world.active_robot.robot_model,
+                        now=runtime_monotonic(),
+                    )
                 event_action = pending_event_actions[0] if pending_event_actions else None
                 _record_manual_structural_event(
                     obstacle_event_logger,
@@ -1087,15 +1447,40 @@ def run_manual_demo(
                 interface_log_paths = interface_session.close()
             except BaseException as exc:
                 cleanup_error = exc
+        if v2_dashboard_receiver is not None:
+            try:
+                v2_dashboard_receiver.close()
+            except BaseException as exc:
+                cleanup_error = exc
+        if v2_dashboard_observer is not None:
+            try:
+                v2_dashboard_observer.close()
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+        if rc_worker is not None:
+            try:
+                close_rc_worker = getattr(rc_worker, "close", None)
+                if callable(close_rc_worker):
+                    close_rc_worker()
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
         if v2_manual_runtime is not None:
-            close_v2_command_client = getattr(v2_command_client, "close", None)
-            if v2_command_client is not None and not callable(close_v2_command_client):
-                cleanup_error = ValueError("v2_command_client must provide close")
-            elif callable(close_v2_command_client):
+            if v2_command_shutdown is not None:
                 try:
-                    close_v2_command_client()
+                    v2_command_shutdown()
                 except BaseException as exc:
                     cleanup_error = exc
+            else:
+                close_v2_command_client = getattr(v2_command_client, "close", None)
+                if v2_command_client is not None and not callable(close_v2_command_client):
+                    cleanup_error = ValueError("v2_command_client must provide close")
+                elif callable(close_v2_command_client):
+                    try:
+                        close_v2_command_client()
+                    except BaseException as exc:
+                        cleanup_error = exc
             try:
                 v2_manual_runtime.close()
             except BaseException as exc:

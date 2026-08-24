@@ -137,7 +137,10 @@ def run_v2_dashboard_session(
 
     application = QApplication.instance() or QApplication([])
     store = V2DashboardSnapshotStore(robot_model=robot_model)
-    widget = V2DashboardWidget(load_v2_descriptor())
+    widget_options: dict[str, object] = {}
+    if screenshot_png is not None and application.platformName() == "offscreen":
+        widget_options["render_gl"] = False
+    widget = V2DashboardWidget(load_v2_descriptor(), **widget_options)
     if offline_evidence is not None:
         widget.set_offline_evidence(offline_evidence)
     completed = Event()

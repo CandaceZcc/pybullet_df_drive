@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import wraps
 from threading import RLock
 import time
@@ -45,6 +45,22 @@ class V2TopicObservation:
     point_count: int | None = None
     telemetry_observed_at: float | None = None
     transport_observed_at: float | None = None
+    authority_error_count: int = 0
+    observer_error_count: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class V2CommandRejection:
+    """一次 command 链拒绝的有界标量诊断，永不保留原始 payload。"""
+
+    topic: str
+    source_id: str | None
+    source_session_id: bytes | None
+    sequence: int | None
+    simulation_session_id: bytes | None
+    world_generation: int | None
+    reason: str
+    received_at: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +78,8 @@ class V2DashboardSnapshot:
     imu: ImuAttitudeV2 | None
     topic_observations: tuple[V2TopicObservation, ...] = ()
     robot_model: str = "unknown"
+    authority_rejections: tuple[V2CommandRejection, ...] = ()
+    observer_rejections: tuple[V2CommandRejection, ...] = ()
 
     def topic_observation(self, topic: str) -> V2TopicObservation:
         """返回固定五话题中一条观测。"""
@@ -99,6 +117,8 @@ class V2DashboardSnapshotStore:
             contract.topic: V2TopicObservation(contract.topic, contract.rate_hz)
             for contract in V2_TOPICS
         }
+        self._authority_rejections: deque[V2CommandRejection] = deque(maxlen=64)
+        self._observer_rejections: deque[V2CommandRejection] = deque(maxlen=64)
 
     def _observation_values(self) -> tuple[V2TopicObservation, ...]:
         return tuple(self._observed[contract.topic] for contract in V2_TOPICS)
@@ -133,6 +153,7 @@ class V2DashboardSnapshotStore:
                     previous.sequence_gap_count, previous.latest_sequence,
                     previous.latest_timestamp_ns, previous.point_count,
                     previous.telemetry_observed_at, previous.transport_observed_at,
+                    previous.authority_error_count, previous.observer_error_count,
                 )
             derived.append(previous)
         return tuple(derived)
@@ -162,6 +183,7 @@ class V2DashboardSnapshotStore:
             previous.protocol_state, previous.error_count, previous.dropped_count,
             gaps, sequence, timestamp_ns, point_count, observed_at,
             previous.transport_observed_at,
+            previous.authority_error_count, previous.observer_error_count,
         )
 
     def _make_snapshot(
@@ -177,6 +199,8 @@ class V2DashboardSnapshotStore:
             lidar_point_count, rtk, imu,
             self._observation_values() if topic_observations is None else topic_observations,
             self._robot_model if robot_model is None else robot_model,
+            tuple(self._authority_rejections),
+            tuple(self._observer_rejections),
         )
 
     def _replace_snapshot(self, snapshot: V2DashboardSnapshot) -> None:
@@ -311,6 +335,30 @@ class V2DashboardSnapshotStore:
         self._record_telemetry("/sim/wheel/command", observed_at=float(received_at),
                                sequence=sequence, timestamp_ns=timestamp_ns)
         if self._snapshot is not None:
+                self._replace_snapshot(self._make_snapshot(
+                    self._identity, wheel_state=self._snapshot.wheel_state,
+                    lidar_timestamp_ns=self._snapshot.lidar_timestamp_ns,
+                    lidar_sequence=self._snapshot.lidar_sequence,
+                    lidar_point_count=self._snapshot.lidar_point_count, rtk=self._snapshot.rtk,
+                    imu=self._snapshot.imu,
+                ))
+
+    @_writer_locked
+    def record_protocol_error(self, topic: str) -> None:
+        """兼容旧观察者入口；新路径应保留具体 observer 原因。"""
+        if topic not in V2_BY_TOPIC:
+            raise ValueError("topic is not part of the v2 dashboard contract")
+        previous = self._observed[topic]
+        self._observed[topic] = replace(
+            previous,
+            error_count=previous.error_count + 1,
+            observer_error_count=previous.observer_error_count + 1,
+        )
+        self._refresh_current_snapshot()
+
+    def _refresh_current_snapshot(self) -> None:
+        """仅在已有遥测快照时投影新诊断，避免凭空伪造 topic 数据。"""
+        if self._snapshot is not None:
             self._replace_snapshot(self._make_snapshot(
                 self._identity, wheel_state=self._snapshot.wheel_state,
                 lidar_timestamp_ns=self._snapshot.lidar_timestamp_ns,
@@ -318,6 +366,54 @@ class V2DashboardSnapshotStore:
                 lidar_point_count=self._snapshot.lidar_point_count, rtk=self._snapshot.rtk,
                 imu=self._snapshot.imu,
             ))
+
+    def _record_rejection(
+        self,
+        domain: str,
+        *,
+        topic: str,
+        source_id: str | None,
+        source_session_id: bytes | None,
+        sequence: int | None,
+        simulation_session_id: bytes | None,
+        world_generation: int | None,
+        reason: str,
+        received_at: float,
+    ) -> None:
+        if domain not in {"authority", "observer"}:
+            raise ValueError("rejection domain is invalid")
+        if topic not in V2_BY_TOPIC or not isinstance(reason, str) or not reason:
+            raise ValueError("rejection topic and reason must be valid")
+        if type(received_at) not in {int, float} or received_at < 0.0:
+            raise ValueError("rejection received_at must be nonnegative")
+        rejection = V2CommandRejection(
+            topic, source_id, source_session_id, sequence, simulation_session_id,
+            world_generation, reason, float(received_at),
+        )
+        previous = self._observed[topic]
+        if domain == "authority":
+            self._authority_rejections.append(rejection)
+            self._observed[topic] = replace(
+                previous, authority_error_count=previous.authority_error_count + 1,
+            )
+        else:
+            self._observer_rejections.append(rejection)
+            self._observed[topic] = replace(
+                previous,
+                error_count=previous.error_count + 1,
+                observer_error_count=previous.observer_error_count + 1,
+            )
+        self._refresh_current_snapshot()
+
+    @_writer_locked
+    def record_authority_rejection(self, **fields: object) -> None:
+        """记录 simulator authority 的 command 拒绝，不混入 Dashboard observer。"""
+        self._record_rejection("authority", **fields)
+
+    @_writer_locked
+    def record_observer_rejection(self, **fields: object) -> None:
+        """记录 Dashboard observer 的拒绝，不影响 authority 计数。"""
+        self._record_rejection("observer", **fields)
 
     @_writer_locked
     def refresh_transport(self, transport_snapshot: object, *, observed_at: float | None = None) -> None:
@@ -335,6 +431,7 @@ class V2DashboardSnapshotStore:
                 previous.sequence_gap_count, previous.latest_sequence,
                 previous.latest_timestamp_ns, previous.point_count,
                 previous.telemetry_observed_at, current_time,
+                previous.authority_error_count, previous.observer_error_count,
             )
         if self._snapshot is not None:
             self._replace_snapshot(self._make_snapshot(

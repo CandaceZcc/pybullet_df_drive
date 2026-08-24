@@ -98,6 +98,30 @@ bool NoMessageFor(std::function<void()> spin, const std::atomic<int>& count, int
   return count.load() == 0;
 }
 
+bool PublishUntil(std::function<bool()> publish, std::function<void()> spin,
+                  const std::atomic<int>& count, int expected_count, int deadline_ms) {
+  return WaitFor([&] {
+    if (!publish()) return false;
+    spin();
+    return count.load() >= expected_count;
+  }, deadline_ms);
+}
+
+std::optional<int> PublishUntilChildExit(
+    pid_t child, std::function<bool()> publish, int deadline_ms) {
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(deadline_ms);
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (!publish()) return std::nullopt;
+    int status = 0;
+    const pid_t observed = ::waitpid(child, &status, WNOHANG);
+    if (observed == child) return status;
+    if (observed < 0) return std::nullopt;
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  int status = 0;
+  return ::waitpid(child, &status, WNOHANG) == child ? std::optional<int>(status) : std::nullopt;
+}
+
 }  // namespace
 
 int main() {
@@ -240,10 +264,12 @@ int main() {
     Require(NoMessageFor([&node] { rclcpp::spin_some(node); }, livox_count, 250),
             "Bridge published Livox CustomMsg before IMU completed the sensor snapshot");
     Require(imu_publisher.Send(imu_payload.data(), imu_payload.size()), "IMU eCAL publish failed");
-    Require(WaitFor([&node, &pointcloud_count] {
-      rclcpp::spin_some(node);
-      return pointcloud_count.load() == 1;
-    }, 5000), "Bridge did not publish paired ROS PointCloud2 frame");
+    Require(PublishUntil([&] {
+      return lidar_publisher.Send(lidar_payload.data(), lidar_payload.size()) &&
+          rtk_publisher.Send(rtk_payload.data(), rtk_payload.size()) &&
+          imu_publisher.Send(imu_payload.data(), imu_payload.size());
+    }, [&node] { rclcpp::spin_some(node); }, pointcloud_count, 1, 5000),
+            "Bridge did not publish paired ROS PointCloud2 frame");
     Require(WaitFor([&node, &livox_count] {
       rclcpp::spin_some(node);
       return livox_count.load() == 1;
@@ -252,11 +278,9 @@ int main() {
       rclcpp::spin_some(node);
       return rtk_count.load() == 1 && imu_count.load() == 1 && tf_count.load() == 1 && clock_count.load() == 1;
     }, 5000), "Bridge did not publish paired ROS RTK, IMU, TF, and clock frames");
-    Require(publisher.Send(payload.data(), payload.size()), "WheelState eCAL publish failed");
-    Require(WaitFor([&node, &received_count] {
-      rclcpp::spin_some(node);
-      return received_count.load() == 1;
-    }, 5000), "Bridge did not publish first ROS JointState frame");
+    Require(PublishUntil([&] { return publisher.Send(payload.data(), payload.size()); },
+                         [&node] { rclcpp::spin_some(node); }, received_count, 1, 5000),
+            "Bridge did not publish first ROS JointState frame");
     Require(publisher.Send(payload.data(), payload.size()), "second WheelState eCAL publish failed");
     Require(WaitFor([&node, &received_count] {
       rclcpp::spin_some(node);
@@ -419,11 +443,11 @@ int main() {
     mismatched_imu.set_world_generation(expected_imu.world_generation() + 1);
     std::string mismatched_imu_payload;
     Require(mismatched_imu.SerializeToString(&mismatched_imu_payload), "Mismatched IMU cannot be serialized");
-    Require(lidar_publisher.Send(lidar_payload.data(), lidar_payload.size()), "Mismatched LiDAR eCAL publish failed");
-    Require(rtk_publisher.Send(rtk_payload.data(), rtk_payload.size()), "Mismatched RTK eCAL publish failed");
-    Require(imu_publisher.Send(mismatched_imu_payload.data(), mismatched_imu_payload.size()),
-            "Mismatched IMU eCAL publish failed");
-    Require(publisher.Send(payload.data(), payload.size()), "Mismatched WheelState eCAL publish failed");
+    const auto mismatched_status = PublishUntilChildExit(mismatched_child, [&] {
+      return lidar_publisher.Send(lidar_payload.data(), lidar_payload.size()) &&
+          rtk_publisher.Send(rtk_payload.data(), rtk_payload.size()) &&
+          imu_publisher.Send(mismatched_imu_payload.data(), mismatched_imu_payload.size());
+    }, 5000);
     Require(NoMessageFor([&node] { rclcpp::spin_some(node); }, pointcloud_count, 250),
             "Bridge published PointCloud2 for mismatched sensor identity");
     Require(NoMessageFor([&node] { rclcpp::spin_some(node); }, livox_count, 250),
@@ -436,8 +460,8 @@ int main() {
             "Bridge published TF for mismatched sensor identity");
     Require(NoMessageFor([&node] { rclcpp::spin_some(node); }, clock_count, 250),
             "Bridge published clock for mismatched sensor identity");
-    Require(::waitpid(mismatched_child, &status, 0) == mismatched_child && WIFEXITED(status) &&
-                WEXITSTATUS(status) != 0,
+    Require(mismatched_status.has_value() && WIFEXITED(*mismatched_status) &&
+                WEXITSTATUS(*mismatched_status) != 0,
             "Bridge accepted mismatched sensor identity");
 
     pointcloud_count.store(0);
@@ -458,16 +482,17 @@ int main() {
     std::string wrong_lidar_frame_payload;
     Require(wrong_lidar_frame.SerializeToString(&wrong_lidar_frame_payload),
             "Wrong-frame LiDAR cannot be serialized");
-    Require(rtk_publisher.Send(rtk_payload.data(), rtk_payload.size()), "Wrong-frame RTK eCAL publish failed");
-    Require(imu_publisher.Send(imu_payload.data(), imu_payload.size()), "Wrong-frame IMU eCAL publish failed");
-    Require(lidar_publisher.Send(wrong_lidar_frame_payload.data(), wrong_lidar_frame_payload.size()),
-            "Wrong-frame LiDAR eCAL publish failed");
+    const auto wrong_lidar_frame_status = PublishUntilChildExit(wrong_lidar_frame_child, [&] {
+      return rtk_publisher.Send(rtk_payload.data(), rtk_payload.size()) &&
+          imu_publisher.Send(imu_payload.data(), imu_payload.size()) &&
+          lidar_publisher.Send(wrong_lidar_frame_payload.data(), wrong_lidar_frame_payload.size());
+    }, 5000);
     Require(NoMessageFor([&node] { rclcpp::spin_some(node); }, pointcloud_count, 250),
             "Bridge published PointCloud2 for a LiDAR frame outside the v2 contract");
     Require(NoMessageFor([&node] { rclcpp::spin_some(node); }, tf_count, 250),
             "Bridge published TF for a LiDAR frame outside the v2 contract");
-    Require(::waitpid(wrong_lidar_frame_child, &status, 0) == wrong_lidar_frame_child && WIFEXITED(status) &&
-                WEXITSTATUS(status) != 0,
+    Require(wrong_lidar_frame_status.has_value() && WIFEXITED(*wrong_lidar_frame_status) &&
+                WEXITSTATUS(*wrong_lidar_frame_status) != 0,
             "Bridge accepted a LiDAR frame outside the v2 contract");
     rclcpp::shutdown();
     eCAL::Finalize();

@@ -4,10 +4,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
@@ -28,8 +30,31 @@ _DEFAULT_VIEWER_ROOT = (
 _VIEWER_ROOT_ENV = "SLOPE_SIM_LIVOX_VIEWER_ROOT"
 _VIEWER_WINDOW_ARGS = ("-windowed", "-ResX=1600", "-ResY=900")
 _VIEWER_OPEN_FILE_BUTTON = (230, 18)
-_VIEWER_FILENAME_FIELD = (924, 538)
-_VIEWER_OPEN_CONFIRM_BUTTON = (1022, 572)
+_VIEWER_DIALOG_REFERENCE_SIZE = (810, 534)
+_VIEWER_FILENAME_FIELD = (577, 461)
+_VIEWER_OPEN_CONFIRM_BUTTON = (683, 495)
+_RENDERED_POINT_COUNT = re.compile(r"RenderMultiFrame,.*?PointsNum\s*=\s*(\d+)")
+
+
+@dataclass(frozen=True, slots=True)
+class ViewerPlaybackEvidence:
+    """本次 LVX2 导入完成状态链的官方 Viewer 日志证据。"""
+
+    opened: bool
+    simulated_mid360_selected: bool
+    playback_started: bool
+    rendered_point_count: int | None
+
+    @property
+    def complete(self) -> bool:
+        """仅当四项状态全部确认时，Dashboard 才能报告导入成功。"""
+        return (
+            self.opened
+            and self.simulated_mid360_selected
+            and self.playback_started
+            and self.rendered_point_count is not None
+            and self.rendered_point_count > 0
+        )
 
 
 def _require_bwrap() -> None:
@@ -95,6 +120,31 @@ def viewer_lvx2_opened(log_path: Path, lvx2_path: Path) -> bool:
         return False
 
 
+def viewer_playback_evidence(log_path: Path, lvx2_path: Path) -> ViewerPlaybackEvidence:
+    """解析官方日志的打开、MID-360 选择、播放和非零渲染状态。"""
+    try:
+        log = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        log = ""
+    opened = f"ALvxKit::OpenLvxFile({lvx2_path}) success" in log
+    simulated_mid360_selected = (
+        "device type = Mid-360 (9)" in log
+        and "PointCloudSelectionChanged" in log
+    )
+    playback_started = (
+        "AViewerUI::OnDeviceEvent PlayLvxStart" in log
+        or "ALvxKit::PlayerPlay" in log
+    )
+    counts = [int(match.group(1)) for match in _RENDERED_POINT_COUNT.finditer(log)]
+    rendered_point_count = next((count for count in reversed(counts) if count > 0), None)
+    return ViewerPlaybackEvidence(
+        opened=opened,
+        simulated_mid360_selected=simulated_mid360_selected,
+        playback_started=playback_started,
+        rendered_point_count=rendered_point_count,
+    )
+
+
 def _run_xdotool(
     args: Sequence[str],
     *,
@@ -140,6 +190,49 @@ def _visible_window_id(
         return None
     window_ids = str(getattr(result, "stdout", "")).split()
     return window_ids[-1] if window_ids else None
+
+
+def _window_geometry(
+    window_id: str,
+    *,
+    display: str,
+    run_command: Callable[..., object],
+) -> tuple[int, int]:
+    """读取已识别 X11 窗口的当前尺寸，用于 DPI/分辨率无关的控件定位。"""
+    result = _run_xdotool(
+        ("getwindowgeometry", "--shell", window_id),
+        display=display,
+        run_command=run_command,
+    )
+    if getattr(result, "returncode", 1) != 0:
+        raise RuntimeError("Livox Viewer window geometry was unavailable")
+    fields: dict[str, str] = {}
+    for line in str(getattr(result, "stdout", "")).splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            fields[key] = value
+    try:
+        width, height = int(fields["WIDTH"]), int(fields["HEIGHT"])
+    except (KeyError, ValueError) as exc:
+        raise RuntimeError("Livox Viewer window geometry was malformed") from exc
+    if width <= 0 or height <= 0:
+        raise RuntimeError("Livox Viewer window geometry was invalid")
+    return width, height
+
+
+def _logical_window_point(
+    point: tuple[int, int],
+    *,
+    width: int,
+    height: int,
+    logical_width: int = 1600,
+    logical_height: int = 900,
+) -> tuple[int, int]:
+    """将已验证窗口内控件坐标映射到其实际尺寸。"""
+    return (
+        round(point[0] * width / logical_width),
+        round(point[1] * height / logical_height),
+    )
 
 
 def _checked_xdotool(
@@ -205,31 +298,62 @@ def automate_lvx2_file_selection(
         display=display,
         run_command=run_command,
     )
-    # 官方 2.6.0 的打开按钮位于固定工具栏。其 Open File 是 Unreal
-    # 内嵌模态层，不会创建独立 X11 窗口。启动器固定 1600×900，使用
-    # 该官方布局中已实测的窗口内坐标，避免 Slate DPI 缩放误点工具按钮。
-    open_file_x, open_file_y = _VIEWER_OPEN_FILE_BUTTON
+    main_width, main_height = _window_geometry(
+        main_window, display=display, run_command=run_command
+    )
+    open_file_x, open_file_y = _logical_window_point(
+        _VIEWER_OPEN_FILE_BUTTON, width=main_width, height=main_height
+    )
     _checked_xdotool(
         ("mousemove", "--window", main_window, str(open_file_x), str(open_file_y), "click", "1"),
         display=display,
         run_command=run_command,
     )
     sleep(0.25)
-    filename_x, filename_y = _VIEWER_FILENAME_FIELD
-    open_x, open_y = _VIEWER_OPEN_CONFIRM_BUTTON
+    dialog_window: str | None = None
+    while monotonic() < deadline and dialog_window is None:
+        dialog_window = _visible_window_id(
+            viewer_pid=viewer_pid,
+            title_pattern="^Open File$",
+            display=display,
+            run_command=run_command,
+        )
+        if dialog_window is None:
+            sleep(0.05)
+    if dialog_window is None:
+        raise RuntimeError("Livox Viewer Open File dialog was not found")
+    # 原生文件框拥有独立 X11 身份；验证后只向它输入，不能把按键误送给主窗口。
+    dialog_width, dialog_height = _window_geometry(
+        dialog_window, display=display, run_command=run_command
+    )
+    filename_x, filename_y = _logical_window_point(
+        _VIEWER_FILENAME_FIELD,
+        width=dialog_width,
+        height=dialog_height,
+        logical_width=_VIEWER_DIALOG_REFERENCE_SIZE[0],
+        logical_height=_VIEWER_DIALOG_REFERENCE_SIZE[1],
+    )
+    open_x, open_y = _logical_window_point(
+        _VIEWER_OPEN_CONFIRM_BUTTON,
+        width=dialog_width,
+        height=dialog_height,
+        logical_width=_VIEWER_DIALOG_REFERENCE_SIZE[0],
+        logical_height=_VIEWER_DIALOG_REFERENCE_SIZE[1],
+    )
     for args in (
-        ("mousemove", "--window", main_window, str(filename_x), str(filename_y), "click", "1"),
-        ("key", "--window", main_window, "ctrl+a"),
+        ("windowactivate", "--sync", dialog_window),
+        ("mousemove", "--window", dialog_window, str(filename_x), str(filename_y), "click", "1"),
+        ("key", "--window", dialog_window, "ctrl+a"),
         (
             "type",
             "--window",
-            main_window,
+            dialog_window,
             "--clearmodifiers",
             "--delay",
             "5",
             str(lvx2_path),
         ),
-        ("mousemove", "--window", main_window, str(open_x), str(open_y), "click", "1"),
+        ("mousemove", "--window", dialog_window, str(open_x), str(open_y), "click", "1"),
     ):
         _checked_xdotool(args, display=display, run_command=run_command)
 
@@ -293,11 +417,11 @@ def import_lvx2_in_livox_viewer(
 
     deadline = monotonic() + timeout_sec
     while monotonic() < deadline:
-        if viewer_lvx2_opened(log_path, lvx2_path):
+        if viewer_playback_evidence(log_path, lvx2_path).complete:
             return launcher_pid, log_path
         sleep(0.05)
     raise RuntimeError(
-        f"Livox Viewer did not confirm opening {lvx2_path}; inspect {log_path}"
+        f"Livox Viewer did not complete LVX2 playback for {lvx2_path}; inspect {log_path}"
     )
 
 

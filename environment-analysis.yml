@@ -1,0 +1,17 @@
+# 独立离线分析环境：用于 MCAP/CSV 研究与 Notebook，不运行 PyBullet GUI 或 eCAL 会话。
+name: slope-sim-analysis
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - numpy
+  - pandas
+  - scipy
+  - matplotlib
+  - mcap
+  - pyyaml
+  - pyqtgraph
+  - pyopengl
+  - jupyterlab
+  - ipykernel

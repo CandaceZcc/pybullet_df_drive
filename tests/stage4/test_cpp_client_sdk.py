@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import socket
 import subprocess
 import sys
 import time
@@ -415,6 +416,121 @@ def test_cpp_recorder_participant_records_all_five_v2_topics(tmp_path: Path) -> 
 
 
 @pytest.mark.stage4_artifact
+def test_cpp_interactive_recorder_ignores_pre_start_sequences(tmp_path: Path) -> None:
+    """交互窗口外的 sequence 不得成为导出会话的连续性基线。"""
+    root = Path(__file__).resolve().parents[2]
+    descriptor_path = root / "slope_sim/interfaces/generated/slope_sim_interfaces_v2.desc"
+    recorder = _recorder_tool()
+    command = _command_tool()
+    probe = _phase0_tool("ecal_v2_raw_probe")
+    output = tmp_path / "session.mcap"
+    result = tmp_path / "recorder.json"
+    control_dir = tmp_path / "control"
+    control_dir.mkdir(mode=0o700)
+    control_socket = control_dir / "recorder.sock"
+    token = "a" * 64
+    topic_inputs = (
+        ("/sim/wheel/command", "slope_sim.interfaces.v2.WheelCommand", "WheelCommand.bin"),
+        ("/sim/wheel/state", "slope_sim.interfaces.v2.WheelState", "WheelState.bin"),
+        ("/sim/lidar/points", "slope_sim.interfaces.v2.LidarPointCloud", "LidarPointCloud.bin"),
+        ("/sim/rtk/state", "slope_sim.interfaces.v2.RtkState", "RtkState.bin"),
+        ("/sim/imu/attitude", "slope_sim.interfaces.v2.ImuAttitude", "ImuAttitude.bin"),
+    )
+
+    def payload(fixture: str, sequence: int, timestamp_ns: int) -> bytes:
+        message_type = {
+            "WheelCommand.bin": pb.WheelCommand,
+            "WheelState.bin": pb.WheelState,
+            "LidarPointCloud.bin": pb.LidarPointCloud,
+            "RtkState.bin": pb.RtkState,
+            "ImuAttitude.bin": pb.ImuAttitude,
+        }[fixture]
+        message = message_type()
+        message.ParseFromString((root / "tests/fixtures/stage4/v2" / fixture).read_bytes())
+        message.sequence = sequence
+        if fixture == "LidarPointCloud.bin":
+            message.timebase_ns = timestamp_ns
+        else:
+            message.timestamp_ns = timestamp_ns
+        return message.SerializeToString(deterministic=True)
+
+    def control(kind: str) -> None:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.connect(str(control_socket))
+            client.sendall(json.dumps({"kind": kind, "token": token}).encode("utf-8"))
+
+    def publish(index: int, sequence: int, timestamp_ns: int, label: str) -> None:
+        topic, type_name, fixture = topic_inputs[index]
+        frame_path = tmp_path / f"{label}-{Path(fixture).stem}.bin"
+        frame_path.write_bytes(payload(fixture, sequence, timestamp_ns))
+        completed = subprocess.run(
+            [
+                str(probe), "publish", "--topic", topic, "--type-name", type_name,
+                "--descriptor-set", str(descriptor_path), "--payload", str(frame_path),
+                "--result", str(tmp_path / f"{label}-{index}.json"), "--deadline-ms", "3000",
+            ],
+            capture_output=True, text=True, timeout=8,
+        )
+        assert completed.returncode == 0, f"topic={topic}\n{completed.stderr}"
+
+    process = subprocess.Popen(
+        [
+            str(recorder), "--interactive",
+            "--descriptor-set", str(descriptor_path),
+            "--scene-id", "interactive-pre-start-sequence",
+            "--simulation-session-id", "00112233445566778899aabbccddeeff",
+            "--world-generation", "7",
+            "--lidar-pattern-version", "livox-mid360-800000-v1",
+            "--lidar-pattern-sha256", "4077e0b68a68e40ba8a5da17d4aff5ba86ea4fb557a4f8b594e4de1ebbeb20ca",
+            "--output", str(output), "--deadline-ms", "20000", "--result", str(result),
+            "--control-socket", str(control_socket), "--control-token", token,
+        ],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    command_process: subprocess.Popen[str] | None = None
+    try:
+        deadline = time.monotonic() + 2.0
+        while not control_socket.exists() and process.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert control_socket.exists(), process.stderr.read()
+        # Discovery is asynchronous. Publish a pre-start sequence only after all
+        # endpoints have had time to agree on the raw v2 contract.
+        time.sleep(1.0)
+        publish(0, 100, 1_000_000_000, "pre-start")
+        command_process = subprocess.Popen(
+            [
+                    str(command), "--descriptor-set", str(descriptor_path),
+                    "--payload", str(root / "tests/fixtures/stage4/v2/WheelCommand.bin"),
+                    "--duration-ms", "15000", "--deadline-ms", "20000",
+                "--result", str(tmp_path / "command.json"),
+            ],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        control("start")
+        time.sleep(0.05)
+        for index in range(2, 5):
+            publish(index, 0, 100, "start")
+        time.sleep(0.05)
+        assert process.poll() is None, process.stderr.read()
+        control("stop")
+        for index in range(2, 5):
+            publish(index, 1, 200, "stop")
+        stdout, stderr = process.communicate(timeout=6)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.communicate()
+        if command_process is not None and command_process.poll() is None:
+            command_process.kill()
+            command_process.communicate()
+
+    assert process.returncode == 0, f"stdout={stdout}\nstderr={stderr}"
+    report = json.loads(result.read_text(encoding="utf-8"))
+    assert report["clean_shutdown"] is True
+    assert report["topics"]["/sim/wheel/command"] > 0
+
+
+@pytest.mark.stage4_artifact
 def test_cpp_recorder_fault_result_requires_safe_stop_and_hides_partial_mcap(tmp_path: Path) -> None:
     """重复 sequence 的 raw frame 必须在入队前安全停车，不能发布部分 MCAP。"""
     root = Path(__file__).resolve().parents[2]
@@ -499,6 +615,63 @@ def test_cpp_recorder_fault_result_requires_safe_stop_and_hides_partial_mcap(tmp
             "/sim/imu/attitude": 0,
         },
     }
+
+
+@pytest.mark.stage4_artifact
+def test_cpp_recorder_identity_fault_records_expected_actual_and_publisher(tmp_path: Path) -> None:
+    """合法但跨 session 的 LiDAR 帧必须留下可定位发布端的拒绝收据。"""
+    root = Path(__file__).resolve().parents[2]
+    descriptor = root / "slope_sim/interfaces/generated/slope_sim_interfaces_v2.desc"
+    recorder = _recorder_tool()
+    probe = _phase0_tool("ecal_v2_raw_probe")
+    recording = tmp_path / "identity-faulted.mcap"
+    result = tmp_path / "recorder-identity-fault.json"
+    payload = tmp_path / "cross-session-lidar.bin"
+    lidar = pb.LidarPointCloud()
+    lidar.ParseFromString((root / "tests/fixtures/stage4/v2/LidarPointCloud.bin").read_bytes())
+    lidar.simulation_session_id = b"\xff" * 16
+    payload.write_bytes(lidar.SerializeToString(deterministic=True))
+    process = subprocess.Popen(
+        [
+            str(recorder), "--descriptor-set", str(descriptor),
+            "--scene-id", "recorder-identity-fault-scene",
+            "--simulation-session-id", "00112233445566778899aabbccddeeff",
+            "--world-generation", "7",
+            "--lidar-pattern-version", "livox-mid360-800000-v1",
+            "--lidar-pattern-sha256", "4077e0b68a68e40ba8a5da17d4aff5ba86ea4fb557a4f8b594e4de1ebbeb20ca",
+            "--output", str(recording), "--expected-count", "1", "--deadline-ms", "10000",
+            "--result", str(result),
+        ],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        time.sleep(1.0)
+        published = subprocess.run(
+            [
+                str(probe), "publish", "--topic", "/sim/lidar/points",
+                "--type-name", "slope_sim.interfaces.v2.LidarPointCloud",
+                "--descriptor-set", str(descriptor), "--payload", str(payload),
+                "--result", str(tmp_path / "publisher.json"), "--deadline-ms", "3000",
+            ],
+            capture_output=True, text=True, timeout=8,
+        )
+        assert published.returncode == 0, published.stderr
+        stdout, stderr = process.communicate(timeout=8)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.communicate()
+
+    assert process.returncode != 0, f"stdout={stdout}\nstderr={stderr}"
+    fault_reason = json.loads(result.read_text(encoding="utf-8"))["fault_reason"]
+    assert "/sim/lidar/points identity does not match recorder plan" in fault_reason
+    assert "expected_session=00112233445566778899aabbccddeeff" in fault_reason
+    assert "expected_world=7" in fault_reason
+    assert "actual_session=ffffffffffffffffffffffffffffffff" in fault_reason
+    assert "actual_world=7" in fault_reason
+    assert "publisher_entity=" in fault_reason
+    assert "publisher_process=" in fault_reason
+    assert "publisher_host=" in fault_reason
 
 
 @pytest.mark.stage4_artifact

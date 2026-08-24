@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cmath>
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -47,8 +48,8 @@ std::string ReadFile(const char* raw) {
 int Positive(const char* raw, const char* name) {
   int value = 0;
   const auto [end, error] = std::from_chars(raw, raw + std::char_traits<char>::length(raw), value);
-  if (error != std::errc{} || *end != '\0' || value < 1 || value > 60000) {
-    throw std::invalid_argument(std::string(name) + " must be in [1, 60000]");
+  if (error != std::errc{} || *end != '\0' || value < 1 || value > 21600000) {
+    throw std::invalid_argument(std::string(name) + " must be in [1, 21600000]");
   }
   return value;
 }
@@ -92,6 +93,7 @@ int RunBridge(const std::string& descriptor, int duration_ms, int deadline_ms, B
     auto tf_output = node->create_publisher<tf2_msgs::msg::TFMessage>(TopicForMode(mode, "/tf"), 1);
     std::atomic<int> accepted{0};
     std::atomic<int> rejected{0};
+    std::atomic<int> pending{0};
     struct SensorPayload final {
       std::string raw;
       std::uint64_t timestamp_ns;
@@ -102,12 +104,20 @@ int RunBridge(const std::string& descriptor, int duration_ms, int deadline_ms, B
     std::optional<SensorPayload> latest_rtk;
     std::optional<SensorPayload> latest_imu;
     std::optional<slope_sim::client::v2::RosSensorPair> last_sensor_pair;
-    auto is_verified = [&](const slope_sim::client::v2::TopicContract& expected,
-                           const eCAL::SDataTypeInformation& info,
-                           const eCAL::SReceiveCallbackData& data) {
+    enum class MetadataState { kPending, kVerified, kConflict };
+    auto metadata_state = [&](const slope_sim::client::v2::TopicContract& expected,
+                              const eCAL::SDataTypeInformation& info,
+                              const eCAL::SReceiveCallbackData& data) {
+      // eCAL can deliver an endpoint before its type metadata is complete.  Such
+      // frames remain fail-closed, but must not poison the verified session.
+      if (data.buffer_size == 0 || info.name.empty() || info.encoding.empty() || info.descriptor.empty()) {
+        return MetadataState::kPending;
+      }
+      if (data.buffer_size > 0 && data.buffer == nullptr) return MetadataState::kConflict;
       return info.name == expected.type_name && info.encoding == "proto" &&
-             stage4::Bytes(stage4::Sha256(info.descriptor)) == digest &&
-             !(data.buffer_size > 0 && data.buffer == nullptr);
+              stage4::Bytes(stage4::Sha256(info.descriptor)) == digest
+          ? MetadataState::kVerified
+          : MetadataState::kConflict;
     };
     auto publish_paired_sensors = [&] {
       struct SensorMessages final {
@@ -271,7 +281,12 @@ int RunBridge(const std::string& descriptor, int duration_ms, int deadline_ms, B
     eCAL::CSubscriber input(TopicForMode(mode, contract.topic), TypeInfo(contract, descriptor));
     input.SetReceiveCallback([&](const eCAL::STopicId&, const eCAL::SDataTypeInformation& info,
                                  const eCAL::SReceiveCallbackData& data) {
-      if (!is_verified(contract, info, data)) { ++rejected; return; }
+      const auto metadata = metadata_state(contract, info, data);
+      if (metadata != MetadataState::kVerified) {
+        if (metadata == MetadataState::kConflict) ++rejected;
+        else ++pending;
+        return;
+      }
       const std::string_view raw(static_cast<const char*>(data.buffer), data.buffer_size);
       if (slope_sim::client::v2::ValidateRawV2Payload(contract.topic, raw, digest) !=
           slope_sim::client::v2::RawV2PayloadValidation::kValid) { ++rejected; return; }
@@ -289,7 +304,12 @@ int RunBridge(const std::string& descriptor, int duration_ms, int deadline_ms, B
     eCAL::CSubscriber lidar_input(TopicForMode(mode, lidar_contract.topic), TypeInfo(lidar_contract, descriptor));
     lidar_input.SetReceiveCallback([&](const eCAL::STopicId&, const eCAL::SDataTypeInformation& info,
                                        const eCAL::SReceiveCallbackData& data) {
-      if (!is_verified(lidar_contract, info, data)) { ++rejected; return; }
+      const auto metadata = metadata_state(lidar_contract, info, data);
+      if (metadata != MetadataState::kVerified) {
+        if (metadata == MetadataState::kConflict) ++rejected;
+        else ++pending;
+        return;
+      }
       const std::string raw(static_cast<const char*>(data.buffer), data.buffer_size);
       if (slope_sim::client::v2::ValidateRawV2Payload(lidar_contract.topic, raw, digest) !=
           slope_sim::client::v2::RawV2PayloadValidation::kValid) { ++rejected; return; }
@@ -302,7 +322,12 @@ int RunBridge(const std::string& descriptor, int duration_ms, int deadline_ms, B
     eCAL::CSubscriber rtk_input(TopicForMode(mode, rtk_contract.topic), TypeInfo(rtk_contract, descriptor));
     rtk_input.SetReceiveCallback([&](const eCAL::STopicId&, const eCAL::SDataTypeInformation& info,
                                      const eCAL::SReceiveCallbackData& data) {
-      if (!is_verified(rtk_contract, info, data)) { ++rejected; return; }
+      const auto metadata = metadata_state(rtk_contract, info, data);
+      if (metadata != MetadataState::kVerified) {
+        if (metadata == MetadataState::kConflict) ++rejected;
+        else ++pending;
+        return;
+      }
       const std::string raw(static_cast<const char*>(data.buffer), data.buffer_size);
       if (slope_sim::client::v2::ValidateRawV2Payload(rtk_contract.topic, raw, digest) !=
           slope_sim::client::v2::RawV2PayloadValidation::kValid) { ++rejected; return; }
@@ -314,7 +339,12 @@ int RunBridge(const std::string& descriptor, int duration_ms, int deadline_ms, B
     eCAL::CSubscriber imu_input(TopicForMode(mode, imu_contract.topic), TypeInfo(imu_contract, descriptor));
     imu_input.SetReceiveCallback([&](const eCAL::STopicId&, const eCAL::SDataTypeInformation& info,
                                      const eCAL::SReceiveCallbackData& data) {
-      if (!is_verified(imu_contract, info, data)) { ++rejected; return; }
+      const auto metadata = metadata_state(imu_contract, info, data);
+      if (metadata != MetadataState::kVerified) {
+        if (metadata == MetadataState::kConflict) ++rejected;
+        else ++pending;
+        return;
+      }
       const std::string raw(static_cast<const char*>(data.buffer), data.buffer_size);
       if (slope_sim::client::v2::ValidateRawV2Payload(imu_contract.topic, raw, digest) !=
           slope_sim::client::v2::RawV2PayloadValidation::kValid) { ++rejected; return; }
@@ -329,7 +359,13 @@ int RunBridge(const std::string& descriptor, int duration_ms, int deadline_ms, B
       rclcpp::spin_some(node);
       std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
-    if (accepted < 1 || rejected != 0) throw std::runtime_error("Bridge did not receive verified WheelState frames");
+    if (accepted.load() < 1 || rejected.load() != 0) {
+      throw std::runtime_error(
+          "Bridge did not receive verified WheelState frames: accepted=" +
+          std::to_string(accepted.load()) + ", rejected=" +
+          std::to_string(rejected.load()) + ", pending=" +
+          std::to_string(pending.load()));
+    }
     eCAL::Finalize();
     return 0;
   } catch (...) { eCAL::Finalize(); throw; }

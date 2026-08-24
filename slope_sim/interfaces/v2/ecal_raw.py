@@ -131,9 +131,9 @@ class EcalRawBindings:
             # raw callback 禁止 hash、monitoring、Protobuf parse 或领域校验。
             entity_id = publisher_id.topic_id
             metadata = RemoteTypeMetadata(
-                str(data_type_info.name),
-                str(data_type_info.encoding),
-                bytes(data_type_info.descriptor),
+                _metadata_string(data_type_info.name),
+                _metadata_string(data_type_info.encoding),
+                _metadata_bytes(data_type_info.descriptor),
             )
             frame = RawReceivedFrame(
                 payload=bytes(data.buffer),
@@ -199,9 +199,9 @@ class EcalRawBindings:
                 ProtocolVerification(ProtocolVerificationState.WAITING, 0, (), (), ())
             )
 
-        names = tuple(str(item.datatype_information.name) for item in endpoints)
-        encodings = tuple(str(item.datatype_information.encoding) for item in endpoints)
-        descriptors = tuple(bytes(item.datatype_information.descriptor) for item in endpoints)
+        names = tuple(_metadata_string(item.datatype_information.name) for item in endpoints)
+        encodings = tuple(_metadata_string(item.datatype_information.encoding) for item in endpoints)
+        descriptors = tuple(_metadata_bytes(item.datatype_information.descriptor) for item in endpoints)
         descriptor_digests = tuple(sha256(raw).hexdigest() for raw in descriptors)
         if len(endpoints) != peer_count:
             return RemoteEndpointSnapshot(
@@ -212,6 +212,19 @@ class EcalRawBindings:
                     encodings,
                     descriptor_digests,
                     "discovery count and monitoring metadata are not yet aligned",
+                )
+            )
+        if any(not name or not encoding or not raw for name, encoding, raw in zip(
+            names, encodings, descriptors, strict=True,
+        )):
+            return RemoteEndpointSnapshot(
+                ProtocolVerification(
+                    ProtocolVerificationState.PENDING,
+                    peer_count,
+                    names,
+                    encodings,
+                    descriptor_digests,
+                    "remote metadata is not yet populated",
                 )
             )
         valid = all(
@@ -235,6 +248,36 @@ class EcalRawBindings:
 def _sha256_digest(payload: bytes) -> bytes:
     """默认 worker hash 函数，便于测试显式验证先后顺序。"""
     return sha256(payload).digest()
+
+
+def _metadata_string(value: object) -> str:
+    """保留 native 启动期 None 为缺失字段，交由 worker 的 pending gate 处理。"""
+    return "" if value is None else str(value)
+
+
+def _metadata_bytes(value: object) -> bytes:
+    """保留 native 启动期 None 为缺失 descriptor。"""
+    return b"" if value is None else bytes(value)
+
+
+def classify_raw_frame_metadata(
+    frame: RawReceivedFrame,
+    *,
+    expected_type: str,
+    descriptor: DescriptorIdentity,
+) -> ProtocolVerificationState:
+    """仅完整的 wire metadata 才能判定协议通过或冲突。"""
+    if not isinstance(frame, RawReceivedFrame):
+        raise ValueError("frame must be a RawReceivedFrame")
+    if not frame.remote_type_name or not frame.remote_encoding or not frame.remote_descriptor:
+        return ProtocolVerificationState.PENDING
+    if (
+        frame.remote_type_name == expected_type
+        and frame.remote_encoding == "proto"
+        and frame.remote_descriptor == descriptor.serialized_file_descriptor_set
+    ):
+        return ProtocolVerificationState.VERIFIED
+    return ProtocolVerificationState.CONFLICT
 
 
 def validate_raw_frame_metadata(

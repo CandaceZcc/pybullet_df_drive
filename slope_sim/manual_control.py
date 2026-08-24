@@ -29,18 +29,19 @@ class ManualCommand:
 def command_from_keyboard(
     keyboard_events: Mapping[int, int],
     settings: ManualControlSettings,
+    allow_exit: bool = True,
 ) -> ManualCommand:
     """把 PyBullet 键盘事件转换成差速车的线速度和角速度命令。"""
-    if _pressed(keyboard_events, ord("q")) or _pressed(keyboard_events, ESCAPE_KEY):
+    if allow_exit and (_pressed(keyboard_events, ord("q")) or _pressed(keyboard_events, ESCAPE_KEY)):
         return ManualCommand(0.0, 0.0, should_exit=True)
 
     if _pressed(keyboard_events, ord(" ")):
         return ManualCommand(0.0, 0.0)
 
-    forward = _held(keyboard_events, p.B3G_UP_ARROW)
-    backward = _held(keyboard_events, p.B3G_DOWN_ARROW)
-    left = _held(keyboard_events, p.B3G_LEFT_ARROW)
-    right = _held(keyboard_events, p.B3G_RIGHT_ARROW)
+    forward = _held(keyboard_events, p.B3G_UP_ARROW) or _held(keyboard_events, ord("w"))
+    backward = _held(keyboard_events, p.B3G_DOWN_ARROW) or _held(keyboard_events, ord("s"))
+    left = _held(keyboard_events, p.B3G_LEFT_ARROW) or _held(keyboard_events, ord("a"))
+    right = _held(keyboard_events, p.B3G_RIGHT_ARROW) or _held(keyboard_events, ord("d"))
 
     linear_direction = int(forward) - int(backward)
     angular_direction = int(left) - int(right)

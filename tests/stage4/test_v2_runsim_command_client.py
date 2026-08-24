@@ -30,7 +30,13 @@ def test_command_client_sends_a_bounded_authenticated_target_and_safe_stops_on_c
             ready.set()
             connection, _ = server.accept()
             with connection:
-                received.append(connection.recv(1024))
+                payload = bytearray()
+                while payload.count(b"\n") < 2:
+                    chunk = connection.recv(1024)
+                    if not chunk:
+                        break
+                    payload.extend(chunk)
+                received.append(bytes(payload))
 
     worker = threading.Thread(target=serve)
     worker.start()
@@ -40,16 +46,27 @@ def test_command_client_sends_a_bounded_authenticated_target_and_safe_stops_on_c
 
     client = RunSimCommandClient(session)
     client.connect()
-    client.send_target(0.4, -0.2, now=10.0)
-    client.close()
+    try:
+        client.send_target(0.4, -0.2, now=10.0)
+        client.sync_generation(2, 2, robot_model="active_steering_4wd", now=10.01)
+    finally:
+        client.close()
     worker.join(timeout=1.0)
 
     assert not worker.is_alive()
-    assert json.loads(received[0]) == {
+    target, generation = received[0].splitlines()
+    assert json.loads(target) == {
         "angular_velocity_rad_s": -0.2,
         "kind": "target",
         "linear_velocity_m_s": 0.4,
         "token": (b"t" * 32).hex(),
+    }
+    assert json.loads(generation) == {
+        "command_generation": 2,
+        "kind": "generation",
+        "robot_model": "active_steering_4wd",
+        "token": (b"t" * 32).hex(),
+        "world_generation": 2,
     }
     snapshot = session.snapshot()
     assert snapshot.state.value == "safe_stop"

@@ -262,6 +262,81 @@ def test_main_applies_explicit_ecal_paths_to_the_preflight_and_v2_runtime(
     ) == expected
 
 
+def test_main_uses_explicit_v2_runtime_root_for_development_acceptance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """源码验收可从受控运行根取得 Command、配置与 localtime 插件。"""
+    import main
+
+    runtime_root = tmp_path / "acceptance-runtime"
+    (runtime_root / "bin").mkdir(parents=True)
+    (runtime_root / "etc" / "ecal").mkdir(parents=True)
+    (runtime_root / "lib").mkdir()
+    (runtime_root / "etc" / "ecal" / "ecal.yaml").write_text("# eCAL\n", encoding="utf-8")
+    (runtime_root / "lib" / "libecaltime-localtime.so").write_bytes(b"plugin")
+    monkeypatch.setenv("SLOPE_SIM_V2_RUNTIME_ROOT", str(runtime_root))
+    module = _module()
+    success = module.EcalPreflightReport(
+        runtime_root / "etc" / "ecal" / "ecal.yaml",
+        runtime_root / "lib" / "libecaltime-localtime.so",
+        "descriptor",
+        True,
+        None,
+        (),
+    )
+    preflight_environments: list[dict[str, str]] = []
+    monkeypatch.setattr(
+        main,
+        "run_v2_ecal_preflight",
+        lambda **kwargs: (preflight_environments.append(dict(kwargs["environment"])), success)[1],
+    )
+    launch_roots: list[Path] = []
+
+    shutdown_trace: list[str] = []
+
+    class Command:
+        session_id_factory = staticmethod(lambda: b"s" * 16)
+        client = object()
+
+        def close(self) -> None:
+            shutdown_trace.append("command.close")
+
+    monkeypatch.setattr(
+        main.RunSimV2Command,
+        "launch",
+        lambda **kwargs: (launch_roots.append(kwargs["release_root"]), Command())[1],
+    )
+    captured_roots: list[Path] = []
+    def fake_run_manual_demo(*_args, **kwargs):
+        captured_roots.append(kwargs["v2_capture_release_root"])
+        kwargs["v2_command_shutdown"]()
+        shutdown_trace.append("runtime.close")
+        return types.SimpleNamespace(
+            log_path=tmp_path / "log.csv",
+            figure_path=tmp_path / "figure.png",
+            feedback_figure_paths=(),
+            diagnostic_summary_path=None,
+            obstacle_event_log_path=None,
+            interface_binary_log=None,
+            interface_event_log=None,
+            scene_export=None,
+            metrics={},
+            diagnostic_summary=None,
+        )
+
+    monkeypatch.setattr(main, "run_manual_demo", fake_run_manual_demo)
+
+    assert main.main(["--gui", "--manual", "--interface-mode", "ecal"]) == 0
+
+    expected_root = runtime_root.resolve()
+    assert launch_roots == [expected_root]
+    assert captured_roots == [expected_root]
+    assert preflight_environments[0]["ECAL_DATA"] == str(expected_root / "etc" / "ecal")
+    assert preflight_environments[0]["ECAL_TIME_PLUGIN_PATH"] == str(expected_root / "lib")
+    assert shutdown_trace == ["command.close", "runtime.close"]
+
+
 def test_main_forwards_v2_capture_and_viewer_paths_to_the_gui_runtime(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

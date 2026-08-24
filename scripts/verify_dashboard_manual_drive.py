@@ -58,8 +58,12 @@ DASHBOARD_TAB_ORDER = (
     "传感频率",
     "接口异常",
 )
+V2_DASHBOARD_TAB_ORDER = (
+    "v2 eCAL",
+    *(label for label in DASHBOARD_TAB_ORDER if label != "LiDAR点云"),
+)
 DASHBOARD_LAYOUT_REPORT_VERSION = 4
-DASHBOARD_CONTENT_TABS = frozenset({"接口状态", "障碍物"})
+DASHBOARD_CONTENT_TABS = frozenset({"接口状态", "障碍物", "v2 eCAL"})
 DASHBOARD_CONTENT_WIDGETS = {
     "接口状态": ("接口状态滚动区",),
     "障碍物": ("障碍物表格",),
@@ -237,7 +241,7 @@ def build_child_command(
         "--duration-sec",
         str(child_run_duration(args)),
         "--interface-mode",
-        "local",
+        "ecal",
     ]
     if args.plot_tab is not None:
         command.append("--developer-diagnostics")
@@ -466,11 +470,18 @@ def validate_dashboard_layout_report(
         if not isinstance(report, Mapping):
             raise TypeError("dashboard layout report must be a mapping")
         frozen_tab_order = tuple(expected_tab_order)
-        allowed_tab_orders = {
-            DASHBOARD_TAB_ORDER,
-            (*DASHBOARD_TAB_ORDER, DEVELOPER_DIAGNOSTIC_TAB_LABEL),
-        }
-        if frozen_tab_order not in allowed_tab_orders:
+        allowed_tab_labels = set(DASHBOARD_TAB_ORDER) | {"v2 eCAL", DEVELOPER_DIAGNOSTIC_TAB_LABEL}
+        if (
+            not frozen_tab_order
+            or len(set(frozen_tab_order)) != len(frozen_tab_order)
+            or any(label not in allowed_tab_labels for label in frozen_tab_order)
+            or frozen_tab_order[0] not in {"接口状态", "v2 eCAL"}
+            or "障碍物" not in frozen_tab_order
+            or (
+                DEVELOPER_DIAGNOSTIC_TAB_LABEL in frozen_tab_order
+                and frozen_tab_order[-1] != DEVELOPER_DIAGNOSTIC_TAB_LABEL
+            )
+        ):
             raise ValueError("expected_tab_order is not a supported Dashboard contract")
         report_version = report.get("report_version")
         if (
@@ -589,30 +600,31 @@ def validate_dashboard_layout_report(
         if not _rect_inside(tab_bar, tabs):
             raise ValueError("tab_bar_rect is outside tabs_rect")
         tab_scroll_buttons = report.get("tab_scroll_button_rects")
-        if not isinstance(tab_scroll_buttons, Mapping) or set(tab_scroll_buttons) != {
-            "left",
-            "right",
-        }:
+        if not isinstance(tab_scroll_buttons, Mapping) or set(tab_scroll_buttons) not in (
+            set(),
+            {"left", "right"},
+        ):
             raise ValueError(
-                "tab_scroll_button_rects must contain exactly left and right"
+                "tab_scroll_button_rects must be empty or contain exactly left and right"
             )
         tab_button_rects = {
             name: report_rect(
                 tab_scroll_buttons[name],
                 f"tab_scroll_button_rects[{name!r}]",
             )
-            for name in ("left", "right")
+            for name in tab_scroll_buttons
         }
         for name, button in tab_button_rects.items():
             if not _rect_inside(button, tab_bar):
                 raise ValueError(f"tab scroll button {name!r} is outside tab_bar_rect")
-        left_button = tab_button_rects["left"]
-        right_button = tab_button_rects["right"]
-        if (
-            left_button.x >= right_button.x
-            or left_button.right - right_button.x > tolerance
-        ):
-            raise ValueError("tab scroll buttons overlap")
+        if tab_button_rects:
+            left_button = tab_button_rects["left"]
+            right_button = tab_button_rects["right"]
+            if (
+                left_button.x >= right_button.x
+                or left_button.right - right_button.x > tolerance
+            ):
+                raise ValueError("tab scroll buttons overlap")
 
         canvas_value = report.get("canvas_rect")
         canvas: Rect | None = None
@@ -973,13 +985,22 @@ def validate_dashboard_layout_stability(
     client_rect: Rect,
 ) -> DashboardLayoutVerification:
     """校验同一页新数据完成绘制后，五个稳定布局矩形保持不变。"""
-    before_result = validate_dashboard_layout_report(before, client_rect)
+    expected_tab_order = tuple(before.get("tab_order", ()))
+    before_result = validate_dashboard_layout_report(
+        before,
+        client_rect,
+        expected_tab_order=expected_tab_order,
+    )
     if not before_result.passed:
         return DashboardLayoutVerification(
             False,
             f"first layout report failed: {before_result.detail}",
         )
-    after_result = validate_dashboard_layout_report(after, client_rect)
+    after_result = validate_dashboard_layout_report(
+        after,
+        client_rect,
+        expected_tab_order=expected_tab_order,
+    )
     if not after_result.passed:
         return DashboardLayoutVerification(
             False,
@@ -1081,6 +1102,7 @@ def verify_dashboard_tabs(
     client_rect: Rect,
     layout_report_path: Path,
     hold_drive_sec: float,
+    expected_tab_order: Sequence[str] = DASHBOARD_TAB_ORDER,
     report_reader: Callable[
         [Path, int, str, float, int],
         DashboardLayoutReportOccurrence,
@@ -1095,6 +1117,12 @@ def verify_dashboard_tabs(
         raise TypeError("client_rect must be a Rect")
     if not math.isfinite(hold_drive_sec) or hold_drive_sec <= 0.0:
         raise ValueError("hold_drive_sec must be positive and finite")
+    frozen_tab_order = tuple(expected_tab_order)
+    if frozen_tab_order not in {
+        DASHBOARD_TAB_ORDER,
+        V2_DASHBOARD_TAB_ORDER,
+    }:
+        raise ValueError("expected_tab_order is not a supported Dashboard contract")
     if capture is None:
         from PIL import ImageGrab
 
@@ -1138,7 +1166,7 @@ def verify_dashboard_tabs(
     try:
         run_command(("keydown", "Up"))
         started_at = clock()
-        for index, label in enumerate(DASHBOARD_TAB_ORDER):
+        for index, label in enumerate(frozen_tab_order):
             if index:
                 run_command(("keydown", "ctrl"))
                 try:
@@ -1162,14 +1190,18 @@ def verify_dashboard_tabs(
                     f"tab {index + 1} report order mismatch: expected={label!r}",
                 )
             reported_order = report.get("tab_order")
-            if reported_order is not None and tuple(reported_order) != DASHBOARD_TAB_ORDER:
+            if reported_order is not None and tuple(reported_order) != frozen_tab_order:
                 return DashboardTabVerification(
                     False,
                     index + 1,
                     0.0,
                     f"tab {index + 1} reported a different top-level order",
                 )
-            layout_result = validate_dashboard_layout_report(report, client_rect)
+            layout_result = validate_dashboard_layout_report(
+                report,
+                client_rect,
+                expected_tab_order=frozen_tab_order,
+            )
             if not layout_result.passed:
                 return DashboardTabVerification(
                     False,
@@ -1332,7 +1364,7 @@ def verify_dashboard_tabs(
                 sleeper(DASHBOARD_PLOT_BUTTON_SETTLE_SEC)
 
         # 第二轮从上一条物理 JSONL 行之后读取，证明新数据绘制未改变布局。
-        for index, label in enumerate(DASHBOARD_TAB_ORDER):
+        for index, label in enumerate(frozen_tab_order):
             run_command(("keydown", "ctrl"))
             try:
                 run_command(("key", "Tab"))
@@ -1364,7 +1396,7 @@ def verify_dashboard_tabs(
         remaining = hold_drive_sec - (clock() - started_at)
         if remaining > 0.0:
             sleeper(remaining)
-        return verify_dashboard_frames(frames, DASHBOARD_TAB_ORDER)
+        return verify_dashboard_frames(frames, frozen_tab_order)
     finally:
         try:
             run_command(("keyup", "ctrl"))
@@ -1801,6 +1833,7 @@ def _run_verification(args: argparse.Namespace, log_dir: Path) -> int:
                 client_rect=dashboard_client,
                 layout_report_path=layout_report_path,
                 hold_drive_sec=args.hold_sec,
+                expected_tab_order=V2_DASHBOARD_TAB_ORDER,
             )
             print(
                 "dashboard_tabs "
@@ -1817,16 +1850,16 @@ def _run_verification(args: argparse.Namespace, log_dir: Path) -> int:
             initial_report = wait_for_dashboard_layout_report(
                 layout_report_path,
                 0,
-                DASHBOARD_TAB_ORDER[0],
+                V2_DASHBOARD_TAB_ORDER[0],
                 DASHBOARD_LAYOUT_REPORT_TIMEOUT_SEC,
             ).report
             initial_layout = validate_dashboard_layout_report(
                 initial_report,
                 dashboard_client,
                 expected_tab_order=(
-                    (*DASHBOARD_TAB_ORDER, DEVELOPER_DIAGNOSTIC_TAB_LABEL)
+                    (*V2_DASHBOARD_TAB_ORDER, DEVELOPER_DIAGNOSTIC_TAB_LABEL)
                     if args.plot_tab is not None
-                    else DASHBOARD_TAB_ORDER
+                    else V2_DASHBOARD_TAB_ORDER
                 ),
             )
             if not initial_layout.passed:

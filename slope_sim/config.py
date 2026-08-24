@@ -48,6 +48,7 @@ class ExperimentConfig:
     interface_mode: str = "auto"
     interface_enabled: bool = True
     interface_log_enabled: bool = True
+    telemetry_log_hz: float = 20.0
     scene_in: Path | None = None
     scene_out: Path | None = None
     developer_diagnostics_enabled: bool = False
@@ -117,6 +118,7 @@ class ExperimentConfig:
             "target_linear_velocity",
             "target_angular_velocity",
             "dashboard_update_hz",
+            "telemetry_log_hz",
             "dashboard_smoothing_alpha",
             "dashboard_plot_update_hz",
             "dashboard_plot_window_sec",
@@ -146,6 +148,8 @@ class ExperimentConfig:
             raise ValueError("time_step must be positive")
         if self.dashboard_update_hz <= 0:
             raise ValueError("dashboard_update_hz must be positive")
+        if self.telemetry_log_hz <= 0:
+            raise ValueError("telemetry_log_hz must be positive")
         if not 0.0 < self.dashboard_smoothing_alpha <= 1.0:
             raise ValueError("dashboard_smoothing_alpha must be in (0, 1]")
         if self.dashboard_plot_update_hz <= 0:

@@ -367,8 +367,8 @@ def test_deskew_slerps_each_raw_point_back_to_one_world_hit() -> None:
         replay.deskew_lidar_frame(cloud, start, short_lookahead)
 
 
-def test_deskew_requires_full_frame_lookahead_and_official_firing_grid() -> None:
-    """稀疏命中或空帧也不能绕过 5 us/100 ms 的离线 firing 合同。"""
+def test_deskew_requires_full_frame_lookahead_and_realtime_firing_grid() -> None:
+    """稀疏命中或空帧也不能绕过实时 MID-360 的 5,760 slot 合同。"""
     replay = import_module("slope_sim.mapping_replay")
     pose = Pose((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))
     start = replay.RecoveredPoseNode(0, pose, pose)
@@ -402,15 +402,15 @@ def test_deskew_requires_full_frame_lookahead_and_official_firing_grid() -> None
 
     for invalid in (
         cloud_with_offsets(1),
-        cloud_with_offsets(10_000, 5_000),
+        cloud_with_offsets(34_722, 17_361),
         cloud_with_offsets(100_000_000),
     ):
         with pytest.raises(ValueError, match="offset_time_ns"):
             replay.deskew_lidar_frame(invalid, start, complete)
 
     maximum = (1 << 64) - 1
-    overflowing = cloud_with_offsets(5_000, timebase_ns=maximum - 4_999)
-    late_start = replay.RecoveredPoseNode(maximum - 4_999, pose, pose)
+    overflowing = cloud_with_offsets(17_361, timebase_ns=maximum - 17_360)
+    late_start = replay.RecoveredPoseNode(maximum - 17_360, pose, pose)
     late_lookahead = replay.RecoveredPoseNode(maximum, pose, pose)
     with pytest.raises(ValueError, match="uint64"):
         replay.deskew_lidar_frame(overflowing, late_start, late_lookahead)

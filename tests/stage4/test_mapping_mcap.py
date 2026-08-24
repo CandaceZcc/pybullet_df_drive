@@ -118,7 +118,7 @@ def _valid_models() -> tuple[tuple[str, object], ...]:
                 1,
                 (
                     LidarPointV2(0, 1.0, 0.0, 0.0, 100, 1, 0),
-                    LidarPointV2(5_000, 2.0, 0.0, 0.0, 120, 2, 1),
+                    LidarPointV2(17_361, 2.0, 0.0, 0.0, 120, 2, 1),
                 ),
                 sequence,
                 _WORLD_GENERATION,
@@ -303,7 +303,46 @@ def test_finalized_session_returns_lightweight_index_and_streams_lidar(
     assert tuple(
         (cloud.timebase_ns, tuple(point.offset_time_ns for point in cloud.points))
         for cloud in frames
-    ) == ((0, (0, 5_000)), (100_000_000, (0, 5_000)))
+    ) == ((0, (0, 17_361)), (100_000_000, (0, 17_361)))
+
+
+def test_mapping_session_accepts_exportable_interactive_recorder_receipt(
+    tmp_path: Path,
+) -> None:
+    """交互 Recorder 的成功回执可携带 exportable，不得误判为未知字段。"""
+    from slope_sim import mapping_mcap
+
+    mcap_path, result_path, _counts = _write_fixture(
+        tmp_path,
+        result_overrides={"exportable": True},
+    )
+
+    index = mapping_mcap.load_mapping_session(mcap_path, result_path)
+
+    assert index.mcap_path == mcap_path
+
+
+def test_mapping_session_accepts_sparse_interactive_windowed_streams(
+    tmp_path: Path,
+) -> None:
+    """交互窗口可从任意 sequence 截取，且保留的原始流允许前向缺帧。"""
+    from slope_sim import mapping_mcap
+
+    frames = [
+        frame
+        for frame in _valid_frames()
+        if frame.model.sequence < 2  # type: ignore[attr-defined]
+    ]
+    for topic in V2_BY_TOPIC:
+        first = _fixture_frame(frames, topic, 0)
+        second = _fixture_frame(frames, topic, 1)
+        first.model = replace(first.model, sequence=500)
+        first.mcap_sequence = 500
+        second.model = replace(second.model, sequence=507)
+        second.mcap_sequence = 507
+    mcap_path, result_path, _counts = _write_fixture(tmp_path, frames=frames)
+
+    assert mapping_mcap.load_mapping_session(mcap_path, result_path).mcap_path == mcap_path
 
 
 @pytest.mark.parametrize(
@@ -375,45 +414,36 @@ def test_mcap_structure_and_manifest_are_exact(
     "mutation",
     (
         "mcap-sequence",
-        "sequence-start",
-        "sequence-gap",
+        "sequence-backward",
         "log-time",
         "publish-time",
-        "hundred-hz-cadence",
-        "ten-hz-cadence",
+        "timestamp-backward",
         "session",
         "world",
         "unknown-field",
     ),
 )
-def test_message_envelope_payload_identity_and_cadence_are_exact(
+def test_message_envelope_payload_identity_and_progress_are_exact(
     tmp_path: Path,
     mutation: str,
 ) -> None:
-    """MCAP envelope 必须逐字段绑定 payload，且每 topic 从 sequence 0 按频率连续。"""
+    """MCAP envelope 绑定 payload，窗口内每 topic 的 sequence 与时间必须单调前进。"""
     from slope_sim import mapping_mcap
 
     frames = _valid_frames()
     if mutation == "mcap-sequence":
         _fixture_frame(frames, "/sim/lidar/points", 0).mcap_sequence = 1
-    elif mutation == "sequence-start":
-        frame = _fixture_frame(frames, "/sim/wheel/command", 0)
-        frame.model = replace(frame.model, sequence=1)
-        frame.mcap_sequence = 1
-    elif mutation == "sequence-gap":
+    elif mutation == "sequence-backward":
         frame = _fixture_frame(frames, "/sim/wheel/command", 1)
-        frame.model = replace(frame.model, sequence=5)
-        frame.mcap_sequence = 5
+        frame.model = replace(frame.model, sequence=0)
+        frame.mcap_sequence = 0
     elif mutation == "log-time":
         _fixture_frame(frames, "/sim/lidar/points", 0).log_time_ns = 1
     elif mutation == "publish-time":
         _fixture_frame(frames, "/sim/lidar/points", 0).publish_time_ns = 1
-    elif mutation == "hundred-hz-cadence":
+    elif mutation == "timestamp-backward":
         frame = _fixture_frame(frames, "/sim/wheel/state", 1)
-        frame.model = replace(frame.model, timestamp_ns=11_000_000)
-    elif mutation == "ten-hz-cadence":
-        frame = _fixture_frame(frames, "/sim/lidar/points", 1)
-        frame.model = replace(frame.model, timebase_ns=110_000_000)
+        frame.model = replace(frame.model, timestamp_ns=0)
     elif mutation == "session":
         frame = _fixture_frame(frames, "/sim/wheel/command", 0)
         frame.model = replace(frame.model, simulation_session_id=b"x" * 16)

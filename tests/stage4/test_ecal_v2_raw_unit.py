@@ -258,6 +258,51 @@ def test_worker_rejects_remote_metadata_before_parse(descriptor) -> None:
             )
 
 
+def test_raw_metadata_classifies_empty_startup_metadata_as_pending(descriptor) -> None:
+    """启动时 eCAL 尚未填充 metadata 只能 pending，完整非空不匹配才 conflict。"""
+    module = require_wished_module("slope_sim.interfaces.v2.ecal_raw")
+    expected = "slope_sim.interfaces.v2.WheelState"
+
+    empty = module.RawReceivedFrame(b"wire", 1, 2, "host", "", "", b"", 1, 1, 1.0)
+    valid = module.RawReceivedFrame(
+        b"wire", 1, 2, "host", expected, "proto",
+        descriptor.serialized_file_descriptor_set, 1, 1, 1.0,
+    )
+    conflict = module.RawReceivedFrame(
+        b"wire", 1, 2, "host", "slope_sim.interfaces.v1.WheelState", "proto",
+        descriptor.serialized_file_descriptor_set, 1, 1, 1.0,
+    )
+
+    classify = module.classify_raw_frame_metadata
+    assert classify(empty, expected_type=expected, descriptor=descriptor) is module.ProtocolVerificationState.PENDING
+    assert classify(valid, expected_type=expected, descriptor=descriptor) is module.ProtocolVerificationState.VERIFIED
+    assert classify(conflict, expected_type=expected, descriptor=descriptor) is module.ProtocolVerificationState.CONFLICT
+
+
+def test_raw_callback_preserves_none_metadata_as_empty_for_pending_gate(fake_core, descriptor) -> None:
+    """native 暂态 None 需要复制为空字段交给 worker，而不是在 callback 内计协议错误。"""
+    module = require_wished_module("slope_sim.interfaces.v2.ecal_raw")
+    bindings = module.EcalRawBindings(fake_core, monotonic=lambda: 4.5)
+    received: list[object] = []
+    bindings.create_subscriber(
+        "/sim/wheel/state", "slope_sim.interfaces.v2.WheelState", descriptor,
+        callback=received.append,
+    )
+
+    fake_core.subscribers[0].emit(
+        b"wire",
+        publisher_id=fake_topic_id(entity_id=41, process_id=7, host_name="remote-host"),
+        data_type_info=_DataTypeInformation(None, None, None),
+        send_timestamp=1234,
+        send_clock=7,
+    )
+
+    frame = received[0]
+    assert frame.remote_type_name == ""
+    assert frame.remote_encoding == ""
+    assert frame.remote_descriptor == b""
+
+
 def test_monitoring_maps_waiting_pending_verified_and_conflict(fake_core, descriptor) -> None:
     """远端 monitoring 按 exact count 做原子协议 gate，其他 topic 不污染结果。"""
     module = require_wished_module("slope_sim.interfaces.v2.ecal_raw")

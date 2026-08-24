@@ -14,6 +14,7 @@ from slope_sim.mapping_replay import RecoveredPoseNode
 from slope_sim.obstacles import ObstacleGeometry, ObstacleSnapshot, ObstacleSpec
 from slope_sim.scene import TerrainBounds
 from slope_sim.sensor_backend import Pose
+from slope_sim.lidar_pointcloud import mid360_offset_time_ns
 
 
 _SESSION_ID = bytes.fromhex("00112233445566778899aabbccddeeff")
@@ -30,7 +31,7 @@ def _cloud(
         point_num=len(values),
         lidar_id=1,
         points=tuple(
-            LidarPointV2(index * 5_000, x, y, z, 100, tag, index % 4)
+            LidarPointV2(mid360_offset_time_ns(index), x, y, z, 100, tag, index % 4)
             for index, (x, y, z, tag) in enumerate(values)
         ),
         sequence=timebase_ns // 100_000_000,

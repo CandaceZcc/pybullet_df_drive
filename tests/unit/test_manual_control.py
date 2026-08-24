@@ -23,6 +23,17 @@ def test_arrow_keys_map_to_forward_and_left_turn_command():
     assert command.should_exit is False
 
 
+def test_wasd_keys_map_to_forward_and_left_turn_command():
+    """手动验收规定的 W/S/A/D 必须与方向键产生相同的差速目标。"""
+    settings = ManualControlSettings(max_linear_speed=0.7, max_angular_speed=1.2)
+
+    command = command_from_keyboard(_down(ord("w"), ord("a")), settings)
+
+    assert command.linear_velocity == pytest.approx(0.7)
+    assert command.angular_velocity == pytest.approx(1.2)
+    assert command.should_exit is False
+
+
 def test_opposite_arrow_keys_cancel_each_other():
     settings = ManualControlSettings(max_linear_speed=0.7, max_angular_speed=1.2)
 
@@ -47,3 +58,18 @@ def test_space_stops_and_q_or_escape_requests_exit():
     assert stop.should_exit is False
     assert quit_with_q.should_exit is True
     assert quit_with_escape.should_exit is True
+
+
+def test_exit_keys_can_be_disabled_while_dashboard_owns_window_events():
+    """Dashboard 操作产生的 Esc/Q 不能让 PyBullet 主循环意外收束。"""
+    settings = ManualControlSettings(max_linear_speed=0.7, max_angular_speed=1.2)
+
+    command = command_from_keyboard(
+        _triggered(ESCAPE_KEY),
+        settings,
+        allow_exit=False,
+    )
+
+    assert command.linear_velocity == 0.0
+    assert command.angular_velocity == 0.0
+    assert command.should_exit is False

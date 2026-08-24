@@ -71,6 +71,27 @@ void SendAll(int descriptor, const std::string& bytes) {
 }  // namespace
 
 int main() {
+  const std::string generation_token(64U, 'g');
+  float generation_linear_velocity_m_s = 0.0F;
+  float generation_angular_velocity_rad_s = 0.0F;
+  std::uint64_t world_generation = 0U;
+  std::uint64_t command_generation = 0U;
+  std::string robot_model;
+  Require(
+      ValidateInteractiveMessage(
+          "{\"kind\":\"generation\",\"token\":\"" + generation_token +
+              "\",\"world_generation\":2,\"command_generation\":3,\"robot_model\":\"active_steering_4wd\"}",
+          generation_token,
+          &generation_linear_velocity_m_s,
+          &generation_angular_velocity_rad_s,
+          &world_generation,
+          &command_generation,
+          &robot_model) == InteractiveMessage::kGeneration,
+      "authenticated generation update was rejected");
+  Require(world_generation == 2U && command_generation == 3U,
+          "generation update values differ");
+  Require(robot_model == "active_steering_4wd", "generation update robot model differs");
+
   ScopedDirectory directory;
   const std::string token(64U, 'a');
   const InteractiveAuthentication authentication{

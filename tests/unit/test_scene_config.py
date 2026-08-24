@@ -4,6 +4,7 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import FrozenInstanceError, replace
 import math
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -32,6 +33,21 @@ from slope_sim.truth_sensors import MountPose, SensorMounts
 
 
 IDENTITY_QUATERNION = (0.0, 0.0, 0.0, 1.0)
+
+
+def test_four_wheel_slope_mixed_obstacle_acceptance_scene_is_loadable() -> None:
+    """下一轮人工验收可由一条 --scene-in 命令复现四驱、斜坡和十个混合障碍。"""
+    scene = load_scene(
+        Path(__file__).resolve().parents[2]
+        / "configs/acceptance_4wd_slope_10_mixed.yaml"
+    )
+
+    assert scene.robot_model == "active_steering_4wd"
+    assert scene.terrain.terrain_model == "slope"
+    assert scene.terrain.slope_deg == pytest.approx(8.0)
+    assert len(scene.obstacles) == 10
+    assert sum(item.mode == "static" for item in scene.obstacles) == 5
+    assert sum(item.mode == "moving" for item in scene.obstacles) == 5
 
 
 def sample_scene_document() -> SceneDocument:

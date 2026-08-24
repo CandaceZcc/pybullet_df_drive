@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import csv
 import json
+import math
+from numbers import Real
 from pathlib import Path
 from time import strftime
 from typing import Any
@@ -17,14 +19,24 @@ class CsvSimulationLogger:
 
     fieldnames = TELEMETRY_FIELDNAMES
 
-    def __init__(self, log_dir: str | Path, prefix: str = "run") -> None:
-        """创建日志文件并写入表头。"""
+    def __init__(
+        self,
+        log_dir: str | Path,
+        prefix: str = "run",
+        *,
+        rate_hz: Real = 20.0,
+    ) -> None:
+        """创建日志文件；默认仅以 20 Hz 将遥测采样落盘。"""
+        if isinstance(rate_hz, bool) or not isinstance(rate_hz, Real) or not math.isfinite(rate_hz) or rate_hz <= 0:
+            raise ValueError("rate_hz must be a positive finite number")
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.path = self.log_dir / f"{prefix}_{strftime('%Y%m%d_%H%M%S')}.csv"
         self._file = self.path.open("w", newline="", encoding="utf-8")
         self._writer = csv.DictWriter(self._file, fieldnames=self.fieldnames)
         self._writer.writeheader()
+        self._sample_period_sec = 1.0 / float(rate_hz)
+        self._next_sample_time: float | None = None
 
     def record(
         self,
@@ -34,8 +46,14 @@ class CsvSimulationLogger:
         estimated_x: float,
         estimated_y: float,
     ) -> None:
-        """记录单个仿真时刻的状态和参考/估计位置。"""
+        """到达采样时间才记录单个仿真状态，物理和控制循环不受影响。"""
+        if (
+            self._next_sample_time is not None
+            and state.t + 1e-9 < self._next_sample_time
+        ):
+            return
         self._writer.writerow(state.to_row(reference_x, reference_y, estimated_x, estimated_y))
+        self._next_sample_time = state.t + self._sample_period_sec
 
     def close(self) -> Path:
         """关闭 CSV 文件，并返回日志路径。"""

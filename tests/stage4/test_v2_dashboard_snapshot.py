@@ -288,6 +288,8 @@ def test_v2_async_runtime_keeps_only_lidar_metadata_in_dashboard_snapshot() -> N
         "imu",
         "topic_observations",
         "robot_model",
+        "authority_rejections",
+        "observer_rejections",
     )
     assert snapshot.lidar_timestamp_ns == 100_000_000
     assert snapshot.lidar_sequence == 0
@@ -439,3 +441,42 @@ def test_v2_dashboard_live_observation_records_only_accepted_command_metadata() 
     assert command.latest_sequence == 7
     assert command.latest_timestamp_ns == 900_000_000
     assert command.telemetry_observed_at == 2.0
+
+
+def test_v2_dashboard_rejection_domain_counts_survive_telemetry_and_transport_refreshes() -> None:
+    """authority/observer 计数是诊断域状态，不得被后续刷新重置。"""
+    module = import_module("slope_sim.interfaces.v2.dashboard_snapshot")
+    frames, _wheel = _coherent_frames_and_wheel()
+    store = module.V2DashboardSnapshotStore()
+    store.update_sensor_frames(frames, observed_at=1.0)
+    fields = {
+        "topic": "/sim/wheel/command",
+        "source_id": "manual.tool-1",
+        "source_session_id": b"m" * 16,
+        "sequence": 3,
+        "simulation_session_id": frames.rtk.simulation_session_id,
+        "world_generation": frames.rtk.world_generation,
+        "reason": "command sequence must advance",
+        "received_at": 1.1,
+    }
+    store.record_authority_rejection(**fields)
+    store.record_observer_rejection(**(fields | {
+        "source_id": None,
+        "source_session_id": None,
+        "sequence": None,
+        "simulation_session_id": None,
+        "world_generation": None,
+        "reason": "ValueError: malformed command",
+        "received_at": 1.2,
+    }))
+    store.record_accepted_command(
+        sequence=4, timestamp_ns=100_000_000, received_at=1.3, accepted=True,
+    )
+    store.refresh_transport(
+        TransportSnapshot("ecal", True, 0, 0, 0, 0, topic_quality=()),
+        observed_at=1.4,
+    )
+
+    observation = store.snapshot().topic_observation("/sim/wheel/command")
+    assert observation.authority_error_count == 1
+    assert observation.observer_error_count == 1

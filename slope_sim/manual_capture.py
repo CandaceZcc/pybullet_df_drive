@@ -2,12 +2,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum
 import json
 import math
 from pathlib import Path
 import tempfile
-from uuid import uuid4
 
 from slope_sim.scene_config import SceneDocument, dump_scene_atomic
 
@@ -41,6 +41,7 @@ class ManualCaptureAction:
     kind: str
     duration_limit_sec: int | None = None
     lvx2_path: Path | None = None
+    mcap_path: Path | None = None
 
     @classmethod
     def start(cls, duration_limit_sec: int | None) -> "ManualCaptureAction":
@@ -57,6 +58,12 @@ class ManualCaptureAction:
         if not isinstance(lvx2_path, Path) or not lvx2_path.is_absolute():
             raise ValueError("lvx2_path must be an absolute Path")
         return cls("open_viewer", lvx2_path=lvx2_path)
+
+    @classmethod
+    def compress_mcap(cls, mcap_path: Path) -> "ManualCaptureAction":
+        if not isinstance(mcap_path, Path) or not mcap_path.is_absolute():
+            raise ValueError("mcap_path must be an absolute Path")
+        return cls("compress_mcap", mcap_path=mcap_path)
 
 
 @dataclass(frozen=True, slots=True)
@@ -278,6 +285,19 @@ class ManualCaptureRecorder:
             raise ValueError("output_root must be a Path")
         self._output_root = output_root
 
+    def _create_output_dir(self) -> Path:
+        """以本地时间创建人工采集目录；同秒冲突按连续后缀避让。"""
+        stem = datetime.now().strftime("capture-%Y%m%d-%H%M%S")
+        for suffix in range(10_000):
+            name = stem if suffix == 0 else f"{stem}-{suffix:02d}"
+            candidate = self._output_root / name
+            try:
+                candidate.mkdir()
+            except FileExistsError:
+                continue
+            return candidate
+        raise RuntimeError(f"capture directory suffixes exhausted for {stem}")
+
     def start(
         self,
         *,
@@ -296,8 +316,7 @@ class ManualCaptureRecorder:
             raise ValueError("duration_limit_sec must be one of 60, 90, 180, or None")
         started = _require_uint64("started_sim_time_ns", started_sim_time_ns)
         self._output_root.mkdir(parents=True, exist_ok=True)
-        output_dir = self._output_root / f"capture-{uuid4().hex}"
-        output_dir.mkdir()
+        output_dir = self._create_output_dir()
         scene_path = dump_scene_atomic(scene_document, output_dir / "scene.yaml")
         return ManualCaptureSession(
             output_dir=output_dir,

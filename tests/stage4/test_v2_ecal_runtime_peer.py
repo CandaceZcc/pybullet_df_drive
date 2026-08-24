@@ -173,6 +173,11 @@ def test_raw_output_collector_verifies_and_records_existing_v2_wheel_bytes() -> 
         "timestamps_ns": [10_000_000],
         "received_at_sec": [12.0],
         "identities": [[wheel.simulation_session_id.hex(), descriptor.sha256.hex(), 1]],
+        "publishers": [{
+            "entity_id": 7,
+            "process_id": 8,
+            "host_name": "localhost",
+        }],
     }
 
 

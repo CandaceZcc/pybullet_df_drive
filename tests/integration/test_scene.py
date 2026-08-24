@@ -10,6 +10,28 @@ import pytest
 import slope_sim.scene as scene_module
 
 
+def test_gui_visualizer_disables_pybullet_keyboard_shortcuts(monkeypatch) -> None:
+    """WASD 必须只进入车辆控制，不能触发 PyBullet 原生可视化快捷键。"""
+    calls: list[tuple[object, int, int]] = []
+
+    monkeypatch.setattr(
+        scene_module.p,
+        "configureDebugVisualizer",
+        lambda flag, enabled, *, physicsClientId: calls.append((flag, enabled, physicsClientId)),
+    )
+    monkeypatch.setattr(scene_module.p, "resetDebugVisualizerCamera", lambda **_kwargs: None)
+
+    scene_module.configure_gui_visualizer(
+        17,
+        camera_distance=6.0,
+        camera_yaw=20.0,
+        camera_pitch=-15.0,
+        camera_target=(0.0, 0.0, 0.0),
+    )
+
+    assert (scene_module.p.COV_ENABLE_KEYBOARD_SHORTCUTS, 0, 17) in calls
+
+
 def _probe(client_id: int, scene: scene_module.SceneInfo, x: float):
     """在中线上探测地形，统一接缝与分段断言。"""
     return scene_module.probe_terrain(client_id, x, 0.0, bounds=scene.bounds)

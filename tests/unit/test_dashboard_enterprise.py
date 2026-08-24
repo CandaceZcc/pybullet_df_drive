@@ -27,9 +27,14 @@ from slope_sim.telemetry import RobotTelemetry
 
 
 TOPIC_LABELS = ("轮子命令", "轮子状态", "前雷达", "后雷达", "RTK", "IMU")
-EXPECTED_DEFAULT_TABS = [
-    "接口状态", "障碍物", "轨迹", "速度/命令",
-    "驱动命令", "驱动反馈", "转向命令", "转向反馈", "LiDAR点云",
+ON_DEMAND_PLOT_TABS = [
+    "轨迹", "速度/命令", "驱动命令", "驱动反馈", "转向命令", "转向反馈",
+    "RTK位置", "RTK航向", "IMU姿态", "轮组频率", "传感频率", "接口异常",
+]
+EXPECTED_DEFAULT_TABS = ["接口状态", "障碍物", "LiDAR点云"]
+EXPECTED_ALL_TABS = [
+    "接口状态", "障碍物", "LiDAR点云", "轨迹", "速度/命令",
+    "驱动命令", "驱动反馈",
     "RTK位置", "RTK航向", "IMU姿态", "轮组频率", "传感频率", "接口异常",
 ]
 
@@ -46,6 +51,24 @@ class RectLike:
 
 def _tab_names(dashboard: TelemetryDashboard) -> list[str]:
     return [dashboard.tabs.tabText(index) for index in range(dashboard.tabs.count())]
+
+
+def _enable_plot(dashboard: TelemetryDashboard, label: str) -> int:
+    """模拟用户在“图表（按需）”菜单中勾选一项并返回其真实页索引。"""
+    dashboard.plot_actions[label].setChecked(True)
+    dashboard.process_events()
+    return next(
+        index for index in range(dashboard.tabs.count())
+        if dashboard.tabs.tabText(index) == label
+    )
+
+
+def _enable_all_plots(dashboard: TelemetryDashboard) -> None:
+    for label in ON_DEMAND_PLOT_TABS:
+        action = dashboard.plot_actions[label]
+        if action.isEnabled():
+            action.setChecked(True)
+    dashboard.process_events()
 
 
 def _all_widget_text(dashboard: TelemetryDashboard) -> str:
@@ -197,6 +220,8 @@ def test_default_dashboard_contains_only_enterprise_tabs_and_controls(monkeypatc
     try:
         assert dashboard.window.windowTitle() == "3D仿真Dashboard"
         assert _tab_names(dashboard) == EXPECTED_DEFAULT_TABS
+        assert set(dashboard.plot_actions) == set(ON_DEMAND_PLOT_TABS)
+        assert set(dashboard.plot_canvases) == {"LiDAR点云"}
         assert dashboard.tabs.usesScrollButtons()
         assert dashboard.diagnostic_tabs is None
         assert len(dashboard.window.findChildren(dashboard.QtWidgets.QTabWidget)) == 1
@@ -250,19 +275,20 @@ def test_layout_report_serializes_current_plot_and_control_rectangles(monkeypatc
     monkeypatch.setenv(dashboard_module.DASHBOARD_LAYOUT_REPORT_ENV, str(report_path))
     dashboard = TelemetryDashboard(interface_config=InterfaceConfig.default())
     try:
+        _enable_all_plots(dashboard)
         scrollbar = dashboard.control_scroll.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
         original_scroll_value = scrollbar.value()
-        dashboard.tabs.setCurrentIndex(EXPECTED_DEFAULT_TABS.index("轨迹"))
+        dashboard.tabs.setCurrentIndex(_enable_plot(dashboard, "轨迹"))
         dashboard.process_events()
         dashboard.process_events()
 
         rows = [json.loads(line) for line in report_path.read_text(encoding="utf-8").splitlines()]
         report = rows[-1]
         assert report["report_version"] == 4
-        assert report["tab_count"] == 15
+        assert report["tab_count"] == len(EXPECTED_ALL_TABS)
         assert report["tab_label"] == "轨迹"
-        assert report["tab_order"] == EXPECTED_DEFAULT_TABS
+        assert report["tab_order"] == EXPECTED_ALL_TABS
         assert report["page_kind"] == "plot"
         assert report["required_plot_buttons"] == ["清空曲线", "保存当前图"]
         assert type(report["rendered_data_revision"]) is int
@@ -329,7 +355,7 @@ def test_layout_report_waits_for_a_new_rendered_revision_before_reemitting_plot(
     monkeypatch.setenv(dashboard_module.DASHBOARD_LAYOUT_REPORT_ENV, str(report_path))
     dashboard = TelemetryDashboard(interface_config=InterfaceConfig.default())
     try:
-        trajectory_index = EXPECTED_DEFAULT_TABS.index("轨迹")
+        trajectory_index = _enable_plot(dashboard, "轨迹")
         dashboard.tabs.setCurrentIndex(trajectory_index)
         for _attempt in range(6):
             dashboard.process_events()
@@ -340,7 +366,7 @@ def test_layout_report_waits_for_a_new_rendered_revision_before_reemitting_plot(
         ]
         assert len(first_rows) == 1
 
-        dashboard.tabs.setCurrentIndex(EXPECTED_DEFAULT_TABS.index("速度/命令"))
+        dashboard.tabs.setCurrentIndex(_enable_plot(dashboard, "速度/命令"))
         for _attempt in range(6):
             dashboard.process_events()
         dashboard.tabs.setCurrentIndex(trajectory_index)
@@ -376,8 +402,9 @@ def test_trajectory_disables_scientific_offsets_and_keeps_axis_artists_separate(
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     dashboard = TelemetryDashboard(interface_config=InterfaceConfig.default())
     try:
+        trajectory_index = _enable_plot(dashboard, "轨迹")
         dashboard.apply_window_rect(RectLike(0, 0, 404, 651))
-        dashboard.tabs.setCurrentIndex(EXPECTED_DEFAULT_TABS.index("轨迹"))
+        dashboard.tabs.setCurrentIndex(trajectory_index)
         for index in range(3):
             dashboard.plot_buffer.append(
                 RobotTelemetry(
@@ -416,7 +443,7 @@ def test_wall_time_xlabel_stays_separate_from_scientific_offset(monkeypatch):
     try:
         dashboard.apply_window_rect(RectLike(0, 0, 404, 651))
         tab_label = "轮组频率"
-        dashboard.tabs.setCurrentIndex(EXPECTED_DEFAULT_TABS.index(tab_label))
+        dashboard.tabs.setCurrentIndex(_enable_plot(dashboard, tab_label))
         dashboard.plot_lines["command_hz"].set_data(
             [17_828.2, 17_828.3, 17_828.4],
             [100.0, 99.0, 101.0],
@@ -494,15 +521,16 @@ def test_layout_report_fully_contains_all_required_controls_at_real_client_size(
 
 
 def test_all_fifteen_default_layout_reports_pass_content_and_artist_containment(monkeypatch):
-    """15 个默认页面都必须由正式 verifier 证明控件、文字 artist 和画布完整包含。"""
+    """勾选全部图表后，15 个页面仍通过正式布局 verifier。"""
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     from scripts.verify_dashboard_manual_drive import validate_dashboard_layout_report
     from slope_sim.window_layout import Rect
 
     dashboard = TelemetryDashboard(interface_config=InterfaceConfig.default())
     try:
+        _enable_all_plots(dashboard)
         dashboard.apply_window_rect(RectLike(0, 0, 404, 651))
-        for index, label in enumerate(EXPECTED_DEFAULT_TABS):
+        for index, label in enumerate(EXPECTED_ALL_TABS):
             dashboard.tabs.setCurrentIndex(index)
             report = None
             for _attempt in range(12):
@@ -516,6 +544,7 @@ def test_all_fifteen_default_layout_reports_pass_content_and_artist_containment(
             result = validate_dashboard_layout_report(
                 report,
                 Rect(x, y, width, height),
+                expected_tab_order=report["tab_order"],
             )
             assert result.passed, (label, result.detail)
     finally:
@@ -530,8 +559,9 @@ def test_real_dashboard_report_stays_stable_after_new_trajectory_data(monkeypatc
 
     dashboard = TelemetryDashboard(interface_config=InterfaceConfig.default())
     try:
+        trajectory_index = _enable_plot(dashboard, "轨迹")
         dashboard.apply_window_rect(RectLike(0, 0, 404, 651))
-        dashboard.tabs.setCurrentIndex(EXPECTED_DEFAULT_TABS.index("轨迹"))
+        dashboard.tabs.setCurrentIndex(trajectory_index)
         for _attempt in range(6):
             dashboard.process_events()
         before = dashboard._layout_report()
@@ -569,13 +599,11 @@ def test_developer_diagnostics_tab_is_opt_in(monkeypatch):
         assert "打滑严重度" in diagnostic_text
         assert "有效接触点" in diagnostic_text
         assert "接触法向力" in diagnostic_text
-        expected_plot_tabs = set(EXPECTED_DEFAULT_TABS) - {"接口状态", "障碍物"}
-        assert normal.tabs.count() == 15
-        assert diagnostic.tabs.count() == 16
+        assert normal.tabs.count() == 3
+        assert diagnostic.tabs.count() == 4
         assert len(normal.plot_specs) == len(diagnostic.plot_specs) == 12
-        assert set(normal.plot_canvases) == expected_plot_tabs
-        assert set(diagnostic.plot_canvases) == expected_plot_tabs
-        assert len(normal.plot_canvases) == len(diagnostic.plot_canvases) == 13
+        assert set(normal.plot_canvases) == {"LiDAR点云"}
+        assert set(diagnostic.plot_canvases) == {"LiDAR点云"}
         assert normal.diagnostic_tabs is diagnostic.diagnostic_tabs is None
         assert len(diagnostic.window.findChildren(diagnostic.QtWidgets.QTabWidget)) == 1
         assert all(diagnostic.tabs.isAncestorOf(canvas) for canvas in diagnostic.plot_canvases.values())
@@ -591,9 +619,13 @@ def test_plot_buttons_use_icons_tooltips_and_keep_callbacks(monkeypatch):
     saved_tabs: list[str] = []
     dashboard.save_plot_snapshot = lambda tab_label: saved_tabs.append(tab_label)
     try:
+        _enable_all_plots(dashboard)
         for index in range(dashboard.tabs.count()):
             tab_label = dashboard.tabs.tabText(index)
             if tab_label not in dashboard.plot_canvases:
+                continue
+            if not dashboard.tabs.isTabEnabled(index):
+                assert tab_label in {"转向命令", "转向反馈"}
                 continue
             dashboard.tabs.setCurrentIndex(index)
             buttons = dashboard.tabs.widget(index).findChildren(
@@ -618,31 +650,31 @@ def test_plot_buttons_use_icons_tooltips_and_keep_callbacks(monkeypatch):
         dashboard.close()
 
 
-def test_hidden_interface_tabs_buffer_without_drawing_then_draw_only_selected(monkeypatch):
+def test_unselected_interface_tabs_skip_buffering_then_draw_only_selected(monkeypatch):
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     now = {"value": 100.0}
     monkeypatch.setattr(dashboard_module.time, "monotonic", lambda: now["value"])
     dashboard = TelemetryDashboard(interface_config=InterfaceConfig.default())
     try:
+        dashboard.update_interface_snapshot(_dashboard_snapshot(dashboard.interface_config))
+        assert dashboard.interface_plot_buffer.series("RTK位置")["t"] == []
+
+        rtk_index = _enable_plot(dashboard, "RTK位置")
+        heading_index = _enable_plot(dashboard, "RTK航向")
         draw_counts = {label: 0 for label in dashboard.plot_canvases}
         for label, canvas in dashboard.plot_canvases.items():
             canvas.draw_idle = lambda label=label: draw_counts.__setitem__(label, draw_counts[label] + 1)
             canvas._draw_pending = False
-        dashboard.tabs.setCurrentIndex(0)
-
+        dashboard.tabs.setCurrentIndex(rtk_index)
         dashboard.update_interface_snapshot(_dashboard_snapshot(dashboard.interface_config))
 
         assert dashboard.interface_plot_buffer.series("RTK位置")["t"] == [1.0]
-        assert all(count == 0 for count in draw_counts.values())
-
-        rtk_index = EXPECTED_DEFAULT_TABS.index("RTK位置")
-        dashboard.tabs.setCurrentIndex(rtk_index)
         assert draw_counts["RTK位置"] >= 1
         assert all(count == 0 for label, count in draw_counts.items() if label != "RTK位置")
 
         first_draw_count = draw_counts["RTK位置"]
         now["value"] = 100.2
-        dashboard.tabs.setCurrentIndex(EXPECTED_DEFAULT_TABS.index("RTK航向"))
+        dashboard.tabs.setCurrentIndex(heading_index)
         dashboard.tabs.setCurrentIndex(rtk_index)
         assert draw_counts["RTK位置"] == first_draw_count
 
@@ -661,7 +693,7 @@ def test_same_generation_reuses_all_plot_artists_and_lidar_latest_success(monkey
     monkeypatch.setattr(dashboard_module.time, "monotonic", lambda: now["value"])
     dashboard = TelemetryDashboard(interface_config=InterfaceConfig.default())
     try:
-        lidar_index = EXPECTED_DEFAULT_TABS.index("LiDAR点云")
+        lidar_index = _tab_names(dashboard).index("LiDAR点云")
         dashboard.tabs.setCurrentIndex(lidar_index)
         dashboard.process_events()
         for canvas in dashboard.plot_canvases.values():
@@ -731,7 +763,7 @@ def test_lidar_viewport_and_artist_geometry_stay_fixed_across_frames(monkeypatch
     monkeypatch.setattr(dashboard_module.time, "monotonic", lambda: now["value"])
     dashboard = TelemetryDashboard(interface_config=InterfaceConfig.default())
     try:
-        dashboard.tabs.setCurrentIndex(EXPECTED_DEFAULT_TABS.index("LiDAR点云"))
+        dashboard.tabs.setCurrentIndex(_tab_names(dashboard).index("LiDAR点云"))
         dashboard.process_events()
         canvas = dashboard.plot_canvases["LiDAR点云"]
         canvas._draw_pending = False
@@ -874,13 +906,13 @@ def test_lidar_tag_colors_and_no_steering_status(monkeypatch):
                 points=((1.0, 1.0, 0, 1), (2.0, 2.0, 1, 1), (3.0, 3.0, 2, 2), (4.0, 4.0, 3, 2)),
             )
         )
-        dashboard.tabs.setCurrentIndex(EXPECTED_DEFAULT_TABS.index("LiDAR点云"))
+        dashboard.tabs.setCurrentIndex(_tab_names(dashboard).index("LiDAR点云"))
         assert dashboard.lidar_collection.get_offsets().shape == (4, 2)
         assert len({tuple(color) for color in dashboard.lidar_collection.get_facecolors()}) == 4
 
-        dashboard.tabs.setCurrentIndex(EXPECTED_DEFAULT_TABS.index("转向命令"))
+        dashboard.tabs.setCurrentIndex(_enable_plot(dashboard, "转向命令"))
         dashboard.process_events()
-        assert dashboard.no_steering_texts["转向命令"].get_text() == "当前车型无转向数据"
+        assert dashboard.no_steering_texts["转向命令"].get_text() == "不适用于差速车型"
         assert all(len(line.get_xdata()) == 0 for key, line in dashboard.plot_lines.items() if key.startswith("steering_command_"))
     finally:
         dashboard.close()
@@ -927,6 +959,8 @@ def test_same_generation_model_change_rebuilds_wheel_artists_and_legend(monkeypa
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     dashboard = TelemetryDashboard(interface_config=InterfaceConfig.default(), robot_model="df_back")
     try:
+        _enable_plot(dashboard, "驱动命令")
+        _enable_plot(dashboard, "转向命令")
         first = _dashboard_snapshot(
             dashboard.interface_config,
             generation=1,
@@ -973,6 +1007,8 @@ def test_interface_snapshot_throttles_qt_status_writes_without_dropping_data(
         update_hz=5.0,
     )
     dashboard._paused = paused
+    _enable_plot(dashboard, "驱动命令")
+    _enable_plot(dashboard, "轮组频率")
     writes = {"value": 0}
     original_set_text = dashboard.transport_mode_label.setText
 
@@ -1121,7 +1157,7 @@ def test_constructor_failure_after_canvas_creation_disposes_mpl_and_qt(monkeypat
         TelemetryDashboard()
     app.processEvents()
 
-    assert len(connections) == 13
+    assert len(connections) == 1
     assert all(
         cid not in registry.callbacks.get(event_name, {})
         for _canvas, event_name, cid, _figure, registry in connections

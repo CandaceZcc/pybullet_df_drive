@@ -65,7 +65,7 @@ def test_capture_directory_uses_local_datetime_and_deterministic_collision_suffi
     second = create_capture_output_dir(tmp_path, now=now)
 
     assert first.name == "capture-20260819-143012"
-    assert second.name == "capture-20260819-143012-1"
+    assert second.name == "capture-20260819-143012-01"
 
 
 def test_latest_successful_lvx2_path_is_persisted_as_an_absolute_path(tmp_path: Path) -> None:
@@ -84,6 +84,193 @@ def test_latest_successful_lvx2_path_is_persisted_as_an_absolute_path(tmp_path: 
     from slope_sim.interfaces.v2.runsim_v2_recorder import load_latest_successful_lvx2_path
 
     assert load_latest_successful_lvx2_path(tmp_path) == lvx2
+
+
+def test_capture_outputs_are_published_only_after_all_artifacts_are_complete(
+    tmp_path: Path,
+) -> None:
+    """临时采集失败不能伪装成最近成功导出，完整输出才可原子发布。"""
+    from slope_sim.interfaces.v2.runsim_v2_recorder import (
+        prepare_capture_output_dirs,
+        publish_capture_output,
+    )
+
+    paths = prepare_capture_output_dirs(tmp_path, now=datetime(2026, 8, 19, 14, 30, 12))
+    assert paths.staging_dir.is_dir()
+    assert not paths.published_dir.exists()
+
+    staging_mcap = paths.staging_dir / "session.mcap"
+    staging_mcap.write_bytes(b"mcap")
+    (paths.staging_dir / "recorder.result.json").write_text(
+        json.dumps(
+            {
+                "clean_shutdown": True,
+                "exportable": True,
+                "mcap": str(staging_mcap),
+                "recorded_count": 5,
+                "role": "recorder",
+                "topics": {},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    export = paths.staging_dir / "export"
+    export.mkdir()
+    (export / "lidar.lvx2").write_bytes(b"lvx2")
+    (export / "frame-0000.pcd").write_text("pcd\n", encoding="utf-8")
+    (export / "frame-0000.ply").write_text("ply\n", encoding="utf-8")
+    (paths.staging_dir / "export.result.json").write_text("{}\n", encoding="utf-8")
+
+    published = publish_capture_output(paths)
+
+    assert published == paths.published_dir
+    assert published.is_dir()
+    assert not paths.staging_dir.exists()
+    assert json.loads((published / "recorder.result.json").read_text(encoding="utf-8"))["mcap"] == str(
+        published / "session.mcap"
+    )
+    manifest = json.loads((published / "capture.manifest.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "complete"
+    assert manifest["artifacts"] == [
+        "export/frame-0000.pcd",
+        "export/frame-0000.ply",
+        "export/lidar.lvx2",
+        "export.result.json",
+        "recorder.result.json",
+        "session.mcap",
+    ]
+
+
+def test_recorder_export_publishes_staged_capture_before_updating_latest_marker(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """正式导出必须先改名最终目录，再把它作为 Viewer 的最近成功输入。"""
+    from slope_sim.interfaces.v2.runsim_v2_recorder import (
+        RunSimV2Recorder,
+        prepare_capture_output_dirs,
+        load_latest_successful_lvx2_path,
+    )
+
+    paths = prepare_capture_output_dirs(tmp_path, now=datetime(2026, 8, 19, 14, 30, 12))
+    mcap = paths.staging_dir / "session.mcap"
+    mcap.write_bytes(b"mcap")
+    (paths.staging_dir / "recorder.result.json").write_text(
+        json.dumps(
+            {
+                "clean_shutdown": True,
+                "exportable": True,
+                "mcap": str(mcap),
+                "recorded_count": 1,
+                "role": "recorder",
+                "topics": {},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    release = tmp_path / "release"
+    executable = release / "bin" / "slope_sim_stage4_export"
+    executable.parent.mkdir(parents=True)
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    executable.chmod(0o755)
+    descriptor = release / "slope_sim/interfaces/generated/slope_sim_interfaces_v2.desc"
+    descriptor.parent.mkdir(parents=True)
+    descriptor.write_bytes(b"descriptor")
+    control_dir = tmp_path / "control"
+    control_dir.mkdir()
+    recorder = RunSimV2Recorder(
+        process=object(),
+        control_socket=control_dir / "recorder.sock",
+        control_token=b"t" * 32,
+        control_dir=control_dir,
+        output_dir=paths.staging_dir,
+        published_output_dir=paths.published_dir,
+    )
+
+    def fake_run(argv, *, check):
+        assert check is True
+        output = Path(argv[argv.index("--output-dir") + 1])
+        output.mkdir()
+        (output / "lidar.lvx2").write_bytes(b"lvx2")
+        (output / "frame-0000.pcd").write_text("pcd\n", encoding="utf-8")
+        (output / "frame-0000.ply").write_text("ply\n", encoding="utf-8")
+        Path(argv[argv.index("--result") + 1]).write_text("{}\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        "slope_sim.interfaces.v2.runsim_v2_recorder.subprocess.run", fake_run
+    )
+
+    lvx2, result = recorder.export(release_root=release, mcap_path=mcap)
+
+    assert lvx2 == paths.published_dir / "export/lidar.lvx2"
+    assert result == paths.published_dir / "export.result.json"
+    assert load_latest_successful_lvx2_path(tmp_path) == lvx2
+    assert not paths.staging_dir.exists()
+
+
+def test_failed_staged_capture_is_marked_incomplete_without_publishing(tmp_path: Path) -> None:
+    """失败采集保留诊断，但不占用最终 capture 目录或最近成功标记。"""
+    from slope_sim.interfaces.v2.runsim_v2_recorder import (
+        mark_capture_output_incomplete,
+        prepare_capture_output_dirs,
+    )
+
+    paths = prepare_capture_output_dirs(tmp_path, now=datetime(2026, 8, 19, 14, 30, 12))
+    marker = mark_capture_output_incomplete(paths.staging_dir, "export exited with status 1")
+
+    assert marker == paths.staging_dir / "capture.incomplete.json"
+    assert json.loads(marker.read_text(encoding="utf-8")) == {
+        "reason": "export exited with status 1",
+        "status": "incomplete",
+    }
+    assert not paths.published_dir.exists()
+
+
+def test_recorder_export_marks_staging_incomplete_when_exporter_fails(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """C++ Export 失败后，Dashboard 可追查暂存原因而非误报成功。"""
+    import pytest
+
+    from slope_sim.interfaces.v2.runsim_v2_recorder import (
+        RunSimV2Recorder,
+        prepare_capture_output_dirs,
+    )
+
+    paths = prepare_capture_output_dirs(tmp_path, now=datetime(2026, 8, 19, 14, 30, 12))
+    mcap = paths.staging_dir / "session.mcap"
+    mcap.write_bytes(b"mcap")
+    release = tmp_path / "release"
+    executable = release / "bin" / "slope_sim_stage4_export"
+    executable.parent.mkdir(parents=True)
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    executable.chmod(0o755)
+    descriptor = release / "slope_sim/interfaces/generated/slope_sim_interfaces_v2.desc"
+    descriptor.parent.mkdir(parents=True)
+    descriptor.write_bytes(b"descriptor")
+    control_dir = tmp_path / "control"
+    control_dir.mkdir()
+    recorder = RunSimV2Recorder(
+        process=object(),
+        control_socket=control_dir / "recorder.sock",
+        control_token=b"t" * 32,
+        control_dir=control_dir,
+        output_dir=paths.staging_dir,
+        published_output_dir=paths.published_dir,
+    )
+    failure = subprocess.CalledProcessError(1, ["stage4-export"])
+    monkeypatch.setattr(
+        "slope_sim.interfaces.v2.runsim_v2_recorder.subprocess.run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(failure),
+    )
+
+    with pytest.raises(subprocess.CalledProcessError):
+        recorder.export(release_root=release, mcap_path=mcap)
+
+    marker = paths.staging_dir / "capture.incomplete.json"
+    assert json.loads(marker.read_text(encoding="utf-8"))["status"] == "incomplete"
+    assert not paths.published_dir.exists()
 
 
 def test_recorder_close_kills_an_unresponsive_process_group(tmp_path: Path, monkeypatch) -> None:

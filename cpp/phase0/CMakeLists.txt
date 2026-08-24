@@ -321,6 +321,10 @@ if(STAGE4_WITH_ROS)
   )
   target_link_libraries(slope_sim_stage4_ros2_bridge PRIVATE slope_sim_client stage4_v2_proto eCAL::core OpenSSL::Crypto geometry_msgs::geometry_msgs rclcpp::rclcpp sensor_msgs::sensor_msgs rosgraph_msgs::rosgraph_msgs tf2_ros::tf2_ros stage4_livox_ros2_interfaces)
   install(TARGETS slope_sim_stage4_ros2_bridge RUNTIME DESTINATION bin)
+  install(
+    FILES "${CMAKE_CURRENT_LIST_DIR}/../client/rviz/stage4_live.rviz"
+    DESTINATION cpp/client/rviz
+  )
   add_executable(
     slope_sim_client_ros2_bridge_integration_test
     "${CMAKE_CURRENT_LIST_DIR}/../client/tests/stage4_ros2_bridge_integration_test.cpp"
@@ -335,6 +339,11 @@ if(STAGE4_WITH_ROS)
     PRIVATE slope_sim_client stage4_v2_proto eCAL::core geometry_msgs::geometry_msgs rclcpp::rclcpp sensor_msgs::sensor_msgs rosgraph_msgs::rosgraph_msgs tf2_msgs::tf2_msgs stage4_livox_ros2_interfaces
   )
   add_test(NAME slope_sim_client_ros2_bridge_integration COMMAND slope_sim_client_ros2_bridge_integration_test)
+  set_tests_properties(
+    slope_sim_client_ros2_bridge_integration
+    PROPERTIES
+      ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_CURRENT_BINARY_DIR}/livox_ros_driver2_interfaces:$ENV{LD_LIBRARY_PATH}"
+  )
   add_executable(
     slope_sim_client_ros2_replay_bridge_integration_test
     "${CMAKE_CURRENT_LIST_DIR}/../client/tests/stage4_ros2_bridge_integration_test.cpp"
@@ -349,6 +358,11 @@ if(STAGE4_WITH_ROS)
     PRIVATE slope_sim_client stage4_v2_proto eCAL::core geometry_msgs::geometry_msgs rclcpp::rclcpp sensor_msgs::sensor_msgs rosgraph_msgs::rosgraph_msgs tf2_msgs::tf2_msgs stage4_livox_ros2_interfaces
   )
   add_test(NAME slope_sim_client_ros2_replay_bridge_integration COMMAND slope_sim_client_ros2_replay_bridge_integration_test)
+  set_tests_properties(
+    slope_sim_client_ros2_replay_bridge_integration
+    PROPERTIES
+      ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_CURRENT_BINARY_DIR}/livox_ros_driver2_interfaces:$ENV{LD_LIBRARY_PATH}"
+  )
 endif()
 
 add_executable(ecal_v2_raw_probe ecal_v2_raw_probe.cpp sha256.hpp)

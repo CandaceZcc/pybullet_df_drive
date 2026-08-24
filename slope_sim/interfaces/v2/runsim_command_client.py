@@ -59,6 +59,43 @@ class RunSimCommandClient:
             self.close()
             raise
 
+    def sync_generation(
+        self,
+        world_generation: int,
+        command_generation: int,
+        *,
+        robot_model: str,
+        now: float,
+    ) -> None:
+        """以同一认证帧同步新 world 代次和车型，令 C++ 重置轮子形状。"""
+        if type(world_generation) is not int or world_generation <= 0:
+            raise ValueError("world_generation must be a positive int")
+        if type(command_generation) is not int or command_generation <= 0:
+            raise ValueError("command_generation must be a positive int")
+        if self._socket is None:
+            raise RuntimeError("Command socket is not connected")
+        payload = json.dumps(
+            {
+                "kind": "generation",
+                "token": self._session.server_authentication["token"],
+                "world_generation": world_generation,
+                "command_generation": command_generation,
+                "robot_model": robot_model,
+            },
+            separators=(",", ":"),
+        ).encode("utf-8") + b"\n"
+        try:
+            self._session.accept_client_message(
+                payload[:-1],
+                client_pid=self._session.snapshot().command_pid,
+                peer_uid=self._session.snapshot().command_uid,
+                now=now,
+            )
+            self._socket.sendall(payload)
+        except OSError:
+            self.close()
+            raise
+
     def close(self) -> None:
         """关闭持久连接并立即撤销人工目标。"""
         client, self._socket = self._socket, None

@@ -10,6 +10,8 @@ from collections.abc import Callable
 
 
 _LIVE_DURATION_MS = "21600000"
+_JAZZY_RVIZ2 = Path("/opt/ros/jazzy/bin/rviz2")
+_JAZZY_SETUP = Path("/opt/ros/jazzy/setup.sh")
 
 
 def _stop_process_group(process: subprocess.Popen[object]) -> None:
@@ -55,19 +57,27 @@ class RunSimV2LiveViewer:
         if not profile.is_file():
             raise RuntimeError(f"runSim RViz profile is unavailable: {profile}")
         rviz = shutil.which("rviz2")
+        if rviz is None and _JAZZY_RVIZ2.is_file() and os.access(_JAZZY_RVIZ2, os.X_OK):
+            rviz = str(_JAZZY_RVIZ2)
         if rviz is None:
             raise RuntimeError("RViz2 is unavailable; install the release ROS/RViz component or source ROS 2 Jazzy")
         bridge_process = subprocess.Popen(
             [
-                str(bridge), "--descriptor-set", str(descriptor),
-                "--duration-ms", _LIVE_DURATION_MS,
-                "--deadline-ms", _LIVE_DURATION_MS,
+                "/bin/sh", "-c",
+                '. /opt/ros/jazzy/setup.sh; '
+                'export LD_LIBRARY_PATH="$1/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"; '
+                'exec "$2" --descriptor-set "$3" --duration-ms "$4" --deadline-ms "$4"',
+                "bridge", str(release_root), str(bridge), str(descriptor), _LIVE_DURATION_MS,
             ],
             start_new_session=True,
         )
         try:
             rviz_process = subprocess.Popen(
-                [rviz, "-d", str(profile)],
+                [
+                    "/bin/sh", "-c",
+                    '. /opt/ros/jazzy/setup.sh; exec "$1" -d "$2"',
+                    "rviz2", rviz, str(profile),
+                ],
                 start_new_session=True,
             )
         except BaseException:

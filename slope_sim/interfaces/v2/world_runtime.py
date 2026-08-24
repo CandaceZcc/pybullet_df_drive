@@ -15,7 +15,7 @@ from slope_sim.interfaces.v2.sensor_frames import (
 )
 from slope_sim.interfaces.v2.simulation_runtime import V2SimulatorRuntime
 from slope_sim.interfaces.v2.transport import create_v2_ecal_transport
-from slope_sim.lidar_worker import LidarScanService, LidarWorkerWorldSpec, start_lidar_worker, world_digest_for_document
+from slope_sim.lidar_worker import _PROTOCOL_VERSION, LidarScanService, LidarWorkerWorldSpec, start_lidar_worker, world_digest_for_document
 from slope_sim.obstacles import ObstacleManager
 from slope_sim.robot import DifferentialDriveRobot
 from slope_sim.sensor_backend import PyBulletSensorBackend
@@ -38,7 +38,7 @@ def start_stage4_lidar_service(
         raise ValueError("service_factory must be callable")
     handle = worker_starter(
         LidarWorkerWorldSpec(
-            world_generation,
+            _PROTOCOL_VERSION,
             config,
             document,
             world_digest_for_document(document),
@@ -115,7 +115,12 @@ class V2WorldRuntime:
         self._prepared = (self._scene_document, self._worker)
         self._close_worker(self._worker)
 
-    def commit_world_rebuild(self, scene_document: SceneDocument) -> None:
+    def commit_world_rebuild(
+        self,
+        scene_document: SceneDocument,
+        *,
+        model: object | None = None,
+    ) -> None:
         """为已构建的同一逻辑场景启动 worker，再提交新的 world generation。"""
         if not isinstance(scene_document, SceneDocument):
             raise ValueError("scene_document must be a SceneDocument")
@@ -127,7 +132,7 @@ class V2WorldRuntime:
         self._worker = next_worker
         self._scene_document = scene_document
         self._prepared = None
-        self._controller.commit_world_rebuild()
+        self._controller.commit_world_rebuild(model=model)
 
     def abort_world_rebuild(self) -> None:
         """恢复旧场景 worker；旧 command generation 保持失效。"""
@@ -276,7 +281,10 @@ class V2ManualWorldRuntime:
     ) -> None:
         """新 body 已完成构建后换 worker，并让输出切到同一新 generation。"""
         self._validate_rebind(robot, sensor_backend, scene_document)
-        self._world_runtime.commit_world_rebuild(scene_document)
+        self._world_runtime.commit_world_rebuild(
+            scene_document,
+            model=robot.model_spec,
+        )
         self._robot = robot
         self._sensor_backend = sensor_backend
         self._reset_dashboard_snapshot_store()

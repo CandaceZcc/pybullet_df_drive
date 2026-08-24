@@ -3,13 +3,14 @@ mode: direct
 slope_deg: 0.0
 duration_sec: 5.0
 time_step: 0.004166666666666667
-target_linear_velocity: 1.0
-target_angular_velocity: 0.0
+target_linear_velocity: 1.5
+target_angular_velocity: 1.0
 robot_model: df_back
 drive_model: physics
 interface_mode: auto
 interface_enabled: true
 interface_log_enabled: true
+telemetry_log_hz: 20.0
 scene_in: null
 scene_out: null
 developer_diagnostics_enabled: false

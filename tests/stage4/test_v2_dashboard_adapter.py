@@ -8,6 +8,8 @@ from dataclasses import replace
 from importlib import import_module
 from pathlib import Path
 
+import numpy as np
+
 import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -156,19 +158,282 @@ def test_v2_dashboard_reserves_width_and_wrapping_for_complete_rtk_text(qapp) ->
     widget = module.V2DashboardWidget(descriptor)
     widget.update_snapshot(snapshot)
 
-    assert widget.minimumWidth() >= 800
+    assert widget.minimumWidth() == 0
     assert widget.lidar_value.wordWrap() is True
     assert widget.rtk_value.wordWrap() is True
     widget.close()
 
 
-def test_v2_dashboard_does_not_expose_a_full_lidar_preview_helper() -> None:
-    """正式 Dashboard 没有完整点云抽样器，避免未来绕过快照边界。"""
+def test_v2_dashboard_fits_narrow_parent_without_overflowing_viewer_actions(qapp) -> None:
+    """无显示器/窄侧栏时 v2 页面不得用固定最小宽度把内容挤出窗口。"""
     module = _adapter_module()
-    widget_type = getattr(module, "V2DashboardWidget", None)
-    assert widget_type is not None, "v2 dashboard widget must exist"
+    descriptor, _snapshot = _snapshot_with_encoded_lidar()
+    widget = module.V2DashboardWidget(descriptor)
+    widget.resize(560, 700)
+    widget.show()
+    qapp.processEvents()
+    assert widget.minimumWidth() <= 560
+    assert widget.live_viewer_status.wordWrap() is True
+    assert widget.offline_viewer_status.wordWrap() is True
+    assert widget.live_viewer_status.geometry().right() <= widget.width()
+    assert widget.offline_viewer_status.geometry().right() <= widget.width()
+    widget.close()
 
-    assert not hasattr(widget_type, "_top_view_points")
+
+def test_v2_dashboard_exposes_an_embedded_bounded_cloud_workbench(qapp) -> None:
+    """阶段五 Dashboard 必须内嵌 OpenGL 点云和有界诊断终端，不再依赖 RViz2。"""
+    module = _adapter_module()
+    descriptor, _snapshot = _snapshot_with_encoded_lidar()
+    widget = module.V2DashboardWidget(descriptor)
+
+    assert widget.cloud_view is not None
+    assert widget.cloud_scatter is not None
+    assert widget.cloud_diagnostics.isReadOnly() is True
+    assert widget.cloud_diagnostics.document().maximumBlockCount() == 2_000
+    widget.close()
+
+
+def test_v2_dashboard_places_cloud_view_above_its_controls(qapp) -> None:
+    """点云视图必须独占整行，控制与诊断统一放在下一行。"""
+    from PySide6.QtWidgets import QVBoxLayout
+
+    module = _adapter_module()
+    descriptor, _snapshot = _snapshot_with_encoded_lidar()
+    widget = module.V2DashboardWidget(descriptor)
+    try:
+        workbench_layout = widget.cloud_workbench.layout()
+
+        assert isinstance(workbench_layout, QVBoxLayout)
+        assert workbench_layout.itemAt(0).widget() is widget.cloud_view
+        assert workbench_layout.itemAt(1).widget() is widget.cloud_controls
+    finally:
+        widget.close()
+
+
+def test_v2_dashboard_defers_cloud_rendering_while_workbench_is_closed(
+    qapp, monkeypatch,
+) -> None:
+    """折叠点云页只缓存最新数据，不得在控制主线程提交 OpenGL。"""
+    adapter = _adapter_module()
+    receiver = import_module("slope_sim.interfaces.v2.dashboard_receiver")
+    descriptor, _snapshot = _snapshot_with_encoded_lidar()
+    widget = adapter.V2DashboardWidget(descriptor)
+    render_calls: list[None] = []
+    monkeypatch.setattr(widget, "_render_cloud", lambda: render_calls.append(None))
+    frame = receiver.V2DashboardCloudFrame(
+        1_000_000_000, 9,
+        np.asarray(((1.0, 2.0, 3.0),), dtype=np.float32),
+        np.asarray((100,), dtype=np.uint32), np.asarray((1,), dtype=np.uint8),
+    )
+    try:
+        assert widget.cloud_workbench.isChecked() is False
+        assert widget.update_cloud_frame(frame) is True
+        assert render_calls == []
+    finally:
+        widget.close()
+
+
+def test_v2_dashboard_builds_accumulated_cloud_once_per_visible_frame(
+    qapp, monkeypatch,
+) -> None:
+    """可见帧只构造一次累计数组，避免相同点云重复拼接。"""
+    adapter = _adapter_module()
+    receiver = import_module("slope_sim.interfaces.v2.dashboard_receiver")
+    descriptor, _snapshot = _snapshot_with_encoded_lidar()
+    widget = adapter.V2DashboardWidget(descriptor)
+    original = widget._cloud_render_data
+    build_calls: list[None] = []
+
+    def build_once():
+        build_calls.append(None)
+        return original()
+
+    monkeypatch.setattr(widget, "_cloud_render_data", build_once)
+    frame = receiver.V2DashboardCloudFrame(
+        1_000_000_000, 9,
+        np.asarray(((1.0, 2.0, 3.0),), dtype=np.float32),
+        np.asarray((100,), dtype=np.uint32), np.asarray((1,), dtype=np.uint8),
+    )
+    try:
+        widget.cloud_workbench.setChecked(True)
+        build_calls.clear()
+        assert widget.update_cloud_frame(frame) is True
+        assert build_calls == [None]
+    finally:
+        widget.close()
+
+
+def test_v2_dashboard_accumulates_only_worker_transformed_cloud_frames(qapp) -> None:
+    """GUI 只能消费世界坐标帧，并按控件时间窗和语义模式更新散点图。"""
+    adapter = _adapter_module()
+    receiver = import_module("slope_sim.interfaces.v2.dashboard_receiver")
+    descriptor, _snapshot = _snapshot_with_encoded_lidar()
+    frame = receiver.V2DashboardCloudFrame(
+        1_000_000_000, 9,
+        np.asarray(((1.0, 2.0, 3.0),), dtype=np.float32),
+        np.asarray((100,), dtype=np.uint32), np.asarray((1,), dtype=np.uint8),
+    )
+    widget = adapter.V2DashboardWidget(descriptor)
+    try:
+        assert widget.update_cloud_frame(frame) is True
+        assert widget.update_cloud_frame(frame) is False
+        assert "seq=9" in widget.cloud_status.text()
+        assert "accepted 1 world points" in widget.cloud_diagnostics.toPlainText()
+    finally:
+        widget.close()
+
+
+def test_v2_dashboard_projects_receiver_errors_and_render_drops(qapp) -> None:
+    """点云工作台必须可见接收端拒绝与容量一队列的 render drop。"""
+    adapter = _adapter_module()
+    descriptor, _snapshot = _snapshot_with_encoded_lidar()
+    widget = adapter.V2DashboardWidget(descriptor)
+    try:
+        assert widget.update_receiver_diagnostics(
+            render_dropped_count=2,
+            diagnostics=(
+                "/sim/lidar/points: remote descriptor does not match v2 contract",
+            ),
+        ) is True
+        assert "render_drop=2" in widget.cloud_transport_status.text()
+        assert "remote descriptor does not match v2 contract" in widget.cloud_diagnostics.toPlainText()
+        assert widget.update_receiver_diagnostics(
+            render_dropped_count=2,
+            diagnostics=(
+                "/sim/lidar/points: remote descriptor does not match v2 contract",
+            ),
+        ) is False
+    finally:
+        widget.close()
+
+
+def test_v2_dashboard_current_frame_mode_clears_historical_points(qapp, monkeypatch) -> None:
+    """当前帧模式的零点帧必须清空渲染，不能把累计历史伪装成当前数据。"""
+    adapter = _adapter_module()
+    receiver = import_module("slope_sim.interfaces.v2.dashboard_receiver")
+    descriptor, _snapshot = _snapshot_with_encoded_lidar()
+    frame = receiver.V2DashboardCloudFrame(
+        1_000_000_000, 10,
+        np.asarray(((1.0, 2.0, 3.0),), dtype=np.float32),
+        np.asarray((100,), dtype=np.uint32), np.asarray((1,), dtype=np.uint8),
+    )
+    empty = receiver.V2DashboardCloudFrame(
+        1_100_000_000, 11,
+        np.empty((0, 3), dtype=np.float32),
+        np.empty(0, dtype=np.uint32), np.empty(0, dtype=np.uint8),
+    )
+    widget = adapter.V2DashboardWidget(descriptor)
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(widget.cloud_scatter, "setData", lambda **kwargs: calls.append(kwargs))
+    try:
+        assert hasattr(widget, "cloud_display_mode")
+        widget.cloud_workbench.setChecked(True)
+        assert widget.cloud_display_mode.currentText() == "累计"
+        assert widget.update_cloud_frame(frame) is True
+        widget.cloud_display_mode.setCurrentText("当前帧")
+        assert widget.update_cloud_frame(empty) is True
+        assert np.asarray(calls[-1]["pos"]).shape == (0, 3)
+        assert "当前帧" in widget.cloud_status.text()
+        assert "本帧=0" in widget.cloud_status.text()
+    finally:
+        widget.close()
+
+
+def test_v2_dashboard_bounds_accumulation_and_marks_vehicle_pose(qapp, monkeypatch) -> None:
+    """累计模式的帧数必须有硬上限，并显示随帧传递的车辆位置和朝向。"""
+    adapter = _adapter_module()
+    receiver = import_module("slope_sim.interfaces.v2.dashboard_receiver")
+    descriptor, _snapshot = _snapshot_with_encoded_lidar()
+    widget = adapter.V2DashboardWidget(descriptor)
+    try:
+        assert hasattr(widget, "cloud_vehicle_marker")
+        marker_calls: list[dict[str, object]] = []
+        monkeypatch.setattr(widget.cloud_vehicle_marker, "setData", lambda **kwargs: marker_calls.append(kwargs))
+        widget.cloud_workbench.setChecked(True)
+        frame = receiver.V2DashboardCloudFrame(
+            1_000_000_000, 0,
+            np.asarray(((1.0, 2.0, 3.0),), dtype=np.float32),
+            np.asarray((100,), dtype=np.uint32), np.asarray((1,), dtype=np.uint8),
+        )
+        assert hasattr(frame, "vehicle_position")
+        assert hasattr(frame, "vehicle_forward")
+        for sequence in range(520):
+            assert widget.update_cloud_frame(
+                receiver.V2DashboardCloudFrame(
+                    frame.timestamp_ns, sequence, frame.positions, frame.reflectivity, frame.tags,
+                )
+            ) is True
+        assert len(widget._cloud_frames) <= adapter._MAX_CLOUD_HISTORY_FRAMES
+        assert marker_calls
+        assert np.asarray(marker_calls[-1]["pos"]).shape == (2, 3)
+    finally:
+        widget.close()
+
+
+def test_v2_dashboard_exposes_camera_presets_fit_and_separate_command_diagnostics(qapp, monkeypatch) -> None:
+    """视角操作可预测，/sim/wheel/command 错误不应污染 LiDAR 健康栏。"""
+    adapter = _adapter_module()
+    receiver = import_module("slope_sim.interfaces.v2.dashboard_receiver")
+    descriptor, _snapshot = _snapshot_with_encoded_lidar()
+    widget = adapter.V2DashboardWidget(descriptor)
+    camera_calls: list[dict[str, object]] = []
+    monkeypatch.setattr(widget.cloud_view, "setCameraPosition", lambda **kwargs: camera_calls.append(kwargs))
+    try:
+        assert hasattr(widget, "cloud_camera_preset")
+        assert widget.cloud_camera_preset.currentText() == "透视"
+        widget.cloud_camera_preset.setCurrentText("俯视")
+        assert camera_calls[-1] == {"distance": 24.0, "elevation": 90.0, "azimuth": 0.0}
+        widget.update_cloud_frame(receiver.V2DashboardCloudFrame(
+            1_000_000_000, 12,
+            np.asarray(((10.0, 20.0, 3.0), (14.0, 24.0, 7.0)), dtype=np.float32),
+            np.asarray((100, 100), dtype=np.uint32), np.asarray((1, 1), dtype=np.uint8),
+        ))
+        widget.cloud_workbench.setChecked(True)
+        widget.cloud_fit_view_button.click()
+        assert "pos" in camera_calls[-1]
+        assert "distance" in camera_calls[-1]
+        assert widget.update_receiver_diagnostics(
+            render_dropped_count=1,
+            diagnostics=(
+                "/sim/wheel/command: wire metadata: remote type mismatch",
+                "/sim/lidar/points: ValueError: invalid point frame",
+            ),
+        ) is True
+        assert "lidar_receiver_errors=1" in widget.cloud_transport_status.text()
+        assert "wheel_command_observer_errors=1" in widget.cloud_command_observer_status.text()
+    finally:
+        widget.close()
+
+
+def test_v2_dashboard_shows_authority_and_observer_rejections_in_separate_domains(qapp) -> None:
+    """命令 authority 与 Dashboard observer 不能共用一个模糊错误计数。"""
+    adapter = _adapter_module()
+    snapshot_module = import_module("slope_sim.interfaces.v2.dashboard_snapshot")
+    descriptor, snapshot = _snapshot_with_encoded_lidar()
+    authority = snapshot_module.V2CommandRejection(
+        "/sim/wheel/command", "manual.tool-1", b"m" * 16, 3,
+        snapshot.simulation_session_id, snapshot.world_generation,
+        "first command sequence must be zero", 2.5,
+    )
+    observer = snapshot_module.V2CommandRejection(
+        "/sim/wheel/command", None, None, None, None, None,
+        "ValueError: malformed wire payload", 2.6,
+    )
+    widget = adapter.V2DashboardWidget(descriptor)
+    try:
+        widget.update_snapshot(replace(
+            snapshot,
+            authority_rejections=(authority,),
+            observer_rejections=(observer,),
+        ))
+
+        assert "累计 1" in widget.authority_rejection_value.text()
+        assert "seq=3" in widget.authority_rejection_value.text()
+        assert "first command sequence must be zero" in widget.authority_rejection_value.text()
+        assert "累计 1" in widget.observer_rejection_value.text()
+        assert "ValueError: malformed wire payload" in widget.observer_rejection_value.text()
+    finally:
+        widget.close()
 
 
 def test_v2_dashboard_widget_rejects_mismatched_lightweight_telemetry_identity(qapp) -> None:
@@ -317,6 +582,37 @@ def test_v2_dashboard_live_status_has_fixed_five_topic_rows_and_telemetry_age(qa
     assert "Errors" in headers
     assert "Action" in headers
     widget.close()
+
+
+def test_v2_dashboard_exposes_five_card_statuses_beside_connection_overview(qapp) -> None:
+    """单一接口页保留连接概览和五个真实 v2 话题卡片，不能退回旧前后雷达。"""
+    module = _adapter_module()
+    descriptor, snapshot = _snapshot_with_encoded_lidar()
+    observation_type = import_module(
+        "slope_sim.interfaces.v2.dashboard_snapshot"
+    ).V2TopicObservation
+    widget = module.V2DashboardWidget(descriptor)
+    try:
+        widget.update_snapshot(replace(
+            snapshot,
+            topic_observations=tuple(
+                observation_type(contract.topic, contract.rate_hz, float(contract.rate_hz), 1, "verified")
+                for contract in import_module("slope_sim.interfaces.v2.topics").V2_TOPICS
+            ),
+        ))
+
+        assert set(widget.topic_cards) == {
+            "/sim/wheel/command",
+            "/sim/wheel/state",
+            "/sim/lidar/points",
+            "/sim/rtk/state",
+            "/sim/imu/attitude",
+        }
+        assert widget.topic_table.isHidden() is True
+        assert widget.topic_cards["/sim/lidar/points"]["state"].text() == "1 / verified"
+        assert "MID-360" in widget.topic_cards["/sim/lidar/points"]["name"].text()
+    finally:
+        widget.close()
 
 
 def test_v2_dashboard_shows_verified_ecal_and_actual_frequency(qapp) -> None:
@@ -502,7 +798,8 @@ def test_v2_dashboard_live_viewer_can_close_and_restart_without_touching_runtime
     widget.live_viewer_button.click()
     assert launches == [1, 2]
     assert widget.live_viewer_close_button.isEnabled() is True
-    widget.close()
+    widget.shutdown()
+    assert closes == [1, 2]
 
 
 def test_stage4_rviz_profile_uses_world_and_bounded_pointcloud_history() -> None:
@@ -529,11 +826,11 @@ def test_v2_dashboard_sampled_preview_is_collapsed_and_not_acceptance_evidence(q
     widget.close()
 
 
-def test_v2_manual_controls_mount_v2_snapshot_widget_without_legacy_inactive_copy(
+def test_v2_manual_controls_merge_status_and_mount_lidar_workbench_in_its_own_tab(
     qapp,
     monkeypatch,
 ) -> None:
-    """v2 手动 GUI 保留控制输入，只显示 v2 eCAL 状态而非旧版禁用文案。"""
+    """v2 只保留一个真实接口页，并把 MID-360 工作台放入顶层点云页。"""
     module = _adapter_module()
     descriptor, snapshot = _snapshot_with_encoded_lidar()
     from slope_sim.dashboard import TelemetryDashboard
@@ -562,16 +859,47 @@ def test_v2_manual_controls_mount_v2_snapshot_widget_without_legacy_inactive_cop
         ))
 
         assert controls.v2_dashboard_widget is widget
+        tab_labels = [controls.tabs.tabText(index) for index in range(controls.tabs.count())]
+        assert tab_labels[:3] == ["接口状态", "障碍物", "LiDAR点云"]
+        assert "v2 eCAL" not in tab_labels
+        assert controls.tabs.widget(0).isAncestorOf(widget.topic_table)
+        lidar_page = controls.tabs.widget(tab_labels.index("LiDAR点云"))
+        assert lidar_page.isAncestorOf(widget.cloud_workbench)
+        assert controls.linear_spin.maximum() == 3.0
+        assert controls.angular_spin.maximum() == 1.2
         assert inactive_calls == []
         assert controls.ecal_status_label.text() != "未启用"
         assert "关闭实时接口" not in controls.transport_detail_label.text()
         assert widget.ecal_status_value.text() == "eCAL 已验证（五话题）"
-        assert "LiDAR点云" not in [
-            controls.tabs.tabText(index) for index in range(controls.tabs.count())
-        ]
         assert "MID-360" in widget.lidar_value.text()
         assert "C++ Recorder" in controls.capture_start_button.toolTip()
         assert "C++ Export" in controls.capture_stop_button.toolTip()
+    finally:
+        controls.close()
+
+
+def test_v2_manual_controls_emit_a_layout_report_for_the_embedded_v2_page(
+    qapp,
+) -> None:
+    """v2 首页没有 Matplotlib canvas，也必须能生成内容页布局报告。"""
+    module = _adapter_module()
+    descriptor, _snapshot = _snapshot_with_encoded_lidar()
+    from slope_sim.dashboard import TelemetryDashboard
+
+    controls = TelemetryDashboard(show_lidar_tools=False, v2_dashboard_enabled=True)
+    try:
+        controls.attach_v2_dashboard_widget(module.V2DashboardWidget(descriptor))
+        qapp.processEvents()
+
+        report = controls._layout_report()
+
+        assert report is not None
+        assert report["tab_label"] == "接口状态"
+        assert report["page_kind"] == "content"
+        assert report["canvas_rect"] is None
+        assert report["required_plot_buttons"] == []
+        assert report["plot_button_rects"] == {}
+        assert report["qt_text_rects"]["plot_buttons"] == {}
     finally:
         controls.close()
 
@@ -782,6 +1110,7 @@ def test_v2_dashboard_offline_evidence_has_five_independent_nonlive_sections(qap
     widget = module.V2DashboardWidget(descriptor)
 
     assert widget.offline_evidence_title.text() == "离线已验证证据，非实时状态"
+    assert widget.offline_evidence_group.isHidden()
     assert tuple(widget.offline_evidence_values) == (
         "recorder", "replay", "export", "viewer_startup", "viewer_display",
     )
@@ -791,6 +1120,7 @@ def test_v2_dashboard_offline_evidence_has_five_independent_nonlive_sections(qap
     )
 
     widget.set_offline_evidence(module.load_offline_evidence(_write_offline_evidence(tmp_path)))
+    assert not widget.offline_evidence_group.isHidden()
     assert "clean_shutdown=True" in widget.offline_evidence_values["recorder"].text()
     assert "4 topics" in widget.offline_evidence_values["replay"].text()
     assert "synthetic=True" in widget.offline_evidence_values["export"].text()
@@ -887,5 +1217,6 @@ def test_v2_dashboard_large_export_evidence_uses_bounded_scrollable_audit_detail
             for second in evidence_widgets[index + 1:]
         )
     assert detail.verticalScrollBar().maximum() > 0
-    assert detail.horizontalScrollBar().maximum() > 0
+    assert detail.lineWrapMode() == detail.LineWrapMode.WidgetWidth
+    assert detail.horizontalScrollBar().maximum() == 0
     widget.close()

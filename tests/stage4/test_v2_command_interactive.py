@@ -49,7 +49,13 @@ def _write_identity_payload(path: Path, descriptor: bytes) -> None:
     )
 
 
-def _launch_record_writer(socket_dir: Path, launch_record: Path, token: str):
+def _launch_record_writer(
+    socket_dir: Path,
+    launch_record: Path,
+    token: str,
+    *,
+    orchestrator_pid: int | None = None,
+):
     """返回 exec 前写记录的回调，使 C++ 自验真实子进程 PID。"""
 
     def write_launch_record() -> None:
@@ -57,7 +63,7 @@ def _launch_record_writer(socket_dir: Path, launch_record: Path, token: str):
             socket_dir,
             command_pid=os.getpid(),
             command_uid=os.getuid(),
-            orchestrator_pid=os.getppid(),
+            orchestrator_pid=os.getppid() if orchestrator_pid is None else orchestrator_pid,
             session_id_factory=lambda: bytes.fromhex("73" * 16),
             token_factory=lambda: bytes.fromhex(token),
         )
@@ -67,7 +73,14 @@ def _launch_record_writer(socket_dir: Path, launch_record: Path, token: str):
 
 
 def _interactive_arguments(
-    command: Path, descriptor_path: Path, payload: Path, result: Path, launch_record: Path, *, duration_ms: int = 800
+    command: Path,
+    descriptor_path: Path,
+    payload: Path,
+    result: Path,
+    launch_record: Path,
+    *,
+    duration_ms: int = 800,
+    deadline_ms: int = 1000,
 ) -> list[str]:
     return [
         str(command),
@@ -75,7 +88,7 @@ def _interactive_arguments(
         "--descriptor-set", str(descriptor_path),
         "--payload", str(payload),
         "--duration-ms", str(duration_ms),
-        "--deadline-ms", "1000",
+        "--deadline-ms", str(deadline_ms),
         "--result", str(result),
         "--launch-record", str(launch_record),
     ]
@@ -238,6 +251,37 @@ def test_interactive_command_rejects_untrusted_launch_records_before_ecal(tmp_pa
 
 
 @pytest.mark.stage4_artifact
+def test_interactive_command_rejects_a_launch_record_from_another_orchestrator(tmp_path: Path) -> None:
+    """Command 不得脱离写入 launch record 的启动器独自继续运行。"""
+    command = _command_binary()
+    root = Path(__file__).resolve().parents[2]
+    descriptor = (root / "slope_sim/interfaces/generated/slope_sim_interfaces_v2.desc").read_bytes()
+    descriptor_path = tmp_path / "v2.desc"
+    descriptor_path.write_bytes(descriptor)
+    payload = tmp_path / "identity.bin"
+    _write_identity_payload(payload, descriptor)
+    socket_dir = tmp_path / "socket"
+    launch_record = socket_dir / "command.launch.lock"
+
+    process = subprocess.Popen(
+        _interactive_arguments(command, descriptor_path, payload, tmp_path / "result.json", launch_record),
+        preexec_fn=_launch_record_writer(socket_dir, launch_record, "f" * 64, orchestrator_pid=1),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=1.0)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        stdout, stderr = process.communicate()
+        pytest.fail("Command did not reject the mismatched orchestrator before eCAL startup")
+
+    assert process.returncode == 66, f"stdout={stdout}\nstderr={stderr}"
+    assert "orchestrator" in stderr
+
+
+@pytest.mark.stage4_artifact
 def test_interactive_command_accepts_authenticated_target_and_stops_when_peer_disconnects(
     tmp_path: Path,
 ) -> None:
@@ -313,6 +357,92 @@ def test_interactive_command_accepts_authenticated_target_and_stops_when_peer_di
     assert report["active_published_count"] > 0
     assert report["safe_stop_published_count"] > 0
     assert not socket_path.exists()
+
+
+@pytest.mark.stage4_artifact
+def test_interactive_command_accepts_subscriber_after_socket_server_starts(tmp_path: Path) -> None:
+    """Python world 在 Command socket 就绪后才订阅时，Command 仍保持安全零速并可连接。"""
+    _require_real_ecal_interactive()
+    from scripts.verify_stage4_v2_phase0 import initialize_phase0_core
+    from slope_sim.interfaces.v2.descriptor import load_v2_descriptor
+    from slope_sim.interfaces.v2.ecal_raw import EcalRawBindings
+
+    command = _command_binary()
+    root = Path(__file__).resolve().parents[2]
+    descriptor = (root / "slope_sim/interfaces/generated/slope_sim_interfaces_v2.desc").read_bytes()
+    descriptor_path = tmp_path / "v2.desc"
+    descriptor_path.write_bytes(descriptor)
+    payload = tmp_path / "identity.bin"
+    _write_identity_payload(payload, descriptor)
+    socket_dir = tmp_path / "socket"
+    socket_path = socket_dir / "command.sock"
+    launch_record = socket_dir / "command.launch.lock"
+    result = tmp_path / "result.json"
+    token = "f" * 64
+    bindings = EcalRawBindings()
+    core = bindings._core
+    subscriber = None
+    received_frames: list[object] = []
+    process = None
+    core_initialized = False
+
+    try:
+        process = subprocess.Popen(
+            _interactive_arguments(
+                command,
+                descriptor_path,
+                payload,
+                result,
+                launch_record,
+                duration_ms=300,
+                deadline_ms=8000,
+            ),
+            preexec_fn=_launch_record_writer(socket_dir, launch_record, token),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        deadline = time.monotonic() + 2.0
+        while not socket_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert socket_path.exists(), process.stderr.read()
+
+        # 原实现会在这里因尚无 eCAL subscriber 等待满五秒后退出。
+        time.sleep(5.2)
+        assert process.poll() is None, process.stderr.read()
+
+        initialize_phase0_core(core, f"runsim-late-command-peer-{os.getpid()}")
+        core_initialized = True
+        subscriber = bindings.create_subscriber(
+            "/sim/wheel/command",
+            "slope_sim.interfaces.v2.WheelCommand",
+            load_v2_descriptor(),
+            received_frames.append,
+        )
+        deadline = time.monotonic() + 2.0
+        while subscriber.get_publisher_count() != 1 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert subscriber.get_publisher_count() == 1
+        deadline = time.monotonic() + 2.0
+        while not received_frames and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert received_frames, "Command did not publish a safe stop after peer discovery"
+
+        _close_subscriber(subscriber)
+        subscriber = None
+        stdout, stderr = process.communicate(timeout=3)
+    finally:
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.communicate()
+        if subscriber is not None:
+            _close_subscriber(subscriber)
+        if core_initialized:
+            core.finalize()
+
+    assert process.returncode == 0, f"stdout={stdout}\nstderr={stderr}"
+    report = json.loads(result.read_text(encoding="utf-8"))
+    assert report["safe_stop_published_count"] > 0
 
 
 @pytest.mark.stage4_artifact

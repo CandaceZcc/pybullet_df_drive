@@ -664,6 +664,10 @@ def _install_ros_bridge_launcher(release_root: Path) -> None:
         "#!/bin/sh\n"
         "set -e\n"
         ". /opt/ros/jazzy/setup.sh\n"
+        'release_root="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"\n'
+        'export LD_LIBRARY_PATH="$release_root/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"\n'
+        'livox_setup="$release_root/share/livox_ros_driver2/local_setup.sh"\n'
+        'if [ -f "$livox_setup" ]; then . "$livox_setup"; fi\n'
         'exec "$(dirname "$0")/slope_sim_stage4_ros2_bridge.bin" "$@"\n'
     )
     with bridge.open("x", encoding="utf-8") as output:

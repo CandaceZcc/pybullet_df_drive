@@ -569,7 +569,7 @@ def test_build_child_command_forwards_explicit_log_dir_and_layout_report(tmp_pat
 
     assert command[-2:] == ["--log-dir", str(tmp_path)]
     assert command[command.index("--figure-dir") + 1] == str(tmp_path / "figures")
-    assert command[command.index("--interface-mode") + 1] == "local"
+    assert command[command.index("--interface-mode") + 1] == "ecal"
     assert child_env[verifier_module.DASHBOARD_LAYOUT_REPORT_ENV] == str(report_path)
     assert child_env[verifier_module.PYBULLET_WINDOW_TOKEN_ENV]
 
@@ -1230,6 +1230,31 @@ def test_layout_report_allows_explicit_diagnostics_without_weakening_default_gat
         client,
         expected_tab_order=diagnostic_order,
     )
+    assert result.passed, result.detail
+
+
+def test_layout_report_accepts_only_the_explicit_v2_page_contract():
+    """v2 首页替换旧 LiDAR 页，验收器不得把它误判为 Matplotlib 图表。"""
+    client = Rect(100, 50, 400, 700)
+    report = _valid_dashboard_report_fixture(
+        index=0,
+        label="接口状态",
+        client_rect=client,
+    )
+    report["tab_index"] = 0
+    report["tab_label"] = "v2 eCAL"
+    report["tab_count"] = len(verifier_module.V2_DASHBOARD_TAB_ORDER)
+    report["tab_order"] = list(verifier_module.V2_DASHBOARD_TAB_ORDER)
+    report["content_widget_rects"] = {}
+    report["qt_text_rects"]["tab"]["text"] = "v2 eCAL"
+
+    assert verifier_module.validate_dashboard_layout_report(report, client).passed is False
+    result = verifier_module.validate_dashboard_layout_report(
+        report,
+        client,
+        expected_tab_order=verifier_module.V2_DASHBOARD_TAB_ORDER,
+    )
+
     assert result.passed, result.detail
 
 

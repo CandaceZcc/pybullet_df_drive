@@ -27,7 +27,7 @@ from slope_sim.interfaces.transport import (
 
 _UINT32_MAX = (1 << 32) - 1
 _UINT64_MAX = (1 << 64) - 1
-_ROLES = frozenset({"simulation", "peer"})
+_ROLES = frozenset({"simulation", "peer", "dashboard"})
 _STOPPING_STATES = frozenset({"quiescing", "quiesced", "closing", "closed"})
 _CALLBACK_CONTEXT = local()
 
@@ -523,7 +523,7 @@ class EcalTransport:
         if not isinstance(start_worker, bool):
             raise ValueError("start_worker must be a bool")
         if not isinstance(role, str) or role not in _ROLES:
-            raise ValueError("role must be 'simulation' or 'peer'")
+            raise ValueError("role must be 'simulation', 'peer', or 'dashboard'")
         if peer_state_callback is not None and not callable(peer_state_callback):
             raise ValueError("peer_state_callback must be callable")
         normalized_name = _require_nonempty_text("participant_name", participant_name)
@@ -596,7 +596,10 @@ class EcalTransport:
             raise ValueError("channel_bindings must use unique topics")
         if any(channel.direction not in {"publish", "subscribe"} for channel in channels):
             raise ValueError("channel_bindings contain an invalid direction")
-        if sum(channel.direction == "subscribe" for channel in channels) != 1:
+        if role == "dashboard":
+            if any(channel.direction != "subscribe" for channel in channels):
+                raise ValueError("dashboard channel_bindings require only subscribe topics")
+        elif sum(channel.direction == "subscribe" for channel in channels) != 1:
             raise ValueError("channel_bindings require exactly one subscribe topic")
         if any(
             channel.raw_wire and (channel.message_type is not None or channel.descriptor is None)

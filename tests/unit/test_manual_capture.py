@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+from datetime import datetime
 
 from slope_sim.scene_config import SceneDocument, SensorDocument, TerrainDocument
 
@@ -119,3 +120,33 @@ def test_finish_and_abort_are_terminal_and_output_directories_never_collide(tmp_
         assert "finalized" in str(error)
     else:
         raise AssertionError("finalized session must reject more samples")
+
+
+def test_recorder_uses_local_timestamp_names_and_suffixes_same_second(
+    tmp_path, monkeypatch
+):
+    """人工采集目录必须可读，且同秒并发启动不覆盖先前会话。"""
+    api = _api()
+
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls):
+            return cls(2026, 8, 19, 9, 7, 5)
+
+    monkeypatch.setattr(api, "datetime", FixedDatetime)
+    recorder = api.ManualCaptureRecorder(tmp_path)
+    sessions = [
+        recorder.start(
+            scene_document=_scene(),
+            world_generation=1,
+            duration_limit_sec=None,
+            started_sim_time_ns=0,
+        )
+        for _ in range(3)
+    ]
+
+    assert [session.output_dir.name for session in sessions] == [
+        "capture-20260819-090705",
+        "capture-20260819-090705-01",
+        "capture-20260819-090705-02",
+    ]

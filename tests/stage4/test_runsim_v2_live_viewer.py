@@ -6,6 +6,24 @@ import signal
 from types import SimpleNamespace
 
 
+def test_ros_cmake_install_includes_the_fixed_live_rviz_profile() -> None:
+    """ROS release 安装必须携带 Dashboard 固定使用的 RViz profile。"""
+    root = Path(__file__).resolve().parents[2]
+    cmake = (root / "cpp" / "phase0" / "CMakeLists.txt").read_text(encoding="utf-8")
+
+    assert '"${CMAKE_CURRENT_LIST_DIR}/../client/rviz/stage4_live.rviz"' in cmake
+    assert "DESTINATION cpp/client/rviz" in cmake
+
+
+def test_ros_bridge_accepts_the_live_viewer_six_hour_deadline() -> None:
+    """实时查看器的 6 小时上限必须落在 Bridge CLI 的有效范围内。"""
+    root = Path(__file__).resolve().parents[2]
+    bridge = (root / "cpp" / "client" / "stage4_ros2_bridge.cpp").read_text(encoding="utf-8")
+
+    assert "value > 21600000" in bridge
+    assert 'must be in [1, 21600000]' in bridge
+
+
 def test_live_viewer_uses_release_bridge_profile_and_independent_process_groups(
     tmp_path: Path,
     monkeypatch,
@@ -39,24 +57,64 @@ def test_live_viewer_uses_release_bridge_profile_and_independent_process_groups(
     monkeypatch.setattr(
         "slope_sim.interfaces.v2.runsim_v2_live_viewer.subprocess.Popen", popen,
     )
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/system/lib")
 
     viewer = RunSimV2LiveViewer.launch(release_root=release)
 
-    assert launches == [
-        (
-            [
-                str(bridge), "--descriptor-set", str(descriptor),
-                "--duration-ms", "21600000", "--deadline-ms", "21600000",
-            ],
-            {"start_new_session": True},
-        ),
-        (
-            ["/usr/bin/rviz2", "-d", str(profile)],
-            {"start_new_session": True},
-        ),
+    assert launches[0][0] == [
+        "/bin/sh", "-c",
+        '. /opt/ros/jazzy/setup.sh; '
+        'export LD_LIBRARY_PATH="$1/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"; '
+        'exec "$2" --descriptor-set "$3" --duration-ms "$4" --deadline-ms "$4"',
+        "bridge", str(release), str(bridge), str(descriptor), "21600000",
     ]
+    assert launches[0][1]["start_new_session"] is True
+    assert "env" not in launches[0][1]
+    assert launches[1] == (
+        [
+            "/bin/sh", "-c",
+            '. /opt/ros/jazzy/setup.sh; exec "$1" -d "$2"',
+            "rviz2", "/usr/bin/rviz2", str(profile),
+        ],
+        {"start_new_session": True},
+    )
     assert viewer.bridge_process.pid == 8101
     assert viewer.rviz_process.pid == 8102
+
+
+def test_live_viewer_finds_installed_jazzy_rviz_without_sourced_path(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """CLI 未 source ROS 时仍应使用已安装的 Jazzy RViz2。"""
+    from slope_sim.interfaces.v2 import runsim_v2_live_viewer as viewer_module
+
+    release = tmp_path / "release"
+    bridge = release / "bin" / "slope_sim_stage4_ros2_bridge"
+    descriptor = release / "slope_sim/interfaces/generated/slope_sim_interfaces_v2.desc"
+    profile = release / "cpp/client/rviz/stage4_live.rviz"
+    for path in (bridge, descriptor, profile):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"release")
+    bridge.chmod(0o755)
+    jazzy_rviz = tmp_path / "jazzy" / "bin" / "rviz2"
+    jazzy_rviz.parent.mkdir(parents=True)
+    jazzy_rviz.write_bytes(b"rviz")
+    jazzy_rviz.chmod(0o755)
+    launches: list[list[str]] = []
+
+    monkeypatch.setattr(viewer_module.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(viewer_module, "_JAZZY_RVIZ2", jazzy_rviz)
+    monkeypatch.setattr(
+        viewer_module.subprocess,
+        "Popen",
+        lambda argv, **_kwargs: launches.append(argv)
+        or SimpleNamespace(pid=8101 + len(launches), poll=lambda: 0),
+    )
+
+    viewer_module.RunSimV2LiveViewer.launch(release_root=release)
+
+    assert launches[1][-2:] == [str(jazzy_rviz), str(profile)]
 
 
 def test_live_viewer_close_terminates_only_its_bridge_and_rviz_groups(monkeypatch) -> None:

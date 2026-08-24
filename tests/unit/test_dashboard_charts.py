@@ -11,6 +11,14 @@ from slope_sim.interfaces.config import InterfaceConfig
 from slope_sim.interfaces.dashboard_snapshot import InterfaceDashboardSnapshot
 from slope_sim.interfaces.models import ImuAttitude, RtkState, WheelCommand, WheelState
 from slope_sim.interfaces.status import InterfaceStatusSnapshot, TopicStatus, WheelCommandStatus
+from slope_sim.interfaces.v2.dashboard_snapshot import V2DashboardSnapshot
+from slope_sim.interfaces.v2.models import (
+    CommandAuthorityState,
+    ImuAttitudeV2,
+    Point3dV2,
+    RtkStateV2,
+    WheelStateV2,
+)
 from slope_sim.model_registry import get_robot_model, robot_model_names
 
 
@@ -345,6 +353,35 @@ def test_differential_specs_use_two_real_drive_lines_and_no_steering_lines(robot
     specs = {spec.tab_label: spec for spec in interface_chart_specs(get_robot_model(robot_model))}
     assert len(specs["驱动命令"].lines) == len(specs["驱动反馈"].lines) == 2
     assert specs["转向命令"].lines == specs["转向反馈"].lines == ()
+
+
+def test_interface_chart_buffer_accepts_v2_wheel_rtk_and_imu_without_v1_snapshot() -> None:
+    """v2 Dashboard store 的真实 wheel/RTK/IMU 必须直接进入企业曲线缓存。"""
+    identity = b"x" * 16
+    descriptor = b"d" * 32
+    state = WheelStateV2(
+        1_000_000_000, (1.25, -0.75), (), 1, 1, 1, "df_mid", identity, descriptor,
+        CommandAuthorityState.ACTIVE, "keyboard", b"k" * 16, 1,
+    )
+    rtk = RtkStateV2(
+        2_000_000_000, 2, 1, "world", Point3dV2(1.0, 2.0, 3.0),
+        Point3dV2(4.0, 5.0, 6.0), Point3dV2(7.0, 8.0, 9.0), 0.25,
+        identity, descriptor,
+    )
+    imu = ImuAttitudeV2(3_000_000_000, 0.1, -0.2, 3, 1, "base_link", identity, descriptor)
+    snapshot = V2DashboardSnapshot(identity, descriptor, 1, state, None, None, None, rtk, imu, (), "df_mid")
+    buffer = InterfaceChartBuffer(20.0, InterfaceConfig.default())
+
+    changed = buffer.append_v2(snapshot)
+
+    assert {"驱动反馈", "RTK位置", "RTK航向", "IMU姿态"} <= changed
+    assert buffer.series("驱动反馈") == {
+        "t": [1.0], "drive_feedback_0": [1.25], "drive_feedback_1": [-0.75],
+    }
+    assert buffer.series("RTK位置")["rtk_x"] == [4.0]
+    assert buffer.series("RTK航向")["rtk_yaw"] == [0.25]
+    assert buffer.series("IMU姿态")["imu_pitch"] == [-0.2]
+    assert buffer.series("转向反馈") == {"t": []}
 
 
 def test_quality_rates_use_monotonic_time_and_reset_counter_rollbacks() -> None:

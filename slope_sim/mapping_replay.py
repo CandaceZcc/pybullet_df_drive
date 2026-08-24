@@ -13,6 +13,7 @@ from slope_sim.interfaces.v2.models import (
     LidarPointCloudV2,
     RtkStateV2,
 )
+from slope_sim.lidar_pointcloud import LIDAR_SCAN_PERIOD_NS, mid360_offset_time_ns
 from slope_sim.sensor_backend import Pose, Quaternion, Vec3
 
 
@@ -23,8 +24,8 @@ _BASELINE_EPSILON_M = 1e-9
 _BASELINE_DIRECTION_TOLERANCE = 5e-6
 _RTK_GEOMETRY_TOLERANCE_M = 5e-6
 _LIDAR_FRAME_PERIOD_NS = 100_000_000
-_LIDAR_OFFSET_STEP_NS = 5_000
-_LIDAR_LAST_OFFSET_NS = 99_995_000
+_LIDAR_FIRING_SLOT_COUNT = 5_760
+_LIDAR_LAST_OFFSET_NS = mid360_offset_time_ns(_LIDAR_FIRING_SLOT_COUNT - 1)
 _MAX_STATIC_DISPLAY_POINTS = 500_000
 _PLAYBACK_RATES = (0.25, 0.5, 1.0, 2.0, 4.0)
 _UINT64_MAX = (1 << 64) - 1
@@ -349,13 +350,9 @@ def deskew_lidar_frame(
         raise ValueError("LiDAR frame timestamps must fit uint64")
     previous_offset = -1
     for point in cloud.points:
-        if (
-            point.offset_time_ns % _LIDAR_OFFSET_STEP_NS != 0
-            or point.offset_time_ns > _LIDAR_LAST_OFFSET_NS
-            or point.offset_time_ns <= previous_offset
-        ):
+        if not _is_realtime_mid360_offset(point.offset_time_ns) or point.offset_time_ns <= previous_offset:
             raise ValueError(
-                "offset_time_ns must be strictly increasing on the 5 us firing grid"
+                "offset_time_ns must be strictly increasing on the realtime MID-360 firing grid"
             )
         if cloud.timebase_ns + point.offset_time_ns > _UINT64_MAX:
             raise ValueError("LiDAR point timestamps must fit uint64")
@@ -385,6 +382,16 @@ def deskew_lidar_frame(
             )
         )
     return tuple(deskewed)
+
+
+def _is_realtime_mid360_offset(offset: int) -> bool:
+    """验证稀疏命中仍来自正式 5,760 slot 的均分 firing 时间表。"""
+    if not 0 <= offset <= _LIDAR_LAST_OFFSET_NS:
+        return False
+    slot = (
+        offset * _LIDAR_FIRING_SLOT_COUNT + LIDAR_SCAN_PERIOD_NS - 1
+    ) // LIDAR_SCAN_PERIOD_NS
+    return slot < _LIDAR_FIRING_SLOT_COUNT and mid360_offset_time_ns(slot) == offset
 
 
 class WorldMapAccumulator:

@@ -106,6 +106,19 @@ def test_first_complete_valid_command_claims_and_other_owner_revokes(session, mo
     assert authority.snapshot().command_generation == 2
 
 
+def test_first_delivered_command_after_metadata_pending_claims_owner(session, model, valid_command) -> None:
+    """metadata fail-closed 丢弃首批帧后，首个已验证帧仍可认领。"""
+    authority = make_authority(session)
+    authority.observe_peer_count(1)
+
+    delivered_after_verification = replace(valid_command, sequence=1581)
+    accepted = authority.accept(delivered_after_verification, model, commit=lambda: True)
+
+    assert accepted.accepted is True
+    assert accepted.claimed_owner is True
+    assert authority.snapshot().last_sequence == 1581
+
+
 @pytest.mark.parametrize("action_name", ("peer_edge", "suspend", "wrong_owner"))
 def test_generation_exhaustion_keeps_active_authority_atomic(action_name, session, model, valid_command) -> None:
     """所有撤权入口在 generation 耗尽时必须保持完整 authority 快照。"""
@@ -139,11 +152,10 @@ def test_generation_exhaustion_keeps_active_authority_atomic(action_name, sessio
     (
         {"simulation_session_id": b"x" * 16},
         {"descriptor_sha256": b"x" * 32},
-        {"world_generation": 2},
-        {"command_generation": 2},
-        {"robot_model": "df_front"},
-        {"sequence": 1},
-        {"drive_wheel_speed_rad_s": (1.0,)},
+            {"world_generation": 2},
+            {"command_generation": 2},
+            {"robot_model": "df_front"},
+            {"drive_wheel_speed_rad_s": (1.0,)},
         {"drive_wheel_speed_rad_s": (21.0, 0.0)},
     ),
 )

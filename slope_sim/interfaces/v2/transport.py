@@ -111,7 +111,9 @@ class _RawV2Bindings:
                 raise RuntimeError("eCAL raw core.finalize returned False")
 
 
-def _v2_channel_bindings(descriptor: DescriptorIdentity) -> tuple[_ChannelBinding, ...]:
+def _v2_channel_bindings(
+    descriptor: DescriptorIdentity, *, dashboard: bool = False,
+) -> tuple[_ChannelBinding, ...]:
     """从唯一 v2 topic 合同构造 raw channel，禁止混入阶段三消息类。"""
     codec = V2ProtoCodec(descriptor)
     parsers = {
@@ -124,7 +126,7 @@ def _v2_channel_bindings(descriptor: DescriptorIdentity) -> tuple[_ChannelBindin
     return tuple(
         _ChannelBinding(
             topic=contract.topic,
-            direction=contract.direction,
+            direction="subscribe" if dashboard else contract.direction,
             type_name=contract.type_name,
             descriptor=descriptor,
             raw_wire=True,
@@ -151,5 +153,7 @@ def create_v2_ecal_transport(
         queue_size=queue_size,
         participant_name=participant_name,
         role=role,
-        channel_bindings=_v2_channel_bindings(descriptor),
+        channel_bindings=_v2_channel_bindings(
+            descriptor, dashboard=role == "dashboard",
+        ),
     )

@@ -15,11 +15,13 @@ import tempfile
 import threading
 from typing import Callable, Iterator
 
+from slope_sim.model_registry import get_robot_model
+
 
 PROTOCOL = "runsim-command-socket-v1"
 MANUAL_TARGET_LEASE_SEC = 0.100
 MAX_SOCKET_MESSAGE_BYTES = 1024
-MAX_LINEAR_VELOCITY_M_S = 1.2
+MAX_LINEAR_VELOCITY_M_S = 3.0
 MAX_ANGULAR_VELOCITY_RAD_S = 1.2
 _UNIX_SOCKET_PATH_MAX_BYTES = 107
 
@@ -279,6 +281,15 @@ class RunSimSession:
             angular = _require_target("angular_velocity_rad_s", document["angular_velocity_rad_s"], MAX_ANGULAR_VELOCITY_RAD_S)
             self._accept_target(linear, angular, now, target_epoch=target_epoch)
             return ControlMessage(kind="target", linear_velocity_m_s=linear, angular_velocity_rad_s=angular)
+        if kind == "generation":
+            _require_exact_keys(
+                document,
+                {"kind", "token", "world_generation", "command_generation", "robot_model"},
+            )
+            _require_generation("world_generation", document["world_generation"])
+            _require_generation("command_generation", document["command_generation"])
+            _require_robot_model(document["robot_model"])
+            return ControlMessage(kind="generation")
         if kind == "status":
             _require_exact_keys(document, {"kind", "token", "state"})
             state = document["state"]
@@ -498,6 +509,24 @@ def _require_target(name: str, value: object, maximum: float) -> float:
     if type(value) not in {int, float} or not math.isfinite(float(value)) or abs(float(value)) > maximum:
         raise ValueError(f"{name} is invalid")
     return float(value)
+
+
+def _require_generation(name: str, value: object) -> int:
+    """代际更新只能携带正整数，防止控制 socket 偷渡浮点或布尔值。"""
+    if type(value) is not int or value <= 0:
+        raise ValueError(f"{name} is invalid")
+    return value
+
+
+def _require_robot_model(value: object) -> str:
+    """车型切换与 generation 同帧认证，拒绝未知 C++ 轮子形状。"""
+    if not isinstance(value, str):
+        raise ValueError("robot_model is invalid")
+    try:
+        get_robot_model(value)
+    except (AttributeError, ValueError) as error:
+        raise ValueError("robot_model is invalid") from error
+    return value
 
 
 def _require_now(value: object) -> float:

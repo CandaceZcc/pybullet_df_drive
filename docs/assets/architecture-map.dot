@@ -1,0 +1,94 @@
+digraph architecture_map {
+    graph [
+        bgcolor="white",
+        fontname="Noto Sans CJK SC",
+        fontsize=22,
+        pad=0.25,
+        rankdir=TB,
+        ranksep=1.0,
+        nodesep=0.55,
+        splines=polyline
+    ];
+    node [
+        color="#64748b",
+        fillcolor="#f8fafc",
+        fontcolor="#0f172a",
+        fontname="Noto Sans CJK SC",
+        fontsize=18,
+        margin="0.22,0.15",
+        shape=box,
+        style="rounded,filled"
+    ];
+    edge [
+        color="#64748b",
+        fontcolor="#334155",
+        fontname="Noto Sans CJK SC",
+        fontsize=13,
+        arrowsize=0.7
+    ];
+
+    subgraph cluster_control {
+        rankdir=LR;
+        label="本机控制面";
+        color="#2563eb";
+        fillcolor="#eff6ff";
+        fontcolor="#1e3a8a";
+        fontname="Noto Sans CJK SC";
+        style="rounded,filled";
+
+        K [label="键盘操作\nPython + PyBullet GUI", color="#2563eb"];
+        Q [label="Dashboard 控制面板\nPython + Qt", color="#2563eb"];
+        S [label="本机控制通道\nUnix socket\n只传控制指令", color="#2563eb"];
+        C [label="控制客户端\nC++", color="#2563eb"];
+
+        { rank=same; K; Q; }
+        K -> S [label="本机控制通道"];
+        Q -> S [label="本机控制通道"];
+        S -> C [label="认证后的目标速度"];
+    }
+
+    subgraph cluster_runtime {
+        rankdir=LR;
+        label="正式实时仿真链路";
+        color="#059669";
+        fillcolor="#ecfdf5";
+        fontcolor="#065f46";
+        fontname="Noto Sans CJK SC";
+        style="rounded,filled";
+
+        E [label="eCAL\n正式实时消息通道", color="#059669"];
+        P [label="仿真器\nPython + PyBullet", color="#059669"];
+        M [
+            label="控制命令（eCAL -> 仿真器）：/sim/wheel/command\n传感器状态（仿真器 -> eCAL）：WheelState 100 Hz、LidarPointCloud 10 Hz\nRtkState 10 Hz、ImuAttitude 10 Hz",
+            fontcolor="#334155",
+            fontsize=12,
+            shape=plain,
+            style=""
+        ];
+        { rank=same; E; P; }
+        C -> E [label="WheelCommand · 100 Hz"];
+        E -> P;
+        P -> E;
+        E -> M [style=invis];
+        P -> M [style=invis];
+    }
+
+    subgraph cluster_consumers {
+        rankdir=TB;
+        label="下游消费者";
+        color="#ea580c";
+        fillcolor="#fff7ed";
+        fontcolor="#9a3412";
+        fontname="Noto Sans CJK SC";
+        style="rounded,filled";
+
+        R [label="记录、回放、导出\nC++", color="#ea580c"];
+        X [label="外部 C++ 客户端\nSDK / Subscriber", color="#ea580c"];
+        V [label="实时显示\nC++ ROS Bridge + RViz", color="#ea580c"];
+        E -> R;
+        E -> X;
+        E -> V;
+    }
+
+    P -> Q [label="轻量状态快照\nPython 进程间通信", constraint=false, style=dashed];
+}

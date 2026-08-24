@@ -194,6 +194,7 @@ class V2AsyncSensorFrameFactory(V2SensorFrameFactory):
         self._truth_sensors = truth_sensors
         self._capture_context = capture_context
         self._pending: dict[int, tuple[OutputIdentity, RtkStateV2, ImuAttitudeV2]] = {}
+        self._last_lidar_failure_detail: str | None = None
 
     def capture(self, timestamp_ns: int) -> None:
         """冻结一份 10 Hz 状态并提交 worker，成功帧稍后由 poll_completed 交付。"""
@@ -219,8 +220,13 @@ class V2AsyncSensorFrameFactory(V2SensorFrameFactory):
             complete_obstacle_snapshots_without_body_ids=obstacle_snapshots,
             output_identity=lidar_identity,
         )
+        if accepted is not True and not self._capture_rejected_by_backpressure():
+            raise RuntimeError(
+                "Stage4 lidar worker rejected a due capture: "
+                + self._capture_rejection_detail()
+            )
         if accepted is not True:
-            raise RuntimeError("Stage4 lidar worker rejected a due capture")
+            return None
         self._pending[timestamp_ns] = (
             lidar_identity,
             RtkStateV2(
@@ -247,6 +253,32 @@ class V2AsyncSensorFrameFactory(V2SensorFrameFactory):
             ),
         )
         return None
+
+    def _capture_rejected_by_backpressure(self) -> bool:
+        """只把健康 service 的两级队列满视为可观测单帧降级。"""
+        snapshot_reader = getattr(self._lidar_service, "snapshot", None)
+        if not callable(snapshot_reader):
+            return False
+        snapshot = snapshot_reader()
+        return (
+            getattr(snapshot, "state", None) == "ready"
+            and getattr(snapshot, "in_flight_identity", None) is not None
+            and getattr(snapshot, "pending_capture_identity", None) is not None
+        )
+
+    def _capture_rejection_detail(self) -> str:
+        """保留 service 既有的有界诊断，避免基础设施失败被泛化文案覆盖。"""
+        snapshot_reader = getattr(self._lidar_service, "snapshot", None)
+        if not callable(snapshot_reader):
+            return "state=unknown"
+        snapshot = snapshot_reader()
+        state = getattr(snapshot, "state", "unknown")
+        error_code = getattr(snapshot, "last_error_code", None) or "none"
+        error_detail = getattr(snapshot, "last_error_detail", "") or "none"
+        detail = f"state={state}, error={error_code}, detail={error_detail}"
+        if self._last_lidar_failure_detail is not None:
+            detail += f", previous_frame_failure={self._last_lidar_failure_detail}"
+        return detail
 
     def poll_completed(self) -> tuple[V2PreparedSensorFrames, ...]:
         """非阻塞消费至多一条 child payload，禁止父端反序列化或二次编码 LiDAR。"""
@@ -275,6 +307,9 @@ class V2AsyncSensorFrameFactory(V2SensorFrameFactory):
                 raise RuntimeError("Stage4 lidar worker returned an invalid service event")
             if event.kind != "frame_failed":
                 continue
+            self._last_lidar_failure_detail = (
+                f"{event.stable_error_code}: {event.bounded_detail}"
+            )
             identity = event.optional_job_identity
             if (
                 event.optional_topic == "lidar_link"

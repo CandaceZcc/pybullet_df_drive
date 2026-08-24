@@ -18,6 +18,12 @@ Both modes are driven exclusively by `references/manifest.yml`. Synchronization 
 
 Current references include PyBullet differential-drive basics, path planning, mobile robot examples, official Bullet examples, slope/terrain examples, and `padawanabhi/pybullet_sim` for sensor streams, obstacle environments, navigation, and RL-ready environment structure.
 
+## 本地遥控器参考
+
+`mower_base.cpp` 是用户提供的真实底盘参考程序，原样保存在本目录，SHA-256 为 `2d57029fa068916e5c3dc3db639bbc08c95d963cd3fc1ec1cfd72ca265f109a6`。文件记录了 115200 baud、25 字节帧、`0x0F` 帧头、16 个 11-bit 通道，以及 `ch1/ch3/ch6` 的遥控映射。它只用于阶段五串口协议分析，不进入生产包或 release 编译输入。
+
+阶段五实现应从 `/dev/serial/by-id/` 识别设备，通过现有 Command authority 发布 `/sim/wheel/command`，并补齐帧重同步、死区、控制权仲裁和 100 ms 失联停车。详细合同见 [`../docs/阶段五需求规格.md`](../docs/阶段五需求规格.md)。
+
 For tracked-proxy V2, prioritize Bullet's `snake.py` for `anisotropicFriction`, Bullet's `racecar_differential.py` for multi-joint linkage/control patterns, and `padawanabhi/pybullet_sim` for sensor/navigation structure. The main project still treats these repositories as references only; do not vendor their code into `slope_sim/`.
 
 ## Stage 4 admitted references

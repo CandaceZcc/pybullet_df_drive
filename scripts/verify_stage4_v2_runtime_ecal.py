@@ -212,7 +212,7 @@ class RawV2OutputCollector:
         self._descriptor = descriptor
         self._codec = V2ProtoCodec(descriptor)
         self._lock = Lock()
-        self._records: dict[str, list[tuple[int, int, float, list[object]]]] = {
+        self._records: dict[str, list[tuple[int, int, float, list[object], dict[str, object]]]] = {
             topic: [] for topic in _OUTPUT_TYPE_NAMES
         }
 
@@ -246,9 +246,14 @@ class RawV2OutputCollector:
             model.descriptor_sha256.hex(),
             model.world_generation,
         ]
+        publisher = {
+            "entity_id": frame.remote_publisher_entity_id,
+            "process_id": frame.remote_publisher_process_id,
+            "host_name": frame.remote_publisher_host_name,
+        }
         with self._lock:
             self._records[topic].append(
-                (model.sequence, timestamp_ns, frame.received_at, identity)
+                (model.sequence, timestamp_ns, frame.received_at, identity, publisher)
             )
 
     def output_evidence(self, topic: str) -> dict[str, object]:
@@ -263,6 +268,7 @@ class RawV2OutputCollector:
             "timestamps_ns": [record[1] for record in records],
             "received_at_sec": [record[2] for record in records],
             "identities": [list(record[3]) for record in records],
+            "publishers": [dict(record[4]) for record in records],
         }
 
 

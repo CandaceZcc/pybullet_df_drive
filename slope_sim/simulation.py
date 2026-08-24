@@ -449,7 +449,11 @@ def run_experiment(
                 config.camera_pitch,
                 config.camera_target,
             )
-        logger = CsvSimulationLogger(config.log_dir, prefix=f"slope_{world.terrain.slope_deg:g}")
+        logger = CsvSimulationLogger(
+            config.log_dir,
+            prefix=f"slope_{world.terrain.slope_deg:g}",
+            rate_hz=config.telemetry_log_hz,
+        )
         steps = max(1, int(config.duration_sec / config.time_step))
         pacer: _DeadlinePacer | None = None
         observation_cadence: RuntimeObservationCadence | None = None

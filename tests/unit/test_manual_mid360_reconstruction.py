@@ -213,6 +213,7 @@ def test_export_validation_rejects_non_lvx2_bytes(tmp_path: Path) -> None:
         _validate_lvx2_path(invalid)
 
 
+@pytest.mark.stage4_artifact
 def test_reconstruct_manual_capture_generates_a_valid_lvx2(tmp_path: Path) -> None:
     """24 个驾驶期姿态必须在离线期生成一帧可读 LVX2。"""
     from slope_sim.config import ExperimentConfig

@@ -480,11 +480,26 @@ def test_expire_manual_target_transitions_only_once(session) -> None:
     assert session.snapshot().state.value == "safe_stop"
 
 
+def test_linear_target_accepts_the_configured_three_meter_per_second_limit(session) -> None:
+    """正式手动会话允许 Dashboard/RC 共享的 3 m/s 线速度上限。"""
+    token = session.server_authentication["token"]
+
+    session.accept_client_message(
+        _target(token, linear=3.0, angular=1.0),
+        client_pid=54321,
+        peer_uid=os.getuid(),
+        now=10.0,
+    )
+
+    snapshot = session.snapshot()
+    assert (snapshot.linear_velocity_m_s, snapshot.angular_velocity_rad_s) == (3.0, 1.0)
+
+
 @pytest.mark.parametrize(
     "payload",
     (
         {"kind": "target", "token": "t" * 64, "linear_velocity_m_s": float("nan"), "angular_velocity_rad_s": 0.0},
-        {"kind": "target", "token": "t" * 64, "linear_velocity_m_s": 1.21, "angular_velocity_rad_s": 0.0},
+        {"kind": "target", "token": "t" * 64, "linear_velocity_m_s": 3.01, "angular_velocity_rad_s": 0.0},
         {"kind": "target", "token": "wrong", "linear_velocity_m_s": 0.0, "angular_velocity_rad_s": 0.0},
     ),
 )

@@ -314,6 +314,8 @@ def test_manual_demo_applies_dashboard_rect_with_enterprise_interface_options(mo
         interface_enabled=False,
         interface_mode="local",
         developer_diagnostics_enabled=True,
+        target_linear_velocity=1.5,
+        target_angular_velocity=1.0,
     )
     with pytest.raises(WindowLayoutError, match="dashboard placement failed"):
         manual_demo_module.run_manual_demo(config)
@@ -322,6 +324,8 @@ def test_manual_demo_applies_dashboard_rect_with_enterprise_interface_options(mo
         transport_mode="local"
     )
     assert constructor_kwargs["developer_diagnostics_enabled"] is True
+    assert constructor_kwargs["max_linear_speed"] == 1.5
+    assert constructor_kwargs["max_angular_speed"] == 1.0
     assert (
         "dashboard.apply",
         layout.dashboard,
@@ -615,6 +619,17 @@ def test_merge_manual_commands_uses_pybullet_keyboard_when_dashboard_is_idle():
     assert merged.structural_action is None
 
 
+def test_non_keyboard_source_rejects_pybullet_keyboard_motion() -> None:
+    """选择 external 后，PyBullet 焦点下的按键不能伪装成外部命令。"""
+    dashboard = DashboardCommand(0.0, 0.0, control_source="external")
+
+    merged = merge_manual_commands(dashboard, ManualCommand(0.4, -0.8))
+
+    assert merged.linear_velocity == 0.0
+    assert merged.angular_velocity == 0.0
+    assert merged.control_source == "external"
+
+
 def test_task12_paused_command_is_zero_and_blocks_keyboard_motion():
     dashboard = DashboardCommand(
         0.7,
@@ -759,8 +774,8 @@ def test_limit_manual_command_step_keeps_slew_for_obstacle_actions(action):
     assert limited.structural_action == action
 
 
-def test_manual_demo_uses_absolute_deadline_and_keeps_configured_camera_state(monkeypatch):
-    """手动循环只等待当前帧余量，且禁用 Dashboard 时沿用配置相机状态。"""
+def test_manual_demo_uses_wall_clock_deadline_and_keeps_configured_camera_state(monkeypatch):
+    """每帧超时后，手动循环仍必须按墙钟截止，不能只依赖步数上限。"""
     client_id = 17
     robot_id = 23
     camera_calls = []
@@ -814,7 +829,7 @@ def test_manual_demo_uses_absolute_deadline_and_keeps_configured_camera_state(mo
     monkeypatch.setattr(manual_demo_module, "_probe_terrain_for_robot", lambda *_args: None)
     def update_follow_camera(*args):
         camera_calls.append(args)
-        clock["now"] += 0.004
+        clock["now"] += 0.02
 
     def sleep(seconds):
         sleep_delays.append(seconds)
@@ -839,12 +854,12 @@ def test_manual_demo_uses_absolute_deadline_and_keeps_configured_camera_state(mo
             camera_follow_enabled=True,
             camera_follow_view="side",
         ),
-        duration_limit_sec=0.01,
+        duration_limit_sec=0.05,
     )
 
-    assert camera_calls == [(client_id, robot_id, 6.0, -35.0, 45.0, "side")]
-    assert sleep_delays == pytest.approx([0.006])
-    assert clock["now"] == pytest.approx(0.01)
+    assert camera_calls == [(client_id, robot_id, 6.0, -35.0, 45.0, "side")] * 3
+    assert sleep_delays == [0.0, 0.0, 0.0]
+    assert clock["now"] == pytest.approx(0.06)
 
 
 def test_manual_demo_keeps_dashboard_busy_while_obstacle_operation_is_pending(monkeypatch):
@@ -1981,7 +1996,7 @@ def test_manual_enabled_local_loop_pauses_polls_rebinds_and_returns_interface_lo
             interface_log_enabled=True,
             scene_out=tmp_path / "scene.yaml",
         ),
-        duration_limit_sec=0.02,
+        duration_limit_sec=0.1,
         monotonic=lambda: clock[0],
         sleep=sleep,
     )

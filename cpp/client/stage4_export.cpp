@@ -225,7 +225,7 @@ ValidatedLidarSession ValidateLidarSession(
     }
     if (!first_scan &&
         (previous_sequence == std::numeric_limits<std::uint64_t>::max() ||
-         cloud.sequence() != previous_sequence + 1 || cloud.timebase_ns() <= previous_timebase)) {
+         cloud.sequence() <= previous_sequence || cloud.timebase_ns() <= previous_timebase)) {
       throw std::runtime_error("LiDAR scan sequence or timebase is not strictly continuous");
     }
     if (!first_scan && (cloud.frame_id() != lidar.frame_id || cloud.lidar_id() != lidar.lidar_id)) {

@@ -127,6 +127,99 @@ class TerminalFailureCenterLidarService(DeferredCenterLidarService):
         )
 
 
+class TransientRejectingCenterLidarService(DeferredCenterLidarService):
+    """模拟有界 worker 队列临时满；下一帧恢复接受。"""
+
+    def __init__(self, payload: bytes) -> None:
+        super().__init__(payload)
+        self.reject_next_capture = True
+        self.accepted_capture: dict[str, object] | None = None
+
+    def capture(self, **kwargs: object) -> bool:
+        self.capture_calls.append(dict(kwargs))
+        if self.reject_next_capture:
+            self.reject_next_capture = False
+            return False
+        self.accepted_capture = dict(kwargs)
+        return True
+
+    def snapshot(self):
+        return type("Snapshot", (), {
+            "state": "ready",
+            "in_flight_identity": (1, 1, 0, "lidar_link", 100_000_000),
+            "pending_capture_identity": (1, 0, "lidar_link", 100_000_000),
+        })()
+
+    def poll(self):
+        if self.pending:
+            self.pending = False
+            return None
+        assert self.accepted_capture is not None
+        return type("Prepared", (), {
+            "topic": "lidar_link",
+            "timestamp_ns": self.accepted_capture["timestamp_ns"],
+            "protobuf_payload": self.payload,
+        })()
+
+
+class FailedCenterLidarService(DeferredCenterLidarService):
+    """模拟 worker 因场景状态失败后拒绝后续 capture。"""
+
+    def capture(self, **kwargs: object) -> bool:
+        self.capture_calls.append(dict(kwargs))
+        return False
+
+    def snapshot(self):
+        return type("Snapshot", (), {
+            "state": "failed",
+            "in_flight_identity": (1, 1, 0, "lidar_link", 100_000_000),
+            "pending_capture_identity": None,
+            "last_error_code": "scene_state_unknown",
+            "last_error_detail": "obstacle snapshot did not match worker world",
+        })()
+
+
+class FailedAfterFrameErrorCenterLidarService(DeferredCenterLidarService):
+    """先回报 shard 帧失败，再模拟 coordinator 退出导致的 service EOF。"""
+
+    def __init__(self) -> None:
+        super().__init__(b"unused")
+        self.failed = False
+
+    def capture(self, **kwargs: object) -> bool:
+        self.capture_calls.append(dict(kwargs))
+        return not self.failed
+
+    def poll(self):
+        return None
+
+    def drain_events(self) -> tuple[object, ...]:
+        if self.failed:
+            return ()
+        self.failed = True
+        request = self.capture_calls[0]
+        return (
+            LidarServiceEvent(
+                1,
+                "frame_failed",
+                "topic",
+                "lidar_link",
+                (1, 0, 0, "lidar_link", request["timestamp_ns"]),
+                "pointcloud_failed",
+                "Stage4 shard scan: RuntimeError: rayTestBatch failed",
+            ),
+        )
+
+    def snapshot(self):
+        return type("Snapshot", (), {
+            "state": "failed",
+            "in_flight_identity": None,
+            "pending_capture_identity": None,
+            "last_error_code": "worker_exited",
+            "last_error_detail": "lidar worker response pipe closed",
+        })()
+
+
 def test_v2_async_sensor_factory_defers_center_scan_and_keeps_one_reserved_identity(
     controller,
 ) -> None:
@@ -196,6 +289,72 @@ def test_v2_async_sensor_factory_discards_truth_pair_when_worker_reports_termina
 
     assert factory.poll_completed() == ()
     assert factory.has_pending() is False
+
+
+def test_v2_async_sensor_factory_drops_transiently_rejected_capture_without_stopping_runtime(
+    controller,
+) -> None:
+    """有界队列满只能丢弃当前同刻传感器对，不能终止手动仿真主循环。"""
+    module = import_module("slope_sim.interfaces.v2.sensor_frames")
+    service = TransientRejectingCenterLidarService(b"prepared-next-frame")
+    factory = module.V2AsyncSensorFrameFactory(
+        controller,
+        service,
+        StubStage4Truth(),
+        lambda: ("mount", ()),
+    )
+
+    assert factory.capture(100_000_000) is None
+    assert factory.has_pending() is False
+
+    assert factory.capture(200_000_000) is None
+    assert factory.has_pending() is True
+    assert factory.poll_completed() == ()
+    completed = factory.poll_completed()
+
+    assert len(completed) == 1
+    assert completed[0].lidar_timestamp_ns == 200_000_000
+    assert completed[0].rtk.timestamp_ns == completed[0].imu.timestamp_ns == 200_000_000
+    assert completed[0].lidar_identity.sequence == 1
+
+
+def test_v2_async_sensor_factory_surfaces_failed_service_diagnostics(controller) -> None:
+    """service 失败后必须保留稳定错误码与受限详情，不能只报泛化 capture 拒绝。"""
+    module = import_module("slope_sim.interfaces.v2.sensor_frames")
+    factory = module.V2AsyncSensorFrameFactory(
+        controller,
+        FailedCenterLidarService(b"unused"),
+        StubStage4Truth(),
+        lambda: ("mount", ()),
+    )
+
+    with pytest.raises(RuntimeError) as error:
+        factory.capture(100_000_000)
+
+    assert "state=failed" in str(error.value)
+    assert "scene_state_unknown" in str(error.value)
+    assert "obstacle snapshot did not match worker world" in str(error.value)
+
+
+def test_v2_async_sensor_factory_preserves_frame_failure_before_worker_exit(controller) -> None:
+    """coordinator EOF 不能覆盖此前已收到的 shard 帧失败详情。"""
+    module = import_module("slope_sim.interfaces.v2.sensor_frames")
+    service = FailedAfterFrameErrorCenterLidarService()
+    factory = module.V2AsyncSensorFrameFactory(
+        controller,
+        service,
+        StubStage4Truth(),
+        lambda: ("mount", ()),
+    )
+
+    factory.capture(100_000_000)
+    assert factory.poll_completed() == ()
+
+    with pytest.raises(RuntimeError) as error:
+        factory.capture(200_000_000)
+
+    assert "worker_exited" in str(error.value)
+    assert "rayTestBatch failed" in str(error.value)
 
 
 def test_v2_output_publisher_forwards_prepared_lidar_payload_without_reencoding(

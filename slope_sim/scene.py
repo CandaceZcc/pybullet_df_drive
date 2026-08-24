@@ -607,6 +607,7 @@ def configure_gui_visualizer(
         p.COV_ENABLE_RGB_BUFFER_PREVIEW,
         p.COV_ENABLE_DEPTH_BUFFER_PREVIEW,
         p.COV_ENABLE_SEGMENTATION_MARK_PREVIEW,
+        p.COV_ENABLE_KEYBOARD_SHORTCUTS,
     ):
         p.configureDebugVisualizer(flag, 0, physicsClientId=client_id)
     p.configureDebugVisualizer(p.COV_ENABLE_GUI, 1, physicsClientId=client_id)

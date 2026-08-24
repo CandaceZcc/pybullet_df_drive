@@ -118,8 +118,8 @@ class V2SimulatorRuntime:
 
     def accept_command_payload(self, payload: bytes, *, received_at: float) -> bool:
         """委托既有 controller 解码和认领，拒绝时绝不触碰物理线程状态。"""
-        accepted = self._controller.accept_payload(payload, received_at=received_at)
-        if accepted and self._dashboard_snapshot_store is not None:
+        result = self._controller.accept_payload_result(payload, received_at=received_at)
+        if result.accepted and self._dashboard_snapshot_store is not None:
             authority = self._controller.snapshot().authority
             timestamp_ns = self._controller.mailbox.latest_timestamp_ns()
             if authority.last_sequence is None or timestamp_ns is None:
@@ -130,7 +130,18 @@ class V2SimulatorRuntime:
                 received_at=received_at,
                 accepted=True,
             )
-        return accepted
+        elif self._dashboard_snapshot_store is not None:
+            self._dashboard_snapshot_store.record_authority_rejection(
+                topic="/sim/wheel/command",
+                source_id=result.source_id,
+                source_session_id=result.source_session_id,
+                sequence=result.sequence,
+                simulation_session_id=result.simulation_session_id,
+                world_generation=result.world_generation,
+                reason=result.reason,
+                received_at=result.received_at,
+            )
+        return result.accepted
 
     def command_decision(self, *, now: float) -> object:
         """返回 mailbox 的当前安全决定，供物理主线程在每步应用。"""

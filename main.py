@@ -5,7 +5,7 @@ import argparse
 import os
 from pathlib import Path
 import sys
-from typing import Sequence
+from typing import Mapping, Sequence
 
 from slope_sim.config import load_config
 from slope_sim.manual_demo import run_manual_demo
@@ -19,6 +19,19 @@ from slope_sim.interfaces.v2.ecal_preflight import (
     run_v2_ecal_preflight,
 )
 from slope_sim.interfaces.v2.runsim_v2_command import RunSimV2Command
+from slope_sim.serial_rc import CommandSourceArbiter, pyserial_opener, start_rc_worker
+
+
+def resolve_v2_runtime_root(environment: Mapping[str, str] | None = None) -> Path:
+    """定位 Command 与 eCAL 资源；源码验收可显式指定非发行运行根。"""
+    env = os.environ if environment is None else environment
+    configured = env.get("SLOPE_SIM_V2_RUNTIME_ROOT")
+    if not configured:
+        return Path(__file__).resolve().parent
+    root = Path(configured).expanduser().resolve()
+    if not root.is_dir():
+        raise ValueError("SLOPE_SIM_V2_RUNTIME_ROOT must be an existing directory")
+    return root
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -48,6 +61,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--capture-duration-sec", type=int, choices=(60, 90, 180), default=None, help="启动正式 v2 采集并在 60、90 或 180 秒后自动导出。")
     parser.add_argument("--viewer-root", type=Path, default=None, help="本地 Livox Viewer 2 安装根目录（用于打开导出的 LVX2）。")
     parser.add_argument("--open-ros-rviz", action="store_true", help="启动时打开独立 ROS Bridge/RViz2 实时点云显示。")
+    parser.add_argument("--rc-port", type=Path, default=None, help="稳定 /dev/serial/by-id 遥控器路径；通过 SBUS 资格检查后启用。")
     parser.add_argument("--no-interface", action="store_true", help="Disable the enterprise interface.")
     parser.add_argument("--no-interface-log", action="store_true", help="Disable enterprise interface logs.")
     parser.add_argument("--scene-in", type=Path, default=None, help="Input scene document path.")
@@ -130,6 +144,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         or args.interface_mode is not None
         or config.interface_mode == "ecal"
     )
+    if args.rc_port is not None and not (
+        args.manual and config.interface_enabled and formal_v2_requested
+    ):
+        print("runSim startup blocked: --rc-port requires formal v2 manual interface", file=sys.stderr)
+        return 2
     if args.manual and config.interface_enabled and formal_v2_requested:
         if args.no_dashboard and (args.capture_duration_sec is not None or args.open_ros_rviz):
             print("runSim v2 startup blocked: capture and ROS/RViz controls require Dashboard", file=sys.stderr)
@@ -147,6 +166,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             runtime_environment_overrides["ECAL_TIME_PLUGIN_PATH"] = str(args.ecal_time_plugin_path.resolve())
         environment = dict(os.environ)
         environment.update(runtime_environment_overrides)
+        try:
+            v2_runtime_root = resolve_v2_runtime_root(environment)
+        except ValueError as error:
+            print(f"runSim v2 startup blocked: {error}", file=sys.stderr)
+            return 2
+        if "ECAL_CONFIG_PATH" not in environment and "ECAL_DATA" not in environment:
+            data_dir = v2_runtime_root / "etc" / "ecal"
+            if (data_dir / "ecal.yaml").is_file():
+                runtime_environment_overrides["ECAL_DATA"] = str(data_dir)
+                environment["ECAL_DATA"] = str(data_dir)
+        if "ECAL_TIME_PLUGIN_PATH" not in environment:
+            plugin_dir = v2_runtime_root / "lib"
+            if (plugin_dir / "libecaltime-localtime.so").is_file():
+                runtime_environment_overrides["ECAL_TIME_PLUGIN_PATH"] = str(plugin_dir)
+                environment["ECAL_TIME_PLUGIN_PATH"] = str(plugin_dir)
         report = run_v2_ecal_preflight(environment=environment)
         if not report.ok:
             print(report.format_terminal(), file=sys.stderr)
@@ -162,19 +196,51 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             try:
                 command = RunSimV2Command.launch(
-                    release_root=Path(__file__).resolve().parent,
+                    release_root=v2_runtime_root,
                     robot_model=config.robot_model,
                 )
             except RuntimeError as error:
                 print(f"runSim v2 Command startup blocked: {error}", file=sys.stderr)
                 return 2
+            command_closed = False
+
+            def close_command() -> None:
+                """在 eCAL world 退订前停止唯一 Command，避免后续 publish 误报失败。"""
+                nonlocal command_closed
+                if not command_closed:
+                    command.close()
+                    command_closed = True
+
             try:
+                command_arbiter = (
+                    CommandSourceArbiter(command.client)
+                    if callable(getattr(command.client, "send_target", None))
+                    else None
+                )
+                rc_worker = None
+                if args.rc_port is not None:
+                    if command_arbiter is None:
+                        print("runSim RC startup blocked: v2 Command client has no controlled target ingress", file=sys.stderr)
+                        return 2
+                    try:
+                        rc_worker = start_rc_worker(
+                            command_sink=lambda candidate, now: command_arbiter.submit_rc(candidate, now=now),
+                            opener=pyserial_opener(),
+                            explicit_path=args.rc_port.resolve(),
+                        )
+                    except (RuntimeError, ValueError) as error:
+                        print(f"runSim RC startup blocked: {error}", file=sys.stderr)
+                        return 2
                 result = run_manual_demo(
                     config,
                     duration_limit_sec=args.duration_sec,
                     v2_session_id_factory=command.session_id_factory,
                     v2_command_client=command.client,
-                    v2_capture_release_root=Path(__file__).resolve().parent,
+                    v2_command_shutdown=close_command,
+                    v2_command_arbiter=command_arbiter,
+                    v2_command_pid=getattr(command, "process_pid", None),
+                    rc_worker=rc_worker,
+                    v2_capture_release_root=v2_runtime_root,
                     v2_capture_output_root=(
                         None
                         if args.capture_output_dir is None
@@ -187,7 +253,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     v2_open_live_viewer=args.open_ros_rviz,
                 )
             finally:
-                command.close()
+                close_command()
         finally:
             for name, previous in previous_environment.items():
                 if previous is None:

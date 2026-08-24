@@ -19,6 +19,8 @@
 
 #include <fcntl.h>
 #include <openssl/crypto.h>
+#include <signal.h>
+#include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -511,6 +513,7 @@ double ParseFiniteNumber(const JsonValue& value, const char* name) {
 struct InteractiveAuthentication final {
   pid_t command_pid;
   uid_t command_uid;
+  pid_t orchestrator_pid;
   fs::path socket_path;
   std::string token;
 };
@@ -567,7 +570,7 @@ InteractiveAuthentication ReadInteractiveAuthentication(const std::string& raw_r
   if (command_uid != static_cast<long>(geteuid())) {
     throw std::invalid_argument("launch-record command uid does not match effective uid");
   }
-  (void)ParseNonnegativeLong(
+  const long orchestrator_pid = ParseNonnegativeLong(
       RequireField(document, "orchestrator_pid", JsonValue::Kind::kNumber), "orchestrator_pid", true);
   if (RequireField(document, "protocol", JsonValue::Kind::kString).text !=
       "runsim-command-socket-v1") {
@@ -584,7 +587,19 @@ InteractiveAuthentication ReadInteractiveAuthentication(const std::string& raw_r
       socket_path.native().size() > sizeof(sockaddr_un{}.sun_path) - 1U) {
     throw std::invalid_argument("launch-record socket_path is invalid");
   }
-  return {static_cast<pid_t>(command_pid), static_cast<uid_t>(command_uid), socket_path, token};
+  return {static_cast<pid_t>(command_pid), static_cast<uid_t>(command_uid),
+          static_cast<pid_t>(orchestrator_pid), socket_path, token};
+}
+
+void ArmInteractiveOrchestratorWatchdog(const InteractiveAuthentication& authentication) {
+  // Command 由 GUI 编排器启动。后者异常退出时内核直接终止独立进程组中的 Command，避免遗留单实例锁。
+  if (prctl(PR_SET_PDEATHSIG, SIGTERM) != 0) {
+    throw std::runtime_error("interactive command cannot arm orchestrator watchdog");
+  }
+  // prctl 与父进程退出之间存在竞态；再次比对 PPID 可拒绝已经被 init 接管的孤儿。
+  if (getppid() != authentication.orchestrator_pid) {
+    throw std::invalid_argument("interactive command orchestrator does not match launch record");
+  }
 }
 
 bool IsAuthenticatedStopFrame(const std::string& payload, const std::string& expected_token);
@@ -728,6 +743,25 @@ slope_sim::client::v2::RobotCommandShape ShapeFor(
   throw std::invalid_argument("interactive payload has unsupported robot wheel shape");
 }
 
+void ResetInteractiveTemplateShape(
+    slope_sim::interfaces::v2::WheelCommand* command,
+    const std::string& robot_model) {
+  if (command == nullptr) throw std::invalid_argument("interactive template command is null");
+  command->set_robot_model(robot_model);
+  command->clear_drive_wheel_speed_rad_s();
+  command->clear_steering_wheel_speed_rad_s();
+  if (robot_model == "df_front" || robot_model == "df_mid" || robot_model == "df_back") {
+    command->add_drive_wheel_speed_rad_s(0.0F);
+    command->add_drive_wheel_speed_rad_s(0.0F);
+  } else if (robot_model == "active_steering_4wd") {
+    for (int index = 0; index < 4; ++index) command->add_drive_wheel_speed_rad_s(0.0F);
+    for (int index = 0; index < 2; ++index) command->add_steering_wheel_speed_rad_s(0.0F);
+  } else {
+    throw std::invalid_argument("interactive robot model is invalid");
+  }
+  (void)ShapeFor(*command);
+}
+
 void ValidateInteractiveIdentity(const slope_sim::interfaces::v2::WheelCommand& command) {
   if (command.simulation_session_id().size() != 16 || command.source_session_id().size() != 16 ||
       command.descriptor_sha256().size() != 32 || command.world_generation() == 0 ||
@@ -742,13 +776,16 @@ bool ConstantTimeTokenMatches(const std::string& actual, const std::string& expe
       CRYPTO_memcmp(actual.data(), expected.data(), expected.size()) == 0;
 }
 
-enum class InteractiveMessage { kTarget, kStatus, kStop };
+enum class InteractiveMessage { kTarget, kGeneration, kStatus, kStop };
 
 InteractiveMessage ValidateInteractiveMessage(
     const std::string& payload,
     const std::string& expected_token,
     float* linear_velocity_m_s,
-    float* angular_velocity_rad_s) {
+    float* angular_velocity_rad_s,
+    std::uint64_t* world_generation,
+    std::uint64_t* command_generation,
+    std::string* robot_model) {
   if (payload.size() > 1024U) throw std::invalid_argument("control payload exceeds maximum size");
   const auto document = JsonObjectParser(payload).Parse();
   for (const auto& [key, ignored] : document) {
@@ -774,6 +811,17 @@ InteractiveMessage ValidateInteractiveMessage(
         RequireField(document, "angular_velocity_rad_s", JsonValue::Kind::kNumber), "angular_velocity_rad_s"));
     return InteractiveMessage::kTarget;
   }
+  if (kind == "generation") {
+    RequireExactFields(document, {"kind", "token", "world_generation", "command_generation", "robot_model"});
+    *world_generation = static_cast<std::uint64_t>(ParseNonnegativeLong(
+        RequireField(document, "world_generation", JsonValue::Kind::kNumber), "world_generation", true));
+    *command_generation = static_cast<std::uint64_t>(ParseNonnegativeLong(
+        RequireField(document, "command_generation", JsonValue::Kind::kNumber), "command_generation", true));
+    *robot_model = RequireField(document, "robot_model", JsonValue::Kind::kString).text;
+    slope_sim::interfaces::v2::WheelCommand shape_probe;
+    ResetInteractiveTemplateShape(&shape_probe, *robot_model);
+    return InteractiveMessage::kGeneration;
+  }
   if (kind == "status") {
     RequireExactFields(document, {"kind", "token", "state"});
     const std::string& state = RequireField(document, "state", JsonValue::Kind::kString).text;
@@ -795,9 +843,13 @@ InteractiveMessage ValidateInteractiveMessage(
 bool IsAuthenticatedStopFrame(const std::string& payload, const std::string& expected_token) {
   float ignored_linear_velocity_m_s = 0.0F;
   float ignored_angular_velocity_rad_s = 0.0F;
+  std::uint64_t ignored_world_generation = 0U;
+  std::uint64_t ignored_command_generation = 0U;
+  std::string ignored_robot_model;
   try {
     return ValidateInteractiveMessage(
-        payload, expected_token, &ignored_linear_velocity_m_s, &ignored_angular_velocity_rad_s) ==
+        payload, expected_token, &ignored_linear_velocity_m_s, &ignored_angular_velocity_rad_s,
+        &ignored_world_generation, &ignored_command_generation, &ignored_robot_model) ==
         InteractiveMessage::kStop;
   } catch (const std::invalid_argument&) {
     return false;
@@ -919,13 +971,12 @@ int RunInteractiveCommand(const std::map<std::string, std::string>& options) {
   if (getpid() != authentication.command_pid) {
     throw std::invalid_argument("interactive command PID does not match launch record");
   }
+  ArmInteractiveOrchestratorWatchdog(authentication);
   slope_sim::interfaces::v2::WheelCommand template_command;
   if (!template_command.ParseFromString(command.payload)) {
     throw std::runtime_error("validated command cannot be parsed");
   }
   ValidateInteractiveIdentity(template_command);
-  const auto shape = ShapeFor(template_command);
-  const auto start_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(deadline_ms);
   slope_sim::client::v2::CommandInstanceLock lock;
   InteractiveSocketServer server(authentication);
   if (!eCAL::Initialize("slope-sim-stage4-command")) {
@@ -933,78 +984,110 @@ int RunInteractiveCommand(const std::map<std::string, std::string>& options) {
   }
   bool initialized = true;
   try {
-    slope_sim::client::v2::WheelCommandLease lease(
-        static_cast<std::size_t>(template_command.drive_wheel_speed_rad_s_size()),
-        static_cast<std::size_t>(template_command.steering_wheel_speed_rad_s_size()));
-    slope_sim::client::v2::TwistCommandConverter converter(shape);
-    const slope_sim::client::v2::WheelMotion zero_motion{
-        std::vector<float>(static_cast<std::size_t>(template_command.drive_wheel_speed_rad_s_size()), 0.0F),
-        std::vector<float>(static_cast<std::size_t>(template_command.steering_wheel_speed_rad_s_size()), 0.0F)};
+    std::optional<slope_sim::client::v2::WheelCommandLease> lease;
+    std::optional<slope_sim::client::v2::TwistCommandConverter> converter;
+    slope_sim::client::v2::WheelMotion zero_motion;
+    const auto reset_motion_contract = [&]() {
+      const auto shape = ShapeFor(template_command);
+      lease.emplace(
+          static_cast<std::size_t>(template_command.drive_wheel_speed_rad_s_size()),
+          static_cast<std::size_t>(template_command.steering_wheel_speed_rad_s_size()));
+      converter.emplace(shape);
+      zero_motion = {
+          std::vector<float>(static_cast<std::size_t>(template_command.drive_wheel_speed_rad_s_size()), 0.0F),
+          std::vector<float>(static_cast<std::size_t>(template_command.steering_wheel_speed_rad_s_size()), 0.0F)};
+    };
+    reset_motion_contract();
     bool has_target = false;
     bool stop_requested = false;
+    std::uint64_t frame_sequence = 0U;
     int active_published_count = 0;
     int safe_stop_published_count = 0;
-    eCAL::CPublisher publisher("/sim/wheel/command", CommandTypeInfo(command.descriptor));
-    const auto start = std::chrono::steady_clock::now();
-    for (int offset_ms = 0; offset_ms < command.duration_ms; offset_ms += 10) {
-      std::this_thread::sleep_until(start + std::chrono::milliseconds(offset_ms));
-      const auto now = std::chrono::steady_clock::now();
-      if (now >= start_deadline) {
-        throw std::runtime_error("interactive command deadline elapsed");
-      }
-      const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start);
-      std::vector<std::string> socket_messages;
-      const auto event = server.Poll(&socket_messages);
-      if (event == InteractiveSocketServer::Event::kClosed || event == InteractiveSocketServer::Event::kInvalid) {
-        has_target = false;
-      } else if (event == InteractiveSocketServer::Event::kMessage ||
-                 event == InteractiveSocketServer::Event::kStop) {
-        (void)slope_sim::client::v2::ProcessCommandSocketFramesUntilTerminal(
-            socket_messages, [&](const std::string& socket_message) {
-              try {
-                float linear_velocity_m_s = 0.0F;
-                float angular_velocity_rad_s = 0.0F;
-                const InteractiveMessage message = ValidateInteractiveMessage(
-                    socket_message, authentication.token, &linear_velocity_m_s, &angular_velocity_rad_s);
-                if (message == InteractiveMessage::kTarget) {
-                  lease.Renew(
-                      converter.Convert(linear_velocity_m_s, angular_velocity_rad_s),
-                      elapsed);
-                  has_target = true;
-                } else if (message == InteractiveMessage::kStop) {
+    {
+      eCAL::CPublisher publisher("/sim/wheel/command", CommandTypeInfo(command.descriptor));
+      // GUI 先启动 Command、再创建 world subscriber；发现收敛前保留 socket，首个 peer 接入后才开始计时。
+      std::optional<std::chrono::steady_clock::time_point> start;
+      for (int offset_ms = 0; offset_ms < command.duration_ms;) {
+        if (!start.has_value()) {
+          if (publisher.GetSubscriberCount() < 1) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
+          }
+          start = std::chrono::steady_clock::now();
+        }
+        std::this_thread::sleep_until(*start + std::chrono::milliseconds(offset_ms));
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= *start + std::chrono::milliseconds(deadline_ms)) {
+          throw std::runtime_error("interactive command deadline elapsed");
+        }
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - *start);
+        std::vector<std::string> socket_messages;
+        const auto event = server.Poll(&socket_messages);
+        if (event == InteractiveSocketServer::Event::kClosed || event == InteractiveSocketServer::Event::kInvalid) {
+          has_target = false;
+        } else if (event == InteractiveSocketServer::Event::kMessage ||
+                   event == InteractiveSocketServer::Event::kStop) {
+          (void)slope_sim::client::v2::ProcessCommandSocketFramesUntilTerminal(
+              socket_messages, [&](const std::string& socket_message) {
+                try {
+                  float linear_velocity_m_s = 0.0F;
+                  float angular_velocity_rad_s = 0.0F;
+                  std::uint64_t world_generation = 0U;
+                  std::uint64_t command_generation = 0U;
+                  std::string robot_model;
+                  const InteractiveMessage message = ValidateInteractiveMessage(
+                      socket_message, authentication.token, &linear_velocity_m_s, &angular_velocity_rad_s,
+                      &world_generation, &command_generation, &robot_model);
+                  if (message == InteractiveMessage::kTarget) {
+                    lease->Renew(
+                        converter->Convert(linear_velocity_m_s, angular_velocity_rad_s),
+                        elapsed);
+                    has_target = true;
+                  } else if (message == InteractiveMessage::kGeneration) {
+                    template_command.set_world_generation(world_generation);
+                    template_command.set_command_generation(command_generation);
+                    ResetInteractiveTemplateShape(&template_command, robot_model);
+                    reset_motion_contract();
+                    frame_sequence = 0U;
+                    has_target = false;
+                  } else if (message == InteractiveMessage::kStop) {
+                    has_target = false;
+                    stop_requested = true;
+                    return true;
+                  }
+                } catch (const std::invalid_argument&) {
+                  // 未认证、超限或未知消息均 fail closed，但不让攻击者终止 publisher。
                   has_target = false;
-                  stop_requested = true;
-                  return true;
                 }
-              } catch (const std::invalid_argument&) {
-                // 未认证、超限或未知消息均 fail closed，但不让攻击者终止 publisher。
-                has_target = false;
-              }
-              return false;
-            });
+                return false;
+              });
+        }
+        const auto values = has_target ? lease->Decision(elapsed) : zero_motion;
+        if (has_target && lease->state() == slope_sim::client::v2::CommandLeaseState::kTimedOut) {
+          has_target = false;
+        }
+        slope_sim::interfaces::v2::WheelCommand frame(template_command);
+        frame.clear_drive_wheel_speed_rad_s();
+        frame.clear_steering_wheel_speed_rad_s();
+        for (const float value : values.drive_wheel_speed_rad_s) frame.add_drive_wheel_speed_rad_s(value);
+        for (const float value : values.steering_wheel_speed_rad_s) frame.add_steering_wheel_speed_rad_s(value);
+        frame.set_timestamp_ns(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count()));
+        frame.set_sequence(frame_sequence++);
+        const std::string payload = frame.SerializeAsString();
+        // 尚未发现 world subscriber 时 eCAL Send 返回 false 属于启动暂态；已有 peer 后才视为真实发送故障。
+        const bool subscriber_ready = publisher.GetSubscriberCount() >= 1;
+        if (!publisher.Send(payload.data(), payload.size()) && subscriber_ready) {
+          throw std::runtime_error("command raw eCAL send failed");
+        }
+        if (has_target) {
+          ++active_published_count;
+        } else {
+          ++safe_stop_published_count;
+        }
+        if (stop_requested) break;
+        offset_ms += 10;
       }
-      const auto values = has_target ? lease.Decision(elapsed) : zero_motion;
-      if (has_target && lease.state() == slope_sim::client::v2::CommandLeaseState::kTimedOut) {
-        has_target = false;
-      }
-      slope_sim::interfaces::v2::WheelCommand frame(template_command);
-      frame.clear_drive_wheel_speed_rad_s();
-      frame.clear_steering_wheel_speed_rad_s();
-      for (const float value : values.drive_wheel_speed_rad_s) frame.add_drive_wheel_speed_rad_s(value);
-      for (const float value : values.steering_wheel_speed_rad_s) frame.add_steering_wheel_speed_rad_s(value);
-      frame.set_timestamp_ns(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-          std::chrono::system_clock::now().time_since_epoch()).count()));
-      frame.set_sequence(template_command.sequence() + static_cast<std::uint64_t>(offset_ms / 10));
-      const std::string payload = frame.SerializeAsString();
-      if (!publisher.Send(payload.data(), payload.size())) {
-        throw std::runtime_error("command raw eCAL send failed");
-      }
-      if (has_target) {
-        ++active_published_count;
-      } else {
-        ++safe_stop_published_count;
-      }
-      if (stop_requested) break;
     }
     eCAL::Finalize();
     initialized = false;

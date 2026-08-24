@@ -245,6 +245,42 @@ def test_commit_alone_advances_world_and_resets_output_sequences(descriptor) -> 
     assert after.world_generation == 2 and after.sequence == 0
 
 
+def test_commit_world_rebuild_rebinds_command_shape_to_the_new_robot_model(descriptor) -> None:
+    """车型切换必须让同一 v2 controller 在新 generation 验证新轮子形状。"""
+    module = require_wished_module("slope_sim.interfaces.v2.runtime_protocol")
+    models = require_wished_module("slope_sim.interfaces.v2.models")
+    transport = FakeV2Transport()
+    transport.set_command_protocol("verified", peer_count=1)
+    controller = module.V2RuntimeProtocol(
+        get_robot_model("df_mid"), transport=transport, descriptor=descriptor
+    )
+    controller.refresh_transport()
+
+    controller.prepare_world_rebuild()
+    controller.commit_world_rebuild(model=get_robot_model("active_steering_4wd"))
+    identity = controller.snapshot()
+    command = models.WheelCommandV2(
+        timestamp_ns=1,
+        drive_wheel_speed_rad_s=(1.0, 1.0, 1.0, 1.0),
+        steering_wheel_speed_rad_s=(0.0, 0.0),
+        sequence=0,
+        world_generation=identity.world_generation,
+        command_generation=identity.command_generation,
+        source_id="owner",
+        source_session_id=b"o" * 16,
+        robot_model="active_steering_4wd",
+        simulation_session_id=identity.simulation_session_id,
+        descriptor_sha256=descriptor.sha256,
+    )
+
+    assert controller.accept_decoded_command(
+        command, received_at=1.0, ingress=controller.capture_ingress()
+    ) is True
+    decision = controller.mailbox.decision(now=1.0)
+    assert decision.drive_wheel_speed_rad_s == (1.0, 1.0, 1.0, 1.0)
+    assert decision.steering_wheel_speed_rad_s == (0.0, 0.0)
+
+
 def test_close_invalidates_lifecycle_before_releasing_transport(descriptor) -> None:
     """关闭必须先拒绝新入口，再释放底层 transport。"""
     module = require_wished_module("slope_sim.interfaces.v2.runtime_protocol")

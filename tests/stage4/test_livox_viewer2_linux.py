@@ -148,6 +148,44 @@ def test_viewer_lvx2_marker_requires_the_exact_absolute_file(tmp_path: Path) -> 
     assert verifier.viewer_lvx2_opened(log_path, selected) is True
 
 
+def test_viewer_playback_evidence_requires_device_selection_playback_and_points(
+    tmp_path: Path,
+) -> None:
+    """打开文件不是成功；必须确认 MID-360、播放与非零渲染都来自同一日志。"""
+    selected = tmp_path / "capture" / "lidar.lvx2"
+    selected.parent.mkdir()
+    selected.write_bytes(b"lvx2")
+    log_path = tmp_path / "launcher.log"
+    log_path.write_text(
+        "\n".join(
+            (
+                f"Livox: ALvxKit::OpenLvxFile({selected}) success, Frame num = 8",
+                "Livox: AViewerUI::OnDeviceEvent PlayLvxStart,",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    evidence = verifier.viewer_playback_evidence(log_path, selected)
+    assert evidence.opened is True
+    assert evidence.simulated_mid360_selected is False
+    assert evidence.playback_started is True
+    assert evidence.rendered_point_count is None
+    assert evidence.complete is False
+
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write("\nLivox: ALvxKit::OpenLvxFile, test slot/handle = 1, device type = Mid-360 (9)\n")
+        handle.write("Livox: AViewerUI::OnDeviceEvent PointCloudSelectionChanged,\n")
+        handle.write("Livox: ALvxKit::PlayerPlay\n")
+        handle.write("Livox: FViewerRenderBuffer::RenderMultiFrame, FrameNum = 1, PointsNum = 42\n")
+
+    evidence = verifier.viewer_playback_evidence(log_path, selected)
+    assert evidence.simulated_mid360_selected is True
+    assert evidence.playback_started is True
+    assert evidence.rendered_point_count == 42
+    assert evidence.complete is True
+
+
 def test_import_lvx2_uses_env_viewer_and_waits_for_exact_open_log(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -188,6 +226,15 @@ def test_import_lvx2_uses_env_viewer_and_waits_for_exact_open_log(
             handle.write(
                 f"Livox: ALvxKit::OpenLvxFile({selected}) success, Frame num = 1\n"
             )
+            handle.write(
+                "Livox: ALvxKit::OpenLvxFile, SLOPESIM00000001 slot/handle = 1, "
+                "device type = Mid-360 (9)\n"
+            )
+            handle.write("Livox: AViewerUI::OnDeviceEvent PointCloudSelectionChanged,\n")
+            handle.write("Livox: ALvxKit::PlayerPlay\n")
+            handle.write(
+                "Livox: FViewerRenderBuffer::RenderMultiFrame, FrameNum = 1, PointsNum = 3\n"
+            )
 
     pid, actual_log = verifier.import_lvx2_in_livox_viewer(
         selected,
@@ -217,7 +264,7 @@ def test_import_lvx2_uses_env_viewer_and_waits_for_exact_open_log(
 
 
 def test_x11_automation_selects_the_exact_absolute_lvx2_path_in_unreal_modal(tmp_path: Path) -> None:
-    """Unreal 内嵌文件框没有独立 X11 窗口，仍须自动填入并提交路径。"""
+    """按 Viewer 和原生 Open File 窗口身份定位，填入并提交绝对路径。"""
     selected = tmp_path / "capture" / "lidar.lvx2"
     selected.parent.mkdir()
     selected.write_bytes(b"lvx2")
@@ -235,10 +282,18 @@ def test_x11_automation_selects_the_exact_absolute_lvx2_path_in_unreal_modal(tmp
         ]:
             if command[-1] == "^LivoxViewer":
                 return SimpleNamespace(returncode=0, stdout="200\n", stderr="")
+            if command[-1] == "^Open File$":
+                return SimpleNamespace(returncode=0, stdout="201\n", stderr="")
         if command[1:4] == ["getwindowgeometry", "--shell", "200"]:
             return SimpleNamespace(
                 returncode=0,
                 stdout="WINDOW=200\nX=216\nY=196\nWIDTH=1600\nHEIGHT=900\n",
+                stderr="",
+            )
+        if command[1:4] == ["getwindowgeometry", "--shell", "201"]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout="WINDOW=201\nX=555\nY=273\nWIDTH=810\nHEIGHT=534\n",
                 stderr="",
             )
         return SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -256,17 +311,24 @@ def test_x11_automation_selects_the_exact_absolute_lvx2_path_in_unreal_modal(tmp
     )
 
     assert ["xdotool", "windowactivate", "--sync", "200"] in commands
-    assert ["xdotool", "mousemove", "--window", "200", "230", "18", "click", "1"] in commands
-    assert not any(command[-1] == "^Open File$" for command in commands)
     assert [
-        "xdotool", "mousemove", "--window", "200", "924", "538", "click", "1",
+        "xdotool", "search", "--all", "--onlyvisible", "--pid", "321", "--name", "^Open File$",
     ] in commands
-    assert ["xdotool", "key", "--window", "200", "ctrl+a"] in commands
+    assert ["xdotool", "getwindowgeometry", "--shell", "200"] in commands
+    assert ["xdotool", "getwindowgeometry", "--shell", "201"] in commands
+    assert ["xdotool", "mousemove", "--window", "200", "230", "18", "click", "1"] in commands
+    assert ["xdotool", "windowactivate", "--sync", "201"] in commands
     assert [
-        "xdotool", "type", "--window", "200", "--clearmodifiers", "--delay", "5",
+        "xdotool", "mousemove", "--window", "201", "577", "461", "click", "1",
+    ] in commands
+    assert ["xdotool", "key", "--window", "201", "ctrl+a"] in commands
+    assert [
+        "xdotool", "type", "--window", "201", "--clearmodifiers", "--delay", "5",
         str(selected),
     ] in commands
-    assert ["xdotool", "mousemove", "--window", "200", "1022", "572", "click", "1"] in commands
+    assert [
+        "xdotool", "mousemove", "--window", "201", "683", "495", "click", "1",
+    ] in commands
 
 
 def test_x11_automation_reports_a_missing_xdotool_clearly(tmp_path: Path) -> None:

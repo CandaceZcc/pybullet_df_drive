@@ -28,11 +28,26 @@ std::vector<RecordedRawFrame> InteractiveRecorderWindow::Observe(
       state_ == State::kSafeStopRequired) {
     return {};
   }
+  if (topic_index < 2) {
+    if (frame.log_time_ns == 0 || frame.log_time_ns != frame.publish_time_ns) {
+      RequireSafeStopLocked("high-rate frame timestamp is invalid");
+      return {};
+    }
+    // Command uses a wall clock while WheelState uses simulation time.  Neither
+    // can participate in the sensor timestamp boundary, so they are accepted
+    // only after that boundary authorizes recording.
+    if (state_ == State::kAwaitingStartBoundary) return {};
+    if (topic_index == 1 && frame.log_time_ns <= last_sensor_boundary_timestamp_ns_) {
+      RequireSafeStopLocked("wheel state arrived after its sensor boundary");
+      return {};
+    }
+    return {std::move(frame)};
+  }
   if (!AddLocked(topic_index, std::move(frame))) return {};
   auto boundary = FirstCompleteBoundaryLocked();
   if (boundary == pending_.end()) return {};
   const std::uint64_t timestamp_ns = boundary->first;
-  if (last_committed_timestamp_ns_ == 0) {
+  if (last_sensor_boundary_timestamp_ns_ == 0) {
     // 起始边界之前的帧不属于用户已经授权的采集区间。
     pending_.erase(pending_.begin(), boundary);
   }
@@ -44,7 +59,7 @@ std::vector<RecordedRawFrame> InteractiveRecorderWindow::Observe(
 
 void InteractiveRecorderWindow::RequireSafeStop() {
   std::lock_guard<std::mutex> lock(mutex_);
-  RequireSafeStopLocked();
+  RequireSafeStopLocked("safe stop requested by recorder");
 }
 
 InteractiveRecorderWindow::State InteractiveRecorderWindow::state() const noexcept {
@@ -52,21 +67,37 @@ InteractiveRecorderWindow::State InteractiveRecorderWindow::state() const noexce
   return state_;
 }
 
+std::string InteractiveRecorderWindow::failure_reason() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return failure_reason_;
+}
+
 bool InteractiveRecorderWindow::AddLocked(std::size_t topic_index, RecordedRawFrame frame) {
-  if (topic_index >= 5 || frame.log_time_ns == 0 || frame.log_time_ns != frame.publish_time_ns ||
-      frame.log_time_ns <= last_committed_timestamp_ns_) {
-    RequireSafeStopLocked();
+  if (topic_index >= 5) {
+    RequireSafeStopLocked("topic index is outside the frozen recorder contract");
+    return false;
+  }
+  if (frame.log_time_ns == 0) {
+    RequireSafeStopLocked("frame timestamp is zero");
+    return false;
+  }
+  if (frame.log_time_ns != frame.publish_time_ns) {
+    RequireSafeStopLocked("frame log and publish timestamps differ");
+    return false;
+  }
+  if (frame.log_time_ns <= last_sensor_boundary_timestamp_ns_) {
+    RequireSafeStopLocked("frame arrived after its committed boundary");
     return false;
   }
   auto [boundary, inserted] = pending_.try_emplace(frame.log_time_ns);
   if (!inserted && boundary->second.received[topic_index]) {
-    RequireSafeStopLocked();
+    RequireSafeStopLocked("duplicate topic frame in one timestamp boundary");
     return false;
   }
   boundary->second.received[topic_index] = true;
   boundary->second.frames.push_back(std::move(frame));
-  if (pending_.size() > kMaximumPendingBoundaries) {
-    RequireSafeStopLocked();
+  if (pending_.size() > kMaximumPendingSensorBoundaries) {
+    RequireSafeStopLocked("pending timestamp boundaries exceeded the bounded 10Hz window");
     return false;
   }
   return true;
@@ -76,7 +107,9 @@ std::map<std::uint64_t, InteractiveRecorderWindow::PendingBoundary>::iterator
 InteractiveRecorderWindow::FirstCompleteBoundaryLocked() {
   for (auto boundary = pending_.begin(); boundary != pending_.end(); ++boundary) {
     bool complete = true;
-    for (const bool received : boundary->second.received) complete = complete && received;
+    for (std::size_t topic_index = 2; topic_index < 5; ++topic_index) {
+      complete = complete && boundary->second.received[topic_index];
+    }
     if (complete) return boundary;
   }
   return pending_.end();
@@ -91,12 +124,13 @@ std::vector<RecordedRawFrame> InteractiveRecorderWindow::CommitThroughLocked(std
                      std::make_move_iterator(frames.end()));
   }
   pending_.erase(pending_.begin(), end);
-  last_committed_timestamp_ns_ = timestamp_ns;
+  last_sensor_boundary_timestamp_ns_ = timestamp_ns;
   return committed;
 }
 
-void InteractiveRecorderWindow::RequireSafeStopLocked() {
+void InteractiveRecorderWindow::RequireSafeStopLocked(std::string_view reason) {
   pending_.clear();
+  failure_reason_.assign(reason);
   state_ = State::kSafeStopRequired;
 }
 

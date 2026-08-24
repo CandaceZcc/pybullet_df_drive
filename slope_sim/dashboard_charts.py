@@ -8,6 +8,7 @@ from numbers import Real
 
 from slope_sim.interfaces.config import InterfaceConfig
 from slope_sim.interfaces.dashboard_snapshot import InterfaceDashboardSnapshot
+from slope_sim.interfaces.v2.dashboard_snapshot import V2DashboardSnapshot
 from slope_sim.model_registry import RobotModelSpec
 from slope_sim.telemetry import RobotTelemetry
 
@@ -464,6 +465,104 @@ class InterfaceChartBuffer:
         changed.update(
             self._prune_tabs(INTERFACE_QUALITY_TABS, self._quality_horizon)
         )
+        return changed
+
+    def append_v2(self, snapshot: V2DashboardSnapshot, *, paused: bool = False) -> set[str]:
+        """直接消费 v2 Dashboard 快照，绝不构造旧接口的组合快照。"""
+        if type(snapshot) is not V2DashboardSnapshot:
+            raise ValueError("snapshot must be an exact V2DashboardSnapshot")
+        if type(paused) is not bool:
+            raise ValueError("paused must be a bool")
+        if snapshot.robot_model == "unknown":
+            return set()
+        model_changed = self._robot_model is not None and snapshot.robot_model != self._robot_model.name
+        if snapshot.world_generation != self._generation or model_changed:
+            self.clear()
+            self._generation = snapshot.world_generation
+            from slope_sim.model_registry import get_robot_model
+
+            self._robot_model = get_robot_model(snapshot.robot_model)
+        elif self._robot_model is None:
+            from slope_sim.model_registry import get_robot_model
+
+            self._robot_model = get_robot_model(snapshot.robot_model)
+
+        changed: set[str] = set()
+        if not paused:
+            changed.update(self._append_v2_wheel_state(snapshot))
+            changed.update(self._append_v2_pose_messages(snapshot))
+        timestamps = [
+            value for value in (
+                snapshot.lidar_timestamp_ns,
+                None if snapshot.wheel_state is None else snapshot.wheel_state.timestamp_ns,
+                None if snapshot.rtk is None else snapshot.rtk.timestamp_ns,
+                None if snapshot.imu is None else snapshot.imu.timestamp_ns,
+            ) if type(value) is int
+        ]
+        if timestamps:
+            self._business_horizon = self._advance_horizon(
+                self._business_horizon, max(timestamps) / 1_000_000_000.0,
+            )
+            changed.update(
+                self._prune_tabs(INTERFACE_BUSINESS_TABS, self._business_horizon)
+            )
+        return changed
+
+    def _append_v2_wheel_state(self, snapshot: V2DashboardSnapshot) -> set[str]:
+        state = snapshot.wheel_state
+        model = self._robot_model
+        if state is None or model is None:
+            return set()
+        state_t = self._new_topic_time("wheel_state", state.timestamp_ns)
+        drive_count = len(model.drive_joint_names)
+        steering_count = len(model.steering_joint_names)
+        if state_t is None or not self._finite_values(state.drive_wheel_speed_rad_s, drive_count):
+            return set()
+        if not self._finite_values(state.steering_wheel_angle_rad, steering_count):
+            return set()
+        self._append_row(
+            "驱动反馈",
+            {"t": state_t, **{
+                f"drive_feedback_{index}": value
+                for index, value in enumerate(state.drive_wheel_speed_rad_s)
+            }},
+        )
+        changed = {"驱动反馈"}
+        if steering_count:
+            self._append_row(
+                "转向反馈",
+                {"t": state_t, **{
+                    f"steering_feedback_{index}": value
+                    for index, value in enumerate(state.steering_wheel_angle_rad)
+                }},
+            )
+            changed.add("转向反馈")
+        self._last_topic_time_ns["wheel_state"] = state.timestamp_ns
+        return changed
+
+    def _append_v2_pose_messages(self, snapshot: V2DashboardSnapshot) -> set[str]:
+        changed: set[str] = set()
+        rtk = snapshot.rtk
+        rtk_t = self._new_topic_time("rtk", None if rtk is None else rtk.timestamp_ns)
+        if rtk is not None and rtk_t is not None:
+            values = (rtk.center.x_m, rtk.center.y_m, rtk.center.z_m, rtk.heading_rad)
+            if all(math.isfinite(value) for value in values):
+                self._append_row(
+                    "RTK位置",
+                    {"t": rtk_t, "rtk_x": values[0], "rtk_y": values[1], "rtk_z": values[2]},
+                )
+                self._append_row("RTK航向", {"t": rtk_t, "rtk_yaw": values[3]})
+                self._last_topic_time_ns["rtk"] = rtk.timestamp_ns
+                changed.update(("RTK位置", "RTK航向"))
+        imu = snapshot.imu
+        imu_t = self._new_topic_time("imu", None if imu is None else imu.timestamp_ns)
+        if imu is not None and imu_t is not None:
+            if math.isfinite(imu.roll_rad) and math.isfinite(imu.pitch_rad):
+                self._append_row(
+                    "IMU姿态", {"t": imu_t, "imu_roll": imu.roll_rad, "imu_pitch": imu.pitch_rad},
+                )
+                self._last_topic_time_ns["imu"] = imu.timestamp_ns
+                changed.add("IMU姿态")
         return changed
 
     def series(self, tab_label: str) -> dict[str, list[float]]:

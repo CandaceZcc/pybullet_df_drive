@@ -37,6 +37,19 @@ def test_phase0_retargets_the_existing_python_interpreter_for_ament_package_xml(
     assert '"${STAGE4_ROSIDL_PYTHON_EXECUTABLE}")' in cmake
 
 
+def test_ros_bridge_ctests_expose_the_build_tree_livox_typesupport() -> None:
+    """ROS Bridge 的 CTest 必须能加载同一构建树生成的 Livox typesupport。"""
+    cmake = (Path(__file__).resolve().parents[2] / "cpp" / "phase0" / "CMakeLists.txt").read_text(encoding="utf-8")
+
+    environment = '"LD_LIBRARY_PATH=${CMAKE_CURRENT_BINARY_DIR}/livox_ros_driver2_interfaces:$ENV{LD_LIBRARY_PATH}"'
+    for test_name in (
+        "slope_sim_client_ros2_bridge_integration",
+        "slope_sim_client_ros2_replay_bridge_integration",
+    ):
+        assert cmake.count(test_name) >= 2
+    assert cmake.count(environment) == 2
+
+
 def test_phase0_cmake_resolves_protoc_through_active_configuration_mapping() -> None:
     """Protobuf 导出必须遵循 eCAL 给当前 build type 的配置映射。"""
     cmake_lists = (
