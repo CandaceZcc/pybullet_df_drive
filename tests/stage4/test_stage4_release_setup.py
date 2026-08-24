@@ -177,6 +177,39 @@ def test_release_setup_installs_locked_ecal_configuration(tmp_path: Path) -> Non
     assert (release / "etc" / "ecal" / "ecal.yaml").read_text(encoding="utf-8") == "ecal:\n"
 
 
+def test_release_setup_relocates_fontconfig_paths_out_of_install_staging(
+    tmp_path: Path,
+) -> None:
+    """Fontconfig 配置不得在激活后继续引用已经删除的 staging 前缀。"""
+    module = __import__(
+        "scripts.stage4_release_setup", fromlist=["_relocate_fontconfig_configuration"]
+    )
+    runtime = tmp_path / ".staging" / "5.0.1-123" / "runtime"
+    configuration = runtime / "etc" / "fonts" / "fonts.conf"
+    configuration.parent.mkdir(parents=True)
+    configuration.write_text(
+        "\n".join(
+            (
+                "<fontconfig>",
+                f"  <dir>{runtime}/share/fonts</dir>",
+                f"  <dir>{runtime}/fonts</dir>",
+                f"  <cachedir>{runtime}/var/cache/fontconfig</cachedir>",
+                "</fontconfig>",
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    module._relocate_fontconfig_configuration(runtime)
+
+    relocated = configuration.read_text(encoding="utf-8")
+    assert str(runtime) not in relocated
+    assert '<dir prefix="relative">../../share/fonts</dir>' in relocated
+    assert '<dir prefix="relative">../../fonts</dir>' in relocated
+    assert '<cachedir prefix="relative">../../var/cache/fontconfig</cachedir>' in relocated
+
+
 def test_release_setup_ros_bridge_launcher_exposes_release_libraries(tmp_path: Path) -> None:
     """Bridge wrapper 必须让 ROS 动态加载器找到 release 内 Livox 类型支持库。"""
     module = __import__("scripts.stage4_release_setup", fromlist=["_install_ros_bridge_launcher"])
@@ -297,8 +330,8 @@ def test_release_setup_runs_locked_micromamba_with_supported_basename(
     assert runner.stat().st_mode & 0o111
 
 
-def test_release_setup_probes_mapping_runtime_imports(tmp_path: Path, monkeypatch) -> None:
-    """锁定 Python 创建后必须验证 MCAP 与双 OpenGL 回放依赖可导入。"""
+def test_release_setup_probes_runtime_imports(tmp_path: Path, monkeypatch) -> None:
+    """锁定 Python 创建后必须验证回放和遥控器依赖可导入。"""
     module = __import__("scripts.stage4_release_setup", fromlist=["_create_locked_python_runtime"])
     release = tmp_path / "release"
     micromamba = release / "dependencies" / "micromamba"
@@ -329,7 +362,7 @@ def test_release_setup_probes_mapping_runtime_imports(tmp_path: Path, monkeypatc
     assert commands[-1] == [
         str(runtime_python),
         "-c",
-        "import mcap.reader, pyqtgraph.opengl, OpenGL.GL",
+        "import mcap.reader, pyqtgraph.opengl, OpenGL.GL, serial",
     ]
 
 

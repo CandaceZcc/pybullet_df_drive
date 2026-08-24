@@ -13,7 +13,7 @@
 version: 1
 metadata:
   content_hash:
-    linux-64: ce67e25dfe7a9eef1e513987663b454735fe43db01c3841a6150d83eebfcb37a
+    linux-64: c658bb3b4a810568e3acfaf5c3cba37a3d2f29574a41fb6d66bf4ce080b2f6c3
   channels:
   - url: conda-forge
     used_env_vars: []
@@ -1701,6 +1701,18 @@ package:
   hash:
     md5: 1a9d422262ef2e0928a90dde1da5b33a
     sha256: f1bc737d8c525a6aeaa687fd4e6ab9d07871be089ec1824349c9dd598e0420ea
+  category: main
+  optional: false
+- name: pyserial
+  version: '3.5'
+  manager: conda
+  platform: linux-64
+  dependencies:
+    python: '>=3.10'
+  url: https://conda.anaconda.org/conda-forge/noarch/pyserial-3.5-pyhcf101f3_2.conda
+  hash:
+    md5: b27a6cd32160c34682ce6053b04c12c6
+    sha256: 8c618e8ca376d73133c9971abe45463a48c9cfb529788d609fd19568764941ba
   category: main
   optional: false
 - name: pyside6

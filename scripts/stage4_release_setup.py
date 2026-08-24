@@ -380,6 +380,28 @@ def _install_locked_ecal_deb(
     return _ecal_config_directory(prefix)
 
 
+def _relocate_fontconfig_configuration(runtime: Path) -> None:
+    """把 Conda 写入 fonts.conf 的 staging 绝对路径改为可迁移相对路径。"""
+    configuration = runtime / "etc" / "fonts" / "fonts.conf"
+    if configuration.is_symlink() or not configuration.is_file():
+        raise ValueError("locked Fontconfig configuration is invalid")
+    content = configuration.read_text(encoding="utf-8")
+    replacements = {
+        f"<dir>{runtime}/share/fonts</dir>": '<dir prefix="relative">../../share/fonts</dir>',
+        f"<dir>{runtime}/fonts</dir>": '<dir prefix="relative">../../fonts</dir>',
+        f"<cachedir>{runtime}/var/cache/fontconfig</cachedir>": (
+            '<cachedir prefix="relative">../../var/cache/fontconfig</cachedir>'
+        ),
+    }
+    for embedded, relocatable in replacements.items():
+        if content.count(embedded) != 1:
+            raise ValueError("locked Fontconfig paths are invalid")
+        content = content.replace(embedded, relocatable)
+    if str(runtime) in content:
+        raise ValueError("locked Fontconfig configuration is not relocatable")
+    configuration.write_text(content, encoding="utf-8")
+
+
 def _create_locked_python_runtime(
     release_root: Path, dependencies_dir: Path, dependencies: list[dict[str, str]], build_root: Path
 ) -> Path | None:
@@ -436,10 +458,13 @@ def _create_locked_python_runtime(
         check=True,
         env=environment,
     )
+    fontconfig = runtime / "etc" / "fonts" / "fonts.conf"
+    if fontconfig.exists() or fontconfig.is_symlink():
+        _relocate_fontconfig_configuration(runtime)
     python = _locked_runtime_python(runtime)
     _install_locked_python_wheels(python, dependencies_dir, dependencies)
     subprocess.run(
-        [str(python), "-c", "import mcap.reader, pyqtgraph.opengl, OpenGL.GL"],
+        [str(python), "-c", "import mcap.reader, pyqtgraph.opengl, OpenGL.GL, serial"],
         check=True,
     )
     return runtime

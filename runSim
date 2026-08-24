@@ -13,7 +13,7 @@ else
 fi
 
 if [ "${1-}" = "--version" ]; then
-  printf '%s\n' 'runSim 5.0.0'
+  printf '%s\n' 'runSim 5.0.1'
   exit 0
 fi
 
@@ -22,6 +22,13 @@ cd "$root"
 # release manifest 覆盖全部常规文件；禁止 Python 在安装目录落下 __pycache__，
 # 否则正常启动后会被下一次同版本安装误判为篡改。
 export PYTHONDONTWRITEBYTECODE=1
+
+# Conda Fontconfig 会把安装前缀写入默认配置查找路径；release 从 staging
+# 原子激活后该前缀已不存在，因此必须显式指向随 runtime 发布的配置。
+if [ -z "${FONTCONFIG_FILE:-}" ] && [ -z "${FONTCONFIG_PATH:-}" ] && [ -f "$root/runtime/etc/fonts/fonts.conf" ]; then
+  export FONTCONFIG_FILE="$root/runtime/etc/fonts/fonts.conf"
+  export FONTCONFIG_PATH="$root/runtime/etc/fonts"
+fi
 
 # 已安装 release 自带 eCAL 数据与 localtime plugin 时直接使用；调用者显式
 # 设置的路径始终优先，便于诊断或接入受管 eCAL 环境。

@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "version": "5.0.0",
+  "version": "5.0.1",
   "runtime_setup": {
     "entrypoint": "scripts/stage4_release_setup.py"
   },

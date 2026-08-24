@@ -22,7 +22,7 @@ def test_run_sim_reports_its_version_without_requiring_conda() -> None:
     )
 
     assert completed.returncode == 0, completed.stderr
-    assert completed.stdout == "runSim 5.0.0\n"
+    assert completed.stdout == "runSim 5.0.1\n"
     assert completed.stderr == ""
 
 
@@ -124,6 +124,66 @@ def test_installed_run_sim_supplies_its_bundled_ecal_defaults(tmp_path: Path) ->
         str(release / "etc" / "ecal"),
         str(release / "lib"),
     ]
+
+
+def test_installed_run_sim_supplies_its_bundled_fontconfig_defaults(tmp_path: Path) -> None:
+    """内嵌 Fontconfig 不能继续查找安装 staging 中已经消失的配置。"""
+    release = tmp_path / "release"
+    launcher = release / "bin" / "runSim"
+    runtime = release / "runtime" / "bin" / "python"
+    launcher.parent.mkdir(parents=True)
+    runtime.parent.mkdir(parents=True)
+    (release / "runtime" / "etc" / "fonts").mkdir(parents=True)
+    shutil.copy2(ROOT / "runSim", launcher)
+    (release / "main.py").write_text("# release entrypoint\n", encoding="utf-8")
+    (release / "runtime" / "etc" / "fonts" / "fonts.conf").write_text(
+        "<fontconfig/>\n", encoding="utf-8"
+    )
+    runtime.write_text(
+        "#!/usr/bin/env sh\nprintf '%s\\n%s\\n' \"$FONTCONFIG_FILE\" \"$FONTCONFIG_PATH\"\n",
+        encoding="utf-8",
+    )
+    runtime.chmod(0o755)
+
+    completed = subprocess.run([str(launcher), "--help"], capture_output=True, text=True)
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.splitlines() == [
+        str(release / "runtime" / "etc" / "fonts" / "fonts.conf"),
+        str(release / "runtime" / "etc" / "fonts"),
+    ]
+
+
+def test_installed_run_sim_preserves_explicit_fontconfig_configuration(tmp_path: Path) -> None:
+    """调用者显式指定的 Fontconfig 配置必须优先于 release 默认值。"""
+    release = tmp_path / "release"
+    launcher = release / "bin" / "runSim"
+    runtime = release / "runtime" / "bin" / "python"
+    launcher.parent.mkdir(parents=True)
+    runtime.parent.mkdir(parents=True)
+    (release / "runtime" / "etc" / "fonts").mkdir(parents=True)
+    shutil.copy2(ROOT / "runSim", launcher)
+    (release / "main.py").write_text("# release entrypoint\n", encoding="utf-8")
+    (release / "runtime" / "etc" / "fonts" / "fonts.conf").write_text(
+        "<fontconfig/>\n", encoding="utf-8"
+    )
+    runtime.write_text(
+        "#!/usr/bin/env sh\nprintf '%s\\n%s\\n' \"$FONTCONFIG_FILE\" \"$FONTCONFIG_PATH\"\n",
+        encoding="utf-8",
+    )
+    runtime.chmod(0o755)
+    environment = {
+        **os.environ,
+        "FONTCONFIG_FILE": "/managed/fonts.conf",
+        "FONTCONFIG_PATH": "/managed/fonts",
+    }
+
+    completed = subprocess.run(
+        [str(launcher), "--help"], capture_output=True, text=True, env=environment
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.splitlines() == ["/managed/fonts.conf", "/managed/fonts"]
 
 
 def test_installed_run_sim_prevents_release_bytecode_writes(tmp_path: Path) -> None:

@@ -120,10 +120,10 @@ runSim
 
 # 可选真实 SBUS 遥控器：仅接受稳定 by-id 路径，并在启动前完成 20 帧资格检查
 runSim \
-  --rc-port /dev/serial/by-id/usb-<device>
+  --rc-port /dev/serial/by-id/usb-FTDI_Quad_RS232-HS-if02-port0
 ```
 
-`--command-dir` 只会创建它管理的 `runSim` 软链接；如果目标已有普通文件或其他链接，安装会拒绝覆盖。安装器 manifest 记录构建时 Git commit。`--with-ros` 仅在需要 ROS 2 bridge/RViz2 时使用，Livox Viewer 2 本身已包含在普通安装中。
+当前修复版的 `runSim --version` 应输出 `runSim 5.0.1`。release 已内置 `pyserial`，不要再向系统 Python 或安装目录执行 `pip install`；同时启动器会在调用者没有显式覆盖时使用包内 Fontconfig 配置，避免激活后继续访问已删除的安装 staging。`--command-dir` 只会创建它管理的 `runSim` 软链接；如果目标已有普通文件或其他链接，安装会拒绝覆盖。安装器 manifest 记录构建时 Git commit。`--with-ros` 仅在需要 ROS 2 bridge/RViz2 时使用，Livox Viewer 2 本身已包含在普通安装中。
 
 ## 运行
 
@@ -176,6 +176,18 @@ runSim --no-dashboard --developer-diagnostics \
 ```
 
 `runSim` 无参数等价于 GUI、手动、v2 实时和 `ecal` 模式。安装包中的 eCAL 配置与 localtime 插件会自动载入；显式设置 `ECAL_CONFIG_PATH`、`ECAL_DATA`、`ECAL_TIME_PLUGIN_PATH` 或相应 CLI 参数可覆盖默认值。
+
+若需要同时观察控制链、Fontconfig/GLX 和遥控器状态，使用：
+
+```bash
+runSim \
+  --developer-diagnostics \
+  --target-linear-velocity 1.5 \
+  --robot-model df_mid --terrain-model slope --slope-deg 8 \
+  --rc-port /dev/serial/by-id/usb-FTDI_Quad_RS232-HS-if02-port0
+```
+
+只有上述 by-id 路径存在时才加入 `--rc-port`。USB 未接入时删除该参数，不能回退到 `/dev/ttyUSB*`；Dashboard 中先将 CH6 低→高完成解锁，再选择“遥控器”。
 
 采集控制也可从 Dashboard 的“MID-360 采集”页操作。成功导出后，输出目录包含 `session.mcap`、`export/lidar.lvx2`、逐帧 PCD/PLY 和导出回执；默认目录为 `results/manual-mid360/`。
 

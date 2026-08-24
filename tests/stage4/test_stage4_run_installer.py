@@ -28,7 +28,7 @@ def test_formal_release_manifest_locks_the_eight_delivery_dependencies() -> None
 
     manifest = module._manifest(RELEASE_MANIFEST)
 
-    assert manifest["version"] == "5.0.0"
+    assert manifest["version"] == "5.0.1"
     assert "with_ros" not in manifest
     assert manifest["payload"] is None
     assert manifest["runtime_setup"] == {"entrypoint": "scripts/stage4_release_setup.py"}
@@ -90,6 +90,21 @@ def test_formal_release_python_runtime_locks_pip_for_embedded_wheels() -> None:
     assert "  - pip\n" in environment
     assert "- name: pip\n" in conda_lock
     assert "/pip-" in explicit_lock
+
+
+def test_formal_release_python_runtime_locks_pyserial_for_rc_input() -> None:
+    """正式 runtime 必须离线包含遥控器串口读取所需的 pyserial。"""
+    environment = (ROOT / "packaging" / "python-environment.yml").read_text(encoding="utf-8")
+    conda_lock = (ROOT / "packaging" / "locks" / "python.conda-lock.yml").read_text(
+        encoding="utf-8"
+    )
+    explicit_lock = (ROOT / "packaging" / "locks" / "python-linux-64.lock").read_text(
+        encoding="utf-8"
+    )
+
+    assert "  - pyserial\n" in environment
+    assert "- name: pyserial\n" in conda_lock
+    assert "/pyserial-" in explicit_lock
 
 
 def test_formal_system_lock_includes_the_viewer_sandbox() -> None:
