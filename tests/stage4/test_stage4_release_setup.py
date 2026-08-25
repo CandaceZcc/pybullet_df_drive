@@ -201,6 +201,21 @@ def test_stage4_runtime_lock_covers_import_time_pandas_dependency() -> None:
     assert "/pandas-" in lock
 
 
+def test_stage4_runtime_lock_covers_rc_serial_dependency() -> None:
+    """干净安装的生产 runtime 必须能导入遥控器串口依赖。"""
+    environment = (ROOT / "packaging" / "python-environment.yml").read_text(encoding="utf-8")
+    conda_lock = (ROOT / "packaging" / "locks" / "python.conda-lock.yml").read_text(
+        encoding="utf-8"
+    )
+    explicit_lock = (ROOT / "packaging" / "locks" / "python-linux-64.lock").read_text(
+        encoding="utf-8"
+    )
+
+    assert "  - pyserial\n" in environment
+    assert "- name: pyserial\n" in conda_lock
+    assert "/pyserial-" in explicit_lock
+
+
 def test_release_setup_bypasses_the_slow_proxy_only_for_locked_conda_runtime(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -297,8 +312,8 @@ def test_release_setup_runs_locked_micromamba_with_supported_basename(
     assert runner.stat().st_mode & 0o111
 
 
-def test_release_setup_probes_mapping_runtime_imports(tmp_path: Path, monkeypatch) -> None:
-    """锁定 Python 创建后必须验证 MCAP 与双 OpenGL 回放依赖可导入。"""
+def test_release_setup_probes_runtime_imports(tmp_path: Path, monkeypatch) -> None:
+    """锁定 Python 创建后必须验证串口、MCAP 与双 OpenGL 依赖可导入。"""
     module = __import__("scripts.stage4_release_setup", fromlist=["_create_locked_python_runtime"])
     release = tmp_path / "release"
     micromamba = release / "dependencies" / "micromamba"
@@ -329,7 +344,7 @@ def test_release_setup_probes_mapping_runtime_imports(tmp_path: Path, monkeypatc
     assert commands[-1] == [
         str(runtime_python),
         "-c",
-        "import mcap.reader, pyqtgraph.opengl, OpenGL.GL",
+        "import serial, mcap.reader, pyqtgraph.opengl, OpenGL.GL",
     ]
 
 

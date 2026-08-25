@@ -439,7 +439,7 @@ def _create_locked_python_runtime(
     python = _locked_runtime_python(runtime)
     _install_locked_python_wheels(python, dependencies_dir, dependencies)
     subprocess.run(
-        [str(python), "-c", "import mcap.reader, pyqtgraph.opengl, OpenGL.GL"],
+        [str(python), "-c", "import serial, mcap.reader, pyqtgraph.opengl, OpenGL.GL"],
         check=True,
     )
     return runtime
