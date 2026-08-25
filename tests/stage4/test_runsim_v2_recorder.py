@@ -314,3 +314,32 @@ def test_recorder_close_kills_an_unresponsive_process_group(tmp_path: Path, monk
     assert signals == [(process.pid, signal.SIGTERM), (process.pid, signal.SIGKILL)]
     assert process.wait_timeouts == [2.0, 1.0, 1.0]
     assert not control_dir.exists()
+
+
+def test_recorder_stop_preserves_the_first_child_failure(tmp_path: Path) -> None:
+    """子进程先失败时，stop 不得用泛化的“不再运行”覆盖原始故障。"""
+    import pytest
+
+    from slope_sim.interfaces.v2.runsim_v2_recorder import RunSimV2Recorder
+
+    class FailedProcess:
+        @staticmethod
+        def poll() -> int:
+            return 1
+
+    control_dir = tmp_path / "private"
+    control_dir.mkdir(mode=0o700)
+    (tmp_path / "recorder.result.json").write_text(
+        json.dumps({"clean_shutdown": False, "fault_reason": "WheelState sequence is not continuous"}),
+        encoding="utf-8",
+    )
+    recorder = RunSimV2Recorder(
+        process=FailedProcess(),
+        control_socket=control_dir / "recorder.sock",
+        control_token=b"t" * 32,
+        control_dir=control_dir,
+        output_dir=tmp_path,
+    )
+
+    with pytest.raises(RuntimeError, match="WheelState sequence is not continuous"):
+        recorder.stop()

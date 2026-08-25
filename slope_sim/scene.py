@@ -10,9 +10,9 @@ from numbers import Integral
 import pybullet as p
 
 from slope_sim.telemetry import TerrainProbe
+from slope_sim.terrain_models import STAGE1_TERRAIN_MODELS, terrain_model_names
 
 
-STAGE1_TERRAIN_MODELS = ("flat", "slope", "golf_heightfield")
 STAGE1_TERRAIN_LENGTH = 20.0
 STAGE1_TERRAIN_WIDTH = 12.0
 SLOPE_UPPER_LENGTH = 4.0
@@ -68,11 +68,6 @@ class SceneInfo:
         """兼容旧调用：未显式传 body_ids 时，主地形就是唯一地形体。"""
         if not self.body_ids:
             object.__setattr__(self, "body_ids", (self.body_id,))
-
-
-def terrain_model_names() -> tuple[str, ...]:
-    """返回阶段一可从配置和命令行选择的三类场地。"""
-    return STAGE1_TERRAIN_MODELS
 
 
 def golf_corridor_center(seed: int, normalized_x: float) -> float:

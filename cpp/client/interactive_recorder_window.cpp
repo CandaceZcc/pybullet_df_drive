@@ -37,11 +37,21 @@ std::vector<RecordedRawFrame> InteractiveRecorderWindow::Observe(
     // can participate in the sensor timestamp boundary, so they are accepted
     // only after that boundary authorizes recording.
     if (state_ == State::kAwaitingStartBoundary) return {};
-    if (topic_index == 1 && frame.log_time_ns <= last_sensor_boundary_timestamp_ns_) {
-      RequireSafeStopLocked("wheel state arrived after its sensor boundary");
+    if (topic_index == 0) return {std::move(frame)};
+    if (frame.log_time_ns <= last_sensor_boundary_timestamp_ns_) {
+      ++dropped_late_wheel_state_count_;
       return {};
     }
-    return {std::move(frame)};
+    const auto [entry, inserted] = pending_wheel_states_.try_emplace(
+        frame.log_time_ns, std::move(frame));
+    if (!inserted) {
+      RequireSafeStopLocked("duplicate WheelState timestamp in bounded reorder window");
+      return {};
+    }
+    if (pending_wheel_states_.size() > kMaximumPendingWheelStates) {
+      RequireSafeStopLocked("pending WheelState frames exceeded the bounded reorder window");
+    }
+    return {};
   }
   if (!AddLocked(topic_index, std::move(frame))) return {};
   auto boundary = FirstCompleteBoundaryLocked();
@@ -70,6 +80,11 @@ InteractiveRecorderWindow::State InteractiveRecorderWindow::state() const noexce
 std::string InteractiveRecorderWindow::failure_reason() const {
   std::lock_guard<std::mutex> lock(mutex_);
   return failure_reason_;
+}
+
+std::size_t InteractiveRecorderWindow::dropped_late_wheel_state_count() const noexcept {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return dropped_late_wheel_state_count_;
 }
 
 bool InteractiveRecorderWindow::AddLocked(std::size_t topic_index, RecordedRawFrame frame) {
@@ -124,12 +139,18 @@ std::vector<RecordedRawFrame> InteractiveRecorderWindow::CommitThroughLocked(std
                      std::make_move_iterator(frames.end()));
   }
   pending_.erase(pending_.begin(), end);
+  const auto wheel_end = pending_wheel_states_.upper_bound(timestamp_ns);
+  for (auto entry = pending_wheel_states_.begin(); entry != wheel_end; ++entry) {
+    committed.push_back(std::move(entry->second));
+  }
+  pending_wheel_states_.erase(pending_wheel_states_.begin(), wheel_end);
   last_sensor_boundary_timestamp_ns_ = timestamp_ns;
   return committed;
 }
 
 void InteractiveRecorderWindow::RequireSafeStopLocked(std::string_view reason) {
   pending_.clear();
+  pending_wheel_states_.clear();
   failure_reason_.assign(reason);
   state_ = State::kSafeStopRequired;
 }

@@ -1,6 +1,7 @@
 """阶段四 B2：独立渲染 v2 有界快照的最小 PySide6 Dashboard。"""
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor
 import hashlib
 import json
 from pathlib import Path
@@ -9,10 +10,8 @@ from typing import Callable
 from collections import deque
 
 import numpy as np
-from pyqtgraph import Vector
-import pyqtgraph.opengl as gl
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor, QPainterPath, QPen
+from PySide6.QtCore import QTimer, Qt
+from PySide6.QtGui import QColor, QImage, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (
     QFormLayout,
     QComboBox,
@@ -43,8 +42,10 @@ _EVIDENCE_SECTIONS = (
     "recorder", "replay", "export", "viewer_startup", "viewer_display",
 )
 _PREVIEW_MAX_HZ = 5.0
+_CLOUD_RENDER_MAX_HZ = 10.0
 _MAX_CLOUD_HISTORY_FRAMES = 512
 _MAX_CLOUD_RENDER_POINTS = 80_000
+_CLOUD_IMAGE_SIZE = (960, 540)
 _CLOUD_CAMERA_PRESETS = {
     "透视": {"distance": 24.0, "elevation": 26.0, "azimuth": 45.0},
     "俯视": {"distance": 24.0, "elevation": 90.0, "azimuth": 0.0},
@@ -233,7 +234,6 @@ class V2DashboardWidget(QWidget):
         *,
         offline_viewer_launcher: Callable[[Path], None] | None = None,
         live_viewer_launcher: Callable[[], Callable[[], None]] | None = None,
-        render_gl: bool = True,
     ) -> None:
         if type(descriptor) is not DescriptorIdentity:
             raise ValueError("descriptor must be an exact DescriptorIdentity")
@@ -241,14 +241,27 @@ class V2DashboardWidget(QWidget):
             raise ValueError("offline_viewer_launcher must be callable")
         if live_viewer_launcher is not None and not callable(live_viewer_launcher):
             raise ValueError("live_viewer_launcher must be callable")
-        if type(render_gl) is not bool:
-            raise ValueError("render_gl must be a bool")
         super().__init__()
         self._descriptor = descriptor
         self._offline_viewer_launcher = offline_viewer_launcher
         # 仅保存受信 launcher 交回的关闭句柄；完整点云始终不进入 Dashboard。
         self._live_viewer_launcher = live_viewer_launcher
-        self._cloud_gl_available = render_gl
+        self._cloud_camera = dict(_CLOUD_CAMERA_PRESETS["透视"])
+        self._cloud_camera["target"] = np.zeros(3, dtype=np.float32)
+        self._cloud_next_render_at = 0.0
+        self._cloud_render_failed = False
+        self._cloud_render_failure = ""
+        self._cloud_render_dropped_count = 0
+        self._cloud_last_render_duration_ms = 0.0
+        self._cloud_render_generation = 0
+        self._cloud_render_pending = False
+        self._cloud_render_inflight: Future[tuple[int, QImage, float]] | None = None
+        self._cloud_render_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="runsim-cloud-image",
+        )
+        self._cloud_render_timer = QTimer(self)
+        self._cloud_render_timer.setInterval(20)
+        self._cloud_render_timer.timeout.connect(self._collect_cloud_render)
         self._live_viewer_close: Callable[[], None] | None = None
         self._offline_viewer_lvx2: Path | None = None
         self._last_store_revision: tuple[object, ...] | None = None
@@ -417,48 +430,19 @@ class V2DashboardWidget(QWidget):
         return self.interface_panel, self.lidar_panel
 
     def _create_cloud_workbench(self, layout: QVBoxLayout, parent: QWidget) -> None:
-        """创建由 GUI 线程独占的 OpenGL 工作台；eCAL worker 不直接操作这些对象。"""
+        """创建不依赖 OpenGL 上下文的 QImage 点云工作台。"""
         self.cloud_workbench = QGroupBox("MID-360 实时点云工作台", parent)
         self.cloud_workbench.setCheckable(True)
         self.cloud_workbench.setChecked(False)
         self.cloud_workbench.setMaximumHeight(34)
         workbench_layout = QVBoxLayout(self.cloud_workbench)
-        if not self._cloud_gl_available:
-            self.cloud_view = None
-            self.cloud_grid = None
-            self.cloud_axis = None
-            self.cloud_scatter = None
-            self.cloud_vehicle_marker = None
-            workbench_layout.addWidget(
-                QLabel("offscreen 截图不渲染 OpenGL 点云；真实 X11 工作台可用", self.cloud_workbench),
-            )
-        else:
-            self.cloud_view = gl.GLViewWidget(self.cloud_workbench)
-            self.cloud_view.setMinimumHeight(360)
-            self.cloud_view.setCameraPosition(distance=24.0, elevation=26.0, azimuth=45.0)
-            self.cloud_grid = gl.GLGridItem()
-            self.cloud_grid.setSize(40.0, 40.0)
-            self.cloud_grid.setSpacing(1.0, 1.0)
-            self.cloud_axis = gl.GLAxisItem()
-            self.cloud_axis.setSize(2.0, 2.0, 2.0)
-            self.cloud_scatter = gl.GLScatterPlotItem(
-                pos=np.empty((0, 3), dtype=np.float32),
-                color=np.empty((0, 4), dtype=np.float32),
-                size=3.0,
-                pxMode=True,
-            )
-            self.cloud_vehicle_marker = gl.GLLinePlotItem(
-                pos=np.empty((0, 3), dtype=np.float32),
-                color=(0.96, 0.96, 0.96, 1.0),
-                width=3.0,
-                antialias=True,
-            )
-            self.cloud_view.addItem(self.cloud_grid)
-            self.cloud_view.addItem(self.cloud_axis)
-            self.cloud_view.addItem(self.cloud_scatter)
-            self.cloud_view.addItem(self.cloud_vehicle_marker)
-            self.cloud_view.setVisible(False)
-            workbench_layout.addWidget(self.cloud_view, stretch=1)
+        self.cloud_canvas = QLabel(self.cloud_workbench)
+        self.cloud_canvas.setMinimumHeight(360)
+        self.cloud_canvas.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.cloud_canvas.setStyleSheet("background: #10151c;")
+        self.cloud_canvas.setPixmap(QPixmap.fromImage(self._empty_cloud_image()))
+        self.cloud_canvas.setVisible(False)
+        workbench_layout.addWidget(self.cloud_canvas, stretch=1)
 
         self.cloud_controls = QWidget(self.cloud_workbench)
         controls = QVBoxLayout(self.cloud_controls)
@@ -514,21 +498,18 @@ class V2DashboardWidget(QWidget):
         layout.addWidget(self.cloud_workbench)
 
     def _set_cloud_point_size(self, size: int) -> None:
-        if not self._cloud_gl_available:
-            return
-        assert self.cloud_scatter is not None
-        self.cloud_scatter.setData(size=float(size))
+        del size
+        self._render_cloud(force=True)
 
     def _reset_cloud_view(self) -> None:
         self.cloud_camera_preset.setCurrentText("透视")
         self._set_cloud_camera_preset("透视")
 
     def _set_cloud_camera_preset(self, preset: str) -> None:
-        """用固定预设恢复可比较的 OpenGL 观察方向。"""
-        if not self._cloud_gl_available:
-            return
-        assert self.cloud_view is not None
-        self.cloud_view.setCameraPosition(**_CLOUD_CAMERA_PRESETS[preset])
+        """用固定预设恢复可比较的 CPU 投影视角。"""
+        self._cloud_camera = dict(_CLOUD_CAMERA_PRESETS[preset])
+        self._cloud_camera["target"] = np.zeros(3, dtype=np.float32)
+        self._render_cloud(force=True)
 
     def _cloud_render_data(self) -> tuple[np.ndarray, np.ndarray]:
         """按显示模式先跨帧等距抽样，再构造有界散点输入。"""
@@ -561,25 +542,160 @@ class V2DashboardWidget(QWidget):
             np.concatenate(tag_chunks, axis=0),
         )
 
-    def _render_cloud(self) -> None:
-        """重绘当前或累计 world 点，并同步车辆的平面前向标记。"""
-        if not self._cloud_gl_available:
-            return
-        assert self.cloud_scatter is not None and self.cloud_vehicle_marker is not None
-        positions, tags = self._cloud_render_data()
-        self.cloud_scatter.setData(
-            pos=positions,
-            color=self._cloud_colors(positions, tags),
-            size=float(self.cloud_point_size_slider.value()),
+    @staticmethod
+    def _empty_cloud_image() -> QImage:
+        image = QImage(*_CLOUD_IMAGE_SIZE, QImage.Format.Format_RGBA8888)
+        image.fill(QColor("#10151c"))
+        painter = QPainter(image)
+        painter.setPen(QPen(QColor("#33404d"), 1))
+        width, height = image.width(), image.height()
+        for offset in range(0, width + 1, 48):
+            painter.drawLine(offset, 0, offset, height)
+        for offset in range(0, height + 1, 48):
+            painter.drawLine(0, offset, width, offset)
+        painter.setPen(QPen(QColor("#697888"), 1))
+        painter.drawLine(width // 2, 0, width // 2, height)
+        painter.drawLine(0, height // 2, width, height // 2)
+        painter.end()
+        return image
+
+    @staticmethod
+    def _project_cloud_points(
+        positions: np.ndarray, camera: dict[str, object] | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """将有界 world 点投影到图像；不触碰任何 GL/驱动上下文。"""
+        if not len(positions):
+            return np.empty((0, 2), dtype=np.int32), np.empty(0, dtype=bool)
+        if camera is None:
+            camera = {**_CLOUD_CAMERA_PRESETS["透视"], "target": np.zeros(3, dtype=np.float32)}
+        target = np.asarray(camera["target"], dtype=np.float32)
+        azimuth = np.deg2rad(float(camera["azimuth"]))
+        elevation = np.deg2rad(float(camera["elevation"]))
+        relative = positions - target
+        cos_azimuth, sin_azimuth = np.cos(azimuth), np.sin(azimuth)
+        x = cos_azimuth * relative[:, 0] - sin_azimuth * relative[:, 1]
+        depth = sin_azimuth * relative[:, 0] + cos_azimuth * relative[:, 1]
+        cos_elevation, sin_elevation = np.cos(elevation), np.sin(elevation)
+        vertical = cos_elevation * relative[:, 2] - sin_elevation * depth
+        depth = sin_elevation * relative[:, 2] + cos_elevation * depth
+        distance = max(1.0, float(camera["distance"]))
+        scale = 0.46 * min(_CLOUD_IMAGE_SIZE) / np.maximum(distance + depth, distance * 0.15)
+        points = np.column_stack((
+            _CLOUD_IMAGE_SIZE[0] / 2.0 + x * scale,
+            _CLOUD_IMAGE_SIZE[1] / 2.0 - vertical * scale,
+        )).astype(np.int32)
+        visible = (
+            (distance + depth > distance * 0.05)
+            & (points[:, 0] >= 0) & (points[:, 0] < _CLOUD_IMAGE_SIZE[0])
+            & (points[:, 1] >= 0) & (points[:, 1] < _CLOUD_IMAGE_SIZE[1])
         )
+        return points, visible
+
+    def _render_cloud(self, *, force: bool = False) -> None:
+        """把有界绘制输入交给唯一后台任务；GUI 线程只提交完成图像。"""
+        if self._cloud_render_failed or not self.cloud_workbench.isChecked():
+            return
+        now = time.monotonic()
+        if not force and now < self._cloud_next_render_at:
+            self._cloud_render_dropped_count += 1
+            return
+        if self._cloud_render_inflight is not None:
+            self._cloud_render_dropped_count += 1
+            self._cloud_render_pending = True
+            return
+        self._cloud_next_render_at = now + 1.0 / _CLOUD_RENDER_MAX_HZ
+        positions, tags = self._cloud_render_data()
         frame = self._last_cloud_frame
-        if frame is None:
-            marker = np.empty((0, 3), dtype=np.float32)
-        else:
-            origin = np.asarray(frame.vehicle_position, dtype=np.float32)
-            forward = np.asarray(frame.vehicle_forward, dtype=np.float32)
-            marker = np.asarray((origin, origin + forward * 1.5), dtype=np.float32)
-        self.cloud_vehicle_marker.setData(pos=marker, color=(0.96, 0.96, 0.96, 1.0), width=3.0)
+        camera = {
+            key: (np.asarray(value, dtype=np.float32).copy() if key == "target" else value)
+            for key, value in self._cloud_camera.items()
+        }
+        self._cloud_render_generation += 1
+        self._cloud_render_inflight = self._cloud_render_executor.submit(
+            self._build_cloud_image,
+            self._cloud_render_generation,
+            positions,
+            tags,
+            frame,
+            camera,
+            self.cloud_color_mode.currentText(),
+            self.cloud_point_size_slider.value(),
+        )
+        self._cloud_render_timer.start()
+
+    def _collect_cloud_render(self) -> None:
+        """在 GUI 线程提交后台完成的 QImage，并对首次异常熔断。"""
+        future = self._cloud_render_inflight
+        if future is None or not future.done():
+            return
+        self._cloud_render_inflight = None
+        self._cloud_render_timer.stop()
+        render_pending = self._cloud_render_pending
+        self._cloud_render_pending = False
+        try:
+            generation, image, duration_ms = future.result()
+            if generation == self._cloud_render_generation and self.cloud_workbench.isChecked():
+                self.cloud_canvas.setPixmap(QPixmap.fromImage(image))
+                self._cloud_last_render_duration_ms = duration_ms
+                self._update_cloud_status()
+        except Exception as error:
+            self._cloud_render_failed = True
+            self._cloud_render_failure = f"{type(error).__name__}: {error}"
+            self.cloud_status.setText(
+                f"点云显示已暂停：{self._cloud_render_failure}。折叠后重新展开可恢复。"
+            )
+            self.cloud_diagnostics.appendPlainText(
+                f"renderer circuit-breaker: {self._cloud_render_failure}"
+            )
+            return
+        if render_pending:
+            self._render_cloud(force=True)
+
+    @classmethod
+    def _build_cloud_image(
+        cls,
+        generation: int,
+        positions: np.ndarray,
+        tags: np.ndarray,
+        frame: object | None,
+        camera: dict[str, object],
+        color_mode: str,
+        point_size: int,
+    ) -> tuple[int, QImage, float]:
+        """后台仅处理不可变 NumPy 帧并返回 QImage，不读取 QWidget 状态。"""
+        started_at = time.monotonic()
+        image = cls._empty_cloud_image()
+        projected, visible = cls._project_cloud_points(positions, camera)
+        colors = (cls._cloud_colors_for_mode(positions, tags, color_mode)[:, :3] * 255).astype(np.uint8)
+        colors = (colors // 32 * 32).astype(np.uint8)
+        visible_points = projected[visible]
+        visible_colors = colors[visible]
+        if len(visible_points):
+            # RGBA8888 与 NumPy byte view 同序，批量写像素避开 80k 次 Qt 调用。
+            pixels = np.frombuffer(image.bits(), dtype=np.uint8).reshape(
+                image.height(), image.bytesPerLine(),
+            )
+            radius = max(0, point_size - 1) // 2
+            for offset_y in range(-radius, radius + 1):
+                y = np.clip(visible_points[:, 1] + offset_y, 0, image.height() - 1)
+                for offset_x in range(-radius, radius + 1):
+                    x = np.clip(visible_points[:, 0] + offset_x, 0, image.width() - 1)
+                    pixels[y, x * 4] = visible_colors[:, 0]
+                    pixels[y, x * 4 + 1] = visible_colors[:, 1]
+                    pixels[y, x * 4 + 2] = visible_colors[:, 2]
+                    pixels[y, x * 4 + 3] = 255
+        painter = QPainter(image)
+        if frame is not None:
+            marker, marker_visible = cls._project_cloud_points(np.asarray((
+                frame.vehicle_position,
+                np.asarray(frame.vehicle_position) + np.asarray(frame.vehicle_forward) * 1.5,
+            ), dtype=np.float32), camera)
+            if bool(marker_visible.all()):
+                painter.setPen(QPen(QColor("#f4f4f4"), 3))
+                painter.drawLine(int(marker[0, 0]), int(marker[0, 1]),
+                                 int(marker[1, 0]), int(marker[1, 1]))
+        painter.end()
+        return generation, image, (time.monotonic() - started_at) * 1_000.0
 
     def _show_current_cloud_frame(self) -> None:
         """从窄侧栏的一键入口切到持续更新的当前帧视图。"""
@@ -612,36 +728,38 @@ class V2DashboardWidget(QWidget):
         )
         rendered_count = (display_count + render_step - 1) // render_step
         self.cloud_status.setText(
-            "%s | seq=%d | 本帧=%d | 时间窗=%0.1fs | 显示=%d"
+            "%s | seq=%d | 本帧=%d | 时间窗=%0.1fs | 显示=%d | render=%0.1fms | drop=%d"
             % (
                 self.cloud_display_mode.currentText(),
                 frame.sequence,
                 len(frame.positions),
                 window_ns / 1_000_000_000,
                 rendered_count,
+                self._cloud_last_render_duration_ms,
+                self._cloud_render_dropped_count,
             )
         )
 
     def _fit_cloud_view(self) -> None:
         """使当前显示点范围居中，空帧时回到可重现的默认透视。"""
-        if not self._cloud_gl_available:
-            return
-        assert self.cloud_view is not None
         positions, _tags = self._cloud_render_data()
         if not len(positions):
             self._reset_cloud_view()
             return
         lower, upper = positions.min(axis=0), positions.max(axis=0)
         distance = max(6.0, float(np.linalg.norm(upper - lower)) * 2.2)
-        self.cloud_view.setCameraPosition(pos=Vector(positions.mean(axis=0)), distance=distance)
+        self._cloud_camera["target"] = positions.mean(axis=0)
+        self._cloud_camera["distance"] = distance
+        self._render_cloud(force=True)
 
     def _set_cloud_workbench_open(self, opened: bool) -> None:
         """默认折叠工作台，避免不查看 3D 时挤压采集与遥测布局。"""
         self.cloud_workbench.setMaximumHeight(900 if opened else 34)
-        if self.cloud_view is not None:
-            self.cloud_view.setVisible(opened)
+        self.cloud_canvas.setVisible(opened)
         if opened:
-            self._render_cloud()
+            self._cloud_render_failed = False
+            self._cloud_render_failure = ""
+            self._render_cloud(force=True)
 
     def update_cloud_frame(self, frame: object) -> bool:
         """在 GUI 线程累积 worker 已转换的 world 点，绝不接收 raw eCAL payload。"""
@@ -663,9 +781,6 @@ class V2DashboardWidget(QWidget):
         if self.cloud_workbench.isChecked():
             self._render_cloud()
         self._update_cloud_status()
-        self.cloud_diagnostics.appendPlainText(
-            "LiDAR seq=%d: accepted %d world points" % (frame.sequence, len(frame.positions))
-        )
         return True
 
     def update_receiver_diagnostics(
@@ -713,7 +828,10 @@ class V2DashboardWidget(QWidget):
         return True
 
     def _cloud_colors(self, positions: np.ndarray, tags: np.ndarray) -> np.ndarray:
-        mode = self.cloud_color_mode.currentText()
+        return self._cloud_colors_for_mode(positions, tags, self.cloud_color_mode.currentText())
+
+    @staticmethod
+    def _cloud_colors_for_mode(positions: np.ndarray, tags: np.ndarray, mode: str) -> np.ndarray:
         if mode == "语义":
             palette = np.asarray(((0.35, 0.72, 0.30, 0.85), (0.85, 0.76, 0.22, 0.95),
                                   (0.90, 0.26, 0.18, 0.95), (0.60, 0.28, 0.78, 0.95)), dtype=np.float32)
@@ -753,6 +871,8 @@ class V2DashboardWidget(QWidget):
     def shutdown(self) -> None:
         """主动回收独立显示链，不依赖嵌入 QWidget 是否接收 close event。"""
         self._close_live_viewer()
+        self._cloud_render_timer.stop()
+        self._cloud_render_executor.shutdown(wait=False, cancel_futures=True)
 
     def closeEvent(self, event: object) -> None:  # noqa: N802 - Qt 固定回调名
         """父 Dashboard 释放嵌入 widget 时，不能遗留独立 Bridge/RViz2 进程组。"""

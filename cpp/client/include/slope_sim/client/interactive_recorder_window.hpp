@@ -37,6 +37,8 @@ class InteractiveRecorderWindow final {
   [[nodiscard]] State state() const noexcept;
   /// 返回最近一次 fail-closed 的分类，供编排层保留有界诊断。
   [[nodiscard]] std::string failure_reason() const;
+  /// 已跨过传感器提交边界的 WheelState 只计数丢弃，不中止合法 eCAL 会话。
+  [[nodiscard]] std::size_t dropped_late_wheel_state_count() const noexcept;
 
  private:
   struct PendingBoundary final {
@@ -45,6 +47,7 @@ class InteractiveRecorderWindow final {
   };
 
   static constexpr std::size_t kMaximumPendingSensorBoundaries = 32;
+  static constexpr std::size_t kMaximumPendingWheelStates = 64;
 
   bool AddLocked(std::size_t topic_index, RecordedRawFrame frame);
   std::map<std::uint64_t, PendingBoundary>::iterator FirstCompleteBoundaryLocked();
@@ -55,6 +58,8 @@ class InteractiveRecorderWindow final {
   State state_ = State::kAwaitingStart;
   std::uint64_t last_sensor_boundary_timestamp_ns_ = 0;
   std::map<std::uint64_t, PendingBoundary> pending_;
+  std::map<std::uint64_t, RecordedRawFrame> pending_wheel_states_;
+  std::size_t dropped_late_wheel_state_count_ = 0;
   std::string failure_reason_;
 };
 

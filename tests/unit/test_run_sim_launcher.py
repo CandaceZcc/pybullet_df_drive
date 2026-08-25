@@ -176,6 +176,47 @@ def test_run_sim_defaults_qt_xcb_gl_integration_to_egl(tmp_path: Path) -> None:
     assert completed.stdout == "xcb_egl\n"
 
 
+def test_run_sim_help_does_not_import_pybullet(tmp_path: Path) -> None:
+    """帮助和诊断入口不创建物理进程，也不得输出 PyBullet build time。"""
+    completed = subprocess.run(
+        [str(ROOT / "runSim"), "--help"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "pybullet build time" not in completed.stdout
+    assert "PyBullet differential-drive slope simulation" in completed.stdout
+
+
+def test_installed_run_sim_supplies_bundled_fontconfig_and_x11_locale(tmp_path: Path) -> None:
+    """冻结 runtime 必须自行定位字体与 compose 数据，不能依赖调用者的系统路径。"""
+    release = tmp_path / "release"
+    launcher = release / "bin" / "runSim"
+    runtime = release / "runtime" / "bin" / "python"
+    fonts = release / "runtime" / "etc" / "fonts" / "fonts.conf"
+    locale = release / "runtime" / "share" / "X11" / "locale"
+    launcher.parent.mkdir(parents=True)
+    runtime.parent.mkdir(parents=True)
+    fonts.parent.mkdir(parents=True)
+    locale.mkdir(parents=True)
+    fonts.write_text("<fontconfig/>\n", encoding="utf-8")
+    shutil.copy2(ROOT / "runSim", launcher)
+    (release / "main.py").write_text("# release entrypoint\n", encoding="utf-8")
+    runtime.write_text(
+        "#!/usr/bin/env sh\nprintf '%s\\n%s\\n' \"${FONTCONFIG_FILE:-}\" \"${XLOCALEDIR:-}\"\n",
+        encoding="utf-8",
+    )
+    runtime.chmod(0o755)
+
+    completed = subprocess.run([str(launcher), "--help"], capture_output=True, text=True)
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.splitlines() == [str(fonts), str(locale)]
+
+
 def test_run_sim_preserves_explicit_qt_xcb_gl_integration(tmp_path: Path) -> None:
     """调试时调用者显式指定的 Qt XCB 集成方式始终优先。"""
     release = tmp_path / "release"

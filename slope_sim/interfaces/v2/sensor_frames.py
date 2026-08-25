@@ -20,8 +20,6 @@ from slope_sim.interfaces.v2.models import (
 from slope_sim.interfaces.v2.runtime_protocol import V2RuntimeProtocol
 from slope_sim.interfaces.v2.session import OutputIdentity
 from slope_sim.interfaces.v2.topics import V2_OUTPUT_TOPICS
-from slope_sim.lidar_worker import LidarServiceEvent
-from slope_sim.truth_sensors import Stage4RtkState
 
 
 @dataclass(frozen=True)
@@ -102,6 +100,8 @@ class V2SensorFrameFactory:
         scan = self._lidar.scan(timestamp_ns)
         rtk = self._truth_sensors.read_rtk(timestamp_ns)
         imu = self._truth_sensors.read_imu(timestamp_ns)
+        from slope_sim.truth_sensors import Stage4RtkState
+
         if not isinstance(scan, LidarPointCloud):
             raise RuntimeError("center lidar scan must return LidarPointCloud")
         if not isinstance(rtk, Stage4RtkState):
@@ -202,6 +202,8 @@ class V2AsyncSensorFrameFactory(V2SensorFrameFactory):
         lidar_identity, rtk_identity, imu_identity = identities
         rtk = self._truth_sensors.read_rtk(timestamp_ns)
         imu = self._truth_sensors.read_imu(timestamp_ns)
+        from slope_sim.truth_sensors import Stage4RtkState
+
         if not isinstance(rtk, Stage4RtkState) or not isinstance(imu, ImuAttitude):
             raise RuntimeError("truth sensor suite returned an invalid Stage4 sample")
         if rtk.timestamp_ns != timestamp_ns or imu.timestamp_ns != timestamp_ns:
@@ -300,6 +302,8 @@ class V2AsyncSensorFrameFactory(V2SensorFrameFactory):
     def _discard_terminal_lidar_events(self) -> None:
         """worker 已明确丢弃的扫描必须连同同刻真值一起撤销，避免关闭等待幽灵帧。"""
         events = self._lidar_service.drain_events()
+        from slope_sim.lidar_worker import LidarServiceEvent
+
         if type(events) is not tuple:
             raise RuntimeError("Stage4 lidar worker drain_events must return an exact tuple")
         for event in events:

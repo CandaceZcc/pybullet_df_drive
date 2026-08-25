@@ -8,18 +8,39 @@ import sys
 from typing import Mapping, Sequence
 
 from slope_sim.config import load_config
-from slope_sim.manual_demo import run_manual_demo
 from slope_sim.model_registry import robot_model_names
-from slope_sim.scene import terrain_model_names
-from slope_sim.simulation import run_experiment
+from slope_sim.terrain_models import terrain_model_names
 from slope_sim.interfaces.v2.ecal_preflight import (
     EcalPreflightReport,
     LegacyInterfaceModeError,
     require_v2_interface_mode,
     run_v2_ecal_preflight,
 )
-from slope_sim.interfaces.v2.runsim_v2_command import RunSimV2Command
 from slope_sim.serial_rc import CommandSourceArbiter, pyserial_opener, start_rc_worker
+
+
+class RunSimV2Command:
+    """延迟导入正式 Command，同时保留入口调用方的可替换启动边界。"""
+
+    @staticmethod
+    def launch(**kwargs: object) -> object:
+        from slope_sim.interfaces.v2.runsim_v2_command import RunSimV2Command as command_type
+
+        return command_type.launch(**kwargs)
+
+
+def run_manual_demo(*args: object, **kwargs: object) -> object:
+    """仅在实际手动会话启动时导入 PyBullet GUI 路径。"""
+    from slope_sim.manual_demo import run_manual_demo as manual_demo
+
+    return manual_demo(*args, **kwargs)
+
+
+def run_experiment(*args: object, **kwargs: object) -> object:
+    """仅在实际自动仿真启动时导入物理运行路径。"""
+    from slope_sim.simulation import run_experiment as experiment
+
+    return experiment(*args, **kwargs)
 
 
 def resolve_v2_runtime_root(environment: Mapping[str, str] | None = None) -> Path:
@@ -150,6 +171,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("runSim startup blocked: --rc-port requires formal v2 manual interface", file=sys.stderr)
         return 2
     if args.manual and config.interface_enabled and formal_v2_requested:
+
         if args.no_dashboard and (args.capture_duration_sec is not None or args.open_ros_rviz):
             print("runSim v2 startup blocked: capture and ROS/RViz controls require Dashboard", file=sys.stderr)
             return 2
@@ -274,6 +296,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 else:
                     os.environ[name] = previous
     elif args.manual:
+
         result = run_manual_demo(config, duration_limit_sec=args.duration_sec)
     else:
         result = run_experiment(config)

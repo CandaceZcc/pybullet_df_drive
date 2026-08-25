@@ -4,6 +4,8 @@ from __future__ import annotations
 import os
 import hashlib
 import json
+import subprocess
+import sys
 from dataclasses import replace
 from importlib import import_module
 from pathlib import Path
@@ -23,6 +25,23 @@ def _adapter_module():
         if error.name != "slope_sim.interfaces.v2.dashboard_adapter":
             raise
         pytest.fail("wished-for behavior is not implemented: v2 dashboard adapter", pytrace=False)
+
+
+def test_dashboard_adapter_import_does_not_load_pybullet_in_its_process() -> None:
+    """Dashboard 观察进程不应仅因导入包而打印或初始化 PyBullet。"""
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; import slope_sim.interfaces.v2.dashboard_adapter; print('pybullet' in sys.modules)",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "False"
 
 
 @pytest.fixture(scope="module")
@@ -181,20 +200,20 @@ def test_v2_dashboard_fits_narrow_parent_without_overflowing_viewer_actions(qapp
 
 
 def test_v2_dashboard_exposes_an_embedded_bounded_cloud_workbench(qapp) -> None:
-    """阶段五 Dashboard 必须内嵌 OpenGL 点云和有界诊断终端，不再依赖 RViz2。"""
+    """阶段五 Dashboard 必须内嵌 CPU 图像点云和有界诊断终端，不再依赖 RViz2。"""
     module = _adapter_module()
     descriptor, _snapshot = _snapshot_with_encoded_lidar()
     widget = module.V2DashboardWidget(descriptor)
 
-    assert widget.cloud_view is not None
-    assert widget.cloud_scatter is not None
+    assert widget.cloud_canvas is not None
+    assert widget.cloud_canvas.pixmap() is not None
     assert widget.cloud_diagnostics.isReadOnly() is True
     assert widget.cloud_diagnostics.document().maximumBlockCount() == 2_000
     widget.close()
 
 
 def test_v2_dashboard_places_cloud_view_above_its_controls(qapp) -> None:
-    """点云视图必须独占整行，控制与诊断统一放在下一行。"""
+    """点云图像必须独占整行，控制与诊断统一放在下一行。"""
     from PySide6.QtWidgets import QVBoxLayout
 
     module = _adapter_module()
@@ -204,7 +223,7 @@ def test_v2_dashboard_places_cloud_view_above_its_controls(qapp) -> None:
         workbench_layout = widget.cloud_workbench.layout()
 
         assert isinstance(workbench_layout, QVBoxLayout)
-        assert workbench_layout.itemAt(0).widget() is widget.cloud_view
+        assert workbench_layout.itemAt(0).widget() is widget.cloud_canvas
         assert workbench_layout.itemAt(1).widget() is widget.cloud_controls
     finally:
         widget.close()
@@ -233,10 +252,10 @@ def test_v2_dashboard_defers_cloud_rendering_while_workbench_is_closed(
         widget.close()
 
 
-def test_v2_dashboard_builds_accumulated_cloud_once_per_visible_frame(
+def test_v2_dashboard_bounds_visible_cloud_rendering_to_the_dashboard_cadence(
     qapp, monkeypatch,
 ) -> None:
-    """可见帧只构造一次累计数组，避免相同点云重复拼接。"""
+    """可见帧只在显示节拍构造一次累计数组，不能跟随物理循环。"""
     adapter = _adapter_module()
     receiver = import_module("slope_sim.interfaces.v2.dashboard_receiver")
     descriptor, _snapshot = _snapshot_with_encoded_lidar()
@@ -258,9 +277,87 @@ def test_v2_dashboard_builds_accumulated_cloud_once_per_visible_frame(
         widget.cloud_workbench.setChecked(True)
         build_calls.clear()
         assert widget.update_cloud_frame(frame) is True
-        assert build_calls == [None]
+        assert build_calls == []
+        assert widget._cloud_render_dropped_count == 1
+        widget._render_cloud(force=True)
+        assert build_calls == []
+        assert widget._cloud_render_inflight is not None
     finally:
         widget.close()
+
+
+def test_v2_dashboard_submits_cloud_images_to_one_bounded_background_renderer(qapp) -> None:
+    """GUI 线程只提交有界绘制输入，QImage 由唯一后台任务生成。"""
+    adapter = _adapter_module()
+    receiver = import_module("slope_sim.interfaces.v2.dashboard_receiver")
+    descriptor, _snapshot = _snapshot_with_encoded_lidar()
+    widget = adapter.V2DashboardWidget(descriptor)
+    frame = receiver.V2DashboardCloudFrame(
+        1_000_000_000, 91,
+        np.asarray(((1.0, 2.0, 3.0),), dtype=np.float32),
+        np.asarray((100,), dtype=np.uint32), np.asarray((1,), dtype=np.uint8),
+    )
+    try:
+        widget.cloud_workbench.setChecked(True)
+        assert widget.update_cloud_frame(frame) is True
+        assert widget._cloud_render_inflight is not None
+    finally:
+        widget.close()
+
+
+def test_v2_dashboard_stops_repeated_rendering_after_the_first_renderer_failure(
+    qapp, monkeypatch,
+) -> None:
+    """首个不可恢复的图像任务故障必须可见且熔断，不得刷 traceback。"""
+    adapter = _adapter_module()
+    receiver = import_module("slope_sim.interfaces.v2.dashboard_receiver")
+    descriptor, _snapshot = _snapshot_with_encoded_lidar()
+    widget = adapter.V2DashboardWidget(descriptor)
+    frame = receiver.V2DashboardCloudFrame(
+        1_000_000_000, 92,
+        np.asarray(((1.0, 2.0, 3.0),), dtype=np.float32),
+        np.asarray((100,), dtype=np.uint32), np.asarray((1,), dtype=np.uint8),
+    )
+
+    def fail_render(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("synthetic image conversion fault")
+
+    try:
+        monkeypatch.setattr(widget, "_build_cloud_image", fail_render)
+        widget.cloud_workbench.setChecked(True)
+        assert widget.update_cloud_frame(frame) is True
+        assert widget._cloud_render_inflight is not None
+        widget._cloud_render_inflight.result(timeout=2.0)
+    except RuntimeError as error:
+        assert "synthetic image conversion fault" in str(error)
+    finally:
+        widget._collect_cloud_render()
+
+    try:
+        assert widget._cloud_render_failed is True
+        assert "点云显示已暂停" in widget.cloud_status.text()
+        assert "synthetic image conversion fault" in widget.cloud_diagnostics.toPlainText()
+        assert widget._cloud_render_inflight is None
+        widget._render_cloud(force=True)
+        assert widget._cloud_render_inflight is None
+    finally:
+        widget.close()
+
+
+def test_v2_dashboard_cpu_renderer_keeps_an_80000_point_frame_below_display_budget(qapp) -> None:
+    """最大显示输入必须能在 10 Hz UI 节拍内完成 CPU 图像投影。"""
+    adapter = _adapter_module()
+    positions = np.zeros((adapter._MAX_CLOUD_RENDER_POINTS, 3), dtype=np.float32)
+    positions[:, 0] = np.linspace(-10.0, 10.0, len(positions), dtype=np.float32)
+    tags = np.ones(len(positions), dtype=np.uint8)
+    camera = {**adapter._CLOUD_CAMERA_PRESETS["透视"], "target": np.zeros(3, dtype=np.float32)}
+
+    _generation, image, duration_ms = adapter.V2DashboardWidget._build_cloud_image(
+        1, positions, tags, None, camera, "语义", 1,
+    )
+
+    assert image.width() == adapter._CLOUD_IMAGE_SIZE[0]
+    assert duration_ms < 100.0
 
 
 def test_v2_dashboard_accumulates_only_worker_transformed_cloud_frames(qapp) -> None:
@@ -278,7 +375,8 @@ def test_v2_dashboard_accumulates_only_worker_transformed_cloud_frames(qapp) -> 
         assert widget.update_cloud_frame(frame) is True
         assert widget.update_cloud_frame(frame) is False
         assert "seq=9" in widget.cloud_status.text()
-        assert "accepted 1 world points" in widget.cloud_diagnostics.toPlainText()
+        assert "本帧=1" in widget.cloud_status.text()
+        assert "accepted 1 world points" not in widget.cloud_diagnostics.toPlainText()
     finally:
         widget.close()
 
@@ -307,8 +405,8 @@ def test_v2_dashboard_projects_receiver_errors_and_render_drops(qapp) -> None:
         widget.close()
 
 
-def test_v2_dashboard_current_frame_mode_clears_historical_points(qapp, monkeypatch) -> None:
-    """当前帧模式的零点帧必须清空渲染，不能把累计历史伪装成当前数据。"""
+def test_v2_dashboard_current_frame_mode_clears_historical_points(qapp) -> None:
+    """当前帧模式的零点帧必须清空 CPU 投影输入，不能伪装累计历史。"""
     adapter = _adapter_module()
     receiver = import_module("slope_sim.interfaces.v2.dashboard_receiver")
     descriptor, _snapshot = _snapshot_with_encoded_lidar()
@@ -323,8 +421,6 @@ def test_v2_dashboard_current_frame_mode_clears_historical_points(qapp, monkeypa
         np.empty(0, dtype=np.uint32), np.empty(0, dtype=np.uint8),
     )
     widget = adapter.V2DashboardWidget(descriptor)
-    calls: list[dict[str, object]] = []
-    monkeypatch.setattr(widget.cloud_scatter, "setData", lambda **kwargs: calls.append(kwargs))
     try:
         assert hasattr(widget, "cloud_display_mode")
         widget.cloud_workbench.setChecked(True)
@@ -333,21 +429,20 @@ def test_v2_dashboard_current_frame_mode_clears_historical_points(qapp, monkeypa
         widget.cloud_display_mode.setCurrentText("当前帧")
         assert "当前帧" in widget.cloud_status.text()
         assert widget.update_cloud_frame(empty) is True
-        assert np.asarray(calls[-1]["pos"]).shape == (0, 3)
+        positions, _tags = widget._cloud_render_data()
+        assert positions.shape == (0, 3)
         assert "当前帧" in widget.cloud_status.text()
         assert "本帧=0" in widget.cloud_status.text()
     finally:
         widget.close()
 
 
-def test_v2_dashboard_exposes_a_one_click_current_frame_action(qapp, monkeypatch) -> None:
+def test_v2_dashboard_exposes_a_one_click_current_frame_action(qapp) -> None:
     """窄侧栏中必须有明确的一键入口，不要求用户在下方下拉框里寻找当前帧模式。"""
     adapter = _adapter_module()
     receiver = import_module("slope_sim.interfaces.v2.dashboard_receiver")
     descriptor, _snapshot = _snapshot_with_encoded_lidar()
     widget = adapter.V2DashboardWidget(descriptor)
-    calls: list[dict[str, object]] = []
-    monkeypatch.setattr(widget.cloud_scatter, "setData", lambda **kwargs: calls.append(kwargs))
     frame = receiver.V2DashboardCloudFrame(
         1_000_000_000, 12,
         np.asarray(((1.0, 2.0, 3.0), (4.0, 5.0, 6.0)), dtype=np.float32),
@@ -360,7 +455,8 @@ def test_v2_dashboard_exposes_a_one_click_current_frame_action(qapp, monkeypatch
         widget.cloud_current_frame_button.click()
 
         assert widget.cloud_display_mode.currentText() == "当前帧"
-        assert np.array_equal(np.asarray(calls[-1]["pos"]), frame.positions)
+        positions, _tags = widget._cloud_render_data()
+        assert np.array_equal(positions, frame.positions)
         assert "当前帧" in widget.cloud_status.text()
     finally:
         widget.close()
@@ -394,16 +490,13 @@ def test_v2_dashboard_bounds_accumulated_render_input_before_opengl(qapp) -> Non
         widget.close()
 
 
-def test_v2_dashboard_bounds_accumulation_and_marks_vehicle_pose(qapp, monkeypatch) -> None:
-    """累计模式的帧数必须有硬上限，并显示随帧传递的车辆位置和朝向。"""
+def test_v2_dashboard_bounds_accumulation_and_projects_vehicle_pose(qapp) -> None:
+    """累计模式的帧数必须有硬上限，并投影随帧传递的车辆位置和朝向。"""
     adapter = _adapter_module()
     receiver = import_module("slope_sim.interfaces.v2.dashboard_receiver")
     descriptor, _snapshot = _snapshot_with_encoded_lidar()
     widget = adapter.V2DashboardWidget(descriptor)
     try:
-        assert hasattr(widget, "cloud_vehicle_marker")
-        marker_calls: list[dict[str, object]] = []
-        monkeypatch.setattr(widget.cloud_vehicle_marker, "setData", lambda **kwargs: marker_calls.append(kwargs))
         widget.cloud_workbench.setChecked(True)
         frame = receiver.V2DashboardCloudFrame(
             1_000_000_000, 0,
@@ -419,25 +512,29 @@ def test_v2_dashboard_bounds_accumulation_and_marks_vehicle_pose(qapp, monkeypat
                 )
             ) is True
         assert len(widget._cloud_frames) <= adapter._MAX_CLOUD_HISTORY_FRAMES
-        assert marker_calls
-        assert np.asarray(marker_calls[-1]["pos"]).shape == (2, 3)
+        marker, visible = widget._project_cloud_points(np.asarray((
+            frame.vehicle_position,
+            np.asarray(frame.vehicle_position) + np.asarray(frame.vehicle_forward) * 1.5,
+        ), dtype=np.float32))
+        assert marker.shape == (2, 2)
+        assert visible.shape == (2,)
     finally:
         widget.close()
 
 
-def test_v2_dashboard_exposes_camera_presets_fit_and_separate_command_diagnostics(qapp, monkeypatch) -> None:
+def test_v2_dashboard_exposes_camera_presets_fit_and_separate_command_diagnostics(qapp) -> None:
     """视角操作可预测，/sim/wheel/command 错误不应污染 LiDAR 健康栏。"""
     adapter = _adapter_module()
     receiver = import_module("slope_sim.interfaces.v2.dashboard_receiver")
     descriptor, _snapshot = _snapshot_with_encoded_lidar()
     widget = adapter.V2DashboardWidget(descriptor)
-    camera_calls: list[dict[str, object]] = []
-    monkeypatch.setattr(widget.cloud_view, "setCameraPosition", lambda **kwargs: camera_calls.append(kwargs))
     try:
         assert hasattr(widget, "cloud_camera_preset")
         assert widget.cloud_camera_preset.currentText() == "透视"
         widget.cloud_camera_preset.setCurrentText("俯视")
-        assert camera_calls[-1] == {"distance": 24.0, "elevation": 90.0, "azimuth": 0.0}
+        assert {key: widget._cloud_camera[key] for key in ("distance", "elevation", "azimuth")} == {
+            "distance": 24.0, "elevation": 90.0, "azimuth": 0.0,
+        }
         widget.update_cloud_frame(receiver.V2DashboardCloudFrame(
             1_000_000_000, 12,
             np.asarray(((10.0, 20.0, 3.0), (14.0, 24.0, 7.0)), dtype=np.float32),
@@ -445,8 +542,8 @@ def test_v2_dashboard_exposes_camera_presets_fit_and_separate_command_diagnostic
         ))
         widget.cloud_workbench.setChecked(True)
         widget.cloud_fit_view_button.click()
-        assert "pos" in camera_calls[-1]
-        assert "distance" in camera_calls[-1]
+        assert np.asarray(widget._cloud_camera["target"]).shape == (3,)
+        assert widget._cloud_camera["distance"] >= 6.0
         assert widget.update_receiver_diagnostics(
             render_dropped_count=1,
             diagnostics=(

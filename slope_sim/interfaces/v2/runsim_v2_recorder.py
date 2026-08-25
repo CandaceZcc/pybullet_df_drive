@@ -386,8 +386,9 @@ class RunSimV2Recorder:
     def _send(self, kind: str) -> None:
         if kind not in {"start", "stop"}:
             raise ValueError("Recorder control kind is invalid")
-        if self._process.poll() is not None:
-            raise RuntimeError("runSim v2 Recorder is no longer running")
+        returncode = self._process.poll()
+        if returncode is not None:
+            raise self._child_failure(returncode)
         document = json.dumps(
             {"kind": kind, "token": self._control_token.hex()},
             separators=(",", ":"),
@@ -395,6 +396,18 @@ class RunSimV2Recorder:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
             client.connect(str(self._control_socket))
             client.sendall(document)
+
+    def _child_failure(self, returncode: object) -> RuntimeError:
+        """优先保留 C++ receipt 已锁存的首个故障，避免 stop 覆盖它。"""
+        try:
+            document = json.loads((self._output_dir / "recorder.result.json").read_text(encoding="utf-8"))
+            reason = document.get("fault_reason") if isinstance(document, dict) else None
+            if (isinstance(document, dict) and document.get("clean_shutdown") is False
+                    and isinstance(reason, str) and reason):
+                return RuntimeError(f"runSim v2 Recorder failed: {reason}")
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            pass
+        return RuntimeError(f"runSim v2 Recorder exited with status {returncode}")
 
 
 def build_interactive_recorder_argv(

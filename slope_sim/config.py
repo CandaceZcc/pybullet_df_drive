@@ -9,7 +9,7 @@ from typing import Any
 import yaml
 
 from slope_sim.model_registry import robot_model_names
-from slope_sim.scene import terrain_model_names
+from slope_sim.terrain_models import terrain_model_names
 
 
 def _require_finite(name: str, value: object) -> None:

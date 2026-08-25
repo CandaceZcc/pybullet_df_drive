@@ -63,12 +63,13 @@ int main() {
 
   // 两条高频 topic 保持各自时钟域，在已授权窗口内即时写入。
   Require(window.Observe(0, Frame(0, 110)).size() == 1, "command was not recorded after start");
-  Require(window.Observe(1, Frame(1, 110)).size() == 1, "wheel state was not recorded after start");
+  Require(window.Observe(1, Frame(1, 110)).empty(),
+          "WheelState was not deferred to its sensor boundary");
   Require(window.RequestStop(), "window rejected a valid stop request");
   Require(window.state() == InteractiveRecorderWindow::State::kAwaitingFinalBoundary,
           "window did not await final boundary");
   const auto stopped = CompleteBoundary(window, 200);
-  Require(stopped.size() == 5, "final boundary did not commit all final-window frames");
+  Require(stopped.size() == 6, "final boundary did not commit all final-window frames");
   for (const auto& frame : stopped) {
     Require(frame.log_time_ns <= 200, "final boundary committed a future frame");
   }
@@ -82,12 +83,40 @@ int main() {
   Require(CompleteBoundary(late_frame, 100).size() == 3,
           "late-frame window did not commit initial boundary");
   // eCAL callback may deliver a 100 Hz frame only after the enclosing 10 Hz
-  // boundary was committed. Keep that violation diagnosable for the recorder.
+  // boundary was committed.  This is legal asynchronous delivery: discard only
+  // the late WheelState and retain the session for its next sensor boundary.
   Require(late_frame.Observe(1, Frame(1, 90)).empty(), "late frame committed unexpectedly");
-  Require(late_frame.state() == InteractiveRecorderWindow::State::kSafeStopRequired,
-          "late frame did not require safe stop");
-  Require(late_frame.failure_reason() == "wheel state arrived after its sensor boundary",
-          "late frame did not preserve its failure classification");
+  Require(late_frame.state() == InteractiveRecorderWindow::State::kRecording,
+          "late WheelState stopped an otherwise valid recorder session");
+  Require(late_frame.dropped_late_wheel_state_count() == 1,
+          "late WheelState was not counted for bounded diagnosis");
+  Require(late_frame.Observe(1, Frame(1, 110)).empty(),
+          "in-window WheelState bypassed the bounded reorder queue");
+  const auto reordered = CompleteSensorBoundary(late_frame, 200);
+  Require(reordered.size() == 4 && reordered.back().log_time_ns == 110,
+          "in-window WheelState was not committed at the next sensor boundary");
+
+  InteractiveRecorderWindow duplicate_wheel;
+  Require(duplicate_wheel.RequestStart(), "duplicate-wheel window rejected start");
+  Require(CompleteSensorBoundary(duplicate_wheel, 100).size() == 3,
+          "duplicate-wheel window did not commit start boundary");
+  Require(duplicate_wheel.Observe(1, Frame(1, 110)).empty(),
+          "duplicate-wheel frame bypassed reorder queue");
+  Require(duplicate_wheel.Observe(1, Frame(1, 110)).empty(),
+          "duplicate-wheel frame committed unexpectedly");
+  Require(duplicate_wheel.state() == InteractiveRecorderWindow::State::kSafeStopRequired,
+          "duplicate WheelState did not fail closed");
+
+  InteractiveRecorderWindow overflowing_wheel;
+  Require(overflowing_wheel.RequestStart(), "overflow-wheel window rejected start");
+  Require(CompleteSensorBoundary(overflowing_wheel, 100).size() == 3,
+          "overflow-wheel window did not commit start boundary");
+  for (std::uint64_t timestamp_ns = 101; timestamp_ns <= 165; ++timestamp_ns) {
+    Require(overflowing_wheel.Observe(1, Frame(1, timestamp_ns)).empty(),
+            "overflow-wheel frame committed unexpectedly");
+  }
+  Require(overflowing_wheel.state() == InteractiveRecorderWindow::State::kSafeStopRequired,
+          "unbounded WheelState reorder backlog did not fail closed");
 
   InteractiveRecorderWindow delayed_sensor;
   Require(delayed_sensor.RequestStart(), "delayed-sensor window rejected start");
@@ -99,8 +128,8 @@ int main() {
   for (std::uint64_t timestamp_ns = 110; timestamp_ns <= 430; timestamp_ns += 10) {
     Require(delayed_sensor.Observe(0, Frame(0, timestamp_ns)).size() == 1,
             "high-rate command was not recorded during the sensor interval");
-    Require(delayed_sensor.Observe(1, Frame(1, timestamp_ns)).size() == 1,
-            "high-rate wheel state was not recorded during the sensor interval");
+    Require(delayed_sensor.Observe(1, Frame(1, timestamp_ns)).empty(),
+            "high-rate WheelState bypassed the bounded reorder queue");
   }
   std::vector<RecordedRawFrame> delayed_committed;
   for (std::size_t topic = 2; topic < 5; ++topic) {
@@ -109,8 +138,8 @@ int main() {
   }
   Require(delayed_sensor.state() == InteractiveRecorderWindow::State::kRecording,
           "asynchronous sensor latency exhausted the 10 Hz recorder window");
-  Require(delayed_committed.size() == 3,
-          "delayed sensor boundary did not commit its three sensor frames");
+  Require(delayed_committed.size() == 13,
+          "delayed sensor boundary did not commit sorted in-window WheelStates");
 
   InteractiveRecorderWindow faulted;
   Require(faulted.RequestStart(), "faulted window rejected start");
@@ -137,13 +166,12 @@ int main() {
   const auto command = mixed_clocks.Observe(0, Frame(0, 1700000000010000000ULL));
   Require(command.size() == 1 && command.front().topic == "/topic/0",
           "recording window did not preserve a wall-clock command");
-  const auto wheel = mixed_clocks.Observe(1, Frame(1, 110000000));
-  Require(wheel.size() == 1 && wheel.front().topic == "/topic/1",
-          "recording window did not preserve a simulation-clock wheel state");
+  Require(mixed_clocks.Observe(1, Frame(1, 110000000)).empty(),
+          "recording window did not defer a simulation-clock wheel state");
   Require(mixed_clocks.RequestStop(), "mixed-clock window rejected stop");
   const auto mixed_stopped = CompleteSensorBoundary(mixed_clocks, 200000000);
-  Require(mixed_stopped.size() == 3,
-          "same-time sensor boundary did not finalize mixed-clock capture");
+  Require(mixed_stopped.size() == 4,
+          "same-time sensor boundary did not finalize sorted WheelState capture");
   Require(mixed_clocks.state() == InteractiveRecorderWindow::State::kReadyToFinalize,
           "mixed-clock final sensor boundary did not finalize capture");
   return 0;
