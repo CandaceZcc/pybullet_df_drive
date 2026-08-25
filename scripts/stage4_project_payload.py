@@ -24,6 +24,7 @@ _REQUIRED_FILES = (
     "scripts/verify_lvx2.py",
     "scripts/mid360_golf_simulation.py",
     "scripts/mid360_golf_command_peer.py",
+    "scripts/test_rc_sticks.py",
     "packaging/python-environment.yml",
 )
 _REQUIRED_DIRECTORIES = (

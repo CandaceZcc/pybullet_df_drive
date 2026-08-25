@@ -629,7 +629,7 @@ def test_dashboard_speed_limits_are_visible_in_simulation_controls(monkeypatch):
 
 
 def test_dashboard_hides_rc_source_when_serial_worker_is_not_enabled(monkeypatch):
-    """未传 --rc-port 时不能选择一个永远不会有输入的遥控器 source。"""
+    """自动扫描无合格 SBUS 时不能留下永远无输入的 RC source。"""
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     dashboard = TelemetryDashboard(max_linear_speed=0.45, max_angular_speed=0.85)
     try:
@@ -638,6 +638,7 @@ def test_dashboard_hides_rc_source_when_serial_worker_is_not_enabled(monkeypatch
         assert dashboard.control_source_combo.findData("rc") == -1
         assert dashboard.current_command().control_source == "keyboard"
         assert "未启用" in dashboard.rc_status_label.text()
+        assert "自动扫描" in dashboard.rc_status_label.text()
         assert "遥控器未启用" in dashboard.control_owner_label.text()
     finally:
         dashboard.close()
@@ -754,25 +755,41 @@ def test_dashboard_rc_status_shows_health_and_command(monkeypatch, tmp_path):
                 actual_hz=99.5,
                 last_frame_age_sec=0.012,
                 last_channels=(1500, 1500, 1420, 1500, 1500, 1700) + (1500,) * 10,
-                command=RcCommand(0.25, -0.5, True, True, "active"),
+                command=RcCommand(0.25, -0.5, True, "active"),
                 failure_reason=None,
             ),
-            source_snapshot=CommandSourceSnapshot("rc", None),
+            source_snapshot=CommandSourceSnapshot(
+                "rc",
+                None,
+                latest_target=(0.25, -0.5),
+                mailbox_update_count=41,
+                command_send_count=39,
+                renewal_count=38,
+                last_renewal_age_sec=0.012,
+                max_renewal_gap_sec=0.031,
+                renewal_hz=50.0,
+            ),
         )
         text = dashboard.rc_status_label.text()
         assert "usb-rc" in text
         assert "99.5 Hz" in text
-        assert "ch1/ch3/ch6=1500/1420/1700" in text
+        assert "ch1/ch3=1500/1420" in text
+        assert "ch6" not in text.lower()
+        assert "unlock" not in text.lower()
         assert "v/w=0.25/-0.50" in text
         assert "source=rc" in text
+        assert "cal=282/1002/1722" in text
+        assert "mailbox=41" in text
+        assert "renew=50.0Hz" in text
+        assert "last/max=12/31ms" in text
     finally:
         dashboard.close()
 
 
-def test_dashboard_falls_back_to_keyboard_when_selected_rc_is_not_ready(
+def test_dashboard_keeps_rc_selected_during_recoverable_timeout(
     monkeypatch, tmp_path
 ):
-    """RC 未解锁时不能把界面留在无 owner 状态并持续屏蔽键盘。"""
+    """RC 短暂断帧只停车，保留选择以便新鲜帧自动恢复。"""
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     dashboard = TelemetryDashboard(max_linear_speed=0.4, max_angular_speed=0.8)
     try:
@@ -785,15 +802,15 @@ def test_dashboard_falls_back_to_keyboard_when_selected_rc_is_not_ready(
                 actual_hz=95.0,
                 last_frame_age_sec=0.01,
                 last_channels=(1002,) * 16,
-                command=RcCommand(0.0, 0.0, False, False, "locked"),
-                failure_reason="locked",
+                command=RcCommand(0.0, 0.0, False, "frame_timeout"),
+                failure_reason="frame_timeout",
             ),
-            source_snapshot=CommandSourceSnapshot(None, "locked"),
+            source_snapshot=CommandSourceSnapshot("rc", "frame_timeout"),
         )
 
-        assert dashboard.control_source_combo.currentData() == "keyboard"
-        assert dashboard.current_command().control_source == "keyboard"
-        assert "退回键盘" in dashboard.rc_status_label.text()
+        assert dashboard.control_source_combo.currentData() == "rc"
+        assert dashboard.current_command().control_source == "rc"
+        assert "退回键盘" not in dashboard.rc_status_label.text()
     finally:
         dashboard.close()
 
@@ -1777,6 +1794,43 @@ def test_dashboard_keyboard_controls_work_when_child_widget_has_focus(monkeypatc
         dashboard.app.sendEvent(dashboard.linear_spin, release)
         dashboard.process_events()
 
+        assert dashboard.current_command().linear_velocity == 0.0
+    finally:
+        dashboard.close()
+
+
+def test_dashboard_keyboard_hold_ignores_auto_repeat_release(monkeypatch):
+    """X11 长按生成的伪释放不能清除驾驶状态，真实松键仍立即停车。"""
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from PySide6 import QtCore, QtGui
+
+    dashboard = TelemetryDashboard(max_linear_speed=0.4)
+    try:
+        dashboard.linear_spin.setFocus()
+        press = QtGui.QKeyEvent(
+            QtCore.QEvent.KeyPress,
+            QtCore.Qt.Key_Up,
+            QtCore.Qt.NoModifier,
+        )
+        dashboard.app.sendEvent(dashboard.linear_spin, press)
+        auto_repeat_release = QtGui.QKeyEvent(
+            QtCore.QEvent.KeyRelease,
+            QtCore.Qt.Key_Up,
+            QtCore.Qt.NoModifier,
+            "",
+            True,
+            1,
+        )
+        dashboard.app.sendEvent(dashboard.linear_spin, auto_repeat_release)
+
+        assert dashboard.current_command().linear_velocity == pytest.approx(0.4)
+
+        release = QtGui.QKeyEvent(
+            QtCore.QEvent.KeyRelease,
+            QtCore.Qt.Key_Up,
+            QtCore.Qt.NoModifier,
+        )
+        dashboard.app.sendEvent(dashboard.linear_spin, release)
         assert dashboard.current_command().linear_velocity == 0.0
     finally:
         dashboard.close()

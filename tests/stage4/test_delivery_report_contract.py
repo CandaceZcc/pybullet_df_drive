@@ -122,3 +122,17 @@ def test_stage4_handoff_records_auditable_final_candidate_and_review_state() -> 
     assert "第二次独立只读复审确认 `Critical=0`、`Important=0`、`Minor=0`" in report
     assert "仍需在 B-E 实施和验收" not in architecture
     assert "状态索引：B-E 已完成" in plan
+
+
+def test_stage5_readme_documents_502_control_and_safety_contract() -> None:
+    """5.0.2 交付入口不能再要求 CH6，并须公开续租与分级停车边界。"""
+    text = Path("README.md").read_text(encoding="utf-8")
+
+    assert "无参数启动时会遍历 `/dev/serial/by-id/`" in text
+    assert "CH6、解锁沿和运行中自锁已移除" in text
+    assert "独立 50 Hz 续租线程" in text
+    assert "到达 200 ms 无合法帧时软停车" in text
+    assert "恢复连续 3 帧后自动继续" in text
+    assert "`QT_XCB_GL_INTEGRATION=xcb_egl`" in text
+    assert "[Errno 5] Input/output error" in text
+    assert "先将 CH6 拨到低位再拨到高位" not in text

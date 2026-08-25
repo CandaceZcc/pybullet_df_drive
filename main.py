@@ -211,26 +211,35 @@ def main(argv: Sequence[str] | None = None) -> int:
                     command.close()
                     command_closed = True
 
+            command_arbiter = None
             try:
                 command_arbiter = (
-                    CommandSourceArbiter(command.client)
+                    CommandSourceArbiter(command.client, renewal_hz=50.0)
                     if callable(getattr(command.client, "send_target", None))
                     else None
                 )
                 rc_worker = None
-                if args.rc_port is not None:
-                    if command_arbiter is None:
-                        print("runSim RC startup blocked: v2 Command client has no controlled target ingress", file=sys.stderr)
-                        return 2
+                if command_arbiter is not None:
+                    explicit_rc_path = (
+                        None if args.rc_port is None else args.rc_port.resolve()
+                    )
                     try:
                         rc_worker = start_rc_worker(
                             command_sink=lambda candidate, now: command_arbiter.submit_rc(candidate, now=now),
                             opener=pyserial_opener(),
-                            explicit_path=args.rc_port.resolve(),
+                            explicit_path=explicit_rc_path,
                         )
-                    except (RuntimeError, ValueError) as error:
-                        print(f"runSim RC startup blocked: {error}", file=sys.stderr)
-                        return 2
+                    except (OSError, RuntimeError, ValueError) as error:
+                        if explicit_rc_path is not None:
+                            print(f"runSim RC startup blocked: {error}", file=sys.stderr)
+                            return 2
+                        print(
+                            f"runSim RC auto-discovery unavailable; continuing with keyboard: {error}",
+                            file=sys.stderr,
+                        )
+                elif args.rc_port is not None:
+                    print("runSim RC startup blocked: v2 Command client has no controlled target ingress", file=sys.stderr)
+                    return 2
                 result = run_manual_demo(
                     config,
                     duration_limit_sec=args.duration_sec,
@@ -253,7 +262,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                     v2_open_live_viewer=args.open_ros_rviz,
                 )
             finally:
-                close_command()
+                try:
+                    if command_arbiter is not None:
+                        command_arbiter.close()
+                finally:
+                    close_command()
         finally:
             for name, previous in previous_environment.items():
                 if previous is None:

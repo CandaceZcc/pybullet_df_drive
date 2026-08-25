@@ -706,7 +706,7 @@ class TelemetryDashboard:
                 if event.type() == QtCore.QEvent.KeyPress:
                     return dashboard._handle_tab_cycle(event) or dashboard._handle_key_press(event.key())
                 if event.type() == QtCore.QEvent.KeyRelease:
-                    return dashboard._handle_key_release(event.key())
+                    return dashboard._handle_key_release_event(event)
                 return False
 
         class DashboardSpinBoxWheelFilter(QtCore.QObject):
@@ -1904,7 +1904,7 @@ class TelemetryDashboard:
             event.ignore()
 
     def _key_release_event(self, event: object) -> None:
-        if self._handle_key_release(event.key()):
+        if self._handle_key_release_event(event):
             event.accept()
         else:
             event.ignore()
@@ -1954,6 +1954,16 @@ class TelemetryDashboard:
         key_code = self._normalize_key(key)
         if key_code not in self._control_keys():
             return False
+        self._pressed_keys.discard(key_code)
+        return True
+
+    def _handle_key_release_event(self, event: object) -> bool:
+        """忽略长按自动重复的伪释放，仅真实松键清除持续驾驶状态。"""
+        key_code = self._normalize_key(event.key())
+        if key_code not in self._control_keys():
+            return False
+        if event.isAutoRepeat():
+            return True
         self._pressed_keys.discard(key_code)
         return True
 
@@ -2372,14 +2382,26 @@ class TelemetryDashboard:
         channels = getattr(snapshot, "last_channels", None)
         source = getattr(source_snapshot, "active_source", None)
         reason = getattr(snapshot, "failure_reason", None)
+        renewal_hz = getattr(source_snapshot, "renewal_hz", None)
+        renewal_age = getattr(source_snapshot, "last_renewal_age_sec", None)
+        renewal_gap = getattr(source_snapshot, "max_renewal_gap_sec", None)
+        renewal_text = (
+            f"renew={renewal_hz:.1f}Hz "
+            f"last/max={1000.0 * (renewal_age or 0.0):.0f}/"
+            f"{1000.0 * (renewal_gap or 0.0):.0f}ms "
+            f"mailbox={getattr(source_snapshot, 'mailbox_update_count', 0)} "
+            f"send={getattr(source_snapshot, 'command_send_count', 0)}"
+            if isinstance(renewal_hz, (int, float))
+            else "renew=未启用"
+        )
         text = (
             f"遥控器：{path or '未启用'} | {getattr(snapshot, 'actual_hz', None) or 0.0:.1f} Hz "
             f"| age {getattr(snapshot, 'last_frame_age_sec', None) or 0.0:.3f}s\n"
-            f"ch1/ch3/ch6={channels[0]}/{channels[2]}/{channels[5]} "
+            f"ch1/ch3={channels[0]}/{channels[2]} cal=282/1002/1722 "
             f"v/w={getattr(command, 'linear_velocity_m_s', 0.0):.2f}/"
             f"{getattr(command, 'angular_velocity_rad_s', 0.0):.2f} "
-            f"unlock={'是' if getattr(command, 'unlocked', False) else '否'} "
-            f"source={source or '无'} fault={reason or getattr(command, 'reason', '无')}"
+            f"source={source or '无'} fault={reason or getattr(command, 'reason', '无')}\n"
+            f"{renewal_text} stop={getattr(source_snapshot, 'zero_reason', None) or '无'}"
             if isinstance(channels, tuple) and len(channels) == 16 and command is not None
             else "遥控器：等待有效 SBUS 帧"
         )
@@ -2387,6 +2409,8 @@ class TelemetryDashboard:
         if (
             command is not None
             and not getattr(command, "active", False)
+            and getattr(command, "reason", "")
+            not in {"waiting_frame", "recovering_frames", "frame_timeout"}
             and self.control_source_combo is not None
             and self.control_source_combo.currentData() == "rc"
         ):
@@ -2395,7 +2419,7 @@ class TelemetryDashboard:
                 self.control_source_combo.setCurrentIndex(keyboard_index)
                 fell_back_to_keyboard = True
         if fell_back_to_keyboard:
-            text += "；遥控器未就绪，已退回键盘（先将 CH6 拨到低位再拨到高位）"
+            text += "；遥控器硬故障，已退回键盘"
         self.rc_status_label.setText(text)
 
     def set_rc_available(self, available: bool) -> None:
@@ -2408,7 +2432,9 @@ class TelemetryDashboard:
         if rc_index >= 0:
             self.control_source_combo.removeItem(rc_index)
         if self.rc_status_label is not None:
-            self.rc_status_label.setText("遥控器：未启用（请使用 --rc-port 启动）")
+            self.rc_status_label.setText(
+                "遥控器：未启用（自动扫描未发现合格 SBUS；可用 --rc-port 显式诊断）"
+            )
         if self.control_owner_label is not None:
             self.control_owner_label.setText("当前所有者：键盘（遥控器未启用）")
 

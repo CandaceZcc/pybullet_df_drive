@@ -118,12 +118,14 @@ runSim --version
 runSim --help
 runSim
 
-# 可选真实 SBUS 遥控器：仅接受稳定 by-id 路径，并在启动前完成 20 帧资格检查
+# 无参数会自动扫描唯一合格 by-id SBUS；需要诊断某一口时再显式指定
 runSim \
   --rc-port /dev/serial/by-id/usb-<device>
 ```
 
-`--command-dir` 只会创建它管理的 `runSim` 软链接；如果目标已有普通文件或其他链接，安装会拒绝覆盖。安装器 manifest 记录构建时 Git commit。`--with-ros` 仅在需要 ROS 2 bridge/RViz2 时使用，Livox Viewer 2 本身已包含在普通安装中。
+`--command-dir` 只会创建它管理的 `runSim` 软链接；如果目标已有普通文件或其他链接，安装会拒绝覆盖。安装器 manifest 记录构建时 Git commit、文件 SHA-256 和 `doctor.files_verified=true`。`--with-ros` 仅在需要 ROS 2 bridge/RViz2 时使用，Livox Viewer 2 本身已包含在普通安装中。
+
+回滚时将 `$HOME/.local/share/runSim/current` 重新指向 `releases/<旧版本>`，然后执行该旧版的 `bin/runSim --version` 复核；不要删除当前指向的 release。卸载时先删除由安装器管理的 `$HOME/.local/bin/runSim` 软链接，再在确认 `current` 不再指向目标版本后删除对应 `releases/<版本>`。
 
 ## 运行
 
@@ -147,9 +149,21 @@ conda run -n slope-sim python main.py \
 +-------------------------------+--------------------------+
 ```
 
-键盘操作：上/下前进后退，左/右转向，空格停车，`q` 或 `Esc` 退出。`active_steering_4wd` 需要同时按纵向和横向键才会转弯。Dashboard 中选择车型或地形后，必须点击对应“应用”按钮才会重建物理世界。
+键盘操作：上/下前进后退，左/右转向，空格停车，`q` 或 `Esc` 退出。Dashboard 会忽略长按产生的 Qt 自动重复伪释放，只在真实松键时归零，保证持续驾驶不被键盘重复率打断。`active_steering_4wd` 需要同时按纵向和横向键才会转弯。Dashboard 中选择车型或地形后，必须点击对应“应用”按钮才会重建物理世界。
 
-Dashboard 的折线图默认不创建；需要观察时，从标签栏右上角“图表（按需）”逐项勾选，取消勾选会同时释放该图的绘图对象和历史缓存。使用 SBUS 遥控器时，先将 CH6 拨到低位再拨到高位完成安全解锁，然后在控制源中选择“遥控器”；如果串口、帧或解锁状态未就绪，Dashboard 会自动退回“键盘”，避免两个输入源同时表现为不可用。
+Dashboard 的折线图默认不创建；需要观察时，从标签栏右上角“图表（按需）”逐项勾选，取消勾选会同时释放该图的绘图对象和历史缓存。
+
+### 控制源、遥控器与安全停车
+
+`runSim` 无参数启动时会遍历 `/dev/serial/by-id/` 并对每个候选执行 20 帧 SBUS 资格检查。只有唯一合格端口时 Dashboard 才保留“遥控器”；无合格端口、单口 EIO 或多口歧义都会继续键盘模式。显式 `--rc-port` 则是诊断/强约束入口：该口不合格或 EIO 会在 GUI 创建前有界失败。
+
+遥控器仅使用 CH3（左杆前后）和 CH1（右杆转向）；CH6、解锁沿和运行中自锁已移除。当前实测校准为 `min/center/max=282/1002/1722`，接收的机械余量可到 1772；程序以中位非对称分段映射，再使用 5 帧中值、小幅滞回、中心死区和有界变化率。固定杆位对应固定目标速度，不是巡航定速。
+
+键盘、RC 和外部候选都先写入容量 1 的 latest-target mailbox，由独立 50 Hz 续租线程每约 20 ms 向唯一 C++ Command socket 发送最新值。切源时同步发送一次零命令，新源在下一续租周期接管；C++ 仍保留 100 ms 最终租约。
+
+RC 断帧 20--150 ms 时继续续租最后稳定目标；到达 200 ms 无合法帧时软停车并保留 RC 选择，恢复连续 3 帧后自动继续。EIO、拔线、无法恢复的 parser 损坏和 IPC 中断会立即零速并撤销当前控制权。这些安全零命令不经过平滑滤波。
+
+Dashboard RC 状态会显示 CH1/CH3 原始值、校准、滤波后 `v/w`、帧率/帧年龄、active source、mailbox 和 Command 发送计数、50 Hz 最近/最大间隔及零速原因。需要单独采样杆位时运行 `python scripts/test_rc_sticks.py --port /dev/serial/by-id/<设备> --duration 30`，该工具只读串口，不发车辆命令。
 
 “LiDAR 点云”页提供“累计”和“当前帧”两种模式，也可直接点击“查看当前帧”。累计模式会在进入 OpenGL 前按时间顺序等步长采样，渲染输入最多 80,000 点，避免长时间驾驶时反复拼接百万级点阵拖慢 GUI；采集和导出仍使用完整原始帧，不受显示采样影响。
 
@@ -177,6 +191,8 @@ runSim --no-dashboard --developer-diagnostics \
 
 `runSim` 无参数等价于 GUI、手动、v2 实时和 `ecal` 模式。安装包中的 eCAL 配置与 localtime 插件会自动载入；显式设置 `ECAL_CONFIG_PATH`、`ECAL_DATA`、`ECAL_TIME_PLUGIN_PATH` 或相应 CLI 参数可覆盖默认值。
 
+`runSim` 在调用者未设置时默认导出 `QT_XCB_GL_INTEGRATION=xcb_egl`，避开 Qt6 xcb-glx 与 PyBullet GLX 的已知冲突；显式环境值始终优先。若串口报 `[Errno 5] Input/output error`，说明故障发生在 SBUS 解析前：先退出当前仿真并重新插拔接收机，检查 `fuser -v /dev/ttyUSB*` 和本次启动日志；如 ModemManager 持续探测 FTDI 口，由系统管理员配置 `ID_MM_DEVICE_IGNORE=1` udev 规则，不要在车辆运动时重置 USB。
+
 采集控制也可从 Dashboard 的“MID-360 采集”页操作。成功导出后，输出目录包含 `session.mcap`、`export/lidar.lvx2`、逐帧 PCD/PLY 和导出回执；默认目录为 `results/manual-mid360/`。
 
 ## 手工验收
@@ -195,11 +211,13 @@ runSim --no-dashboard --developer-diagnostics \
 ### B. 新 release 构建后：完整 v2 GUI
 
 1. 在已安装的新 release 中执行 `bin/runSim`，确认两个 GUI 同时启动，终端未出现 `BrokenPipeError` 或 Command 退出信息。
-2. 用键盘短暂前进、转向和停车；确认 Dashboard 的 v2 状态页持续刷新。
-3. 在“MID-360 采集”页选择 1 分钟，点击“启用采集”，观察采集状态变化；提前点击“结束采集”。
-4. 确认输出目录存在 `session.mcap`、`export/lidar.lvx2`、PCD/PLY 与成功回执；点击“导入 Livox Viewer”，确认不再报告 launcher missing。
-5. 在 LiDAR 页切换累计显示并点击“查看当前帧”，确认 GUI 连续响应且采集文件点数不因显示限流而减少。
-6. 使用 `runSim --version` 和 `runSim --help` 复核安装入口及参数合同。
+2. 键盘固定前进 30 秒，确认无非预期零命令；Dashboard 中续租常态约 20 ms、最大小于 80 ms。
+3. 接收机健康时选择 RC，固定杆位 30 秒；验证 150 ms 短断帧不停车、200 ms 断帧停车、EIO/拔线立即停车与连续 3 帧自动恢复。
+4. 执行键盘→RC→外部→RC 往返，每次切源只允许一个 20 ms 控制周期零命令，不允许旧源命令穿越。
+5. 在“MID-360 采集”页选择 1 分钟，点击“启用采集”，观察采集状态变化；提前点击“结束采集”。
+6. 确认输出目录存在 `session.mcap`、`export/lidar.lvx2`、PCD/PLY 与成功回执；点击“导入 Livox Viewer”，确认不再报告 launcher missing。
+7. 在 LiDAR 页切换累计显示并点击“查看当前帧”，确认 GUI 连续响应且采集文件点数不因显示限流而减少。
+8. 使用 `runSim --version` 和 `runSim --help` 复核安装入口及参数合同。
 
 完整 v2 验收以新建、已安装的 release 为准。安装器的 manifest 必须记录包含修复的 commit，不能以未提交工作树生成最终包。
 

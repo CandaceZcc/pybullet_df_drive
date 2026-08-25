@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from importlib import import_module
 from pathlib import Path
+from threading import Event, Lock
+import time
 
 import pytest
 
@@ -47,38 +49,112 @@ def test_pyserial_opener_requires_dependency_and_uses_sbus_settings() -> None:
     assert opened == [(str(path), 115200, 0.02)]
 
 
-def test_rc_gate_requires_a_fresh_unlock_edge_and_stops_after_timeout() -> None:
-    """故障恢复不能自动接管，ch6 必须先低后高，100 ms 无帧必须输出零。"""
+def test_rc_gate_ignores_ch6_and_recovers_after_three_fresh_frames() -> None:
+    """CH6 不参与控制；短暂失联停车后连续三帧自动恢复。"""
     module = import_module("slope_sim.serial_rc")
     gate = module.RcCommandGate()
-    locked = (1000, 1000, 1722, 1000, 1000, 448) + (1000,) * 10
-    unlocked = (1000, 1000, 1722, 1000, 1000, 1002) + (1000,) * 10
+    ch6_low = (1002, 1002, 1722, 1002, 1002, 448) + (1002,) * 10
+    ch6_high = (1002, 1002, 1722, 1002, 1002, 1002) + (1002,) * 10
 
-    assert gate.observe(unlocked, now=0.0).active is False
-    assert gate.observe(locked, now=0.01).active is False
-    command = gate.observe(unlocked, now=0.02)
-    assert command.active is True
-    assert command.linear_velocity_m_s == 3.0
-    assert command.angular_velocity_rad_s == 0.0
-    timed_out = gate.decision(now=0.121)
+    assert gate.observe(ch6_low, now=0.00).active is True
+    assert gate.observe(ch6_high, now=0.01).active is True
+    assert gate.decision(now=0.16).active is True
+    timed_out = gate.decision(now=0.211)
     assert timed_out.active is False
     assert timed_out.linear_velocity_m_s == 0.0
     assert timed_out.reason == "frame_timeout"
+    assert gate.observe(ch6_low, now=0.22).active is False
+    assert gate.observe(ch6_low, now=0.23).active is False
+    recovered = gate.observe(ch6_low, now=0.24)
+    assert recovered.active is True
+    assert 0.0 < recovered.linear_velocity_m_s < 3.0
 
 
-def test_rc_gate_accepts_the_observed_two_position_switch_range() -> None:
-    """实机 CH6 只覆盖约 448..1002，低到高沿仍必须能安全解锁。"""
+def test_rc_gate_holds_last_target_for_short_gap_and_stops_at_200_ms() -> None:
+    """20--150 ms 短丢帧续租稳定目标，到达 200 ms 边界立即停车。"""
     module = import_module("slope_sim.serial_rc")
     gate = module.RcCommandGate()
-    locked = (1002, 1002, 1002, 1002, 1002, 448) + (1002,) * 10
-    unlocked = (1002, 1002, 1722, 1002, 1002, 1002) + (1002,) * 10
+    forward = (1002, 1002, 1722, 1002, 1002, 1002) + (1002,) * 10
 
-    assert gate.observe(locked, now=0.0).reason == "locked"
-    command = gate.observe(unlocked, now=0.01)
+    active = gate.observe(forward, now=1.0)
 
-    assert command.active is True
-    assert command.unlocked is True
-    assert command.linear_velocity_m_s == 3.0
+    assert gate.decision(now=1.15) == active
+    stopped = gate.decision(now=1.2)
+    assert stopped.active is False
+    assert stopped.reason == "frame_timeout"
+    assert stopped.linear_velocity_m_s == 0.0
+
+
+def test_rc_gate_maps_observed_ch1_ch3_endpoints_and_center() -> None:
+    """实机端点必须按 1002 中位分段映射，1772 不能成为坏帧停车。"""
+    module = import_module("slope_sim.serial_rc")
+    centered = (1002,) * 16
+    minimum = (1772, 1002, 282, 1002, 1002, 448) + (1002,) * 10
+    maximum = (282, 1002, 1772, 1002, 1002, 1002) + (1002,) * 10
+
+    center_command = module.RcCommandGate().observe(centered, now=0.00)
+    minimum_command = module.RcCommandGate().observe(minimum, now=0.00)
+    maximum_command = module.RcCommandGate().observe(maximum, now=0.00)
+
+    assert center_command.linear_velocity_m_s == 0.0
+    assert center_command.angular_velocity_rad_s == 0.0
+    assert minimum_command.linear_velocity_m_s == -module.MAX_LINEAR_VELOCITY_M_S
+    assert minimum_command.angular_velocity_rad_s == -module.MAX_ANGULAR_VELOCITY_RAD_S
+    assert maximum_command.linear_velocity_m_s == module.MAX_LINEAR_VELOCITY_M_S
+    assert maximum_command.angular_velocity_rad_s == module.MAX_ANGULAR_VELOCITY_RAD_S
+
+
+def test_rc_gate_filters_small_stick_jitter_and_limits_target_change_rate() -> None:
+    """固定杆位的小抖动不改变目标；大幅操作平滑跟随而不跳变。"""
+    module = import_module("slope_sim.serial_rc")
+    gate = module.RcCommandGate()
+
+    def frame(throttle: int) -> tuple[int, ...]:
+        return (1002, 1002, throttle, 1002, 1002, 1002) + (1002,) * 10
+
+    for index in range(5):
+        baseline = gate.observe(frame(1350), now=index * 0.01)
+    jittered = [
+        gate.observe(frame(value), now=0.05 + index * 0.01).linear_velocity_m_s
+        for index, value in enumerate((1352, 1348, 1351, 1349, 1350))
+    ]
+    assert jittered == [baseline.linear_velocity_m_s] * 5
+
+    before_jump = jittered[-1]
+    gate.observe(frame(1722), now=0.10)
+    gate.observe(frame(1722), now=0.11)
+    after_jump = gate.observe(frame(1722), now=0.12)
+    assert before_jump < after_jump.linear_velocity_m_s < module.MAX_LINEAR_VELOCITY_M_S
+
+
+def test_rc_command_contract_has_no_ch6_unlock_state() -> None:
+    module = import_module("slope_sim.serial_rc")
+
+    command = module.RcCommand(0.0, 0.0, False, "frame_timeout")
+
+    assert not hasattr(command, "unlocked")
+
+
+def test_rc_stick_readout_maps_ch3_to_throttle_and_ch1_to_steering() -> None:
+    """只读测试显示左杆前后与右杆转向，且不涉及解锁或控制输出。"""
+    module = import_module("slope_sim.serial_rc")
+    channels = (282, 1002, 1722) + (1002,) * 13
+
+    readout = module.rc_stick_readout(channels)
+
+    assert readout.throttle_channel == 3
+    assert readout.steering_channel == 1
+    assert readout.throttle_raw == 1722
+    assert readout.steering_raw == 282
+    assert readout.throttle_normalized == 1.0
+    assert readout.steering_normalized == -1.0
+
+
+def test_rc_stick_readout_rejects_invalid_sbus_channels() -> None:
+    module = import_module("slope_sim.serial_rc")
+
+    with pytest.raises(ValueError, match="16 SBUS channel"):
+        module.rc_stick_readout((1002,) * 15)
 
 
 @pytest.mark.parametrize(
@@ -180,16 +256,49 @@ def test_rc_port_qualification_requires_twenty_valid_frames_and_rejects_ambiguit
         raise AssertionError("ambiguous RC ports must not be auto-selected")
 
 
+def test_rc_auto_qualification_skips_eio_ports_but_explicit_port_reports_eio(
+    tmp_path: Path,
+) -> None:
+    """自动扫描跳过单口 EIO；显式指定同一坏口时保留原始故障。"""
+    module = import_module("slope_sim.serial_rc")
+    bad = tmp_path / "usb-bad"
+    good = tmp_path / "usb-good"
+    valid = _frame((1002,) * 16)
+
+    class Reader:
+        def read(self, _size):
+            return valid
+
+        def close(self):
+            return None
+
+    def opener(path: Path):
+        if path == bad:
+            raise OSError(5, "Input/output error")
+        return Reader()
+
+    assert module.select_rc_port(
+        (bad, good), opener=opener, duration_sec=0.1
+    ) == good
+    with pytest.raises(OSError, match="Input/output error"):
+        module.select_rc_port(
+            (bad, good),
+            opener=opener,
+            explicit_path=bad,
+            duration_sec=0.1,
+        )
+
+
 def test_rc_worker_forwards_only_gated_commands_and_stops_on_parser_fault() -> None:
     """worker 只向注入的本地 IPC sink 发送候选，不创建 eCAL publisher。"""
     module = import_module("slope_sim.serial_rc")
-    locked = _frame((1000, 1000, 1722, 1000, 1000, 448) + (1000,) * 10)
-    unlocked = _frame((1000, 1000, 1722, 1000, 1000, 1002) + (1000,) * 10)
+    ch6_low = _frame((1002, 1002, 1722, 1002, 1002, 448) + (1002,) * 10)
+    ch6_high = _frame((1002, 1002, 1722, 1002, 1002, 1002) + (1002,) * 10)
     sent = []
 
     class Reader:
         def __init__(self):
-            self.payloads = iter((locked, unlocked, b"\x0f" + b"\xff" * 24))
+            self.payloads = iter((ch6_low, ch6_high, b"\x0f" + b"\xff" * 24))
 
         def read(self, _size):
             return next(self.payloads, b"")
@@ -209,7 +318,8 @@ def test_rc_worker_forwards_only_gated_commands_and_stops_on_parser_fault() -> N
     snapshot = worker.snapshot(now=0.02)
     worker.close()
 
-    assert sent[0][0].reason == "locked"
+    assert sent[0][0].active is True
+    assert sent[0][0].linear_velocity_m_s == 3.0
     assert sent[1][0].active is True
     assert sent[1][0].linear_velocity_m_s == 3.0
     assert sent[2][0].reason == "parser_desynchronized"
@@ -217,8 +327,8 @@ def test_rc_worker_forwards_only_gated_commands_and_stops_on_parser_fault() -> N
     assert snapshot.last_channels is not None and snapshot.last_channels[5] == 1002
 
 
-def test_rc_worker_preserves_unlock_when_resync_batch_contains_a_valid_frame() -> None:
-    """同批坏候选后的有效帧仍须续租，不能把流重同步升级为永久失锁。"""
+def test_rc_worker_uses_valid_frame_when_resync_batch_contains_one() -> None:
+    """同批坏候选后的有效帧仍须续租，不能把流重同步升级为硬故障。"""
     module = import_module("slope_sim.serial_rc")
     locked = _frame((1000, 1000, 1722, 1000, 1000, 448) + (1000,) * 10)
     unlocked = _frame((1000, 1000, 1722, 1000, 1000, 1002) + (1000,) * 10)
@@ -248,13 +358,12 @@ def test_rc_worker_preserves_unlock_when_resync_batch_contains_a_valid_frame() -
     worker.close()
 
     assert command.active is True
-    assert command.unlocked is True
     assert command.reason == "active"
     assert sent[2][0] == command
 
 
 def test_rc_worker_uses_a_valid_frame_after_a_scheduler_delay_before_timing_out() -> None:
-    """线程延迟后若已读到新鲜有效帧，不得先清除既有解锁授权。"""
+    """线程延迟后若已读到新鲜有效帧，不得先触发超时停车。"""
     module = import_module("slope_sim.serial_rc")
     locked = _frame((1000, 1000, 1722, 1000, 1000, 448) + (1000,) * 10)
     unlocked = _frame((1000, 1000, 1722, 1000, 1000, 1002) + (1000,) * 10)
@@ -282,19 +391,18 @@ def test_rc_worker_uses_a_valid_frame_after_a_scheduler_delay_before_timing_out(
     worker.close()
 
     assert command.active is True
-    assert command.unlocked is True
     assert command.reason == "active"
 
 
-def test_rc_worker_requires_a_new_unlock_edge_after_a_real_empty_read_timeout() -> None:
-    """真实空读超过 100 ms 后必须失锁，恢复时保持高位不能自行复活。"""
+def test_rc_worker_recovers_after_three_frames_following_empty_read_timeout() -> None:
+    """真实空读超过 200 ms 停车，恢复连续三帧后自动续行。"""
     module = import_module("slope_sim.serial_rc")
     locked = _frame((1000, 1000, 1722, 1000, 1000, 448) + (1000,) * 10)
     unlocked = _frame((1000, 1000, 1722, 1000, 1000, 1002) + (1000,) * 10)
 
     class Reader:
         def __init__(self):
-            self.payloads = iter((locked, unlocked, b"", unlocked))
+            self.payloads = iter((locked, unlocked, b"", unlocked, unlocked, unlocked))
 
         def read(self, _size):
             return next(self.payloads, b"")
@@ -311,25 +419,29 @@ def test_rc_worker_requires_a_new_unlock_edge_after_a_real_empty_read_timeout() 
 
     worker.process_once(now=0.0)
     assert worker.process_once(now=0.01).active is True
-    timed_out = worker.process_once(now=0.12)
-    recovered_high = worker.process_once(now=0.13)
+    timed_out = worker.process_once(now=0.211)
+    recovering_one = worker.process_once(now=0.22)
+    recovering_two = worker.process_once(now=0.23)
+    recovered = worker.process_once(now=0.24)
     worker.close()
 
     assert timed_out.reason == "frame_timeout"
     assert timed_out.active is False
-    assert recovered_high.reason == "awaiting_unlock_edge"
-    assert recovered_high.active is False
+    assert recovering_one.reason == "recovering_frames"
+    assert recovering_two.reason == "recovering_frames"
+    assert recovered.reason == "active"
+    assert recovered.active is True
 
 
 def test_rc_worker_counts_each_watchdog_timeout_transition_once() -> None:
     """资源页的 watchdog 计数代表失联事件数，不随空读循环重复膨胀。"""
     module = import_module("slope_sim.serial_rc")
-    locked = _frame((1000, 1000, 1722, 1000, 1000, 448) + (1000,) * 10)
-    unlocked = _frame((1000, 1000, 1722, 1000, 1000, 1002) + (1000,) * 10)
+    first = _frame((1002, 1002, 1722, 1002, 1002, 448) + (1002,) * 10)
+    second = _frame((1002, 1002, 1722, 1002, 1002, 1002) + (1002,) * 10)
 
     class Reader:
         def __init__(self):
-            self.payloads = iter((locked, unlocked))
+            self.payloads = iter((first, second))
 
         def read(self, _size):
             return next(self.payloads, b"")
@@ -345,14 +457,40 @@ def test_rc_worker_counts_each_watchdog_timeout_transition_once() -> None:
     )
     worker.process_once(now=0.0)
     worker.process_once(now=0.01)
-    worker.process_once(now=0.12)
-    worker.process_once(now=0.13)
+    worker.process_once(now=0.211)
+    worker.process_once(now=0.22)
 
-    assert worker.snapshot(now=0.13).watchdog_timeout_count == 1
+    assert worker.snapshot(now=0.22).watchdog_timeout_count == 1
 
 
-def test_command_arbiter_requires_explicit_source_and_revokes_rc_on_fault() -> None:
-    """控制源切换、RC 失锁和 IPC 故障均先通过唯一 socket 发零目标。"""
+def test_rc_worker_stops_immediately_when_serial_read_raises_eio() -> None:
+    """EIO/拔线是硬故障，不等待 200 ms 软超时。"""
+    module = import_module("slope_sim.serial_rc")
+    sent = []
+
+    class Reader:
+        def read(self, _size):
+            raise OSError(5, "Input/output error")
+
+        def close(self):
+            return None
+
+    worker = module.SerialRcWorker(
+        Path("/dev/serial/by-id/usb-FTDI"),
+        reader=Reader(),
+        command_sink=lambda command, now: sent.append((command, now)),
+        start_worker=False,
+    )
+
+    command = worker.process_once(now=0.01)
+
+    assert command.active is False
+    assert command.reason == "serial_read_failed"
+    assert sent == [(command, 0.01)]
+
+
+def test_command_arbiter_keeps_selected_rc_during_soft_stop_and_revokes_hard_fault() -> None:
+    """RC 暂时失联只停车并保持选择；硬故障仍撤销控制权。"""
     module = import_module("slope_sim.serial_rc")
     sent: list[tuple[float, float, float]] = []
 
@@ -361,8 +499,8 @@ def test_command_arbiter_requires_explicit_source_and_revokes_rc_on_fault() -> N
             sent.append((linear_velocity, angular_velocity, now))
 
     arbiter = module.CommandSourceArbiter(Client())
-    active = module.RcCommand(1.5, -0.5, True, True, "active")
-    locked = module.RcCommand(0.0, 0.0, False, False, "locked")
+    active = module.RcCommand(1.5, -0.5, True, "active")
+    timed_out = module.RcCommand(0.0, 0.0, False, "frame_timeout")
 
     assert arbiter.snapshot().active_source is None
 
@@ -374,10 +512,19 @@ def test_command_arbiter_requires_explicit_source_and_revokes_rc_on_fault() -> N
     assert arbiter.submit_rc(active, now=0.02) is True
     assert sent[-1] == (1.5, -0.5, 0.02)
 
-    assert arbiter.submit_rc(locked, now=0.03) is False
+    assert arbiter.submit_rc(timed_out, now=0.03) is False
     assert sent[-1] == (0.0, 0.0, 0.03)
+    assert arbiter.snapshot().active_source == "rc"
+    assert arbiter.snapshot().failure_reason == "frame_timeout"
+    assert arbiter.submit_rc(active, now=0.035) is True
+    assert sent[-1] == (1.5, -0.5, 0.035)
+    assert arbiter.snapshot().failure_reason is None
+
+    parser_fault = module.RcCommand(0.0, 0.0, False, "parser_desynchronized")
+    assert arbiter.submit_rc(parser_fault, now=0.037) is False
+    assert sent[-1] == (0.0, 0.0, 0.037)
     assert arbiter.snapshot().active_source is None
-    assert arbiter.snapshot().failure_reason == "locked"
+    assert arbiter.snapshot().failure_reason == "parser_desynchronized"
 
     arbiter.select_source("keyboard", now=0.04)
     assert arbiter.submit_keyboard(0.2, 0.3, now=0.05) is True
@@ -385,6 +532,108 @@ def test_command_arbiter_requires_explicit_source_and_revokes_rc_on_fault() -> N
     arbiter.submit_fault("ipc_interrupted", now=0.06)
     assert sent[-1] == (0.0, 0.0, 0.06)
     assert arbiter.snapshot().active_source is None
+
+
+def test_command_arbiter_fixed_rate_renewer_uses_latest_target_and_immediate_stop() -> None:
+    """主循环只更新最新目标；续租节拍发最新值，停车不等待节拍。"""
+    module = import_module("slope_sim.serial_rc")
+    sent: list[tuple[float, float, float]] = []
+
+    class Client:
+        def send_target(self, linear_velocity, angular_velocity, *, now):
+            sent.append((linear_velocity, angular_velocity, now))
+
+    arbiter = module.CommandSourceArbiter(
+        Client(), renewal_hz=50.0, start_renewer=False
+    )
+    arbiter.select_source("keyboard", now=0.0)
+    assert sent == [(0.0, 0.0, 0.0)]
+
+    assert arbiter.submit_keyboard(0.5, 0.1, now=0.001) is True
+    assert arbiter.submit_keyboard(0.8, -0.2, now=0.010) is True
+    assert sent == [(0.0, 0.0, 0.0)]
+
+    arbiter.renew_once(now=0.020)
+    arbiter.renew_once(now=0.040)
+    assert sent[-2:] == [(0.8, -0.2, 0.020), (0.8, -0.2, 0.040)]
+    snapshot = arbiter.snapshot(now=0.045)
+    assert snapshot.latest_target == (0.8, -0.2)
+    assert snapshot.mailbox_update_count == 2
+    assert snapshot.command_send_count == 3
+    assert snapshot.renewal_count == 2
+    assert snapshot.last_renewal_age_sec == pytest.approx(0.005)
+    assert snapshot.max_renewal_gap_sec == pytest.approx(0.020)
+    assert snapshot.renewal_hz == 50.0
+
+    arbiter.select_source("rc", now=0.041)
+    assert sent[-1] == (0.0, 0.0, 0.041)
+    arbiter.close(now=0.050)
+    assert sent[-1] == (0.0, 0.0, 0.050)
+
+
+def test_command_arbiter_thread_renews_at_50_hz_below_final_lease_margin() -> None:
+    """真实线程节拍在无 GUI 负载时必须远低于 C++ 100 ms 最终租约。"""
+    module = import_module("slope_sim.serial_rc")
+    sent: list[tuple[float, float, float]] = []
+    lock = Lock()
+    enough = Event()
+
+    class Client:
+        def send_target(self, linear_velocity, angular_velocity, *, now):
+            with lock:
+                sent.append((linear_velocity, angular_velocity, now))
+                if sum(value[0] == 1.0 for value in sent) >= 6:
+                    enough.set()
+
+    arbiter = module.CommandSourceArbiter(Client(), renewal_hz=50.0)
+    arbiter.select_source("keyboard", now=time.monotonic())
+    arbiter.submit_keyboard(1.0, 0.0, now=time.monotonic())
+    try:
+        assert enough.wait(0.5)
+    finally:
+        arbiter.close()
+
+    renewals = [timestamp for linear, _angular, timestamp in sent if linear == 1.0]
+    gaps = [current - previous for previous, current in zip(renewals, renewals[1:])]
+    assert len(renewals) >= 6
+    assert max(gaps) < 0.08
+
+
+def test_command_arbiter_switches_keyboard_rc_external_with_one_zero_cycle() -> None:
+    """键盘→RC→外部→RC 每次只插入一次零命令，新源下一续租周期接管。"""
+    module = import_module("slope_sim.serial_rc")
+    sent: list[tuple[float, float]] = []
+
+    class Client:
+        def send_target(self, linear, angular, *, now):
+            sent.append((linear, angular))
+
+    arbiter = module.CommandSourceArbiter(
+        Client(), renewal_hz=50.0, start_renewer=False
+    )
+    arbiter.select_source("keyboard", now=0.00)
+    arbiter.submit_keyboard(0.4, 0.0, now=0.01)
+    arbiter.renew_once(now=0.02)
+    arbiter.select_source("rc", now=0.03)
+    arbiter.submit_rc(module.RcCommand(0.8, -0.1, True, "active"), now=0.04)
+    arbiter.renew_once(now=0.05)
+    arbiter.select_source("external", now=0.06)
+    arbiter.submit_external(-0.2, 0.3, now=0.07)
+    arbiter.renew_once(now=0.08)
+    arbiter.select_source("rc", now=0.09)
+    arbiter.submit_rc(module.RcCommand(0.6, 0.2, True, "active"), now=0.10)
+    arbiter.renew_once(now=0.11)
+
+    assert sent == [
+        (0.0, 0.0),
+        (0.4, 0.0),
+        (0.0, 0.0),
+        (0.8, -0.1),
+        (0.0, 0.0),
+        (-0.2, 0.3),
+        (0.0, 0.0),
+        (0.6, 0.2),
+    ]
 
 
 def test_start_rc_worker_qualifies_by_id_port_before_forwarding_to_arbiter(
@@ -397,8 +646,8 @@ def test_start_rc_worker_qualifies_by_id_port_before_forwarding_to_arbiter(
     port = by_id / "usb-FTDI"
     port.touch()
     valid = _frame((1000,) * 16)
-    locked = _frame((1000, 1000, 1722, 1000, 1000, 448) + (1000,) * 10)
-    unlocked = _frame((1000, 1000, 1722, 1000, 1000, 1002) + (1000,) * 10)
+    first = _frame((1002, 1002, 1722, 1002, 1002, 448) + (1002,) * 10)
+    second = _frame((1002, 1002, 1722, 1002, 1002, 1002) + (1002,) * 10)
     sent: list[tuple[float, float, float]] = []
 
     class Reader:
@@ -411,7 +660,7 @@ def test_start_rc_worker_qualifies_by_id_port_before_forwarding_to_arbiter(
         def close(self):
             return None
 
-    readers = iter((Reader([valid] * 20), Reader([locked, unlocked])))
+    readers = iter((Reader([valid] * 20), Reader([first, second])))
     arbiter = module.CommandSourceArbiter(
         type("Client", (), {"send_target": lambda _self, v, w, *, now: sent.append((v, w, now))})()
     )

@@ -20,8 +20,93 @@ _FRAME_BYTES = 25
 _CHANNELS = 16
 _CHANNEL_INPUT_MIN = 282
 _CHANNEL_INPUT_MAX = 1772
-_CHANNEL_CALIBRATION_MIN = 282
-_CHANNEL_CALIBRATION_MAX = 1722
+_STICK_MIN = 282
+_STICK_CENTER = 1002
+_STICK_MAX = 1722
+_RECOVERABLE_RC_REASONS = frozenset({"waiting_frame", "recovering_frames", "frame_timeout"})
+
+
+def _normalize_stick(value: int, *, deadzone: float = 0.0) -> float:
+    """按实测中位分段映射，避免物理极值被理论 SBUS 量程压缩。"""
+    if value <= _STICK_CENTER:
+        scaled = (value - _STICK_CENTER) / (_STICK_CENTER - _STICK_MIN)
+    else:
+        scaled = (value - _STICK_CENTER) / (_STICK_MAX - _STICK_CENTER)
+    if abs(scaled) <= deadzone:
+        return 0.0
+    return max(-1.0, min(1.0, scaled))
+
+
+class _StickAxisFilter:
+    """短窗口中值滤波叠加变化率限制，安全停车由门禁直接绕过。"""
+
+    def __init__(self, *, deadzone: float, max_rate_per_sec: float = 4.0) -> None:
+        self._deadzone = deadzone
+        self._max_rate_per_sec = max_rate_per_sec
+        self._samples: deque[int] = deque(maxlen=5)
+        self._stable_raw: int | None = None
+        self._output: float | None = None
+        self._last_at: float | None = None
+
+    def update(self, value: int, *, now: float) -> float:
+        self._samples.append(value)
+        ordered = sorted(self._samples)
+        median = ordered[len(ordered) // 2]
+        if self._stable_raw is None or abs(median - self._stable_raw) >= 4:
+            self._stable_raw = median
+        target = _normalize_stick(self._stable_raw, deadzone=self._deadzone)
+        if self._output is None:
+            self._output = target
+        elif self._last_at is None:
+            # 故障后以零为起点；首帧只建立时间基准，不瞬间跳回旧速度。
+            pass
+        else:
+            limit = self._max_rate_per_sec * max(0.0, float(now) - self._last_at)
+            delta = max(-limit, min(limit, target - self._output))
+            self._output += delta
+        self._last_at = float(now)
+        return self._output
+
+    def reset(self, *, safe_zero: bool = False) -> None:
+        self._samples.clear()
+        self._stable_raw = None
+        self._output = 0.0 if safe_zero else None
+        self._last_at = None
+
+
+@dataclass(frozen=True, slots=True)
+class RcStickReadout:
+    """只读遥控器测试的两个操纵杆状态，不参与解锁或车辆控制。"""
+
+    throttle_channel: int
+    steering_channel: int
+    throttle_raw: int
+    steering_raw: int
+    throttle_normalized: float
+    steering_normalized: float
+
+
+def rc_stick_readout(channels: tuple[int, ...]) -> RcStickReadout:
+    """提取 CH3 左杆前后和 CH1 右杆转向，并按实测中位分段归一化。"""
+    if (
+        not isinstance(channels, tuple)
+        or len(channels) != _CHANNELS
+        or any(
+            type(value) is not int
+            or not _CHANNEL_INPUT_MIN <= value <= _CHANNEL_INPUT_MAX
+            for value in channels
+        )
+    ):
+        raise ValueError("channels must be 16 SBUS channel values in range")
+
+    return RcStickReadout(
+        throttle_channel=3,
+        steering_channel=1,
+        throttle_raw=channels[2],
+        steering_raw=channels[0],
+        throttle_normalized=_normalize_stick(channels[2]),
+        steering_normalized=_normalize_stick(channels[0]),
+    )
 
 
 def pyserial_opener(
@@ -119,28 +204,31 @@ def qualify_rc_ports(
     duration_sec: float = 2.0,
     min_valid_frames: int = 20,
     monotonic: Callable[[], float] = time.monotonic,
+    ignore_io_errors: bool = True,
 ) -> tuple[Path, ...]:
     """逐个端口验证连续 SBUS 帧；读取超时由 opener 配置，函数不假设 pyserial 可用。"""
     if not isinstance(candidates, tuple) or any(not isinstance(path, Path) for path in candidates):
         raise ValueError("candidates must be a tuple of Path values")
     if not callable(opener) or not callable(monotonic):
         raise ValueError("opener and monotonic must be callable")
+    if not isinstance(ignore_io_errors, bool):
+        raise ValueError("ignore_io_errors must be a bool")
     if duration_sec <= 0.0 or min_valid_frames <= 0:
         raise ValueError("duration_sec and min_valid_frames must be positive")
     qualified: list[Path] = []
     for path in candidates:
-        reader = opener(path)
-        read = getattr(reader, "read", None)
-        close = getattr(reader, "close", None)
-        if not callable(read):
-            if callable(close):
-                close()
-            raise ValueError("serial opener result must provide read")
+        reader = None
+        close = None
         parser = SbusFrameParser()
         consecutive = 0
         discarded = 0
         deadline = float(monotonic()) + duration_sec
         try:
+            reader = opener(path)
+            read = getattr(reader, "read", None)
+            close = getattr(reader, "close", None)
+            if not callable(read):
+                raise ValueError("serial opener result must provide read")
             while float(monotonic()) < deadline:
                 payload = read(256)
                 frames = parser.feed(payload)
@@ -151,9 +239,16 @@ def qualify_rc_ports(
                 if consecutive >= min_valid_frames:
                     qualified.append(path)
                     break
+        except OSError:
+            if not ignore_io_errors:
+                raise
         finally:
             if callable(close):
-                close()
+                try:
+                    close()
+                except OSError:
+                    if not ignore_io_errors:
+                        raise
     return tuple(qualified)
 
 
@@ -176,6 +271,7 @@ def select_rc_port(
         duration_sec=duration_sec,
         min_valid_frames=min_valid_frames,
         monotonic=monotonic,
+        ignore_io_errors=explicit_path is None,
     )
     if not qualified:
         return None
@@ -192,7 +288,6 @@ class RcCommand:
     linear_velocity_m_s: float
     angular_velocity_rad_s: float
     active: bool
-    unlocked: bool
     reason: str
 
 
@@ -202,6 +297,14 @@ class CommandSourceSnapshot:
 
     active_source: str | None
     failure_reason: str | None
+    latest_target: tuple[float, float] = (0.0, 0.0)
+    mailbox_update_count: int = 0
+    command_send_count: int = 0
+    renewal_count: int = 0
+    last_renewal_age_sec: float | None = None
+    max_renewal_gap_sec: float | None = None
+    renewal_hz: float | None = None
+    zero_reason: str | None = None
 
 
 class CommandSourceArbiter:
@@ -209,19 +312,57 @@ class CommandSourceArbiter:
 
     _SOURCES = frozenset(("keyboard", "rc", "external"))
 
-    def __init__(self, command_client: object) -> None:
+    def __init__(
+        self,
+        command_client: object,
+        *,
+        renewal_hz: float | None = None,
+        start_renewer: bool = True,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
         if not callable(getattr(command_client, "send_target", None)):
             raise ValueError("command_client must provide send_target")
+        if renewal_hz is not None and (
+            isinstance(renewal_hz, bool)
+            or not isinstance(renewal_hz, (int, float))
+            or renewal_hz <= 0.0
+        ):
+            raise ValueError("renewal_hz must be positive or None")
+        if not isinstance(start_renewer, bool) or not callable(monotonic):
+            raise ValueError("start_renewer and monotonic must be valid")
         self._command_client = command_client
         self._lock = RLock()
         self._active_source: str | None = None
         self._failure_reason: str | None = None
+        self._latest_target = (0.0, 0.0)
+        self._mailbox_update_count = 0
+        self._command_send_count = 0
+        self._renewal_count = 0
+        self._last_renewal_at: float | None = None
+        self._max_renewal_gap_sec: float | None = None
+        self._zero_reason: str | None = None
+        self._renewal_hz = None if renewal_hz is None else float(renewal_hz)
+        self._renewal_period_sec = (
+            None if self._renewal_hz is None else 1.0 / self._renewal_hz
+        )
+        self._monotonic = monotonic
+        self._renewal_stop = Event()
+        self._renewal_thread: Thread | None = None
+        if self._renewal_period_sec is not None and start_renewer:
+            self._renewal_thread = Thread(
+                target=self._run_renewer,
+                name="command-target-renewer",
+                daemon=True,
+            )
+            self._renewal_thread.start()
 
     def select_source(self, source: str, *, now: float) -> None:
         """用户显式选择输入源；不保留上一个源的运动目标。"""
         if source not in self._SOURCES:
             raise ValueError(f"unsupported command source: {source}")
         with self._lock:
+            previous_source = self._active_source or "none"
+            self._zero_reason = f"source_switch:{previous_source}->{source}"
             self._send_zero(now)
             self._active_source = source
             self._failure_reason = None
@@ -251,20 +392,29 @@ class CommandSourceArbiter:
         )
 
     def submit_rc(self, command: RcCommand, *, now: float) -> bool:
-        """RC 只有在已选择且 ch6 门禁 active 时可以提交运动。"""
+        """RC 软超时只停车不撤销选择，新鲜帧恢复后自动续行。"""
         if not isinstance(command, RcCommand):
             raise ValueError("command must be an RcCommand")
         with self._lock:
             if self._active_source != "rc":
                 return False
             if not command.active:
-                self._revoke(command.reason, now=now)
+                if command.reason in _RECOVERABLE_RC_REASONS:
+                    if self._failure_reason != command.reason:
+                        self._zero_reason = command.reason
+                        self._send_zero(now)
+                    else:
+                        self._latest_target = (0.0, 0.0)
+                    self._failure_reason = command.reason
+                else:
+                    self._revoke(command.reason, now=now)
                 return False
-            self._send_target(
+            self._publish_or_store_target(
                 command.linear_velocity_m_s,
                 command.angular_velocity_rad_s,
                 now=now,
             )
+            self._failure_reason = None
             return True
 
     def submit_fault(self, reason: str, *, now: float) -> None:
@@ -274,10 +424,56 @@ class CommandSourceArbiter:
         with self._lock:
             self._revoke(reason, now=now)
 
-    def snapshot(self) -> CommandSourceSnapshot:
+    def snapshot(self, *, now: float | None = None) -> CommandSourceSnapshot:
         """返回不可变状态，避免 Dashboard 读取时竞态。"""
+        observed_at = float(self._monotonic() if now is None else now)
         with self._lock:
-            return CommandSourceSnapshot(self._active_source, self._failure_reason)
+            last_renewal_age = (
+                None
+                if self._last_renewal_at is None
+                else max(0.0, observed_at - self._last_renewal_at)
+            )
+            return CommandSourceSnapshot(
+                self._active_source,
+                self._failure_reason,
+                self._latest_target,
+                self._mailbox_update_count,
+                self._command_send_count,
+                self._renewal_count,
+                last_renewal_age,
+                self._max_renewal_gap_sec,
+                self._renewal_hz,
+                self._zero_reason,
+            )
+
+    def renew_once(self, *, now: float) -> None:
+        """按固定节拍发送容量 1 mailbox 中的最新目标。"""
+        with self._lock:
+            if self._renewal_period_sec is None:
+                return
+            self._send_target(*self._latest_target, now=now)
+            if self._last_renewal_at is not None:
+                gap = max(0.0, float(now) - self._last_renewal_at)
+                self._max_renewal_gap_sec = (
+                    gap
+                    if self._max_renewal_gap_sec is None
+                    else max(self._max_renewal_gap_sec, gap)
+                )
+            self._last_renewal_at = float(now)
+            self._renewal_count += 1
+
+    def close(self, *, now: float | None = None) -> None:
+        """停止续租线程并同步发送最终零命令。"""
+        if self._renewal_stop.is_set():
+            return
+        self._renewal_stop.set()
+        if self._renewal_thread is not None:
+            self._renewal_thread.join(timeout=1.0)
+        observed_at = float(self._monotonic() if now is None else now)
+        with self._lock:
+            self._zero_reason = "closed"
+            self._send_zero(observed_at)
+            self._active_source = None
 
     def _submit(
         self,
@@ -290,18 +486,53 @@ class CommandSourceArbiter:
         with self._lock:
             if self._active_source != source:
                 return False
-            self._send_target(linear_velocity_m_s, angular_velocity_rad_s, now=now)
+            self._publish_or_store_target(
+                linear_velocity_m_s,
+                angular_velocity_rad_s,
+                now=now,
+            )
             return True
 
     def _revoke(self, reason: str, *, now: float) -> None:
         try:
+            self._zero_reason = reason
             self._send_zero(now)
         finally:
             self._active_source = None
             self._failure_reason = reason
 
     def _send_zero(self, now: float) -> None:
+        self._latest_target = (0.0, 0.0)
         self._send_target(0.0, 0.0, now=now)
+
+    def _publish_or_store_target(
+        self,
+        linear_velocity_m_s: float,
+        angular_velocity_rad_s: float,
+        *,
+        now: float,
+    ) -> None:
+        self._latest_target = (linear_velocity_m_s, angular_velocity_rad_s)
+        self._mailbox_update_count += 1
+        self._zero_reason = None
+        if self._renewal_period_sec is None:
+            self._send_target(linear_velocity_m_s, angular_velocity_rad_s, now=now)
+
+    def _run_renewer(self) -> None:
+        assert self._renewal_period_sec is not None
+        next_deadline = float(self._monotonic()) + self._renewal_period_sec
+        while not self._renewal_stop.wait(
+            max(0.0, next_deadline - float(self._monotonic()))
+        ):
+            observed_at = float(self._monotonic())
+            try:
+                self.renew_once(now=observed_at)
+            except Exception:
+                self._renewal_stop.set()
+                return
+            next_deadline += self._renewal_period_sec
+            if next_deadline <= observed_at:
+                next_deadline = observed_at + self._renewal_period_sec
 
     def _send_target(
         self,
@@ -314,6 +545,7 @@ class CommandSourceArbiter:
             self._command_client.send_target(
                 linear_velocity_m_s, angular_velocity_rad_s, now=now
             )
+            self._command_send_count += 1
         except Exception:
             self._active_source = None
             self._failure_reason = "ipc_interrupted"
@@ -334,31 +566,29 @@ class RcWorkerSnapshot:
 
 
 class RcCommandGate:
-    """解锁沿与 100 ms watchdog；恢复后必须重新选择且重新解锁。"""
+    """把新鲜 CH1/CH3 帧映射为控制目标，并在持续失联时安全停车。"""
 
     def __init__(
         self,
         *,
-        unlock_high: int = 850,
-        unlock_low: int = 650,
-        timeout_sec: float = 0.1,
+        timeout_sec: float = 0.2,
         deadzone: float = 0.05,
+        recovery_frames: int = 3,
     ) -> None:
-        if not (
-            _CHANNEL_INPUT_MIN <= unlock_low < unlock_high <= _CHANNEL_INPUT_MAX
-        ):
-            raise ValueError("unlock thresholds must be ordered RC channel values")
         if timeout_sec <= 0.0 or not 0.0 <= deadzone < 1.0:
             raise ValueError("timeout_sec and deadzone must be valid")
-        self._unlock_high = unlock_high
-        self._unlock_low = unlock_low
+        if isinstance(recovery_frames, bool) or not isinstance(recovery_frames, int) or recovery_frames <= 0:
+            raise ValueError("recovery_frames must be a positive integer")
         self._timeout_sec = timeout_sec
         self._deadzone = deadzone
+        self._recovery_frames = recovery_frames
         self._last_frame_at: float | None = None
-        self._seen_locked = False
-        self._unlocked = False
+        # 端口资格检查已经验证至少 20 帧；只有真实故障后才重新累计恢复帧。
+        self._fresh_frame_count = recovery_frames
+        self._throttle_filter = _StickAxisFilter(deadzone=deadzone)
+        self._steering_filter = _StickAxisFilter(deadzone=deadzone)
         self._active = False
-        self._last = self._zero("awaiting_unlock_edge")
+        self._last = self._zero("waiting_frame")
 
     def observe(self, channels: tuple[int, ...], *, now: float) -> RcCommand:
         if not isinstance(channels, tuple) or len(channels) != _CHANNELS:
@@ -370,61 +600,47 @@ class RcCommandGate:
         ):
             return self.fault("channel_out_of_range")
         self._last_frame_at = float(now)
-        arm = channels[5]
-        if arm <= self._unlock_low:
-            self._seen_locked = True
-            self._unlocked = False
+        self._fresh_frame_count = min(self._recovery_frames, self._fresh_frame_count + 1)
+        filtered_throttle = self._throttle_filter.update(channels[2], now=now)
+        filtered_steering = self._steering_filter.update(channels[0], now=now)
+        if self._fresh_frame_count < self._recovery_frames:
             self._active = False
-            self._last = self._zero("locked")
+            self._last = self._zero("recovering_frames")
             return self._last
-        if arm < self._unlock_high:
-            self._unlocked = False
-            self._active = False
-            self._last = self._zero("unlock_hysteresis")
-            return self._last
-        self._unlocked = self._seen_locked
-        self._active = self._unlocked
-        if not self._active:
-            self._last = self._zero("awaiting_unlock_edge")
-            return self._last
+        self._active = True
         self._last = RcCommand(
-            MAX_LINEAR_VELOCITY_M_S * self._normalized(channels[2]),
-            -MAX_ANGULAR_VELOCITY_RAD_S * self._normalized(channels[0]),
-            True,
+            MAX_LINEAR_VELOCITY_M_S
+            * filtered_throttle,
+            -MAX_ANGULAR_VELOCITY_RAD_S
+            * filtered_steering,
             True,
             "active",
         )
         return self._last
 
     def decision(self, *, now: float) -> RcCommand:
-        if self._last_frame_at is None or float(now) - self._last_frame_at > self._timeout_sec:
+        if self._last_frame_at is None:
+            return self._last
+        if float(now) - self._last_frame_at >= self._timeout_sec - 1e-12:
             self._active = False
-            self._unlocked = False
-            self._seen_locked = False
+            self._fresh_frame_count = 0
+            self._reset_filters()
             self._last = self._zero("frame_timeout")
         return self._last
 
     def fault(self, reason: str) -> RcCommand:
         self._active = False
-        self._unlocked = False
-        self._seen_locked = False
+        self._fresh_frame_count = 0
+        self._reset_filters()
         self._last = self._zero(reason)
         return self._last
 
-    def _normalized(self, value: int) -> float:
-        # 接收实机端点余量，但保持既有校准手感；超出校准端点时由末行限幅。
-        scaled = (
-            2.0
-            * (value - _CHANNEL_CALIBRATION_MIN)
-            / (_CHANNEL_CALIBRATION_MAX - _CHANNEL_CALIBRATION_MIN)
-            - 1.0
-        )
-        if abs(scaled) <= self._deadzone:
-            return 0.0
-        return max(-1.0, min(1.0, scaled))
+    def _reset_filters(self) -> None:
+        self._throttle_filter.reset(safe_zero=True)
+        self._steering_filter.reset(safe_zero=True)
 
     def _zero(self, reason: str) -> RcCommand:
-        return RcCommand(0.0, 0.0, False, self._unlocked, reason)
+        return RcCommand(0.0, 0.0, False, reason)
 
 
 class SerialRcWorker:

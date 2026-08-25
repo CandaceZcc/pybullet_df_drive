@@ -439,3 +439,201 @@ def test_main_restores_explicit_ecal_paths_when_command_startup_is_blocked(
     ]) == 2
     assert "ECAL_CONFIG_PATH" not in main.os.environ
     assert "ECAL_TIME_PLUGIN_PATH" not in main.os.environ
+
+
+def test_main_auto_discovers_rc_nonfatally_when_no_port_qualifies(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """无参数 runSim 自动扫描 RC，无合格端口时仍进入键盘模式。"""
+    import main
+
+    config_path, plugin_dir, _descriptor_path = _fixture_files(tmp_path)
+    module = _module()
+    monkeypatch.setattr(
+        main,
+        "run_v2_ecal_preflight",
+        lambda **_kwargs: module.EcalPreflightReport(
+            config_path,
+            plugin_dir / "libecaltime-localtime.so",
+            "descriptor",
+            True,
+            None,
+            (),
+        ),
+    )
+
+    class Client:
+        def send_target(self, _linear, _angular, *, now):
+            assert isinstance(now, float)
+
+    class Command:
+        session_id_factory = staticmethod(lambda: b"s" * 16)
+        client = Client()
+        process_pid = 123
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(main.RunSimV2Command, "launch", lambda **_kwargs: Command())
+    attempts: list[Path | None] = []
+    monkeypatch.setattr(
+        main,
+        "start_rc_worker",
+        lambda **kwargs: (
+            attempts.append(kwargs["explicit_path"]),
+            (_ for _ in ()).throw(RuntimeError("no qualified RC SBUS port")),
+        )[1],
+    )
+    runtime_workers: list[object | None] = []
+    monkeypatch.setattr(
+        main,
+        "run_manual_demo",
+        lambda *_args, **kwargs: (
+            runtime_workers.append(kwargs["rc_worker"]),
+            types.SimpleNamespace(
+                log_path=tmp_path / "log.csv",
+                figure_path=tmp_path / "figure.png",
+                feedback_figure_paths=(),
+                diagnostic_summary_path=None,
+                obstacle_event_log_path=None,
+                interface_binary_log=None,
+                interface_event_log=None,
+                scene_export=None,
+                metrics={},
+                diagnostic_summary=None,
+            ),
+        )[1],
+    )
+
+    assert main.main(["--gui", "--manual", "--interface-mode", "ecal"]) == 0
+    assert attempts == [None]
+    assert runtime_workers == [None]
+    assert "RC auto-discovery unavailable" in capsys.readouterr().err
+
+
+def test_main_closes_command_even_when_arbiter_final_zero_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """最终 socket 归零失败也不能跳过受监管 C++ Command 的回收。"""
+    import main
+
+    config_path, plugin_dir, _descriptor_path = _fixture_files(tmp_path)
+    module = _module()
+    monkeypatch.setattr(
+        main,
+        "run_v2_ecal_preflight",
+        lambda **_kwargs: module.EcalPreflightReport(
+            config_path,
+            plugin_dir / "libecaltime-localtime.so",
+            "descriptor",
+            True,
+            None,
+            (),
+        ),
+    )
+    closed: list[str] = []
+
+    class Client:
+        @staticmethod
+        def send_target(_linear, _angular, *, now):
+            assert isinstance(now, float)
+
+    class Command:
+        session_id_factory = staticmethod(lambda: b"s" * 16)
+        client = Client()
+        process_pid = 123
+
+        @staticmethod
+        def close() -> None:
+            closed.append("command")
+
+    class Arbiter:
+        def __init__(self, _client, **_kwargs) -> None:
+            pass
+
+        @staticmethod
+        def close(*, now=None) -> None:
+            raise RuntimeError("arbiter close failed")
+
+    monkeypatch.setattr(main.RunSimV2Command, "launch", lambda **_kwargs: Command())
+    monkeypatch.setattr(main, "CommandSourceArbiter", Arbiter)
+    monkeypatch.setattr(main, "start_rc_worker", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        main,
+        "run_manual_demo",
+        lambda *_args, **_kwargs: types.SimpleNamespace(
+            log_path=tmp_path / "log.csv",
+            figure_path=tmp_path / "figure.png",
+            feedback_figure_paths=(),
+            diagnostic_summary_path=None,
+            obstacle_event_log_path=None,
+            interface_binary_log=None,
+            interface_event_log=None,
+            scene_export=None,
+            metrics={},
+            diagnostic_summary=None,
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="arbiter close failed"):
+        main.main(["--gui", "--manual", "--interface-mode", "ecal"])
+
+    assert closed == ["command"]
+
+
+def test_main_explicit_rc_eio_blocks_startup_with_bounded_diagnostic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """显式 --rc-port 的 EIO 必须在 GUI 启动前有界失败并保留原因。"""
+    import main
+
+    config_path, plugin_dir, _descriptor_path = _fixture_files(tmp_path)
+    module = _module()
+    monkeypatch.setattr(
+        main,
+        "run_v2_ecal_preflight",
+        lambda **_kwargs: module.EcalPreflightReport(
+            config_path,
+            plugin_dir / "libecaltime-localtime.so",
+            "descriptor",
+            True,
+            None,
+            (),
+        ),
+    )
+
+    class Client:
+        def send_target(self, _linear, _angular, *, now):
+            assert isinstance(now, float)
+
+    class Command:
+        session_id_factory = staticmethod(lambda: b"s" * 16)
+        client = Client()
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(main.RunSimV2Command, "launch", lambda **_kwargs: Command())
+    monkeypatch.setattr(
+        main,
+        "start_rc_worker",
+        lambda **_kwargs: (_ for _ in ()).throw(OSError(5, "Input/output error")),
+    )
+    manual_started = []
+    monkeypatch.setattr(main, "run_manual_demo", lambda *_args, **_kwargs: manual_started.append(True))
+
+    assert main.main([
+        "--gui",
+        "--manual",
+        "--interface-mode",
+        "ecal",
+        "--rc-port",
+        "/dev/serial/by-id/usb-test",
+    ]) == 2
+    assert manual_started == []
+    assert "Input/output error" in capsys.readouterr().err

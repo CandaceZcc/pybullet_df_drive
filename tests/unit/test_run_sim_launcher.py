@@ -22,7 +22,7 @@ def test_run_sim_reports_its_version_without_requiring_conda() -> None:
     )
 
     assert completed.returncode == 0, completed.stderr
-    assert completed.stdout == "runSim 5.0.0\n"
+    assert completed.stdout == "runSim 5.0.2\n"
     assert completed.stderr == ""
 
 
@@ -44,6 +44,7 @@ def test_run_sim_forwards_help_to_the_manual_gui_entrypoint() -> None:
     assert "--capture-duration-sec" in completed.stdout
     assert "--viewer-root" in completed.stdout
     assert "--open-ros-rviz" in completed.stdout
+    assert "--rc-port" in completed.stdout
     assert "--lidar" not in completed.stdout
 
 
@@ -145,6 +146,61 @@ def test_installed_run_sim_prevents_release_bytecode_writes(tmp_path: Path) -> N
 
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout == "1\n"
+
+
+def test_run_sim_defaults_qt_xcb_gl_integration_to_egl(tmp_path: Path) -> None:
+    """Qt6 Dashboard 默认避开与 PyBullet GLX 冲突的 xcb-glx 路径。"""
+    release = tmp_path / "release"
+    launcher = release / "bin" / "runSim"
+    runtime = release / "runtime" / "bin" / "python"
+    launcher.parent.mkdir(parents=True)
+    runtime.parent.mkdir(parents=True)
+    shutil.copy2(ROOT / "runSim", launcher)
+    (release / "main.py").write_text("# release entrypoint\n", encoding="utf-8")
+    runtime.write_text(
+        "#!/usr/bin/env sh\nprintf '%s\\n' \"${QT_XCB_GL_INTEGRATION:-}\"\n",
+        encoding="utf-8",
+    )
+    runtime.chmod(0o755)
+    environment = dict(os.environ)
+    environment.pop("QT_XCB_GL_INTEGRATION", None)
+
+    completed = subprocess.run(
+        [str(launcher), "--help"],
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout == "xcb_egl\n"
+
+
+def test_run_sim_preserves_explicit_qt_xcb_gl_integration(tmp_path: Path) -> None:
+    """调试时调用者显式指定的 Qt XCB 集成方式始终优先。"""
+    release = tmp_path / "release"
+    launcher = release / "bin" / "runSim"
+    runtime = release / "runtime" / "bin" / "python"
+    launcher.parent.mkdir(parents=True)
+    runtime.parent.mkdir(parents=True)
+    shutil.copy2(ROOT / "runSim", launcher)
+    (release / "main.py").write_text("# release entrypoint\n", encoding="utf-8")
+    runtime.write_text(
+        "#!/usr/bin/env sh\nprintf '%s\\n' \"${QT_XCB_GL_INTEGRATION:-}\"\n",
+        encoding="utf-8",
+    )
+    runtime.chmod(0o755)
+    environment = {**os.environ, "QT_XCB_GL_INTEGRATION": "xcb_glx"}
+
+    completed = subprocess.run(
+        [str(launcher), "--help"],
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout == "xcb_glx\n"
 
 
 def test_run_sim_defaults_to_formal_v2_ecal_keyboard_control(

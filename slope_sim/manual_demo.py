@@ -1533,6 +1533,14 @@ def run_manual_demo(
             except BaseException as exc:
                 if cleanup_error is None:
                     cleanup_error = exc
+        if v2_command_arbiter is not None:
+            try:
+                close_command_arbiter = getattr(v2_command_arbiter, "close", None)
+                if callable(close_command_arbiter):
+                    close_command_arbiter(now=runtime_monotonic())
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
         if v2_manual_runtime is not None:
             if v2_command_shutdown is not None:
                 try:
