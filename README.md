@@ -100,7 +100,7 @@ export SLOPE_SIM_V2_RUNTIME_ROOT="$PWD/build/stage5-acceptance-runtime"
 
 ### `runSim.run` 安装
 
-最终发布包为 Ubuntu 24.04 amd64 单文件安装器 `runSim.run`。安装过程需要联网下载锁定依赖，所有下载和内嵌文件均校验 SHA-256；Livox Viewer 2 使用 Livox 官方 Linux 2.6.0 包，并安装到 release 内的固定路径。Viewer 是 Livox 的专有二进制，本仓库不提交其 ZIP，安装器只保存官方 URL、版本与摘要。
+最终发布包为 Ubuntu 24.04 amd64 单文件安装器 `build/slope-sim-stage4-5.0.3-ubuntu24.04-amd64.run`。安装过程需要联网下载锁定依赖，所有下载和内嵌文件均校验 SHA-256；Livox Viewer 2 使用 Livox 官方 Linux 2.6.0 包，并安装到 release 内的固定路径。Viewer 是 Livox 的专有二进制，本仓库不提交其 ZIP，安装器只保存官方 URL、版本与摘要。
 
 5.0.3 将“生成安装包”和“首次安装编译”明确分开。下面两条发布命令只复制、哈希和压缩项目文件，不会触发 C++ 编译，日常 GUI/eCAL 验收可继续复用 `build/stage5-acceptance-runtime`：
 
@@ -116,15 +116,15 @@ conda run -n slope-sim python scripts/build_stage4_run.py \
 接近一小时的依赖和核心 C++ 编译只发生在 `.run` 首次完整安装。安装器按 CPU 数和 `/proc/meminfo` 的 `MemAvailable` 自动选择并行度：预留 2 GiB、每任务预算 1.5 GiB、最多 8 路；探测失败安全降级为单任务。安装了 `ccache` 时会自动作为 C/C++ launcher，跨版本 staging 共用系统 canonical cache，并限制为 5 GiB；未安装也可正常并行。需要人工限流时可设置严格的 `SLOPE_SIM_BUILD_JOBS=1..CPU数`，非法值会在编译前直接报错，例如：
 
 ```bash
-SLOPE_SIM_BUILD_JOBS=2 ./runSim.run \
+SLOPE_SIM_BUILD_JOBS=2 ./build/slope-sim-stage4-5.0.3-ubuntu24.04-amd64.run \
   --install-root "$HOME/.local/share/runSim" \
   --command-dir "$HOME/.local/bin"
 ```
 
 ```bash
-chmod +x runSim.run
+chmod +x build/slope-sim-stage4-5.0.3-ubuntu24.04-amd64.run
 mkdir -p "$HOME/.local/bin"
-./runSim.run \
+./build/slope-sim-stage4-5.0.3-ubuntu24.04-amd64.run \
   --install-root "$HOME/.local/share/runSim" \
   --command-dir "$HOME/.local/bin"
 
