@@ -46,6 +46,8 @@ _CLOUD_RENDER_MAX_HZ = 10.0
 _MAX_CLOUD_HISTORY_FRAMES = 512
 _MAX_CLOUD_RENDER_POINTS = 80_000
 _CLOUD_IMAGE_SIZE = (960, 540)
+_CLOUD_VOXEL_SIZE_M = 0.05
+_CLOUD_MOVING_TTL_NS = 300_000_000
 _CLOUD_CAMERA_PRESETS = {
     "透视": {"distance": 24.0, "elevation": 26.0, "azimuth": 45.0},
     "俯视": {"distance": 24.0, "elevation": 90.0, "azimuth": 0.0},
@@ -77,6 +79,162 @@ _SECTION_FIELDS = {
         "playback_progress_observed", "screenshot",
     },
 }
+
+
+class _DashboardWorldMap:
+    """以 5cm 体素维护当前 world 的有界静态层和短时运动层。"""
+
+    def __init__(self) -> None:
+        self.clear()
+
+    @staticmethod
+    def _keys(positions: np.ndarray) -> np.ndarray:
+        return np.floor(positions / _CLOUD_VOXEL_SIZE_M).astype(np.int64)
+
+    @staticmethod
+    def _bounded_indices(keys: np.ndarray) -> np.ndarray:
+        """以向量化固定散列选择稳定子集，避免 GUI 线程逐点排序。"""
+        if len(keys) <= _MAX_CLOUD_RENDER_POINTS:
+            return np.arange(len(keys), dtype=np.int64)
+        unsigned = keys.astype(np.uint64)
+        scores = (
+            unsigned[:, 0] * np.uint64(73_856_093)
+            ^ unsigned[:, 1] * np.uint64(19_349_663)
+            ^ unsigned[:, 2] * np.uint64(83_492_791)
+        )
+        order = np.lexsort((keys[:, 2], keys[:, 1], keys[:, 0], scores))
+        return order[:_MAX_CLOUD_RENDER_POINTS]
+
+    @classmethod
+    def _unique_first_indices(cls, keys: np.ndarray) -> np.ndarray:
+        if not len(keys):
+            return np.empty(0, dtype=np.int64)
+        _unique, first = np.unique(cls._row_tokens(keys), return_index=True)
+        return np.sort(first)
+
+    @staticmethod
+    def _row_tokens(keys: np.ndarray) -> np.ndarray:
+        """把三列体素键视为定长值，供 NumPy 批量成员判断。"""
+        contiguous = np.ascontiguousarray(keys)
+        return contiguous.view(np.dtype((np.void, contiguous.dtype.itemsize * 3))).ravel()
+
+    @classmethod
+    def _new_key_mask(cls, sorted_existing: np.ndarray, incoming: np.ndarray) -> np.ndarray:
+        """在缓存的有序体素 token 中批量查找，避免每帧重复排序永久层。"""
+        if not len(incoming):
+            return np.empty(0, dtype=bool)
+        if not len(sorted_existing):
+            return np.ones(len(incoming), dtype=bool)
+        tokens = cls._row_tokens(incoming)
+        locations = np.searchsorted(sorted_existing, tokens)
+        inside = locations < len(sorted_existing)
+        matches = np.zeros(len(tokens), dtype=bool)
+        matches[inside] = sorted_existing[locations[inside]] == tokens[inside]
+        return ~matches
+
+    def clear(self) -> None:
+        self._permanent_keys = np.empty((0, 3), dtype=np.int64)
+        self._permanent_positions = np.empty((0, 3), dtype=np.float32)
+        self._permanent_tags = np.empty(0, dtype=np.uint8)
+        self._permanent_tokens_sorted = self._row_tokens(self._permanent_keys)
+        self._moving_keys = np.empty((0, 3), dtype=np.int64)
+        self._moving_positions = np.empty((0, 3), dtype=np.float32)
+        self._moving_tags = np.empty(0, dtype=np.uint8)
+        self._moving_timestamps = np.empty(0, dtype=np.int64)
+
+    def add_frame(self, positions: np.ndarray, tags: np.ndarray, timestamp_ns: int) -> None:
+        """批量量化、去重和筛选，静态永久累计，运动点保留 300ms。"""
+        self._expire_moving(timestamp_ns)
+        keys = self._keys(positions)
+
+        static_mask = np.isin(tags, (1, 2))
+        incoming_keys = keys[static_mask]
+        incoming_positions = positions[static_mask].astype(np.float32, copy=False)
+        incoming_tags = tags[static_mask]
+        indices = self._unique_first_indices(incoming_keys)
+        incoming_keys = incoming_keys[indices]
+        incoming_positions = incoming_positions[indices]
+        incoming_tags = incoming_tags[indices]
+        if len(self._permanent_keys) and len(incoming_keys):
+            is_new = self._new_key_mask(
+                self._permanent_tokens_sorted,
+                incoming_keys,
+            )
+            incoming_keys = incoming_keys[is_new]
+            incoming_positions = incoming_positions[is_new]
+            incoming_tags = incoming_tags[is_new]
+        if not len(incoming_keys):
+            static_keys = self._permanent_keys
+            static_positions = self._permanent_positions
+            static_tags = self._permanent_tags
+        else:
+            static_keys = np.concatenate((self._permanent_keys, incoming_keys))
+            static_positions = np.concatenate((self._permanent_positions, incoming_positions))
+            static_tags = np.concatenate((self._permanent_tags, incoming_tags))
+            indices = self._bounded_indices(static_keys)
+            static_keys = static_keys[indices]
+            static_positions = static_positions[indices]
+            static_tags = static_tags[indices]
+        self._permanent_keys = static_keys
+        self._permanent_positions = static_positions
+        self._permanent_tags = static_tags
+        if len(incoming_keys):
+            self._permanent_tokens_sorted = np.sort(self._row_tokens(static_keys))
+
+        moving_mask = tags == 3
+        incoming_keys = keys[moving_mask]
+        incoming_positions = positions[moving_mask].astype(np.float32, copy=False)
+        incoming_tags = tags[moving_mask]
+        indices = self._unique_first_indices(incoming_keys)
+        incoming_keys = incoming_keys[indices]
+        incoming_positions = incoming_positions[indices]
+        incoming_tags = incoming_tags[indices]
+        keep_old = np.ones(len(self._moving_keys), dtype=bool)
+        if len(self._moving_keys) and len(incoming_keys):
+            keep_old = ~np.isin(
+                self._row_tokens(self._moving_keys),
+                self._row_tokens(incoming_keys),
+            )
+        # 新帧排在旧层之前，使同一体素总是采用最新运动点。
+        moving_keys = np.concatenate((incoming_keys, self._moving_keys[keep_old]))
+        moving_positions = np.concatenate((incoming_positions, self._moving_positions[keep_old]))
+        moving_tags = np.concatenate((incoming_tags, self._moving_tags[keep_old]))
+        moving_timestamps = np.concatenate((
+            np.full(len(incoming_keys), timestamp_ns, dtype=np.int64),
+            self._moving_timestamps[keep_old],
+        ))
+        indices = self._bounded_indices(moving_keys)
+        self._moving_keys = moving_keys[indices]
+        self._moving_positions = moving_positions[indices]
+        self._moving_tags = moving_tags[indices]
+        self._moving_timestamps = moving_timestamps[indices]
+
+    def _expire_moving(self, timestamp_ns: int) -> None:
+        keep = timestamp_ns - self._moving_timestamps <= _CLOUD_MOVING_TTL_NS
+        self._moving_keys = self._moving_keys[keep]
+        self._moving_positions = self._moving_positions[keep]
+        self._moving_tags = self._moving_tags[keep]
+        self._moving_timestamps = self._moving_timestamps[keep]
+
+    def snapshot(self, timestamp_ns: int) -> tuple[np.ndarray, np.ndarray]:
+        self._expire_moving(timestamp_ns)
+        keys = np.concatenate((self._permanent_keys, self._moving_keys))
+        positions = np.concatenate((self._permanent_positions, self._moving_positions))
+        tags = np.concatenate((self._permanent_tags, self._moving_tags))
+        indices = self._bounded_indices(keys)
+        positions = np.ascontiguousarray(positions[indices], dtype=np.float32)
+        tags = np.ascontiguousarray(tags[indices], dtype=np.uint8)
+        positions.setflags(write=False)
+        tags.setflags(write=False)
+        return positions, tags
+
+    def display_count(self, timestamp_ns: int) -> int:
+        """返回应用 TTL 与显示上限后的点数，不为状态栏构造大数组。"""
+        self._expire_moving(timestamp_ns)
+        return min(
+            _MAX_CLOUD_RENDER_POINTS,
+            len(self._permanent_keys) + len(self._moving_keys),
+        )
 
 
 def _evidence_identity(value: object) -> tuple[str, str, int, str]:
@@ -269,6 +427,9 @@ class V2DashboardWidget(QWidget):
         self._preview_rtk: object | None = None
         self._preview_next_render_at = 0.0
         self._cloud_frames: deque[object] = deque()
+        self._cloud_map = _DashboardWorldMap()
+        self._cloud_world_generation: int | None = None
+        self._cloud_last_image: QImage | None = None
         self._last_cloud_frame: object | None = None
         self._last_cloud_sequence: int | None = None
         self._last_receiver_diagnostics: tuple[str, ...] = ()
@@ -437,10 +598,14 @@ class V2DashboardWidget(QWidget):
         self.cloud_workbench.setMaximumHeight(34)
         workbench_layout = QVBoxLayout(self.cloud_workbench)
         self.cloud_canvas = QLabel(self.cloud_workbench)
-        self.cloud_canvas.setMinimumHeight(360)
+        self.cloud_canvas.setMinimumWidth(0)
+        self.cloud_canvas.setMinimumHeight(240)
+        self.cloud_canvas.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+        )
         self.cloud_canvas.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.cloud_canvas.setStyleSheet("background: #10151c;")
-        self.cloud_canvas.setPixmap(QPixmap.fromImage(self._empty_cloud_image()))
+        self._present_cloud_image(self._empty_cloud_image())
         self.cloud_canvas.setVisible(False)
         workbench_layout.addWidget(self.cloud_canvas, stretch=1)
 
@@ -456,8 +621,8 @@ class V2DashboardWidget(QWidget):
         self.cloud_color_mode = QComboBox(self.cloud_workbench)
         self.cloud_color_mode.addItems(("语义", "距离", "高度"))
         self.cloud_display_mode = QComboBox(self.cloud_workbench)
-        self.cloud_display_mode.addItems(("累计", "当前帧"))
-        self.cloud_current_frame_button = QPushButton("查看当前帧", self.cloud_workbench)
+        self.cloud_display_mode.addItems(("全图累计", "当前帧"))
+        self.cloud_current_frame_button = QPushButton("实时全图建模", parent)
         self.cloud_camera_preset = QComboBox(self.cloud_workbench)
         self.cloud_camera_preset.addItems(tuple(_CLOUD_CAMERA_PRESETS))
         self.cloud_reset_view_button = QPushButton("重置视角", self.cloud_workbench)
@@ -474,7 +639,6 @@ class V2DashboardWidget(QWidget):
         cloud_controls.addRow("着色", self.cloud_color_mode)
         cloud_controls.addRow("显示", self.cloud_display_mode)
         cloud_controls.addRow("视角", self.cloud_camera_preset)
-        controls.addWidget(self.cloud_current_frame_button)
         controls.addLayout(cloud_controls)
         controls.addWidget(self.cloud_reset_view_button)
         controls.addWidget(self.cloud_fit_view_button)
@@ -484,18 +648,40 @@ class V2DashboardWidget(QWidget):
         self.cloud_diagnostics = QPlainTextEdit(self.cloud_workbench)
         self.cloud_diagnostics.setReadOnly(True)
         self.cloud_diagnostics.document().setMaximumBlockCount(2_000)
+        self.cloud_diagnostics.setMaximumHeight(120)
         self.cloud_diagnostics.setPlainText("eCAL 点云工作台已初始化")
         controls.addWidget(self.cloud_diagnostics, stretch=1)
         workbench_layout.addWidget(self.cloud_controls)
         self.cloud_point_size_slider.valueChanged.connect(self._set_cloud_point_size)
         self.cloud_color_mode.currentTextChanged.connect(lambda _value: self._render_cloud())
         self.cloud_display_mode.currentTextChanged.connect(self._change_cloud_display_mode)
-        self.cloud_current_frame_button.clicked.connect(self._show_current_cloud_frame)
+        self.cloud_current_frame_button.clicked.connect(self._show_full_cloud_map)
         self.cloud_camera_preset.currentTextChanged.connect(self._set_cloud_camera_preset)
         self.cloud_reset_view_button.clicked.connect(self._reset_cloud_view)
         self.cloud_fit_view_button.clicked.connect(self._fit_cloud_view)
         self.cloud_workbench.toggled.connect(self._set_cloud_workbench_open)
+        layout.addWidget(self.cloud_current_frame_button)
         layout.addWidget(self.cloud_workbench)
+
+    def _present_cloud_image(self, image: QImage) -> None:
+        """保留 960×540 内部图像，并按当前画布等比例缩放显示。"""
+        self._cloud_last_image = image.copy()
+        target = self.cloud_canvas.size()
+        width = max(1, target.width())
+        height = max(1, target.height())
+        pixmap = QPixmap.fromImage(image).scaled(
+            width,
+            height,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.cloud_canvas.setPixmap(pixmap)
+
+    def resizeEvent(self, event: object) -> None:
+        """Dashboard 改变宽度时重新适配缓存图像，不触发点云重算。"""
+        super().resizeEvent(event)
+        if self._cloud_last_image is not None:
+            self._present_cloud_image(self._cloud_last_image)
 
     def _set_cloud_point_size(self, size: int) -> None:
         del size
@@ -512,14 +698,16 @@ class V2DashboardWidget(QWidget):
         self._render_cloud(force=True)
 
     def _cloud_render_data(self) -> tuple[np.ndarray, np.ndarray]:
-        """按显示模式先跨帧等距抽样，再构造有界散点输入。"""
+        """当前帧确定性抽样；全图模式读取当前 world 的有界体素快照。"""
         if self.cloud_display_mode.currentText() == "当前帧":
             frame = self._last_cloud_frame
             if frame is None:
                 return np.empty((0, 3), dtype=np.float32), np.empty(0, dtype=np.uint8)
             frames = (frame,)
         else:
-            frames = tuple(self._cloud_frames)
+            if self._last_cloud_frame is None:
+                return np.empty((0, 3), dtype=np.float32), np.empty(0, dtype=np.uint8)
+            return self._cloud_map.snapshot(self._last_cloud_frame.timestamp_ns)
         total_points = sum(len(item.positions) for item in frames)
         if total_points == 0:
             return np.empty((0, 3), dtype=np.float32), np.empty(0, dtype=np.uint8)
@@ -605,6 +793,8 @@ class V2DashboardWidget(QWidget):
             return
         self._cloud_next_render_at = now + 1.0 / _CLOUD_RENDER_MAX_HZ
         positions, tags = self._cloud_render_data()
+        if self.cloud_display_mode.currentText() == "全图累计" and len(positions):
+            self._fit_camera_to_positions(positions)
         frame = self._last_cloud_frame
         camera = {
             key: (np.asarray(value, dtype=np.float32).copy() if key == "target" else value)
@@ -635,7 +825,7 @@ class V2DashboardWidget(QWidget):
         try:
             generation, image, duration_ms = future.result()
             if generation == self._cloud_render_generation and self.cloud_workbench.isChecked():
-                self.cloud_canvas.setPixmap(QPixmap.fromImage(image))
+                self._present_cloud_image(image)
                 self._cloud_last_render_duration_ms = duration_ms
                 self._update_cloud_status()
         except Exception as error:
@@ -697,16 +887,17 @@ class V2DashboardWidget(QWidget):
         painter.end()
         return generation, image, (time.monotonic() - started_at) * 1_000.0
 
-    def _show_current_cloud_frame(self) -> None:
-        """从窄侧栏的一键入口切到持续更新的当前帧视图。"""
-        already_current = self.cloud_display_mode.currentText() == "当前帧"
-        self.cloud_display_mode.setCurrentText("当前帧")
-        if already_current:
-            self._change_cloud_display_mode("当前帧")
+    def _show_full_cloud_map(self) -> None:
+        """一键展开工作台并进入持续自动适配的全图累计模式。"""
+        self.cloud_workbench.setChecked(True)
+        already_full = self.cloud_display_mode.currentText() == "全图累计"
+        self.cloud_display_mode.setCurrentText("全图累计")
+        if already_full:
+            self._change_cloud_display_mode("全图累计")
 
     def _change_cloud_display_mode(self, _mode: str) -> None:
         """显示模式切换后在同一 GUI 事件内同步点云与状态文字。"""
-        self._render_cloud()
+        self._render_cloud(force=_mode == "全图累计")
         self._update_cloud_status()
 
     def _update_cloud_status(self) -> None:
@@ -715,29 +906,30 @@ class V2DashboardWidget(QWidget):
         if frame is None:
             self.cloud_status.setText("等待已验证的 LiDAR/RTK/IMU 同刻数据")
             return
-        window_ns = self.cloud_window_slider.value() * 100_000_000
         display_count = (
             len(frame.positions)
             if self.cloud_display_mode.currentText() == "当前帧"
-            else sum(len(item.positions) for item in self._cloud_frames)
+            else self._cloud_map.display_count(frame.timestamp_ns)
         )
-        render_step = max(
-            1,
-            (display_count + _MAX_CLOUD_RENDER_POINTS - 1)
-            // _MAX_CLOUD_RENDER_POINTS,
-        )
-        rendered_count = (display_count + render_step - 1) // render_step
         self.cloud_status.setText(
-            "%s | seq=%d | 本帧=%d | 时间窗=%0.1fs | 显示=%d | render=%0.1fms | drop=%d"
+            "%s | world=%d | seq=%d | 本帧=%d | 显示=%d | render=%0.1fms | drop=%d"
             % (
                 self.cloud_display_mode.currentText(),
+                frame.world_generation,
                 frame.sequence,
                 len(frame.positions),
-                window_ns / 1_000_000_000,
-                rendered_count,
+                display_count,
                 self._cloud_last_render_duration_ms,
                 self._cloud_render_dropped_count,
             )
+        )
+
+    def _fit_camera_to_positions(self, positions: np.ndarray) -> None:
+        """仅更新相机，使全图每次累计后持续居中并完整落入视野。"""
+        lower, upper = positions.min(axis=0), positions.max(axis=0)
+        self._cloud_camera["target"] = (lower + upper) / 2.0
+        self._cloud_camera["distance"] = max(
+            6.0, float(np.linalg.norm(upper - lower)) * 2.2
         )
 
     def _fit_cloud_view(self) -> None:
@@ -746,15 +938,12 @@ class V2DashboardWidget(QWidget):
         if not len(positions):
             self._reset_cloud_view()
             return
-        lower, upper = positions.min(axis=0), positions.max(axis=0)
-        distance = max(6.0, float(np.linalg.norm(upper - lower)) * 2.2)
-        self._cloud_camera["target"] = positions.mean(axis=0)
-        self._cloud_camera["distance"] = distance
+        self._fit_camera_to_positions(positions)
         self._render_cloud(force=True)
 
     def _set_cloud_workbench_open(self, opened: bool) -> None:
         """默认折叠工作台，避免不查看 3D 时挤压采集与遥测布局。"""
-        self.cloud_workbench.setMaximumHeight(900 if opened else 34)
+        self.cloud_workbench.setMaximumHeight(620 if opened else 34)
         self.cloud_canvas.setVisible(opened)
         if opened:
             self._cloud_render_failed = False
@@ -767,11 +956,21 @@ class V2DashboardWidget(QWidget):
 
         if type(frame) is not V2DashboardCloudFrame:
             raise ValueError("cloud frame must be an exact V2DashboardCloudFrame")
+        if frame.world_generation != self._cloud_world_generation:
+            self._cloud_world_generation = frame.world_generation
+            self._cloud_map.clear()
+            self._cloud_frames.clear()
+            self._last_cloud_frame = None
+            self._last_cloud_sequence = None
+            self._cloud_render_generation += 1
         if frame.sequence == self._last_cloud_sequence:
             return False
         self._last_cloud_sequence = frame.sequence
+        self._cloud_map.add_frame(frame.positions, frame.tags, frame.timestamp_ns)
         self._cloud_frames.append(frame)
         self._last_cloud_frame = frame
+        # 新帧使尚未完成的旧世界/旧序列图像失效；唯一 worker 完成后会重画最新状态。
+        self._cloud_render_generation += 1
         window_ns = self.cloud_window_slider.value() * 100_000_000
         cutoff = frame.timestamp_ns - window_ns
         while self._cloud_frames and self._cloud_frames[0].timestamp_ns < cutoff:

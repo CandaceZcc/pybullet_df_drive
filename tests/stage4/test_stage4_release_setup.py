@@ -17,6 +17,89 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 SETUP = ROOT / "scripts" / "stage4_release_setup.py"
 ROS_APT_LOCK = ROOT / "packaging" / "locks" / "ros2-apt-packages.lock"
+_GIB = 1024**3
+
+
+@pytest.mark.parametrize(
+    "cpu_count,mem_available_bytes,expected",
+    (
+        (8, 9 * _GIB, 4),
+        (16, 32 * _GIB, 8),
+        (8, 4 * _GIB, 1),
+        (None, 16 * _GIB, 1),
+        (8, None, 1),
+    ),
+)
+def test_release_setup_selects_memory_aware_parallel_build_jobs(
+    cpu_count: int | None,
+    mem_available_bytes: int | None,
+    expected: int,
+) -> None:
+    """自动并行必须用 CPU 和可用内存共同限流，探测失败时单任务降级。"""
+    module = __import__("scripts.stage4_release_setup", fromlist=["_resolve_build_jobs"])
+
+    assert module._resolve_build_jobs(
+        cpu_count=cpu_count,
+        mem_available_bytes=mem_available_bytes,
+        override=None,
+    ) == expected
+
+
+@pytest.mark.parametrize("override", ("0", "9", "1.5", "fast", ""))
+def test_release_setup_rejects_invalid_parallel_build_override(override: str) -> None:
+    """显式并行度只能是当前 CPU 范围内的正整数。"""
+    module = __import__("scripts.stage4_release_setup", fromlist=["_resolve_build_jobs"])
+
+    with pytest.raises(ValueError, match="SLOPE_SIM_BUILD_JOBS"):
+        module._resolve_build_jobs(
+            cpu_count=8,
+            mem_available_bytes=16 * _GIB,
+            override=override,
+        )
+
+
+def test_release_setup_uses_bounded_ccache_when_available(tmp_path: Path) -> None:
+    """可用 ccache 必须跨 staging 复用，同时把单一缓存限制在 5 GiB。"""
+    module = __import__("scripts.stage4_release_setup", fromlist=["_cmake_build_context"])
+    release = tmp_path / "release"
+    release.mkdir()
+
+    context = module._cmake_build_context(
+        release,
+        base_environment={"PATH": "/usr/bin"},
+        cpu_count=8,
+        mem_available_bytes=9 * _GIB,
+        build_jobs_override=None,
+        ccache="/usr/bin/ccache",
+    )
+
+    assert context.jobs == "4"
+    assert context.configure_options == (
+        "-DCMAKE_C_COMPILER_LAUNCHER=/usr/bin/ccache",
+        "-DCMAKE_CXX_COMPILER_LAUNCHER=/usr/bin/ccache",
+    )
+    assert context.environment["CCACHE_BASEDIR"] == str(release)
+    assert context.environment["CCACHE_MAXSIZE"] == "5G"
+
+
+def test_release_setup_keeps_parallel_build_without_ccache(tmp_path: Path) -> None:
+    """无 ccache 的干净机仍应使用自动并行，且不伪造 launcher 选项。"""
+    module = __import__("scripts.stage4_release_setup", fromlist=["_cmake_build_context"])
+    release = tmp_path / "release"
+    release.mkdir()
+
+    context = module._cmake_build_context(
+        release,
+        base_environment={"PATH": "/usr/bin"},
+        cpu_count=8,
+        mem_available_bytes=9 * _GIB,
+        build_jobs_override=None,
+        ccache=None,
+    )
+
+    assert context.jobs == "4"
+    assert context.configure_options == ()
+    assert "CCACHE_BASEDIR" not in context.environment
 
 
 def test_release_setup_installs_payload_run_sim_into_release_bin(tmp_path: Path) -> None:
@@ -1502,7 +1585,7 @@ def test_release_setup_installs_locked_protobuf_python_before_ecal_wheel(tmp_pat
 
 
 def test_release_setup_bounds_locked_protobuf_build_parallelism(tmp_path: Path, monkeypatch) -> None:
-    """Protobuf 构建必须显式单任务，避免安装器耗尽宿主机内存。"""
+    """Protobuf configure/build 必须复用安装级并行度和 ccache 上下文。"""
     module = __import__("scripts.stage4_release_setup", fromlist=["_build_locked_protobuf"])
     build_protobuf = getattr(module, "_build_locked_protobuf", None)
     assert callable(build_protobuf), "setup needs the locked Protobuf build helper"
@@ -1514,7 +1597,10 @@ def test_release_setup_bounds_locked_protobuf_build_parallelism(tmp_path: Path, 
     prefix = build_root / "prefix"
     commands: list[list[str]] = []
 
-    def fake_run(command: list[str], *, check: bool) -> subprocess.CompletedProcess[str]:
+    def fake_run(
+        command: list[str], *, check: bool, env: dict[str, str]
+    ) -> subprocess.CompletedProcess[str]:
+        assert env["CCACHE_MAXSIZE"] == "5G"
         commands.append(command)
         if command[1] == "--install":
             protoc = prefix / "bin" / "protoc"
@@ -1525,8 +1611,20 @@ def test_release_setup_bounds_locked_protobuf_build_parallelism(tmp_path: Path, 
 
     monkeypatch.setattr(module.subprocess, "run", fake_run)
 
-    assert build_protobuf("cmake", build_root, prefix) == prefix
-    assert ["cmake", "--build", str(build_root / "dependencies" / "protobuf"), "--parallel", "1"] in commands
+    context = module._cmake_build_context(
+        tmp_path / "release",
+        base_environment={},
+        cpu_count=8,
+        mem_available_bytes=9 * _GIB,
+        build_jobs_override=None,
+        ccache="/usr/bin/ccache",
+    )
+    assert build_protobuf("cmake", build_root, prefix, context) == prefix
+    assert ["cmake", "--build", str(build_root / "dependencies" / "protobuf"), "--parallel", "4"] in commands
+    assert any(
+        "-DCMAKE_CXX_COMPILER_LAUNCHER=/usr/bin/ccache" in command
+        for command in commands
+    )
 
 
 def test_release_setup_accepts_locked_versioned_protoc_link(tmp_path: Path, monkeypatch) -> None:

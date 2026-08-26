@@ -28,7 +28,7 @@ def test_formal_release_manifest_locks_the_eight_delivery_dependencies() -> None
 
     manifest = module._manifest(RELEASE_MANIFEST)
 
-    assert manifest["version"] == "5.0.2"
+    assert manifest["version"] == "5.0.3"
     assert "with_ros" not in manifest
     assert manifest["payload"] is None
     assert manifest["runtime_setup"] == {"entrypoint": "scripts/stage4_release_setup.py"}

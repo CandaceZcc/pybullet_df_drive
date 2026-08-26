@@ -45,6 +45,7 @@ class V2DashboardCloudFrame:
     tags: np.ndarray
     vehicle_position: tuple[float, float, float] = (0.0, 0.0, 0.0)
     vehicle_forward: tuple[float, float, float] = (1.0, 0.0, 0.0)
+    world_generation: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -566,6 +567,7 @@ class V2DashboardEcalReceiver:
             tags,
             tuple(float(value) for value in recovered.base_pose.position),
             tuple(float(rotation[index, 0]) for index in range(3)),
+            lidar.world_generation,
         )
         with self._condition:
             self._cloud_frame = frame

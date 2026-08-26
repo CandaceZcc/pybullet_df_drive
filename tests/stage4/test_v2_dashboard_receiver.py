@@ -81,6 +81,7 @@ def test_dashboard_receiver_replaces_stale_lidar_before_worker_decodes() -> None
         assert snapshot.imu is not None and snapshot.imu.sequence == 7
         cloud = receiver.cloud_frame()
         assert cloud is not None
+        assert cloud.world_generation == 3
         assert cloud.positions.tolist() == [[1.0, 2.0, 3.325000047683716]]
         assert cloud.positions.flags.writeable is False
 

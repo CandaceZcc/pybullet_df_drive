@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import hashlib
 import json
 import os
@@ -29,11 +30,87 @@ _REQUIRED_ECAL_SUBMODULES = frozenset(
         "thirdparty/yaml-cpp/yaml-cpp",
     }
 )
-_CMAKE_BUILD_JOBS = "1"
+_GIB = 1024**3
+_BUILD_RESERVED_BYTES = 2 * _GIB
+_BUILD_BYTES_PER_JOB = 1536 * 1024**2
+_BUILD_JOBS_CAP = 8
 _LIVOX_VIEWER_DEPENDENCY = "livox-viewer2-linux"
 _LIVOX_VIEWER_DIRECTORY = "Viewer2_2.6.0_Linux"
 _LIVOX_VIEWER_MAX_FILES = 128
 _LIVOX_VIEWER_MAX_BYTES = 512 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class _CMakeBuildContext:
+    """保存一次安装内所有 CMake 阶段共用的并行度、launcher 与环境。"""
+
+    jobs: str
+    configure_options: tuple[str, ...]
+    environment: dict[str, str]
+
+
+def _resolve_build_jobs(
+    *, cpu_count: int | None, mem_available_bytes: int | None, override: str | None
+) -> int:
+    """按 CPU 与可用内存选择安全并行度，并严格校验显式覆盖。"""
+    if override is not None:
+        if (
+            cpu_count is None
+            or cpu_count < 1
+            or not override.isascii()
+            or not override.isdecimal()
+        ):
+            raise ValueError("SLOPE_SIM_BUILD_JOBS must be an integer in 1..CPU count")
+        jobs = int(override)
+        if jobs < 1 or jobs > cpu_count:
+            raise ValueError("SLOPE_SIM_BUILD_JOBS must be an integer in 1..CPU count")
+        return jobs
+    if cpu_count is None or cpu_count < 1 or mem_available_bytes is None:
+        return 1
+    memory_jobs = max(
+        1,
+        (mem_available_bytes - _BUILD_RESERVED_BYTES) // _BUILD_BYTES_PER_JOB,
+    )
+    return min(cpu_count, _BUILD_JOBS_CAP, memory_jobs)
+
+
+def _mem_available_bytes(path: Path = Path("/proc/meminfo")) -> int | None:
+    """读取 Linux MemAvailable；非 Linux 或格式异常时让调用方安全降级。"""
+    try:
+        for line in path.read_text(encoding="ascii").splitlines():
+            match = re.fullmatch(r"MemAvailable:\s+(\d+)\s+kB", line)
+            if match:
+                return int(match.group(1)) * 1024
+    except (OSError, UnicodeError, ValueError):
+        pass
+    return None
+
+
+def _cmake_build_context(
+    release_root: Path,
+    *,
+    base_environment: dict[str, str],
+    cpu_count: int | None,
+    mem_available_bytes: int | None,
+    build_jobs_override: str | None,
+    ccache: str | None,
+) -> _CMakeBuildContext:
+    """为整个 release 安装只计算一次 CMake 并行与 ccache 配置。"""
+    jobs = _resolve_build_jobs(
+        cpu_count=cpu_count,
+        mem_available_bytes=mem_available_bytes,
+        override=build_jobs_override,
+    )
+    environment = base_environment.copy()
+    options: tuple[str, ...] = ()
+    if ccache is not None:
+        options = (
+            f"-DCMAKE_C_COMPILER_LAUNCHER={ccache}",
+            f"-DCMAKE_CXX_COMPILER_LAUNCHER={ccache}",
+        )
+        environment["CCACHE_BASEDIR"] = str(release_root)
+        environment["CCACHE_MAXSIZE"] = "5G"
+    return _CMakeBuildContext(str(jobs), options, environment)
 
 
 def _require_release_directory(path: Path, *, label: str) -> Path:
@@ -275,9 +352,15 @@ def _install_locked_livox_viewer(
     return viewer_root
 
 
-def _build_cmake_target(cmake: str, build_directory: Path, *, environment: dict[str, str] | None = None) -> None:
-    """以单任务构建锁定 CMake 目标，避免安装时耗尽宿主机内存。"""
-    command = [cmake, "--build", str(build_directory), "--parallel", _CMAKE_BUILD_JOBS]
+def _build_cmake_target(
+    cmake: str,
+    build_directory: Path,
+    *,
+    environment: dict[str, str] | None = None,
+    jobs: str = "1",
+) -> None:
+    """以本次安装统一计算的并行度构建锁定 CMake 目标。"""
+    command = [cmake, "--build", str(build_directory), "--parallel", jobs]
     if environment is None:
         subprocess.run(command, check=True)
     else:
@@ -485,7 +568,9 @@ def _install_locked_python_wheels(
         subprocess.run([str(python), "-c", import_probe], check=True)
 
 
-def _build_locked_abseil(cmake: str, build_root: Path) -> Path | None:
+def _build_locked_abseil(
+    cmake: str, build_root: Path, context: _CMakeBuildContext | None = None
+) -> Path | None:
     """先构建锁定 Abseil，供同轮 Protobuf 的离线 CMake configure 使用。"""
     source = _locked_source_root(build_root, "abseil-cpp")
     if source is None:
@@ -507,18 +592,34 @@ def _build_locked_abseil(cmake: str, build_root: Path) -> Path | None:
             "-DABSL_BUILD_TESTING=OFF",
             "-DABSL_ENABLE_INSTALL=ON",
             "-DABSL_PROPAGATE_CXX_STD=ON",
+            *(context.configure_options if context else ()),
         ],
         check=True,
+        **({"env": context.environment} if context else {}),
     )
-    _build_cmake_target(cmake, dependency_build)
-    subprocess.run([cmake, "--install", str(dependency_build)], check=True)
+    _build_cmake_target(
+        cmake,
+        dependency_build,
+        environment=context.environment if context else None,
+        jobs=context.jobs if context else "1",
+    )
+    subprocess.run(
+        [cmake, "--install", str(dependency_build)],
+        check=True,
+        **({"env": context.environment} if context else {}),
+    )
     config = prefix / "lib" / "cmake" / "absl" / "abslConfig.cmake"
     if config.is_symlink() or not config.is_file():
         raise ValueError("locked Abseil install is invalid")
     return prefix
 
 
-def _build_locked_protobuf(cmake: str, build_root: Path, prefix: Path | None) -> Path | None:
+def _build_locked_protobuf(
+    cmake: str,
+    build_root: Path,
+    prefix: Path | None,
+    context: _CMakeBuildContext | None = None,
+) -> Path | None:
     """只在本轮临时前缀构建锁定 Protobuf，供随后同一 CMake configure 使用。"""
     source = _locked_source_root(build_root, "protobuf")
     if source is None:
@@ -540,11 +641,22 @@ def _build_locked_protobuf(cmake: str, build_root: Path, prefix: Path | None) ->
             f"-DCMAKE_PREFIX_PATH={prefix}",
             "-Dprotobuf_BUILD_TESTS=OFF",
             "-Dprotobuf_LOCAL_DEPENDENCIES_ONLY=ON",
+            *(context.configure_options if context else ()),
         ],
         check=True,
+        **({"env": context.environment} if context else {}),
     )
-    _build_cmake_target(cmake, dependency_build)
-    subprocess.run([cmake, "--install", str(dependency_build)], check=True)
+    _build_cmake_target(
+        cmake,
+        dependency_build,
+        environment=context.environment if context else None,
+        jobs=context.jobs if context else "1",
+    )
+    subprocess.run(
+        [cmake, "--install", str(dependency_build)],
+        check=True,
+        **({"env": context.environment} if context else {}),
+    )
     try:
         _locked_prefix_executable(prefix, "protoc")
     except ValueError:
@@ -574,7 +686,12 @@ def _verify_ecal_source_closure(source: Path) -> None:
             raise ValueError("locked eCAL source closure is invalid")
 
 
-def _build_locked_ecal(cmake: str, build_root: Path, prefix: Path | None) -> Path | None:
+def _build_locked_ecal(
+    cmake: str,
+    build_root: Path,
+    prefix: Path | None,
+    context: _CMakeBuildContext | None = None,
+) -> Path | None:
     """以本轮 Protobuf prefix 构建完整 eCAL，禁止 FetchContent 或系统包回退。"""
     source = _locked_source_root(build_root, "ecal")
     if source is None:
@@ -603,11 +720,22 @@ def _build_locked_ecal(cmake: str, build_root: Path, prefix: Path | None) -> Pat
             "-DFETCHCONTENT_UPDATES_DISCONNECTED=ON",
             "-DCMAKE_FIND_USE_PACKAGE_REGISTRY=FALSE",
             "-DCMAKE_FIND_USE_SYSTEM_PACKAGE_REGISTRY=FALSE",
+            *(context.configure_options if context else ()),
         ],
         check=True,
+        **({"env": context.environment} if context else {}),
     )
-    _build_cmake_target(cmake, functions_build)
-    subprocess.run([cmake, "--install", str(functions_build)], check=True)
+    _build_cmake_target(
+        cmake,
+        functions_build,
+        environment=context.environment if context else None,
+        jobs=context.jobs if context else "1",
+    )
+    subprocess.run(
+        [cmake, "--install", str(functions_build)],
+        check=True,
+        **({"env": context.environment} if context else {}),
+    )
     dependency_build = build_root / "dependencies" / "ecal"
     subprocess.run(
         [
@@ -637,11 +765,22 @@ def _build_locked_ecal(cmake: str, build_root: Path, prefix: Path | None) -> Pat
             "-DFETCHCONTENT_UPDATES_DISCONNECTED=ON",
             "-DCMAKE_FIND_USE_PACKAGE_REGISTRY=FALSE",
             "-DCMAKE_FIND_USE_SYSTEM_PACKAGE_REGISTRY=FALSE",
+            *(context.configure_options if context else ()),
         ],
         check=True,
+        **({"env": context.environment} if context else {}),
     )
-    _build_cmake_target(cmake, dependency_build)
-    subprocess.run([cmake, "--install", str(dependency_build)], check=True)
+    _build_cmake_target(
+        cmake,
+        dependency_build,
+        environment=context.environment if context else None,
+        jobs=context.jobs if context else "1",
+    )
+    subprocess.run(
+        [cmake, "--install", str(dependency_build)],
+        check=True,
+        **({"env": context.environment} if context else {}),
+    )
     return _ecal_config_directory(prefix)
 
 
@@ -786,6 +925,19 @@ def build_cpp_tools(
     cmake = shutil.which("cmake")
     if cmake is None:
         raise RuntimeError("cmake is required for release setup")
+    context = _cmake_build_context(
+        release_root,
+        base_environment=os.environ.copy(),
+        cpu_count=os.cpu_count(),
+        mem_available_bytes=_mem_available_bytes(),
+        build_jobs_override=os.environ.get("SLOPE_SIM_BUILD_JOBS"),
+        ccache=shutil.which("ccache"),
+    )
+    print(
+        "release CMake build: "
+        f"jobs={context.jobs}, ccache={'enabled' if context.configure_options else 'disabled'}",
+        flush=True,
+    )
     build_root = release_root / ".stage4-build"
     if build_root.exists() or build_root.is_symlink():
         raise ValueError("release temporary build directory already exists")
@@ -795,11 +947,11 @@ def build_cpp_tools(
         livox_message_source = _locked_livox_message_source(build_root) if with_ros else None
         if with_ros and livox_message_source is None:
             raise ValueError("locked Livox message source is missing")
-        prefix = _build_locked_abseil(cmake, build_root)
-        prefix = _build_locked_protobuf(cmake, build_root, prefix)
+        prefix = _build_locked_abseil(cmake, build_root, context)
+        prefix = _build_locked_protobuf(cmake, build_root, prefix, context)
         ecal_dir = _install_locked_ecal_deb(dependencies_dir, locked_dependencies, build_root, prefix)
         if ecal_dir is None:
-            ecal_dir = _build_locked_ecal(cmake, build_root, prefix)
+            ecal_dir = _build_locked_ecal(cmake, build_root, prefix, context)
         command = [
             cmake,
             "-S",
@@ -809,14 +961,17 @@ def build_cpp_tools(
             "-DCMAKE_BUILD_TYPE=Release",
             "-DCMAKE_INSTALL_RPATH=$ORIGIN/../lib",
             f"-DSTAGE4_WITH_ROS={'ON' if with_ros else 'OFF'}",
+            *context.configure_options,
         ]
         cmake_prefixes = [str(prefix)] if prefix is not None else []
-        cmake_environment = None
+        cmake_environment = context.environment.copy()
         if with_ros:
             cmake_prefixes.append("/opt/ros/jazzy")
             command.append(f"-DSTAGE4_LIVOX_MSG_SOURCE={livox_message_source}")
             command.append("-DSTAGE4_ROSIDL_PYTHON_EXECUTABLE=/usr/bin/python3")
-            cmake_environment = _jazzy_environment()
+            jazzy_environment = _jazzy_environment()
+            for name in ("ROS_DISTRO", "AMENT_PREFIX_PATH", "PYTHONPATH"):
+                cmake_environment[name] = jazzy_environment[name]
         if cmake_prefixes:
             command.append(f"-DCMAKE_PREFIX_PATH={';'.join(cmake_prefixes)}")
         if runtime is not None:
@@ -832,16 +987,15 @@ def build_cpp_tools(
         mcap_include = _locked_mcap_include_directory(build_root)
         if mcap_include is not None:
             command.append(f"-DSTAGE4_MCAP_INCLUDE_DIR={mcap_include}")
-        if cmake_environment is None:
-            subprocess.run(command, check=True)
-        else:
-            subprocess.run(command, check=True, env=cmake_environment)
-        _build_cmake_target(cmake, build_root, environment=cmake_environment)
+        subprocess.run(command, check=True, env=cmake_environment)
+        _build_cmake_target(
+            cmake,
+            build_root,
+            environment=cmake_environment,
+            jobs=context.jobs,
+        )
         install_command = [cmake, "--install", str(build_root), "--prefix", str(release_root)]
-        if cmake_environment is None:
-            subprocess.run(install_command, check=True)
-        else:
-            subprocess.run(install_command, check=True, env=cmake_environment)
+        subprocess.run(install_command, check=True, env=cmake_environment)
         # 通用 CMake 夹具可只验证 Protobuf/MCAP；只有实际安装 eCAL 后才有配置可发布。
         if ecal_dir is not None:
             _install_ecal_runtime_config(prefix, release_root)

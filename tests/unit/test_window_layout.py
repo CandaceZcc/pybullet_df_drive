@@ -197,12 +197,13 @@ def test_window_layout_is_frozen():
 @pytest.mark.parametrize(
     "width,height,main_width,dashboard_width",
     (
-        (1366, 768, 915, 451),
-        (1920, 1080, 1286, 634),
-        (2560, 1440, 1715, 845),
+        (1000, 700, 600, 400),
+        (1366, 768, 646, 720),
+        (1920, 1080, 1152, 768),
+        (2560, 1440, 1536, 1024),
     ),
 )
-def test_layout_fills_available_geometry_at_exact_sixty_seven_thirty_three_split(
+def test_layout_keeps_dashboard_readable_and_fills_available_geometry(
     width,
     height,
     main_width,
@@ -227,8 +228,8 @@ def test_layout_preserves_nonzero_origin_and_nondivisible_width_without_a_seam()
 
     layout = calculate_window_layout(available, dashboard_enabled=True)
 
-    assert layout.main == Rect(37, 53, 916, 701)
-    assert layout.dashboard == Rect(953, 53, 451, 701)
+    assert layout.main == Rect(37, 53, 647, 701)
+    assert layout.dashboard == Rect(684, 53, 720, 701)
     assert layout.main.right == layout.dashboard.x
     assert layout.dashboard.right == available.right
     assert layout.dashboard.bottom == available.bottom
@@ -249,15 +250,15 @@ def test_dashboard_split_aligns_to_two_physical_pixels_without_changing_coverage
 
     aligned = window_layout_module.align_window_layout_to_scale(layout, 2.0)
 
-    assert aligned.main == Rect(112, 64, 1640, 1376)
-    assert aligned.dashboard == Rect(1752, 64, 808, 1376)
+    assert aligned.main == Rect(112, 64, 1468, 1376)
+    assert aligned.dashboard == Rect(1580, 64, 980, 1376)
     assert aligned.main.right == aligned.dashboard.x
     assert aligned.dashboard.right == available.right
 
 
-@pytest.mark.parametrize("available_width", (50, 1250))
+@pytest.mark.parametrize("available_width", (50, 1000))
 def test_dashboard_scale_alignment_uses_half_up_at_exact_half_pixel(available_width):
-    """DPR 对齐不得用 ties-to-even 改写 33% 的 half-up 契约。"""
+    """DPR 对齐不得用 ties-to-even 改写 40% 的 half-up 契约。"""
     layout = calculate_window_layout(
         Rect(0, 0, available_width, 700),
         dashboard_enabled=True,
@@ -277,8 +278,8 @@ def test_dashboard_scale_alignment_uses_exact_ratio_at_decimal_dpr_half_boundary
 
     aligned = window_layout_module.align_window_layout_to_scale(layout, 1.1)
 
-    assert aligned.main == Rect(0, 0, 914, 700)
-    assert aligned.dashboard == Rect(914, 0, 451, 700)
+    assert aligned.main == Rect(0, 0, 644, 700)
+    assert aligned.dashboard == Rect(644, 0, 721, 700)
 
 
 def test_x11_available_geometry_uses_current_desktop_workarea_and_primary_screen():

@@ -102,6 +102,25 @@ export SLOPE_SIM_V2_RUNTIME_ROOT="$PWD/build/stage5-acceptance-runtime"
 
 最终发布包为 Ubuntu 24.04 amd64 单文件安装器 `runSim.run`。安装过程需要联网下载锁定依赖，所有下载和内嵌文件均校验 SHA-256；Livox Viewer 2 使用 Livox 官方 Linux 2.6.0 包，并安装到 release 内的固定路径。Viewer 是 Livox 的专有二进制，本仓库不提交其 ZIP，安装器只保存官方 URL、版本与摘要。
 
+5.0.3 将“生成安装包”和“首次安装编译”明确分开。下面两条发布命令只复制、哈希和压缩项目文件，不会触发 C++ 编译，日常 GUI/eCAL 验收可继续复用 `build/stage5-acceptance-runtime`：
+
+```bash
+conda run -n slope-sim python scripts/stage4_project_payload.py \
+  --source "$PWD" --output "$PWD/build/stage5-503-project-payload"
+conda run -n slope-sim python scripts/build_stage4_run.py \
+  --manifest "$PWD/packaging/stage4-release-manifest.json" \
+  --project-payload "$PWD/build/stage5-503-project-payload" \
+  --output "$PWD/build/slope-sim-stage4-5.0.3-ubuntu24.04-amd64.run"
+```
+
+接近一小时的依赖和核心 C++ 编译只发生在 `.run` 首次完整安装。安装器按 CPU 数和 `/proc/meminfo` 的 `MemAvailable` 自动选择并行度：预留 2 GiB、每任务预算 1.5 GiB、最多 8 路；探测失败安全降级为单任务。安装了 `ccache` 时会自动作为 C/C++ launcher，跨版本 staging 共用系统 canonical cache，并限制为 5 GiB；未安装也可正常并行。需要人工限流时可设置严格的 `SLOPE_SIM_BUILD_JOBS=1..CPU数`，非法值会在编译前直接报错，例如：
+
+```bash
+SLOPE_SIM_BUILD_JOBS=2 ./runSim.run \
+  --install-root "$HOME/.local/share/runSim" \
+  --command-dir "$HOME/.local/bin"
+```
+
 ```bash
 chmod +x runSim.run
 mkdir -p "$HOME/.local/bin"
@@ -165,7 +184,7 @@ RC 断帧 20--150 ms 时继续续租最后稳定目标；到达 200 ms 无合法
 
 Dashboard RC 状态会显示 CH1/CH3 原始值、校准、滤波后 `v/w`、帧率/帧年龄、active source、mailbox 和 Command 发送计数、50 Hz 最近/最大间隔及零速原因。需要单独采样杆位时运行 `python scripts/test_rc_sticks.py --port /dev/serial/by-id/<设备> --duration 30`，该工具只读串口，不发车辆命令。
 
-“LiDAR 点云”页提供“累计”和“当前帧”两种模式，也可直接点击“查看当前帧”。累计模式会在进入 CPU QImage 投影前按时间顺序等步长采样，渲染输入最多 80,000 点；图像生成由单个后台任务限至 10 Hz，避免长时间驾驶时反复拼接百万级点阵拖慢 GUI。采集和导出仍使用完整原始帧，不受显示采样影响。
+“LiDAR 点云”页提供“全图累计”和“当前帧”两种模式。点击“实时全图建模”会展开工作台并持续自动居中、缩放：当前 world 内的静态点以 5 cm 体素累计，动态点保留 300 ms；重建 world 后旧地图立即清空。内部始终使用 960×540 CPU QImage，画布按可用宽度等比例缩放，最多显示 80,000 个确定性采样点；图像由单个后台任务限至 10 Hz。Dashboard 宽屏约占 40%，紧凑画布和诊断区都由同一纵向滚动页访问。采集和导出仍使用完整原始帧，不受显示上限影响。
 
 ### 正式 release v2 会话
 
@@ -216,7 +235,7 @@ runSim --no-dashboard --developer-diagnostics \
 4. 执行键盘→RC→外部→RC 往返，每次切源只允许一个 20 ms 控制周期零命令，不允许旧源命令穿越。
 5. 在“MID-360 采集”页选择 1 分钟，点击“启用采集”，观察采集状态变化；提前点击“结束采集”。
 6. 确认输出目录存在 `session.mcap`、`export/lidar.lvx2`、PCD/PLY 与成功回执；点击“导入 Livox Viewer”，确认不再报告 launcher missing。
-7. 在 LiDAR 页切换累计显示并点击“查看当前帧”，确认 GUI 连续响应且采集文件点数不因显示限流而减少。
+7. 在 LiDAR 页点击“实时全图建模”，驾驶经过多个区域后确认全图持续累计、自动适配且无裁剪；再切换“当前帧”，确认 GUI 连续响应且采集文件点数不因显示限流而减少。
 8. 使用 `runSim --version` 和 `runSim --help` 复核安装入口及参数合同。
 
 完整 v2 验收以新建、已安装的 release 为准。安装器的 manifest 必须记录包含修复的 commit，不能以未提交工作树生成最终包。

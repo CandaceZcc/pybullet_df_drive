@@ -22,7 +22,7 @@ def test_run_sim_reports_its_version_without_requiring_conda() -> None:
     )
 
     assert completed.returncode == 0, completed.stderr
-    assert completed.stdout == "runSim 5.0.2\n"
+    assert completed.stdout == "runSim 5.0.3\n"
     assert completed.stderr == ""
 
 
