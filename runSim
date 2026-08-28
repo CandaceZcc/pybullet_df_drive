@@ -23,6 +23,11 @@ cd "$root"
 # 否则正常启动后会被下一次同版本安装误判为篡改。
 export PYTHONDONTWRITEBYTECODE=1
 
+# Dashboard 的有界点云运行指标跟随实际 release，不写入调用目录。
+if [ -z "${SLOPE_SIM_RESULTS_DIR:-}" ]; then
+  export SLOPE_SIM_RESULTS_DIR="$root/results"
+fi
+
 # Qt6 xcb-glx 与已创建 GLX 上下文的 PyBullet 在部分驱动上会崩溃；
 # 仅在调用者未显式选择时使用已验证的 EGL 集成。
 if [ -z "${QT_XCB_GL_INTEGRATION:-}" ]; then

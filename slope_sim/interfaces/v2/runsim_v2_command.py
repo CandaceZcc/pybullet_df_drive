@@ -11,7 +11,7 @@ from slope_sim.interfaces.v2.descriptor import load_v2_descriptor
 from slope_sim.interfaces.v2.models import WheelCommandV2
 from slope_sim.interfaces.v2.runsim_command_supervisor import RunSimCommandLaunch
 from slope_sim.interfaces.v2.runsim_command_supervisor import RunSimCommandSupervisor
-from slope_sim.interfaces.v2.runsim_command_client import RunSimCommandClient
+from slope_sim.interfaces.v2.runsim_command_client import RunSimCommandRelayClient
 from slope_sim.model_registry import get_robot_model
 
 
@@ -21,7 +21,7 @@ _INTERACTIVE_DURATION_MS = 21_600_000
 class RunSimV2Command:
     """持有正式 C++ Command 与 GUI 使用的唯一认证 socket client。"""
 
-    def __init__(self, supervisor: RunSimCommandSupervisor, client: RunSimCommandClient) -> None:
+    def __init__(self, supervisor: RunSimCommandSupervisor, client: object) -> None:
         self._supervisor = supervisor
         self.client = client
 
@@ -65,8 +65,7 @@ class RunSimV2Command:
                 if time.monotonic() >= deadline:
                     raise RuntimeError("runSim v2 Command did not open its authenticated socket")
                 time.sleep(0.01)
-            client = RunSimCommandClient(supervisor.session)
-            client.connect()
+            client = RunSimCommandRelayClient.launch(supervisor.session)
             return cls(supervisor, client)
         except BaseException:
             supervisor.close()

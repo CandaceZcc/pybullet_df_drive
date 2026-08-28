@@ -628,14 +628,16 @@ def test_dashboard_speed_limits_are_visible_in_simulation_controls(monkeypatch):
         dashboard.close()
 
 
-def test_dashboard_hides_rc_source_when_serial_worker_is_not_enabled(monkeypatch):
-    """自动扫描无合格 SBUS 时不能留下永远无输入的 RC source。"""
+def test_dashboard_keeps_unavailable_rc_source_visible_but_disabled(monkeypatch):
+    """自动扫描无合格 SBUS 时让用户看见 RC 状态，且不能接管控制。"""
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     dashboard = TelemetryDashboard(max_linear_speed=0.45, max_angular_speed=0.85)
     try:
         dashboard.set_rc_available(False)
 
-        assert dashboard.control_source_combo.findData("rc") == -1
+        rc_index = dashboard.control_source_combo.findData("rc")
+        assert rc_index >= 0
+        assert not dashboard.control_source_combo.model().item(rc_index).isEnabled()
         assert dashboard.current_command().control_source == "keyboard"
         assert "未启用" in dashboard.rc_status_label.text()
         assert "自动扫描" in dashboard.rc_status_label.text()
@@ -1256,10 +1258,10 @@ def test_dashboard_plot_specs_use_one_chart_per_tab_with_compact_legend():
     }
 
 
-def test_dashboard_window_size_uses_exact_thirty_three_percent_width_and_full_height():
-    assert dashboard_window_size(available_width=900, available_height=700) == (297, 700)
-    assert dashboard_window_size(available_width=5000, available_height=3000) == (1650, 3000)
-    assert dashboard_window_size(available_width=320, available_height=320) == (106, 320)
+def test_dashboard_window_size_reserves_a_readable_wide_screen_workbench():
+    assert dashboard_window_size(available_width=1920, available_height=1080) == (768, 1080)
+    assert dashboard_window_size(available_width=1366, available_height=768) == (720, 768)
+    assert dashboard_window_size(available_width=900, available_height=700) == (360, 700)
 
 
 def test_dashboard_applied_rect_keeps_enterprise_and_diagnostic_scrolls_separate(monkeypatch):
@@ -1554,8 +1556,8 @@ def test_dashboard_compact_content_layout_keeps_geometry_and_controls_reachable(
 
 
 def test_dashboard_layout_constants_describe_vertical_sidebar():
-    assert dashboard_module.DASHBOARD_DEFAULT_WIDTH_RATIO.numerator == 33
-    assert dashboard_module.DASHBOARD_DEFAULT_WIDTH_RATIO.denominator == 100
+    assert dashboard_module.DASHBOARD_DEFAULT_WIDTH_RATIO.numerator == 2
+    assert dashboard_module.DASHBOARD_DEFAULT_WIDTH_RATIO.denominator == 5
     assert dashboard_module.DASHBOARD_TOP_AREA_STRETCH == 50
     assert dashboard_module.DASHBOARD_CONTROL_AREA_STRETCH == 50
     assert dashboard_module.DASHBOARD_TOP_TABS_MIN_HEIGHT == 320

@@ -506,6 +506,21 @@ def test_dashboard_manual_verifier_accepts_plot_tab_argument():
     assert args.plot_tab == "speed"
 
 
+def test_dashboard_manual_verifier_can_target_pybullet_keyboard_window():
+    args = verifier_module.parse_args(
+        ["--keyboard-window", "pybullet", "--no-verify-dashboard-tabs"]
+    )
+
+    assert args.keyboard_window == "pybullet"
+
+
+def test_pybullet_keyboard_target_rejects_dashboard_tab_walk(capsys):
+    with pytest.raises(SystemExit):
+        verifier_module.parse_args(["--keyboard-window", "pybullet"])
+
+    assert "--keyboard-window pybullet requires --no-verify-dashboard-tabs" in capsys.readouterr().err
+
+
 def test_dashboard_manual_verifier_accepts_window_layout_options_without_default_plot_tab():
     args = verifier_module.parse_args(
         [
@@ -524,6 +539,14 @@ def test_dashboard_manual_verifier_enables_geometry_gate_by_default():
     args = verifier_module.parse_args([])
 
     assert args.verify_window_layout is True
+
+
+def test_dashboard_manual_verifier_can_disable_geometry_gate_for_drive_only():
+    args = verifier_module.parse_args(
+        ["--no-verify-window-layout", "--no-verify-dashboard-tabs"]
+    )
+
+    assert args.verify_window_layout is False
 
 
 def test_dashboard_manual_verifier_enables_complete_tab_gate_by_default():
@@ -1790,13 +1813,13 @@ def test_validate_window_layout_accepts_exact_shared_layout():
     )
 
 
-def test_validate_window_layout_uses_independent_thirty_three_percent_oracle(
+def test_validate_window_layout_uses_independent_responsive_oracle(
     monkeypatch,
 ):
     """验收比例不得复用生产布局 helper，否则同一错误会双向自洽。"""
     available = Rect(10, 20, 1000, 700)
-    main = Rect(10, 20, 670, 700)
-    dashboard = Rect(680, 20, 330, 700)
+    main = Rect(10, 20, 600, 700)
+    dashboard = Rect(610, 20, 400, 700)
     forbidden = lambda *_args, **_kwargs: (_ for _ in ()).throw(
         AssertionError("production layout helper must not be called")
     )
@@ -1823,14 +1846,14 @@ def test_validate_window_layout_uses_independent_thirty_three_percent_oracle(
 @pytest.mark.parametrize(
     ("available_width", "device_pixel_ratio", "dashboard_width"),
     (
-        (1366, 1.0, 451),
-        (1920, 1.0, 634),
-        (2560, 1.0, 845),
-        (1366, 1.25, 451),
-        (1366, 1.5, 452),
-        (1366, 2.0, 450),
-        (2448, 2.0, 808),
-        (1365, 1.1, 451),
+        (1366, 1.0, 720),
+        (1920, 1.0, 768),
+        (2560, 1.0, 1024),
+        (1366, 1.25, 720),
+        (1366, 1.5, 720),
+        (1366, 2.0, 720),
+        (2448, 2.0, 980),
+        (1365, 1.1, 721),
     ),
 )
 def test_validate_window_layout_accepts_only_literal_dpr_aligned_width(
@@ -1853,12 +1876,13 @@ def test_validate_window_layout_accepts_only_literal_dpr_aligned_width(
 @pytest.mark.parametrize(
     ("available_width", "device_pixel_ratio", "dashboard_width"),
     (
-        (1366, 1.0, 450),
-        (1920, 1.0, 633),
-        (2560, 1.0, 844),
-        (2448, 2.0, 806),
-        (2448, 2.0, 807),
-        (2448, 2.0, 809),
+        (1366, 1.0, 719),
+        (1366, 1.0, 721),
+        (1920, 1.0, 767),
+        (2560, 1.0, 1023),
+        (2448, 2.0, 978),
+        (2448, 2.0, 979),
+        (2448, 2.0, 981),
     ),
 )
 def test_validate_window_layout_rejects_nearby_but_wrong_aligned_width(
@@ -1870,7 +1894,7 @@ def test_validate_window_layout_rejects_nearby_but_wrong_aligned_width(
     available = Rect(0, 0, available_width, 768)
     main_width = available_width - dashboard_width
 
-    with pytest.raises(ValueError, match="33/100"):
+    with pytest.raises(ValueError, match="responsive width"):
         verifier_module.validate_window_layout(
             available,
             Rect(0, 0, main_width, 768),
@@ -1895,7 +1919,7 @@ def test_validate_window_layout_rejects_legacy_or_fixed_dashboard_widths(
     available = Rect(0, 0, available_width, 768)
     main_width = available_width - dashboard_width
 
-    with pytest.raises(ValueError, match="33/100"):
+    with pytest.raises(ValueError, match="responsive width"):
         verifier_module.validate_window_layout(
             available,
             Rect(0, 0, main_width, 768),
@@ -2323,6 +2347,72 @@ def test_summarize_manual_motion_extracts_dashboard_success_metrics(tmp_path: Pa
     assert summary.tail_body_forward_speed == pytest.approx(0.215)
     assert summary.max_body_forward_speed == pytest.approx(0.23)
     assert summary.out_of_bounds is False
+    assert motion_passed(summary) is True
+
+
+def test_motion_gate_rejects_zero_pulse_inside_held_drive_interval(
+    tmp_path: Path,
+) -> None:
+    """长按区间即使最终移动，也不能把中途零命令误判为连续控制。"""
+    log_path = tmp_path / "manual-pulsed.csv"
+    pd.DataFrame(
+        {
+            "x": (0.0, 0.03, 0.06, 0.08, 0.10, 0.13, 0.16),
+            "command_linear_velocity": (0.0, 0.25, 0.25, 0.0, 0.25, 0.25, 0.0),
+            "body_forward_speed": (0.0, 0.10, 0.15, 0.08, 0.14, 0.15, 0.08),
+            "out_of_bounds": (False,) * 7,
+        }
+    ).to_csv(log_path, index=False)
+
+    summary = summarize_manual_motion(log_path, tail_samples=2)
+
+    assert summary.interior_zero_command_count == 1
+    assert motion_passed(summary) is False
+
+
+def test_motion_gate_uses_formal_v2_wheel_targets_for_continuity(
+    tmp_path: Path,
+) -> None:
+    """正式 v2 高层 command 列恒零时，门禁必须检查 C++ 下发的轮目标。"""
+    log_path = tmp_path / "manual-v2-pulsed.csv"
+    pd.DataFrame(
+        {
+            "x": (0.0, 0.03, 0.06, 0.08, 0.10, 0.13, 0.16),
+            "command_linear_velocity": (0.0,) * 7,
+            "left_target_drive_speed": (0.0, 2.0, 2.0, 0.0, 2.0, 2.0, 0.0),
+            "right_target_drive_speed": (0.0, 2.0, 2.0, 0.0, 2.0, 2.0, 0.0),
+            "body_forward_speed": (0.0, 0.10, 0.15, 0.08, 0.14, 0.15, 0.08),
+            "out_of_bounds": (False,) * 7,
+        }
+    ).to_csv(log_path, index=False)
+
+    summary = summarize_manual_motion(log_path, tail_samples=2)
+
+    assert summary.max_target_drive_speed == 2.0
+    assert summary.interior_zero_command_count == 1
+    assert motion_passed(summary) is False
+
+
+def test_motion_gate_accepts_continuous_formal_v2_wheel_targets(
+    tmp_path: Path,
+) -> None:
+    """正式 v2 轮目标连续且车辆移动时，应满足手动驾驶门禁。"""
+    log_path = tmp_path / "manual-v2-continuous.csv"
+    pd.DataFrame(
+        {
+            "x": (0.0, 0.03, 0.06, 0.10, 0.13),
+            "command_linear_velocity": (0.0,) * 5,
+            "left_target_drive_speed": (0.0, 2.0, 2.0, 2.0, 0.0),
+            "right_target_drive_speed": (0.0, 2.0, 2.0, 2.0, 0.0),
+            "body_forward_speed": (0.0, 0.10, 0.15, 0.14, 0.08),
+            "out_of_bounds": (False,) * 5,
+        }
+    ).to_csv(log_path, index=False)
+
+    summary = summarize_manual_motion(log_path, tail_samples=2)
+
+    assert summary.max_target_drive_speed == 2.0
+    assert summary.interior_zero_command_count == 0
     assert motion_passed(summary) is True
 
 

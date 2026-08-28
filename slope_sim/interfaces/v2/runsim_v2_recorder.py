@@ -356,12 +356,17 @@ class RunSimV2Recorder:
             raise RuntimeError(f"runSim v2 Export executable is unavailable: {executable}")
         try:
             subprocess.run(
-                build_export_argv(
-                    executable=executable,
-                    descriptor_set=descriptor_set,
-                    mcap_path=mcap_path,
-                    output_dir=self._output_dir,
-                ),
+                [
+                    "nice",
+                    "-n",
+                    "10",
+                    *build_export_argv(
+                        executable=executable,
+                        descriptor_set=descriptor_set,
+                        mcap_path=mcap_path,
+                        output_dir=self._output_dir,
+                    ),
+                ],
                 check=True,
             )
             staging_lvx2 = self._output_dir / "export" / "lidar.lvx2"

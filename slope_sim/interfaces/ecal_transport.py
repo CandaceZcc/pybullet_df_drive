@@ -614,13 +614,15 @@ class EcalTransport:
         if role == "peer":
             channels = tuple(
                 _ChannelBinding(
-                    channel.topic,
-                    "publish" if channel.direction == "subscribe" else "subscribe",
-                    channel.type_name,
-                    channel.message_type,
-                    channel.descriptor,
-                    channel.raw_wire,
-                    channel.raw_parser,
+                    topic=channel.topic,
+                    direction=(
+                        "publish" if channel.direction == "subscribe" else "subscribe"
+                    ),
+                    type_name=channel.type_name,
+                    message_type=channel.message_type,
+                    descriptor=channel.descriptor,
+                    raw_wire=channel.raw_wire,
+                    raw_parser=channel.raw_parser,
                 )
                 for channel in channels
             )
@@ -973,9 +975,11 @@ class EcalTransport:
                 self._require_open_locked()
 
     def _on_raw_payload(self, channel: _ChannelBinding, frame: object) -> None:
-        """native callback 只转交 owned raw frame，禁止同步 hash、解析或用户交付。"""
+        """native callback 只转交有逻辑消费者的 owned raw frame。"""
         with self._condition:
             if self._state in _STOPPING_STATES:
+                return
+            if not self._subscriptions[channel.topic]:
                 return
             self._in_flight_raw_callbacks += 1
         try:

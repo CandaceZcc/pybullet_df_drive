@@ -4,6 +4,7 @@ from __future__ import annotations
 from importlib import import_module
 from pathlib import Path
 import sys
+import time
 
 import pytest
 
@@ -179,6 +180,111 @@ def test_raw_output_collector_verifies_and_records_existing_v2_wheel_bytes() -> 
             "host_name": "localhost",
         }],
     }
+
+
+def test_runtime_peer_collector_scans_lidar_audit_fields_without_point_object_decode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """满负载 LiDAR 审计不得为每个点创建 Python 领域对象。"""
+    module = import_module("scripts.verify_stage4_v2_runtime_ecal")
+    descriptor = import_module("slope_sim.interfaces.v2.descriptor").load_v2_descriptor()
+    codec = import_module("slope_sim.interfaces.v2.codec").V2ProtoCodec(descriptor)
+    models = import_module("slope_sim.interfaces.v2.models")
+    raw_frame_type = import_module("slope_sim.interfaces.v2.ecal_raw").RawReceivedFrame
+    session = bytes.fromhex("00112233445566778899aabbccddeeff")
+    cloud = models.LidarPointCloudV2(
+        10_000_000,
+        "lidar_link",
+        2,
+        1,
+        (
+            models.LidarPointV2(0, 1.0, 2.0, 3.0, 100, 1, 0),
+            models.LidarPointV2(10, 4.0, 5.0, 6.0, 120, 2, 1),
+        ),
+        7,
+        1,
+        session,
+        descriptor.sha256,
+    )
+    encoded = codec.encode(cloud)
+    frame = raw_frame_type(
+        payload=encoded.payload,
+        remote_publisher_entity_id=7,
+        remote_publisher_process_id=8,
+        remote_publisher_host_name="localhost",
+        remote_type_name=encoded.type_name,
+        remote_encoding="proto",
+        remote_descriptor=descriptor.serialized_file_descriptor_set,
+        send_timestamp_us=10,
+        send_clock=11,
+        received_at=12.0,
+    )
+    collector = module.RawV2OutputCollector(descriptor)
+
+    def fail_if_decoded(_topic: str):
+        raise AssertionError("LiDAR collector must not create point objects")
+
+    monkeypatch.setattr(collector, "_parser_for_topic", fail_if_decoded)
+
+    collector.record("/sim/lidar/points", frame)
+
+    assert collector.output_evidence("/sim/lidar/points") == {
+        "count": 1,
+        "sequences": [7],
+        "timestamps_ns": [10_000_000],
+        "point_counts": [2],
+        "received_at_sec": [12.0],
+        "identities": [[session.hex(), descriptor.sha256.hex(), 1]],
+        "publishers": [{
+            "entity_id": 7,
+            "process_id": 8,
+            "host_name": "localhost",
+        }],
+    }
+
+
+def test_runtime_peer_collector_processes_80000_point_lidar_within_callback_budget() -> None:
+    """满负载 LiDAR 审计必须小于 30 ms，避免堵塞 native receive callback。"""
+    module = import_module("scripts.verify_stage4_v2_runtime_ecal")
+    descriptor = import_module("slope_sim.interfaces.v2.descriptor").load_v2_descriptor()
+    codec = import_module("slope_sim.interfaces.v2.codec").V2ProtoCodec(descriptor)
+    models = import_module("slope_sim.interfaces.v2.models")
+    raw_frame_type = import_module("slope_sim.interfaces.v2.ecal_raw").RawReceivedFrame
+    cloud = models.LidarPointCloudV2(
+        10_000_000,
+        "lidar_link",
+        80_000,
+        1,
+        tuple(
+            models.LidarPointV2(index, 1.0, 2.0, 3.0, 100, 1, 0)
+            for index in range(80_000)
+        ),
+        7,
+        1,
+        bytes(16),
+        descriptor.sha256,
+    )
+    encoded = codec.encode(cloud)
+    frame = raw_frame_type(
+        payload=encoded.payload,
+        remote_publisher_entity_id=7,
+        remote_publisher_process_id=8,
+        remote_publisher_host_name="localhost",
+        remote_type_name=encoded.type_name,
+        remote_encoding="proto",
+        remote_descriptor=descriptor.serialized_file_descriptor_set,
+        send_timestamp_us=10,
+        send_clock=11,
+        received_at=12.0,
+    )
+    collector = module.RawV2OutputCollector(descriptor)
+
+    start = time.perf_counter()
+    collector.record("/sim/lidar/points", frame)
+    duration_ms = (time.perf_counter() - start) * 1_000.0
+
+    assert collector.output_evidence("/sim/lidar/points")["point_counts"] == [80_000]
+    assert duration_ms < 30.0
 
 
 def test_runtime_peer_collector_command_is_explicit_and_module_based(tmp_path: Path) -> None:

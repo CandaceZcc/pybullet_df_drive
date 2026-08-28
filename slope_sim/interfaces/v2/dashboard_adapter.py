@@ -4,6 +4,7 @@ from __future__ import annotations
 from concurrent.futures import Future, ThreadPoolExecutor
 import hashlib
 import json
+import os
 from pathlib import Path
 import time
 from typing import Callable
@@ -253,9 +254,17 @@ class V2DashboardWidget(QWidget):
         self._cloud_render_failure = ""
         self._cloud_render_dropped_count = 0
         self._cloud_last_render_duration_ms = 0.0
+        self._cloud_render_submit_count = 0
+        self._cloud_pixmap_commit_count = 0
+        self._cloud_metrics_next_at = 0.0
+        self._cloud_metrics_monotonic = time.monotonic
+        self._cloud_metrics_error = ""
+        results_root = Path(os.environ.get("SLOPE_SIM_RESULTS_DIR", "results"))
+        self._cloud_metrics_path = (results_root / "dashboard-pointcloud-metrics.json").resolve()
         self._cloud_render_generation = 0
         self._cloud_render_pending = False
         self._cloud_render_inflight: Future[tuple[int, QImage, float]] | None = None
+        self._cloud_canvas_overlay = "等待数据"
         self._cloud_render_executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="runsim-cloud-image",
         )
@@ -271,6 +280,7 @@ class V2DashboardWidget(QWidget):
         self._cloud_frames: deque[object] = deque()
         self._last_cloud_frame: object | None = None
         self._last_cloud_sequence: int | None = None
+        self._cloud_world_generation: int | None = None
         self._last_receiver_diagnostics: tuple[str, ...] = ()
         self._last_render_dropped_count = 0
         self.setWindowTitle("Slope Sim Stage 5 Dashboard")
@@ -437,10 +447,10 @@ class V2DashboardWidget(QWidget):
         self.cloud_workbench.setMaximumHeight(34)
         workbench_layout = QVBoxLayout(self.cloud_workbench)
         self.cloud_canvas = QLabel(self.cloud_workbench)
-        self.cloud_canvas.setMinimumHeight(360)
+        self.cloud_canvas.setMinimumHeight(240)
         self.cloud_canvas.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.cloud_canvas.setStyleSheet("background: #10151c;")
-        self.cloud_canvas.setPixmap(QPixmap.fromImage(self._empty_cloud_image()))
+        self.cloud_canvas.setPixmap(QPixmap.fromImage(self._empty_cloud_image("等待数据")))
         self.cloud_canvas.setVisible(False)
         workbench_layout.addWidget(self.cloud_canvas, stretch=1)
 
@@ -468,6 +478,8 @@ class V2DashboardWidget(QWidget):
         self.cloud_transport_status.setWordWrap(True)
         self.cloud_command_observer_status = QLabel("wheel_command_observer_errors=0", self.cloud_workbench)
         self.cloud_command_observer_status.setWordWrap(True)
+        self.cloud_metrics_path = QLabel(f"metrics: {self._cloud_metrics_path}", self.cloud_workbench)
+        self.cloud_metrics_path.setWordWrap(True)
         cloud_controls = QFormLayout()
         cloud_controls.addRow("时间窗", self.cloud_window_slider)
         cloud_controls.addRow("点大小", self.cloud_point_size_slider)
@@ -481,9 +493,11 @@ class V2DashboardWidget(QWidget):
         controls.addWidget(self.cloud_status)
         controls.addWidget(self.cloud_transport_status)
         controls.addWidget(self.cloud_command_observer_status)
+        controls.addWidget(self.cloud_metrics_path)
         self.cloud_diagnostics = QPlainTextEdit(self.cloud_workbench)
         self.cloud_diagnostics.setReadOnly(True)
         self.cloud_diagnostics.document().setMaximumBlockCount(2_000)
+        self.cloud_diagnostics.setMaximumHeight(120)
         self.cloud_diagnostics.setPlainText("eCAL 点云工作台已初始化")
         controls.addWidget(self.cloud_diagnostics, stretch=1)
         workbench_layout.addWidget(self.cloud_controls)
@@ -543,7 +557,7 @@ class V2DashboardWidget(QWidget):
         )
 
     @staticmethod
-    def _empty_cloud_image() -> QImage:
+    def _empty_cloud_image(message: str | None = None) -> QImage:
         image = QImage(*_CLOUD_IMAGE_SIZE, QImage.Format.Format_RGBA8888)
         image.fill(QColor("#10151c"))
         painter = QPainter(image)
@@ -556,8 +570,61 @@ class V2DashboardWidget(QWidget):
         painter.setPen(QPen(QColor("#697888"), 1))
         painter.drawLine(width // 2, 0, width // 2, height)
         painter.drawLine(0, height // 2, width, height // 2)
+        if message:
+            painter.setPen(QPen(QColor("#dbe7f3"), 1))
+            painter.drawText(image.rect(), Qt.AlignmentFlag.AlignCenter, message)
         painter.end()
         return image
+
+    def _show_cloud_canvas_overlay(self, message: str) -> None:
+        """把短状态直接叠在现有画布，避免诊断只能在下方滚动区读取。"""
+        self._cloud_canvas_overlay = message
+        pixmap = self.cloud_canvas.pixmap()
+        image = (
+            self._empty_cloud_image()
+            if pixmap is None or pixmap.isNull()
+            else pixmap.toImage().convertToFormat(QImage.Format.Format_RGBA8888)
+        )
+        painter = QPainter(image)
+        overlay = image.rect().adjusted(12, image.height() - 58, -12, -12)
+        painter.fillRect(overlay, QColor(16, 21, 28, 220))
+        painter.setPen(QPen(QColor("#dbe7f3"), 1))
+        painter.drawText(overlay, Qt.AlignmentFlag.AlignCenter, message)
+        painter.end()
+        self.cloud_canvas.setPixmap(QPixmap.fromImage(image))
+
+    def _write_cloud_metrics(self, *, force: bool = False) -> Path:
+        """低频原子覆盖同一 JSON 快照，不让运行指标随帧数增长。"""
+        now = self._cloud_metrics_monotonic()
+        if not force and now < self._cloud_metrics_next_at:
+            return self._cloud_metrics_path
+        self._cloud_metrics_next_at = now + 5.0
+        frame = self._last_cloud_frame
+        payload = {
+            "receiver_status": self.cloud_transport_status.text(),
+            "metadata_validation": self._last_receiver_diagnostics[-1: ],
+            "latest_sequence": None if frame is None else frame.sequence,
+            "current_points": 0 if frame is None else len(frame.positions),
+            "accumulated_points": sum(len(item.positions) for item in self._cloud_frames),
+            "render_duration_ms": round(self._cloud_last_render_duration_ms, 3),
+            "render_submissions": self._cloud_render_submit_count,
+            "pixmap_commits": self._cloud_pixmap_commit_count,
+            "display_drops": self._cloud_render_dropped_count,
+            "receiver_drops": self._last_render_dropped_count,
+            "circuit_breaker": self._cloud_render_failure or None,
+        }
+        try:
+            self._cloud_metrics_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self._cloud_metrics_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+            temporary.replace(self._cloud_metrics_path)
+            self._cloud_metrics_error = ""
+        except OSError as error:
+            self._cloud_metrics_error = f"{type(error).__name__}: {error}"
+            self.cloud_metrics_path.setText(
+                f"metrics unavailable: {self._cloud_metrics_error}"
+            )
+        return self._cloud_metrics_path
 
     @staticmethod
     def _project_cloud_points(
@@ -596,12 +663,14 @@ class V2DashboardWidget(QWidget):
         if self._cloud_render_failed or not self.cloud_workbench.isChecked():
             return
         now = time.monotonic()
-        if not force and now < self._cloud_next_render_at:
-            self._cloud_render_dropped_count += 1
-            return
         if self._cloud_render_inflight is not None:
             self._cloud_render_dropped_count += 1
             self._cloud_render_pending = True
+            # 新输入已取代任务快照；旧任务即使先完成也不能覆盖画布。
+            self._cloud_render_generation += 1
+            return
+        if not force and now < self._cloud_next_render_at:
+            self._cloud_render_dropped_count += 1
             return
         self._cloud_next_render_at = now + 1.0 / _CLOUD_RENDER_MAX_HZ
         positions, tags = self._cloud_render_data()
@@ -621,6 +690,8 @@ class V2DashboardWidget(QWidget):
             self.cloud_color_mode.currentText(),
             self.cloud_point_size_slider.value(),
         )
+        self._cloud_render_submit_count += 1
+        self._show_cloud_canvas_overlay("正在渲染")
         self._cloud_render_timer.start()
 
     def _collect_cloud_render(self) -> None:
@@ -636,8 +707,16 @@ class V2DashboardWidget(QWidget):
             generation, image, duration_ms = future.result()
             if generation == self._cloud_render_generation and self.cloud_workbench.isChecked():
                 self.cloud_canvas.setPixmap(QPixmap.fromImage(image))
+                self._cloud_canvas_overlay = (
+                    "本帧0点"
+                    if self._last_cloud_frame is not None
+                    and len(self._last_cloud_frame.positions) == 0
+                    else ""
+                )
                 self._cloud_last_render_duration_ms = duration_ms
+                self._cloud_pixmap_commit_count += 1
                 self._update_cloud_status()
+                self._write_cloud_metrics()
         except Exception as error:
             self._cloud_render_failed = True
             self._cloud_render_failure = f"{type(error).__name__}: {error}"
@@ -647,6 +726,10 @@ class V2DashboardWidget(QWidget):
             self.cloud_diagnostics.appendPlainText(
                 f"renderer circuit-breaker: {self._cloud_render_failure}"
             )
+            self._show_cloud_canvas_overlay(
+                f"渲染已暂停：{self._cloud_render_failure}"
+            )
+            self._write_cloud_metrics(force=True)
             return
         if render_pending:
             self._render_cloud(force=True)
@@ -671,20 +754,43 @@ class V2DashboardWidget(QWidget):
         visible_points = projected[visible]
         visible_colors = colors[visible]
         if len(visible_points):
-            # RGBA8888 与 NumPy byte view 同序，批量写像素避开 80k 次 Qt 调用。
-            pixels = np.frombuffer(image.bits(), dtype=np.uint8).reshape(
-                image.height(), image.bytesPerLine(),
+            # RGBA8888 与 NumPy byte view 同序；一次写入一批完整点块，避免点大小
+            # 扩展后按偏移反复触发 80k 级高级索引写入，同时限制临时像素索引大小。
+            pixels = np.frombuffer(image.bits(), dtype="<u4").reshape(
+                image.height(), image.width(),
             )
             radius = max(0, point_size - 1) // 2
-            for offset_y in range(-radius, radius + 1):
-                y = np.clip(visible_points[:, 1] + offset_y, 0, image.height() - 1)
-                for offset_x in range(-radius, radius + 1):
-                    x = np.clip(visible_points[:, 0] + offset_x, 0, image.width() - 1)
-                    pixels[y, x * 4] = visible_colors[:, 0]
-                    pixels[y, x * 4 + 1] = visible_colors[:, 1]
-                    pixels[y, x * 4 + 2] = visible_colors[:, 2]
-                    pixels[y, x * 4 + 3] = 255
+            offsets = np.stack(np.meshgrid(
+                np.arange(-radius, radius + 1, dtype=np.int32),
+                np.arange(-radius, radius + 1, dtype=np.int32),
+                indexing="xy",
+            ), axis=-1).reshape(-1, 2)
+            batch_points = max(1, 250_000 // len(offsets))
+            packed_rgba = (
+                visible_colors[:, 0].astype(np.uint32)
+                | (visible_colors[:, 1].astype(np.uint32) << 8)
+                | (visible_colors[:, 2].astype(np.uint32) << 16)
+                | np.uint32(0xFF000000)
+            )
+            for start in range(0, len(visible_points), batch_points):
+                points = visible_points[start:start + batch_points]
+                x = np.clip(
+                    points[:, None, 0] + offsets[None, :, 0],
+                    0, image.width() - 1,
+                )
+                y = np.clip(
+                    points[:, None, 1] + offsets[None, :, 1],
+                    0, image.height() - 1,
+                )
+                pixels[y, x] = packed_rgba[start:start + len(points), None]
         painter = QPainter(image)
+        if not len(positions):
+            painter.setPen(QPen(QColor("#dbe7f3"), 1))
+            painter.drawText(
+                image.rect(),
+                Qt.AlignmentFlag.AlignCenter,
+                "本帧0点" if frame is not None else "等待数据",
+            )
         if frame is not None:
             marker, marker_visible = cls._project_cloud_points(np.asarray((
                 frame.vehicle_position,
@@ -727,9 +833,11 @@ class V2DashboardWidget(QWidget):
             // _MAX_CLOUD_RENDER_POINTS,
         )
         rendered_count = (display_count + render_step - 1) // render_step
+        empty_prefix = "最新帧0点 | " if len(frame.positions) == 0 else ""
         self.cloud_status.setText(
-            "%s | seq=%d | 本帧=%d | 时间窗=%0.1fs | 显示=%d | render=%0.1fms | drop=%d"
+            "%s%s | seq=%d | 本帧=%d | 时间窗=%0.1fs | 显示=%d | render=%0.1fms | drop=%d"
             % (
+                empty_prefix,
                 self.cloud_display_mode.currentText(),
                 frame.sequence,
                 len(frame.positions),
@@ -754,7 +862,7 @@ class V2DashboardWidget(QWidget):
 
     def _set_cloud_workbench_open(self, opened: bool) -> None:
         """默认折叠工作台，避免不查看 3D 时挤压采集与遥测布局。"""
-        self.cloud_workbench.setMaximumHeight(900 if opened else 34)
+        self.cloud_workbench.setMaximumHeight(620 if opened else 34)
         self.cloud_canvas.setVisible(opened)
         if opened:
             self._cloud_render_failed = False
@@ -767,6 +875,13 @@ class V2DashboardWidget(QWidget):
 
         if type(frame) is not V2DashboardCloudFrame:
             raise ValueError("cloud frame must be an exact V2DashboardCloudFrame")
+        if frame.world_generation != self._cloud_world_generation:
+            self._cloud_frames.clear()
+            self._last_cloud_frame = None
+            self._last_cloud_sequence = None
+            self._cloud_world_generation = frame.world_generation
+            # 已在后台的旧世界图像完成后因 generation 不匹配而不会提交。
+            self._cloud_render_generation += 1
         if frame.sequence == self._last_cloud_sequence:
             return False
         self._last_cloud_sequence = frame.sequence
@@ -781,6 +896,7 @@ class V2DashboardWidget(QWidget):
         if self.cloud_workbench.isChecked():
             self._render_cloud()
         self._update_cloud_status()
+        self._write_cloud_metrics()
         return True
 
     def update_receiver_diagnostics(
@@ -825,6 +941,7 @@ class V2DashboardWidget(QWidget):
             self.cloud_diagnostics.appendPlainText("receiver: %s" % detail)
         self._last_render_dropped_count = render_dropped_count
         self._last_receiver_diagnostics = diagnostics
+        self._write_cloud_metrics()
         return True
 
     def _cloud_colors(self, positions: np.ndarray, tags: np.ndarray) -> np.ndarray:
@@ -872,6 +989,9 @@ class V2DashboardWidget(QWidget):
         """主动回收独立显示链，不依赖嵌入 QWidget 是否接收 close event。"""
         self._close_live_viewer()
         self._cloud_render_timer.stop()
+        metrics_path = self._write_cloud_metrics(force=True)
+        if not self._cloud_metrics_error:
+            print(f"dashboard point-cloud metrics: {metrics_path}")
         self._cloud_render_executor.shutdown(wait=False, cancel_futures=True)
 
     def closeEvent(self, event: object) -> None:  # noqa: N802 - Qt 固定回调名
@@ -1109,6 +1229,13 @@ class V2DashboardWidget(QWidget):
             raise ValueError("snapshot must be an exact V2DashboardSnapshot")
         if snapshot.descriptor_sha256 != self._descriptor.sha256:
             raise ValueError("dashboard snapshot descriptor does not match widget")
+        if self._cloud_world_generation != snapshot.world_generation:
+            self._cloud_frames.clear()
+            self._last_cloud_frame = None
+            self._last_cloud_sequence = None
+            self._cloud_world_generation = snapshot.world_generation
+            self._cloud_render_generation += 1
+            self._update_cloud_status()
         self.identity_value.setText(
             "session=%s | descriptor=%s | world=%d | %s | lidar_link | MID-360 simulation"
             % (snapshot.simulation_session_id.hex()[:12], snapshot.descriptor_sha256.hex()[:12],

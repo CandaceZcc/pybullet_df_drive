@@ -190,6 +190,7 @@ def test_recorder_export_publishes_staged_capture_before_updating_latest_marker(
 
     def fake_run(argv, *, check):
         assert check is True
+        assert argv[:3] == ["nice", "-n", "10"]
         output = Path(argv[argv.index("--output-dir") + 1])
         output.mkdir()
         (output / "lidar.lvx2").write_bytes(b"lvx2")

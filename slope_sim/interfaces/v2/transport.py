@@ -157,3 +157,32 @@ def create_v2_ecal_transport(
             descriptor, dashboard=role == "dashboard",
         ),
     )
+
+
+def create_v2_command_receive_transport(
+    *,
+    descriptor: DescriptorIdentity,
+    participant_name: str,
+    bindings: object | None = None,
+) -> EcalTransport:
+    """创建 sidecar 专用的单命令 raw subscriber，不创建遥测资源。"""
+    if not isinstance(descriptor, DescriptorIdentity):
+        raise ValueError("descriptor must be a DescriptorIdentity")
+    contract = next(item for item in V2_TOPICS if item.topic == "/sim/wheel/command")
+    codec = V2ProtoCodec(descriptor)
+    selected = _RawV2Bindings() if bindings is None else bindings
+    return EcalTransport(
+        bindings=selected,
+        participant_name=participant_name,
+        role="simulation",
+        channel_bindings=(
+            _ChannelBinding(
+                topic=contract.topic,
+                direction="subscribe",
+                type_name=contract.type_name,
+                descriptor=descriptor,
+                raw_wire=True,
+                raw_parser=codec.decode_wheel_command,
+            ),
+        ),
+    )

@@ -45,6 +45,7 @@ class V2DashboardCloudFrame:
     tags: np.ndarray
     vehicle_position: tuple[float, float, float] = (0.0, 0.0, 0.0)
     vehicle_forward: tuple[float, float, float] = (1.0, 0.0, 0.0)
+    world_generation: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -316,13 +317,14 @@ class V2DashboardRawObserverTransport:
 
 
 class V2DashboardEcalReceiver:
-    """独立订阅五路 v2 数据，向 GUI 提供经过校验的不可变 snapshot。"""
+    """接收五路 v2 数据，向 GUI 提供经过校验的不可变 snapshot。"""
 
     def __init__(
         self,
         descriptor: DescriptorIdentity,
         *,
         transport: object,
+        command_subscribe: Callable[[Callable[[bytes, float], None]], object] | None = None,
         start_worker: bool = True,
     ) -> None:
         if type(descriptor) is not DescriptorIdentity:
@@ -330,6 +332,8 @@ class V2DashboardEcalReceiver:
         subscribe = getattr(transport, "subscribe", None)
         if not callable(subscribe):
             raise ValueError("transport must provide subscribe")
+        if command_subscribe is not None and not callable(command_subscribe):
+            raise ValueError("command_subscribe must be callable or None")
         if not isinstance(start_worker, bool):
             raise ValueError("start_worker must be a bool")
         self._descriptor = descriptor
@@ -349,10 +353,14 @@ class V2DashboardEcalReceiver:
         self._closed = False
         self._stop = Event()
         self._worker: Thread | None = None
-        self._subscriptions = tuple(
-            subscribe(contract.topic, contract.type_name, self._callback(contract.topic))
-            for contract in V2_TOPICS
-        )
+        subscriptions = []
+        for contract in V2_TOPICS:
+            callback = self._callback(contract.topic)
+            if contract.topic == "/sim/wheel/command" and command_subscribe is not None:
+                subscriptions.append(command_subscribe(callback))
+            else:
+                subscriptions.append(subscribe(contract.topic, contract.type_name, callback))
+        self._subscriptions = tuple(subscriptions)
         if start_worker:
             self._worker = Thread(
                 target=self._run,
@@ -566,6 +574,7 @@ class V2DashboardEcalReceiver:
             tags,
             tuple(float(value) for value in recovered.base_pose.position),
             tuple(float(rotation[index, 0]) for index in range(3)),
+            lidar.world_generation,
         )
         with self._condition:
             self._cloud_frame = frame

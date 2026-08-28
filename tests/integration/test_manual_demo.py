@@ -824,7 +824,7 @@ def test_manual_demo_uses_wall_clock_deadline_and_keeps_configured_camera_state(
     monkeypatch.setattr(manual_demo_module, "configure_gui_visualizer", lambda *_args: None)
     monkeypatch.setattr(manual_demo_module, "CsvSimulationLogger", FakeLogger)
     monkeypatch.setattr(manual_demo_module, "ObstacleEventLogger", FakeObstacleEventLogger)
-    monkeypatch.setattr(manual_demo_module, "command_from_keyboard", lambda *_args: ManualCommand(0.0, 0.0))
+    _disable_pybullet_keyboard(monkeypatch)
     monkeypatch.setattr(manual_demo_module, "_read_lidar_for_robot", lambda *_args: None)
     monkeypatch.setattr(manual_demo_module, "_probe_terrain_for_robot", lambda *_args: None)
     def update_follow_camera(*args):
@@ -963,7 +963,7 @@ def test_manual_demo_keeps_dashboard_busy_while_obstacle_operation_is_pending(mo
     monkeypatch.setattr(manual_demo_module, "configure_gui_visualizer", lambda *_args: None)
     monkeypatch.setattr(manual_demo_module, "CsvSimulationLogger", FakeLogger)
     monkeypatch.setattr(manual_demo_module, "ObstacleEventLogger", FakeObstacleEventLogger)
-    monkeypatch.setattr(manual_demo_module, "command_from_keyboard", lambda *_args: ManualCommand(0.0, 0.0))
+    _disable_pybullet_keyboard(monkeypatch)
     monkeypatch.setattr(manual_demo_module, "update_follow_camera", lambda *_args: None)
     monkeypatch.setattr(manual_demo_module.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(manual_demo_module.pd, "read_csv", lambda _path: object())
@@ -1083,7 +1083,7 @@ def test_manual_demo_keeps_dashboard_busy_after_immediate_action_when_queue_rema
     monkeypatch.setattr(manual_demo_module, "configure_gui_visualizer", lambda *_args: None)
     monkeypatch.setattr(manual_demo_module, "CsvSimulationLogger", FakeLogger)
     monkeypatch.setattr(manual_demo_module, "ObstacleEventLogger", FakeObstacleEventLogger)
-    monkeypatch.setattr(manual_demo_module, "command_from_keyboard", lambda *_args: ManualCommand(0.0, 0.0))
+    _disable_pybullet_keyboard(monkeypatch)
     monkeypatch.setattr(manual_demo_module, "update_follow_camera", lambda *_args: None)
     monkeypatch.setattr(manual_demo_module.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(manual_demo_module.pd, "read_csv", lambda _path: object())
@@ -1189,7 +1189,7 @@ def test_manual_demo_refreshes_dashboard_obstacle_snapshots(monkeypatch):
     monkeypatch.setattr(manual_demo_module, "configure_gui_visualizer", lambda *_args: None)
     monkeypatch.setattr(manual_demo_module, "CsvSimulationLogger", FakeLogger)
     monkeypatch.setattr(manual_demo_module, "ObstacleEventLogger", FakeObstacleEventLogger)
-    monkeypatch.setattr(manual_demo_module, "command_from_keyboard", lambda *_args: ManualCommand(0.0, 0.0))
+    _disable_pybullet_keyboard(monkeypatch)
     monkeypatch.setattr(manual_demo_module, "update_follow_camera", lambda *_args: None)
     monkeypatch.setattr(manual_demo_module.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(manual_demo_module.pd, "read_csv", lambda _path: object())
@@ -1400,7 +1400,7 @@ def test_manual_demo_logs_obstacle_failure_and_keeps_drive_active(monkeypatch, t
     monkeypatch.setattr(manual_demo_module, "build_world_from_scene_document", lambda *_args, **_kwargs: (world, object()))
     monkeypatch.setattr(manual_demo_module, "configure_gui_visualizer", lambda *_args: None)
     monkeypatch.setattr(manual_demo_module, "CsvSimulationLogger", FakeCsvLogger)
-    monkeypatch.setattr(manual_demo_module, "command_from_keyboard", lambda *_args: ManualCommand(0.0, 0.0))
+    _disable_pybullet_keyboard(monkeypatch)
     monkeypatch.setattr(manual_demo_module, "update_follow_camera", lambda *_args: None)
     monkeypatch.setattr(manual_demo_module.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(manual_demo_module.pd, "read_csv", lambda _path: object())
@@ -1632,7 +1632,7 @@ def test_manual_demo_logs_stateful_fifo_events_without_duplicates(monkeypatch):
     monkeypatch.setattr(manual_demo_module, "configure_gui_visualizer", lambda *_args: None)
     monkeypatch.setattr(manual_demo_module, "CsvSimulationLogger", FakeCsvLogger)
     monkeypatch.setattr(manual_demo_module, "ObstacleEventLogger", CapturingObstacleEventLogger)
-    monkeypatch.setattr(manual_demo_module, "command_from_keyboard", lambda *_args: ManualCommand(0.0, 0.0))
+    _disable_pybullet_keyboard(monkeypatch)
     monkeypatch.setattr(manual_demo_module, "update_follow_camera", lambda *_args: None)
     monkeypatch.setattr(manual_demo_module.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(manual_demo_module.pd, "read_csv", lambda _path: object())
@@ -1725,7 +1725,7 @@ def test_manual_demo_closes_obstacle_event_logger_on_exception(monkeypatch):
     monkeypatch.setattr(manual_demo_module, "configure_gui_visualizer", lambda *_args: None)
     monkeypatch.setattr(manual_demo_module, "CsvSimulationLogger", FakeCsvLogger)
     monkeypatch.setattr(manual_demo_module, "ObstacleEventLogger", FakeObstacleEventLogger, raising=False)
-    monkeypatch.setattr(manual_demo_module, "command_from_keyboard", lambda *_args: ManualCommand(0.0, 0.0))
+    _disable_pybullet_keyboard(monkeypatch)
 
     with pytest.raises(RuntimeError, match="physics failed"):
         manual_demo_module.run_manual_demo(
@@ -1975,7 +1975,7 @@ def test_manual_enabled_local_loop_pauses_polls_rebinds_and_returns_interface_lo
     monkeypatch.setattr(manual_demo_module, "configure_gui_visualizer", lambda *_args: None)
     monkeypatch.setattr(manual_demo_module, "CsvSimulationLogger", FakeLogger)
     monkeypatch.setattr(manual_demo_module, "ObstacleEventLogger", FakeObstacleEventLogger)
-    monkeypatch.setattr(manual_demo_module, "command_from_keyboard", lambda *_args: ManualCommand(0.0, 0.0))
+    _disable_pybullet_keyboard(monkeypatch)
     monkeypatch.setattr(manual_demo_module, "_read_lidar_for_robot", lambda *_args: None)
     monkeypatch.setattr(manual_demo_module, "_probe_terrain_for_robot", lambda *_args: None)
     monkeypatch.setattr(manual_demo_module, "update_follow_camera", lambda *_args: None)
@@ -2078,3 +2078,13 @@ def test_manual_dashboard_command_moves_mid_drive_on_slope():
         assert not any(state.out_of_bounds for state in states)
     finally:
         p.disconnect(client_id)
+
+def _disable_pybullet_keyboard(monkeypatch) -> None:
+    """让主循环测试显式替换当前有状态键盘入口。"""
+    monkeypatch.setattr(
+        manual_demo_module,
+        "KeyboardEventTracker",
+        lambda: SimpleNamespace(
+            command=lambda *_args, **_kwargs: ManualCommand(0.0, 0.0)
+        ),
+    )

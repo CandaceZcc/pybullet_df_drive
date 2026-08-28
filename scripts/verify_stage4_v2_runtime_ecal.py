@@ -16,9 +16,17 @@ from threading import Lock
 import time
 from typing import Callable, Sequence
 
+from google.protobuf.message import DecodeError
+
+from slope_sim.interfaces.generated import slope_sim_interfaces_v2_pb2 as pb
 from slope_sim.interfaces.v2.codec import V2ProtoCodec
 from slope_sim.interfaces.v2.descriptor import DescriptorIdentity
-from slope_sim.interfaces.v2.ecal_raw import EcalRawBindings, RawReceivedFrame, process_raw_frame
+from slope_sim.interfaces.v2.ecal_raw import (
+    EcalRawBindings,
+    RawReceivedFrame,
+    process_raw_frame,
+    validate_raw_frame_metadata,
+)
 from slope_sim.interfaces.v2.topics import V2_TOPICS
 
 
@@ -212,7 +220,7 @@ class RawV2OutputCollector:
         self._descriptor = descriptor
         self._codec = V2ProtoCodec(descriptor)
         self._lock = Lock()
-        self._records: dict[str, list[tuple[int, int, float, list[object], dict[str, object]]]] = {
+        self._records: dict[str, list[tuple[int, int, int | None, float, list[object], dict[str, object]]]] = {
             topic: [] for topic in _OUTPUT_TYPE_NAMES
         }
 
@@ -231,21 +239,27 @@ class RawV2OutputCollector:
         expected_type = _OUTPUT_TYPE_NAMES.get(topic)
         if expected_type is None:
             raise ValueError("topic is not a v2 runtime output")
-        processed = process_raw_frame(
-            frame,
-            expected_type=expected_type,
-            descriptor=self._descriptor,
-            parser=self._parser_for_topic(topic),
-        )
-        model = processed.parsed
-        timestamp_ns = (
-            model.timebase_ns if topic == "/sim/lidar/points" else model.timestamp_ns
-        )
-        identity = [
-            model.simulation_session_id.hex(),
-            model.descriptor_sha256.hex(),
-            model.world_generation,
-        ]
+        if topic == "/sim/lidar/points":
+            timestamp_ns, sequence, world_generation, session_id, descriptor_sha256, point_count = (
+                _scan_lidar_audit_payload(frame, self._descriptor)
+            )
+            identity = [session_id.hex(), descriptor_sha256.hex(), world_generation]
+        else:
+            processed = process_raw_frame(
+                frame,
+                expected_type=expected_type,
+                descriptor=self._descriptor,
+                parser=self._parser_for_topic(topic),
+            )
+            model = processed.parsed
+            timestamp_ns = model.timestamp_ns
+            sequence = model.sequence
+            point_count = None
+            identity = [
+                model.simulation_session_id.hex(),
+                model.descriptor_sha256.hex(),
+                model.world_generation,
+            ]
         publisher = {
             "entity_id": frame.remote_publisher_entity_id,
             "process_id": frame.remote_publisher_process_id,
@@ -253,7 +267,7 @@ class RawV2OutputCollector:
         }
         with self._lock:
             self._records[topic].append(
-                (model.sequence, timestamp_ns, frame.received_at, identity, publisher)
+                (sequence, timestamp_ns, point_count, frame.received_at, identity, publisher)
             )
 
     def output_evidence(self, topic: str) -> dict[str, object]:
@@ -262,14 +276,54 @@ class RawV2OutputCollector:
             raise ValueError("topic is not a v2 runtime output")
         with self._lock:
             records = tuple(self._records[topic])
-        return {
+        evidence = {
             "count": len(records),
             "sequences": [record[0] for record in records],
             "timestamps_ns": [record[1] for record in records],
-            "received_at_sec": [record[2] for record in records],
-            "identities": [list(record[3]) for record in records],
-            "publishers": [dict(record[4]) for record in records],
+            "received_at_sec": [record[3] for record in records],
+            "identities": [list(record[4]) for record in records],
+            "publishers": [dict(record[5]) for record in records],
         }
+        if topic == "/sim/lidar/points":
+            evidence["point_counts"] = [record[2] for record in records]
+        return evidence
+
+
+def _scan_lidar_audit_payload(
+    frame: RawReceivedFrame,
+    descriptor: DescriptorIdentity,
+) -> tuple[int, int, int, bytes, bytes, int]:
+    """只读取 C++ Protobuf 根字段，避免为每个点分配 Python 领域对象。"""
+    validate_raw_frame_metadata(
+        frame,
+        expected_type="slope_sim.interfaces.v2.LidarPointCloud",
+        descriptor=descriptor,
+    )
+    message = pb.LidarPointCloud()
+    try:
+        message.ParseFromString(frame.payload)
+    except DecodeError as error:
+        raise ValueError("failed to decode LiDAR payload") from error
+    if not message.frame_id:
+        raise ValueError("LiDAR frame_id must be nonempty")
+    if message.point_num != len(message.points):
+        raise ValueError("LiDAR point_num must equal encoded point count")
+    if message.world_generation == 0:
+        raise ValueError("LiDAR world_generation must be positive")
+    session_id = bytes(message.simulation_session_id)
+    if len(session_id) != 16:
+        raise ValueError("LiDAR simulation_session_id must be exactly 16 bytes")
+    descriptor_sha256 = bytes(message.descriptor_sha256)
+    if descriptor_sha256 != descriptor.sha256:
+        raise ValueError("LiDAR descriptor SHA-256 mismatch")
+    return (
+        message.timebase_ns,
+        message.sequence,
+        message.world_generation,
+        session_id,
+        descriptor_sha256,
+        message.point_num,
+    )
 
 
 def _write_new_json(path: Path, value: object) -> None:

@@ -32,7 +32,7 @@ from slope_sim.interfaces.v2.world_runtime import V2ManualWorldRuntime
 from slope_sim.logger import CsvSimulationLogger, ObstacleEventLogger
 from slope_sim.resource_monitor import ResourceMonitor
 from slope_sim.manual_capture import ManualCaptureRecorder, ManualCaptureSession
-from slope_sim.manual_control import ManualCommand, ManualControlSettings, command_from_keyboard
+from slope_sim.manual_control import KeyboardEventTracker, ManualCommand, ManualControlSettings
 from slope_sim.manual_mid360_reconstruction import reconstruction_worker_entrypoint
 from slope_sim.metrics import compute_tracking_metrics
 from slope_sim.realtime import ControlPathDiagnostics, DeadlinePacer, RuntimeObservationCadence
@@ -247,7 +247,11 @@ def _resource_scalar_metrics(
     return metrics
 
 
-def _create_v2_dashboard_receiver(descriptor: object) -> tuple[object, object]:
+def _create_v2_dashboard_receiver(
+    descriptor: object,
+    *,
+    command_subscribe: Callable[[Callable[[bytes, float], None]], object],
+) -> tuple[object, object]:
     """创建附着既有 eCAL core 的 Dashboard 接收链，暂不启动 worker。"""
     from slope_sim.interfaces.v2.dashboard_receiver import (
         V2DashboardEcalReceiver,
@@ -255,7 +259,11 @@ def _create_v2_dashboard_receiver(descriptor: object) -> tuple[object, object]:
     )
 
     observer = V2DashboardRawObserverTransport(descriptor, start_worker=False)
-    receiver = V2DashboardEcalReceiver(descriptor, transport=observer)
+    receiver = V2DashboardEcalReceiver(
+        descriptor,
+        transport=observer,
+        command_subscribe=command_subscribe,
+    )
     observer.set_diagnostic_callback(receiver.record_transport_error)
     return observer, receiver
 
@@ -811,6 +819,7 @@ def run_manual_demo(
                     v2_dashboard_receiver,
                 ) = _create_v2_dashboard_receiver(
                     v2_manual_runtime.descriptor,
+                    command_subscribe=v2_manual_runtime.subscribe_command_observer,
                 )
                 v2_dashboard_observer.start()
                 v2_dashboard = _create_v2_dashboard_widget(
@@ -871,6 +880,7 @@ def run_manual_demo(
             camera_follow_enabled=camera_follow_enabled,
             camera_follow_view=camera_follow_view,
         )
+        keyboard_tracker = KeyboardEventTracker()
         handled_result = None
         manual_paused = False
         pending_event_actions: deque[RuntimeAction] = deque()
@@ -889,6 +899,8 @@ def run_manual_demo(
         )
         last_v2_dashboard_refresh_at: float | None = None
         last_command_source_status_refresh_at: float | None = None
+        last_control_edge_diagnostic: tuple[object, ...] | None = None
+        last_keyboard_input_diagnostic: tuple[object, ...] | None = None
         dashboard_event_iteration = 0
         pacer.start()
         while (
@@ -1150,11 +1162,26 @@ def run_manual_demo(
                 )
                 # Dashboard 的下拉框取消键会被 PyBullet 捕获；退出只接受 Dashboard
                 # 明确请求，避免切换控制源时把 Esc/Q 误当作关闭仿真。
-                keyboard_command = command_from_keyboard(
-                    p.getKeyboardEvents(),
+                keyboard_events = p.getKeyboardEvents()
+                keyboard_command = keyboard_tracker.command(
+                    keyboard_events,
                     settings,
                     False,
+                    now=runtime_monotonic(),
                 )
+                if control_path_diagnostics is not None:
+                    keyboard_input = (
+                        tuple(sorted(keyboard_events.items())),
+                        tuple(sorted(getattr(dashboard, "_pressed_keys", ()))),
+                    )
+                    if keyboard_input != last_keyboard_input_diagnostic:
+                        print(
+                            "v2-keyboard-input "
+                            f"pybullet={keyboard_input[0]} qt_held={keyboard_input[1]}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        last_keyboard_input_diagnostic = keyboard_input
                 command = merge_manual_commands(command, keyboard_command)
                 camera_follow_enabled = command.camera_follow_enabled
                 camera_follow_view = command.camera_follow_view
@@ -1164,7 +1191,22 @@ def run_manual_demo(
                 max_angular_speed = p.readUserDebugParameter(angular_slider)
                 settings = ManualControlSettings(max_linear_speed=max_linear_speed, max_angular_speed=max_angular_speed)
                 # 方向键只在 PyBullet 窗口获得焦点时生效。
-                keyboard_command = command_from_keyboard(p.getKeyboardEvents(), settings)
+                keyboard_events = p.getKeyboardEvents()
+                keyboard_command = keyboard_tracker.command(
+                    keyboard_events,
+                    settings,
+                    now=runtime_monotonic(),
+                )
+                if control_path_diagnostics is not None:
+                    keyboard_input = (tuple(sorted(keyboard_events.items())), ())
+                    if keyboard_input != last_keyboard_input_diagnostic:
+                        print(
+                            "v2-keyboard-input "
+                            f"pybullet={keyboard_input[0]} qt_held=()",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        last_keyboard_input_diagnostic = keyboard_input
                 command = DashboardCommand(
                     keyboard_command.linear_velocity,
                     keyboard_command.angular_velocity,
@@ -1243,17 +1285,59 @@ def run_manual_demo(
                     source=limited_command.control_source,
                 )
                 if control_path_diagnostics is not None:
+                    source_snapshot = (
+                        v2_command_arbiter.snapshot(now=runtime_monotonic())
+                        if v2_command_arbiter is not None
+                        else None
+                    )
+                    rc_snapshot = (
+                        rc_worker.snapshot(now=runtime_monotonic())
+                        if rc_worker is not None
+                        else None
+                    )
+                    rc_command = getattr(rc_snapshot, "command", None)
+                    edge = (
+                        getattr(source_snapshot, "active_source", None),
+                        getattr(source_snapshot, "failure_reason", None),
+                        any(
+                            abs(value) > 1e-12
+                            for value in getattr(
+                                source_snapshot, "latest_target", (0.0, 0.0)
+                            )
+                        ),
+                        getattr(source_snapshot, "zero_reason", None),
+                        getattr(rc_command, "active", None),
+                        getattr(rc_command, "reason", None),
+                        getattr(rc_snapshot, "watchdog_timeout_count", None),
+                    )
+                    if edge != last_control_edge_diagnostic:
+                        print(
+                            "v2-control-edge "
+                            f"source={edge[0]} fault={edge[1]} moving={edge[2]} "
+                            f"zero_reason={edge[3]} rc_active={edge[4]} "
+                            f"rc_reason={edge[5]} rc_watchdog={edge[6]}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        last_control_edge_diagnostic = edge
                     # 调用两次 monotonic 仅存在于显式 developer diagnostics 路径。
                     control_path_diagnostics.record_send(
                         elapsed_sec=runtime_monotonic() - send_started_at,
                     )
                     sample = control_path_diagnostics.sample_if_due(now=runtime_monotonic())
                     if sample is not None:
+                        relay_snapshot = None
+                        relay_diagnostics = getattr(
+                            v2_command_client, "diagnostic_snapshot", None
+                        )
+                        if callable(relay_diagnostics):
+                            relay_snapshot = relay_diagnostics()
                         print(
                             "v2-control-diagnostics "
                             f"loop_count={sample.loop_count} "
                             f"max_loop_gap_ms={sample.max_loop_gap_sec * 1000.0:.3f} "
-                            f"max_send_ms={sample.max_send_elapsed_sec * 1000.0:.3f}",
+                            f"max_send_ms={sample.max_send_elapsed_sec * 1000.0:.3f} "
+                            f"relay={relay_snapshot}",
                             file=sys.stderr,
                             flush=True,
                         )

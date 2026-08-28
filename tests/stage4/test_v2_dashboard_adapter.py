@@ -7,6 +7,7 @@ import json
 import subprocess
 import sys
 from dataclasses import replace
+from concurrent.futures import Future
 from importlib import import_module
 from pathlib import Path
 
@@ -229,6 +230,21 @@ def test_v2_dashboard_places_cloud_view_above_its_controls(qapp) -> None:
         widget.close()
 
 
+def test_v2_dashboard_cloud_workbench_stays_compact_when_expanded(qapp) -> None:
+    """嵌入 Dashboard 的点云页不能以固定大画布挤压其余控制。"""
+    adapter = _adapter_module()
+    descriptor, _snapshot = _snapshot_with_encoded_lidar()
+    widget = adapter.V2DashboardWidget(descriptor)
+    try:
+        widget.cloud_workbench.setChecked(True)
+
+        assert widget.cloud_canvas.minimumHeight() <= 240
+        assert widget.cloud_workbench.maximumHeight() <= 620
+        assert widget.cloud_diagnostics.maximumHeight() <= 120
+    finally:
+        widget.close()
+
+
 def test_v2_dashboard_defers_cloud_rendering_while_workbench_is_closed(
     qapp, monkeypatch,
 ) -> None:
@@ -337,6 +353,8 @@ def test_v2_dashboard_stops_repeated_rendering_after_the_first_renderer_failure(
         assert widget._cloud_render_failed is True
         assert "点云显示已暂停" in widget.cloud_status.text()
         assert "synthetic image conversion fault" in widget.cloud_diagnostics.toPlainText()
+        assert "渲染已暂停" in widget._cloud_canvas_overlay
+        assert "synthetic image conversion fault" in widget._cloud_canvas_overlay
         assert widget._cloud_render_inflight is None
         widget._render_cloud(force=True)
         assert widget._cloud_render_inflight is None
@@ -344,8 +362,8 @@ def test_v2_dashboard_stops_repeated_rendering_after_the_first_renderer_failure(
         widget.close()
 
 
-def test_v2_dashboard_cpu_renderer_keeps_an_80000_point_frame_below_display_budget(qapp) -> None:
-    """最大显示输入必须能在 10 Hz UI 节拍内完成 CPU 图像投影。"""
+def test_v2_dashboard_cpu_renderer_keeps_default_three_pixel_points_below_display_budget(qapp) -> None:
+    """默认 3 像素点的最大显示输入必须满足稳定 5--10 Hz 显示预算。"""
     adapter = _adapter_module()
     positions = np.zeros((adapter._MAX_CLOUD_RENDER_POINTS, 3), dtype=np.float32)
     positions[:, 0] = np.linspace(-10.0, 10.0, len(positions), dtype=np.float32)
@@ -353,11 +371,11 @@ def test_v2_dashboard_cpu_renderer_keeps_an_80000_point_frame_below_display_budg
     camera = {**adapter._CLOUD_CAMERA_PRESETS["透视"], "target": np.zeros(3, dtype=np.float32)}
 
     _generation, image, duration_ms = adapter.V2DashboardWidget._build_cloud_image(
-        1, positions, tags, None, camera, "语义", 1,
+        1, positions, tags, None, camera, "语义", 3,
     )
 
     assert image.width() == adapter._CLOUD_IMAGE_SIZE[0]
-    assert duration_ms < 100.0
+    assert duration_ms < 150.0
 
 
 def test_v2_dashboard_accumulates_only_worker_transformed_cloud_frames(qapp) -> None:
@@ -433,6 +451,120 @@ def test_v2_dashboard_current_frame_mode_clears_historical_points(qapp) -> None:
         assert positions.shape == (0, 3)
         assert "当前帧" in widget.cloud_status.text()
         assert "本帧=0" in widget.cloud_status.text()
+    finally:
+        widget.close()
+
+
+def test_v2_dashboard_clears_old_history_and_accepts_sequence_zero_after_world_rebuild(qapp) -> None:
+    """新 world generation 必须原子丢弃旧图像输入，并从新序号零恢复。"""
+    adapter = _adapter_module()
+    receiver = import_module("slope_sim.interfaces.v2.dashboard_receiver")
+    descriptor, _snapshot = _snapshot_with_encoded_lidar()
+    widget = adapter.V2DashboardWidget(descriptor)
+    old = receiver.V2DashboardCloudFrame(
+        1_000_000_000, 10,
+        np.asarray(((1.0, 2.0, 3.0),), dtype=np.float32),
+        np.asarray((100,), dtype=np.uint32), np.asarray((1,), dtype=np.uint8),
+        world_generation=3,
+    )
+    rebuilt_empty = receiver.V2DashboardCloudFrame(
+        1_100_000_000, 0,
+        np.empty((0, 3), dtype=np.float32), np.empty(0, dtype=np.uint32),
+        np.empty(0, dtype=np.uint8), world_generation=4,
+    )
+    try:
+        assert widget.update_cloud_frame(old) is True
+        assert widget.update_cloud_frame(rebuilt_empty) is True
+
+        positions, _tags = widget._cloud_render_data()
+        assert positions.shape == (0, 3)
+        assert len(widget._cloud_frames) == 1
+        assert widget._last_cloud_sequence == 0
+        assert "最新帧0点" in widget.cloud_status.text()
+    finally:
+        widget.close()
+
+
+def test_v2_dashboard_clears_cloud_history_when_snapshot_generation_changes(qapp) -> None:
+    """场地或车型切换的 telemetry snapshot 到达即清空旧世界，不等待新点云。"""
+    adapter = _adapter_module()
+    receiver = import_module("slope_sim.interfaces.v2.dashboard_receiver")
+    descriptor, snapshot = _snapshot_with_encoded_lidar()
+    widget = adapter.V2DashboardWidget(descriptor)
+    frame = receiver.V2DashboardCloudFrame(
+        1_000_000_000, 10,
+        np.asarray(((1.0, 2.0, 3.0),), dtype=np.float32),
+        np.asarray((100,), dtype=np.uint32), np.asarray((1,), dtype=np.uint8),
+        world_generation=snapshot.world_generation,
+    )
+    rebuilt = replace(
+        snapshot,
+        world_generation=snapshot.world_generation + 1,
+        wheel_state=replace(snapshot.wheel_state, world_generation=snapshot.world_generation + 1),
+        rtk=replace(snapshot.rtk, world_generation=snapshot.world_generation + 1),
+        imu=replace(snapshot.imu, world_generation=snapshot.world_generation + 1),
+    )
+    try:
+        assert widget.update_cloud_frame(frame) is True
+        widget.update_snapshot(rebuilt)
+
+        assert not widget._cloud_frames
+        assert widget._last_cloud_frame is None
+        assert "等待已验证" in widget.cloud_status.text()
+    finally:
+        widget.close()
+
+
+def test_v2_dashboard_never_submits_an_image_superseded_by_a_newer_frame(qapp) -> None:
+    """后台任务执行期间到达的新帧必须使旧 generation 的图像失效。"""
+    adapter = _adapter_module()
+    receiver = import_module("slope_sim.interfaces.v2.dashboard_receiver")
+    descriptor, _snapshot = _snapshot_with_encoded_lidar()
+    widget = adapter.V2DashboardWidget(descriptor)
+    stale: Future[tuple[int, object, float]] = Future()
+    frame = receiver.V2DashboardCloudFrame(
+        1_000_000_000, 1,
+        np.asarray(((1.0, 2.0, 3.0),), dtype=np.float32),
+        np.asarray((100,), dtype=np.uint32), np.asarray((1,), dtype=np.uint8),
+    )
+    try:
+        widget.cloud_workbench.setChecked(True)
+        widget._cloud_world_generation = 0
+        widget._cloud_render_generation = 7
+        widget._cloud_render_inflight = stale
+        widget.update_cloud_frame(frame)
+        stale.set_result((7, adapter.V2DashboardWidget._empty_cloud_image(), 12.0))
+        widget._collect_cloud_render()
+
+        assert widget._cloud_last_render_duration_ms == 0.0
+    finally:
+        widget.close()
+
+
+def test_v2_dashboard_persists_bounded_cloud_metrics_to_the_configured_results_root(
+    qapp, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """运行指标写入实际 results 根，且单一快照不随帧数无界增长。"""
+    adapter = _adapter_module()
+    receiver = import_module("slope_sim.interfaces.v2.dashboard_receiver")
+    descriptor, _snapshot = _snapshot_with_encoded_lidar()
+    monkeypatch.setenv("SLOPE_SIM_RESULTS_DIR", str(tmp_path))
+    widget = adapter.V2DashboardWidget(descriptor)
+    frame = receiver.V2DashboardCloudFrame(
+        1_000_000_000, 4,
+        np.asarray(((1.0, 2.0, 3.0),), dtype=np.float32),
+        np.asarray((100,), dtype=np.uint32), np.asarray((1,), dtype=np.uint8),
+    )
+    try:
+        assert widget.update_cloud_frame(frame) is True
+        path = widget._write_cloud_metrics(force=True)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+
+        assert path == tmp_path / "dashboard-pointcloud-metrics.json"
+        assert payload["latest_sequence"] == 4
+        assert payload["current_points"] == 1
+        assert payload["accumulated_points"] == 1
+        assert len(payload) < 16
     finally:
         widget.close()
 

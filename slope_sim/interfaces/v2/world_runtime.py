@@ -3,11 +3,14 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import replace
+import sys
 
 from slope_sim.config import ExperimentConfig
 from slope_sim.interfaces.v2.dashboard_snapshot import V2DashboardSnapshotStore
+from slope_sim.interfaces.v2.codec import V2ProtoCodec
 from slope_sim.interfaces.v2.descriptor import DescriptorIdentity, load_v2_descriptor
 from slope_sim.interfaces.v2.runtime_protocol import V2RuntimeProtocol
+from slope_sim.interfaces.v2.runsim_command_receiver import RunSimCommandReceiver
 from slope_sim.interfaces.v2.sensor_frames import (
     V2AsyncSensorFrameFactory,
     V2OutputFramePublisher,
@@ -203,11 +206,28 @@ class V2ManualWorldRuntime:
         self._sensor_backend = sensor_backend
         self._obstacle_manager = obstacle_manager
         self._descriptor = load_v2_descriptor()
+        self._command_receiver = None
+        self._command_receiver_version = 0
+        self._command_observers: list[Callable[[bytes, float], None]] = []
+        self._command_receiver_last_at: float | None = None
+        self._command_receiver_last_accepted: bool | None = None
+        self._command_receiver_last_sequence: int | None = None
+        self._command_receiver_last_drive_max = 0.0
+        self._command_receiver_next_diagnostic_at = 0.0
+        self._command_codec = V2ProtoCodec(self._descriptor)
         self._transport = (
             create_v2_ecal_transport(descriptor=self._descriptor)
             if transport is None
             else transport
         )
+        if transport is None:
+            try:
+                self._command_receiver = RunSimCommandReceiver.launch(
+                    self._descriptor
+                )
+            except BaseException:
+                self._transport.close()
+                raise
         self._controller = V2RuntimeProtocol(
             robot.model_spec,
             transport=self._transport,
@@ -226,13 +246,14 @@ class V2ManualWorldRuntime:
         if not callable(subscribe):
             self._world_runtime.close()
             raise RuntimeError("v2 transport must provide subscribe")
-        subscribe(
-            "/sim/wheel/command",
-            "slope_sim.interfaces.v2.WheelCommand",
-            lambda payload, received_at: self._runtime.accept_command_payload(
-                payload, received_at=received_at
-            ),
-        )
+        if self._command_receiver is None:
+            subscribe(
+                "/sim/wheel/command",
+                "slope_sim.interfaces.v2.WheelCommand",
+                lambda payload, received_at: self._runtime.accept_command_payload(
+                    payload, received_at=received_at
+                ),
+            )
 
     @property
     def scene_document(self) -> SceneDocument:
@@ -249,13 +270,94 @@ class V2ManualWorldRuntime:
         """供 GUI 线程读取物理线程原子发布的 v2 不可变快照。"""
         return self._dashboard_snapshot_store
 
+    def subscribe_command_observer(
+        self, callback: Callable[[bytes, float], None],
+    ) -> object:
+        """把 Dashboard 观察回调挂到 Simulator 已有的 command transport。"""
+        if not callable(callback):
+            raise ValueError("callback must be callable")
+        command_receiver = getattr(self, "_command_receiver", None)
+        if command_receiver is not None:
+            observers = getattr(self, "_command_observers", None)
+            if observers is None:
+                observers = []
+                self._command_observers = observers
+            observers.append(callback)
+            return _CommandObserverSubscription(observers, callback)
+        return self._transport.subscribe(
+            "/sim/wheel/command",
+            "slope_sim.interfaces.v2.WheelCommand",
+            callback,
+        )
+
     def protocol_snapshot(self) -> object:
         """返回同一锁内 session/world snapshot，供 Recorder 启动冻结身份。"""
         return self._controller.snapshot()
 
     def command_decision(self, *, now: float) -> object:
         """每个物理帧读取一次当前安全 command 决策。"""
-        return self._runtime.command_decision(now=now)
+        emit_diagnostic = False
+        command_receiver = getattr(self, "_command_receiver", None)
+        if command_receiver is not None:
+            latest = command_receiver.take_latest(
+                self._command_receiver_version
+            )
+            if latest is not None:
+                version, payload, received_at = latest
+                self._command_receiver_version = version
+                accepted = self._runtime.accept_command_payload(
+                    payload,
+                    received_at=received_at,
+                )
+                self._command_receiver_last_at = received_at
+                self._command_receiver_last_accepted = accepted
+                if getattr(
+                    getattr(self, "_config", None),
+                    "developer_diagnostics_enabled",
+                    False,
+                ):
+                    decoded = self._command_codec.decode_wheel_command(payload)
+                    self._command_receiver_last_sequence = decoded.sequence
+                    self._command_receiver_last_drive_max = max(
+                        (abs(value) for value in decoded.drive_wheel_speed_rad_s),
+                        default=0.0,
+                    )
+                for callback in tuple(getattr(self, "_command_observers", ())):
+                    callback(payload, received_at)
+            if (
+                getattr(
+                    getattr(self, "_config", None),
+                    "developer_diagnostics_enabled",
+                    False,
+                )
+                and now >= self._command_receiver_next_diagnostic_at
+            ):
+                emit_diagnostic = True
+                age_ms = (
+                    None
+                    if self._command_receiver_last_at is None
+                    else max(0.0, now - self._command_receiver_last_at) * 1000.0
+                )
+                self._command_receiver_next_diagnostic_at = now + 1.0
+        decision = self._runtime.command_decision(now=now)
+        if emit_diagnostic:
+            protocol = self._controller.snapshot()
+            print(
+                "v2-command-receiver "
+                f"version={self._command_receiver_version} "
+                f"age_ms={'none' if age_ms is None else f'{age_ms:.3f}'} "
+                f"accepted={self._command_receiver_last_accepted} "
+                f"sequence={self._command_receiver_last_sequence} "
+                f"max_drive={self._command_receiver_last_drive_max:.6f} "
+                f"decision_max={max((abs(value) for value in decision.drive_wheel_speed_rad_s), default=0.0):.6f} "
+                f"waiting={decision.waiting} timed_out={decision.timed_out} "
+                f"protocol={protocol.command_protocol_state} "
+                f"peers={protocol.authority.peer_count} "
+                f"authority={protocol.authority.state.name}",
+                file=sys.stderr,
+                flush=True,
+            )
+        return decision
 
     def refresh_transport(self) -> object:
         """在低频观测节拍刷新 raw discovery。"""
@@ -341,6 +443,8 @@ class V2ManualWorldRuntime:
     def close(self) -> None:
         """先排空异步 LiDAR，再关闭唯一 v2 command ingress。"""
         self._runtime.drain_sensor_outputs(timeout_sec=5.0)
+        if self._command_receiver is not None:
+            self._command_receiver.close()
         self._world_runtime.close()
 
     def _start_lidar_service(self, document: SceneDocument, generation: int) -> LidarScanService:
@@ -398,3 +502,25 @@ class V2ManualWorldRuntime:
             raise ValueError("sensor_backend must be a PyBulletSensorBackend")
         if not isinstance(scene_document, SceneDocument):
             raise ValueError("scene_document must be a SceneDocument")
+
+
+class _CommandObserverSubscription:
+    """sidecar latest command 的进程内观察订阅，可由 Dashboard 幂等关闭。"""
+
+    def __init__(
+        self,
+        callbacks: list[Callable[[bytes, float], None]],
+        callback: Callable[[bytes, float], None],
+    ) -> None:
+        self._callbacks = callbacks
+        self._callback = callback
+        self._closed = False
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._callbacks.remove(self._callback)
+        except ValueError:
+            pass

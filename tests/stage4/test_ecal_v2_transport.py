@@ -281,14 +281,18 @@ def test_v2_transport_rejects_callback_frame_with_wrong_remote_metadata(descript
         transport.close()
 
 
-def test_v2_transport_native_callback_only_enqueues_raw_frame(
+def test_v2_telemetry_native_callback_only_enqueues_raw_frame(
     descriptor, monkeypatch
 ) -> None:
-    """native callback 必须在 hash 前返回，耗时校验只能由 receive lane 执行。"""
+    """大体量遥测回调必须在 hash 前返回，耗时工作留给 receive lane。"""
     module = require_wished_module("slope_sim.interfaces.v2.transport")
     raw_module = require_wished_module("slope_sim.interfaces.v2.ecal_raw")
     bindings = FakeRawV2Bindings()
-    transport = module.create_v2_ecal_transport(descriptor=descriptor, bindings=bindings)
+    transport = module.create_v2_ecal_transport(
+        descriptor=descriptor,
+        role="dashboard",
+        bindings=bindings,
+    )
     hasher_started = Event()
     release_hasher = Event()
     native_returned = Event()
@@ -300,15 +304,20 @@ def test_v2_transport_native_callback_only_enqueues_raw_frame(
 
     monkeypatch.setattr(raw_module, "validate_raw_frame_metadata", blocking_metadata_validator)
     try:
-        bindings.set_peer_count("/sim/wheel/command", 1)
-        bindings.set_protocol_verified("/sim/wheel/command")
+        transport.subscribe(
+            "/sim/lidar/points",
+            "slope_sim.interfaces.v2.LidarPointCloud",
+            lambda _payload, _received_at: None,
+        )
+        bindings.set_peer_count("/sim/lidar/points", 1)
+        bindings.set_protocol_verified("/sim/lidar/points")
         transport.poll_peer_state()
         frame = RawReceivedFrame(
             payload=b"wire",
             remote_publisher_entity_id=1,
             remote_publisher_process_id=2,
             remote_publisher_host_name="fixture",
-            remote_type_name="slope_sim.interfaces.v2.WheelCommand",
+            remote_type_name="slope_sim.interfaces.v2.LidarPointCloud",
             remote_encoding="proto",
             remote_descriptor=descriptor.serialized_file_descriptor_set,
             send_timestamp_us=1,
@@ -316,7 +325,7 @@ def test_v2_transport_native_callback_only_enqueues_raw_frame(
             received_at=1.0,
         )
         native_thread = Thread(
-            target=lambda: (bindings.emit("/sim/wheel/command", frame), native_returned.set()),
+            target=lambda: (bindings.emit("/sim/lidar/points", frame), native_returned.set()),
             daemon=True,
         )
         native_thread.start()
@@ -330,14 +339,57 @@ def test_v2_transport_native_callback_only_enqueues_raw_frame(
         transport.close()
 
 
-def test_v2_transport_raw_receive_lane_keeps_owner_and_latest_frame(
+def test_v2_simulation_ignores_command_payload_without_a_logical_subscriber(
     descriptor, monkeypatch
 ) -> None:
-    """慢校验期间 command receive lane 只保留 owner 与最新帧，并准确计一次覆盖。"""
+    """sidecar 接管后，GUI 进程的占位 subscriber 不得再解析同一命令。"""
+    module = require_wished_module("slope_sim.interfaces.v2.transport")
+    bindings = FakeRawV2Bindings()
+    raw_module = require_wished_module("slope_sim.interfaces.v2.ecal_raw")
+    parsed = Event()
+
+    def observe_parse(*_args, **_kwargs):
+        parsed.set()
+        raise AssertionError("unobserved command must not be parsed")
+
+    monkeypatch.setattr(raw_module, "validate_raw_frame_metadata", observe_parse)
+    transport = module.create_v2_ecal_transport(descriptor=descriptor, bindings=bindings)
+    try:
+        bindings.set_peer_count("/sim/wheel/command", 1)
+        bindings.set_protocol_verified("/sim/wheel/command")
+        transport.poll_peer_state()
+        bindings.emit(
+            "/sim/wheel/command",
+            RawReceivedFrame(
+                payload=b"wire",
+                remote_publisher_entity_id=1,
+                remote_publisher_process_id=2,
+                remote_publisher_host_name="fixture",
+                remote_type_name="slope_sim.interfaces.v2.WheelCommand",
+                remote_encoding="proto",
+                remote_descriptor=descriptor.serialized_file_descriptor_set,
+                send_timestamp_us=1,
+                send_clock=1,
+                received_at=1.0,
+            ),
+        )
+        assert not parsed.wait(timeout=0.05)
+    finally:
+        transport.close()
+
+
+def test_v2_telemetry_receive_lane_keeps_owner_and_latest_frame(
+    descriptor, monkeypatch
+) -> None:
+    """慢校验期间遥测 receive lane 只保留 owner 与最新帧，并准确计一次覆盖。"""
     module = require_wished_module("slope_sim.interfaces.v2.transport")
     raw_module = require_wished_module("slope_sim.interfaces.v2.ecal_raw")
     bindings = FakeRawV2Bindings()
-    transport = module.create_v2_ecal_transport(descriptor=descriptor, bindings=bindings)
+    transport = module.create_v2_ecal_transport(
+        descriptor=descriptor,
+        role="dashboard",
+        bindings=bindings,
+    )
     first_started = Event()
     release_first = Event()
     latest_processed = Event()
@@ -359,7 +411,7 @@ def test_v2_transport_raw_receive_lane_keeps_owner_and_latest_frame(
             remote_publisher_entity_id=1,
             remote_publisher_process_id=2,
             remote_publisher_host_name="fixture",
-            remote_type_name="slope_sim.interfaces.v2.WheelCommand",
+            remote_type_name="slope_sim.interfaces.v2.LidarPointCloud",
             remote_encoding="proto",
             remote_descriptor=descriptor.serialized_file_descriptor_set,
             send_timestamp_us=1,
@@ -370,13 +422,18 @@ def test_v2_transport_raw_receive_lane_keeps_owner_and_latest_frame(
     monkeypatch.setattr(raw_module, "validate_raw_frame_metadata", blocking_metadata_validator)
     threads: list[Thread] = []
     try:
-        bindings.set_peer_count("/sim/wheel/command", 1)
-        bindings.set_protocol_verified("/sim/wheel/command")
+        transport.subscribe(
+            "/sim/lidar/points",
+            "slope_sim.interfaces.v2.LidarPointCloud",
+            lambda _payload, _received_at: None,
+        )
+        bindings.set_peer_count("/sim/lidar/points", 1)
+        bindings.set_protocol_verified("/sim/lidar/points")
         transport.poll_peer_state()
         for index, payload in enumerate((b"first", b"second", b"third")):
             thread = Thread(
                 target=lambda payload=payload, index=index: (
-                    bindings.emit("/sim/wheel/command", frame(payload)),
+                    bindings.emit("/sim/lidar/points", frame(payload)),
                     native_returned[index].set(),
                 ),
                 daemon=True,
@@ -389,7 +446,7 @@ def test_v2_transport_raw_receive_lane_keeps_owner_and_latest_frame(
         assert native_returned[2].wait(timeout=0.1)
         snapshot = transport.snapshot()
         quality = next(
-            item for item in snapshot.topic_quality if item.topic == "/sim/wheel/command"
+            item for item in snapshot.topic_quality if item.topic == "/sim/lidar/points"
         )
         assert snapshot.dropped_count == 1
         assert quality.dropped_count == 1

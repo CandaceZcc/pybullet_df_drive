@@ -52,6 +52,7 @@ from slope_sim.window_layout import (
     FrameExtents,
     Rect,
     WindowLayoutError,
+    dashboard_width_for_available,
     logical_client_rect_for_outer,
     wait_for_x11_outer_geometry,
     x11_window_manager_available,
@@ -224,11 +225,8 @@ def _fmt_abs_slip(value: float, valid: bool) -> str:
 
 
 def dashboard_window_size(available_width: int, available_height: int) -> tuple[int, int]:
-    """返回屏幕可用区域右侧 33% 的默认 Dashboard 尺寸。"""
-    width = (
-        int(available_width) * DASHBOARD_DEFAULT_WIDTH_RATIO.numerator
-        + DASHBOARD_DEFAULT_WIDTH_RATIO.denominator // 2
-    ) // DASHBOARD_DEFAULT_WIDTH_RATIO.denominator
+    """返回适配可用屏幕宽度的默认 Dashboard 尺寸。"""
+    width = dashboard_width_for_available(int(available_width))
     return max(1, width), max(1, int(available_height))
 
 
@@ -2423,14 +2421,16 @@ class TelemetryDashboard:
         self.rc_status_label.setText(text)
 
     def set_rc_available(self, available: bool) -> None:
-        """仅在串口 worker 已启动时保留遥控器控制源，避免无输入的假接管。"""
+        """标注未接入的遥控器，且不允许它在无 SBUS 帧时接管控制。"""
         if type(available) is not bool:
             raise ValueError("rc availability must be a bool")
         if available or self.control_source_combo is None:
             return
         rc_index = self.control_source_combo.findData("rc")
         if rc_index >= 0:
-            self.control_source_combo.removeItem(rc_index)
+            rc_item = self.control_source_combo.model().item(rc_index)
+            if rc_item is not None:
+                rc_item.setEnabled(False)
         if self.rc_status_label is not None:
             self.rc_status_label.setText(
                 "遥控器：未启用（自动扫描未发现合格 SBUS；可用 --rc-port 显式诊断）"

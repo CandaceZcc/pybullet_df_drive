@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+import time
 
 import pybullet as p
 
@@ -24,6 +25,62 @@ class ManualCommand:
     linear_velocity: float
     angular_velocity: float
     should_exit: bool = False
+
+
+class KeyboardEventTracker:
+    """跨过 X11 自动重复的伪释放间隙，并在真实松键后有界清除方向键。"""
+
+    _DIRECTION_KEYS = frozenset(
+        (
+            p.B3G_UP_ARROW,
+            p.B3G_DOWN_ARROW,
+            p.B3G_LEFT_ARROW,
+            p.B3G_RIGHT_ARROW,
+            ord("w"),
+            ord("s"),
+            ord("a"),
+            ord("d"),
+        )
+    )
+
+    def __init__(self, *, release_grace_sec: float = 0.05) -> None:
+        if isinstance(release_grace_sec, bool) or release_grace_sec <= 0.0:
+            raise ValueError("release_grace_sec must be positive")
+        self._release_grace_sec = float(release_grace_sec)
+        self._held_keys: set[int] = set()
+        self._pending_release_at: dict[int, float] = {}
+
+    def command(
+        self,
+        keyboard_events: Mapping[int, int],
+        settings: ManualControlSettings,
+        allow_exit: bool = True,
+        *,
+        now: float | None = None,
+    ) -> ManualCommand:
+        if not isinstance(keyboard_events, Mapping):
+            raise ValueError("keyboard_events must be a mapping")
+        observed_at = time.monotonic() if now is None else float(now)
+        for key, state in keyboard_events.items():
+            if key not in self._DIRECTION_KEYS:
+                continue
+            if state & (p.KEY_IS_DOWN | p.KEY_WAS_TRIGGERED):
+                self._held_keys.add(key)
+                self._pending_release_at.pop(key, None)
+            elif state & p.KEY_WAS_RELEASED and key in self._held_keys:
+                self._pending_release_at[key] = observed_at + self._release_grace_sec
+        for key, deadline in tuple(self._pending_release_at.items()):
+            if observed_at >= deadline:
+                self._held_keys.discard(key)
+                del self._pending_release_at[key]
+
+        normalized = {
+            key: state
+            for key, state in keyboard_events.items()
+            if key not in self._DIRECTION_KEYS
+        }
+        normalized.update({key: p.KEY_IS_DOWN for key in self._held_keys})
+        return command_from_keyboard(normalized, settings, allow_exit)
 
 
 def command_from_keyboard(

@@ -18,8 +18,9 @@ from slope_sim.interfaces.v2.runsim_session import (
 _FRAME_HEADER = 0x0F
 _FRAME_BYTES = 25
 _CHANNELS = 16
-_CHANNEL_INPUT_MIN = 282
-_CHANNEL_INPUT_MAX = 1772
+# SBUS 协议的标准有效模拟量范围；摇杆校准端点在其内，超出校准端点时饱和而非停车。
+_CHANNEL_INPUT_MIN = 172
+_CHANNEL_INPUT_MAX = 1811
 _STICK_MIN = 282
 _STICK_CENTER = 1002
 _STICK_MAX = 1722

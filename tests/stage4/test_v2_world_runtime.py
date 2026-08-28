@@ -67,6 +67,68 @@ class _Service:
         self.closed = True
 
 
+def test_manual_runtime_reuses_transport_command_resource_for_dashboard_observer() -> None:
+    """Dashboard command observer 只能挂到 Simulator 已有 transport 的逻辑订阅。"""
+    from slope_sim.interfaces.v2.world_runtime import V2ManualWorldRuntime
+
+    calls: list[tuple[str, str, object]] = []
+
+    class Transport:
+        def subscribe(self, topic: str, type_name: str, callback: object) -> _FakeSubscription:
+            calls.append((topic, type_name, callback))
+            return _FakeSubscription()
+
+    class _FakeSubscription:
+        def close(self) -> None:
+            return None
+
+    runtime = object.__new__(V2ManualWorldRuntime)
+    runtime._transport = Transport()
+    callback = lambda _payload, _received_at: None
+
+    subscription = runtime.subscribe_command_observer(callback)
+
+    assert isinstance(subscription, _FakeSubscription)
+    assert calls == [(
+        "/sim/wheel/command",
+        "slope_sim.interfaces.v2.WheelCommand",
+        callback,
+    )]
+
+
+def test_manual_runtime_applies_latest_sidecar_command_before_decision() -> None:
+    """物理主线程恢复后只消费 GUI 进程外保存的最新 command。"""
+    from slope_sim.interfaces.v2.world_runtime import V2ManualWorldRuntime
+
+    calls: list[tuple[object, ...]] = []
+
+    class Receiver:
+        def take_latest(self, after_version: int):
+            assert after_version == 0
+            return 7, b"latest-wire", 12.5
+
+    class Runtime:
+        def accept_command_payload(self, payload: bytes, *, received_at: float) -> bool:
+            calls.append(("accept", payload, received_at))
+            return True
+
+        def command_decision(self, *, now: float) -> str:
+            calls.append(("decision", now))
+            return "current-decision"
+
+    runtime = object.__new__(V2ManualWorldRuntime)
+    runtime._command_receiver = Receiver()
+    runtime._command_receiver_version = 0
+    runtime._runtime = Runtime()
+
+    assert runtime.command_decision(now=12.51) == "current-decision"
+    assert runtime._command_receiver_version == 7
+    assert calls == [
+        ("accept", b"latest-wire", 12.5),
+        ("decision", 12.51),
+    ]
+
+
 def test_stage4_lidar_worker_protocol_version_is_independent_of_world_generation() -> None:
     """场景重建后的 generation 不能被误作 LiDAR IPC 协议版本。"""
     from slope_sim.interfaces.v2.world_runtime import start_stage4_lidar_service
@@ -378,6 +440,10 @@ def test_manual_demo_ecal_branch_injects_v2_runtime_into_existing_gui_coordinato
             self.descriptor = object()
             self.dashboard_snapshot_store = object()
 
+        def subscribe_command_observer(self, callback: object) -> object:
+            calls["command_observer_callback"] = callback
+            return object()
+
         def close(self) -> None:
             calls["v2_closed"] = True
 
@@ -514,14 +580,25 @@ def test_manual_demo_ecal_branch_injects_v2_runtime_into_existing_gui_coordinato
     monkeypatch.setattr(
         manual_demo,
         "_create_v2_dashboard_receiver",
-        lambda _descriptor: (observer, receiver),
+        lambda _descriptor, *, command_subscribe: (
+            calls.setdefault("dashboard_command_subscribe", command_subscribe),
+            (observer, receiver),
+        )[1],
     )
     monkeypatch.setattr(manual_demo, "SimulationCoordinator", FakeCoordinator)
     monkeypatch.setattr(manual_demo, "create_interface_session", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("v1 interface session must not be created")))
     monkeypatch.setattr(manual_demo, "configure_gui_visualizer", lambda *_args: None)
     monkeypatch.setattr(manual_demo, "CsvSimulationLogger", FakeLogger)
     monkeypatch.setattr(manual_demo, "ObstacleEventLogger", FakeObstacleLogger)
-    monkeypatch.setattr(manual_demo, "command_from_keyboard", lambda *_args: manual_demo.ManualCommand(0.0, 0.0, should_exit=True))
+    monkeypatch.setattr(
+        manual_demo,
+        "KeyboardEventTracker",
+        lambda: SimpleNamespace(
+            command=lambda *_args, **_kwargs: manual_demo.ManualCommand(
+                0.0, 0.0, should_exit=True
+            )
+        ),
+    )
     monkeypatch.setattr(manual_demo.pd, "read_csv", lambda _path: object())
     monkeypatch.setattr(manual_demo, "compute_diagnostic_summary", lambda _frame: SimpleNamespace(to_dict=lambda: {}))
     monkeypatch.setattr(manual_demo, "write_diagnostic_summary", lambda *_args: "diagnostics.json")
@@ -567,6 +644,7 @@ def test_manual_demo_ecal_branch_injects_v2_runtime_into_existing_gui_coordinato
     assert calls["capture_duration_index"] == 2
     assert calls["capture_start_requested"] is True
     assert calls["observer_started"] is True
+    assert calls["dashboard_command_subscribe"].__self__.__class__ is FakeV2ManualWorldRuntime
     assert calls["v2_refreshes"] == [receiver_store]
     assert calls["v2_cloud_updates"] == 1
     assert calls["dashboard_closed"] is True

@@ -53,6 +53,53 @@ def _frames(descriptor, *, world_generation: int = 3, sequence: int = 7):
     }
 
 
+def test_dashboard_receiver_reuses_simulator_command_subscription() -> None:
+    """command 复用 Simulator 订阅；其余四路仍由 Dashboard raw observer 接收。"""
+    descriptor = import_module("slope_sim.interfaces.v2.descriptor").load_v2_descriptor()
+    module = import_module("slope_sim.interfaces.v2.dashboard_receiver")
+    codec = import_module("slope_sim.interfaces.v2.codec").V2ProtoCodec(descriptor)
+    models = import_module("slope_sim.interfaces.v2.models")
+    transport = _FakeTransport()
+    shared_callbacks: list[object] = []
+
+    def subscribe_command(callback: object) -> _FakeSubscription:
+        shared_callbacks.append(callback)
+        return _FakeSubscription()
+
+    receiver = module.V2DashboardEcalReceiver(
+        descriptor,
+        transport=transport,
+        command_subscribe=subscribe_command,
+        start_worker=False,
+    )
+    try:
+        assert set(transport.callbacks) == {
+            "/sim/wheel/state",
+            "/sim/lidar/points",
+            "/sim/rtk/state",
+            "/sim/imu/attitude",
+        }
+        assert len(shared_callbacks) == 1
+        command = models.WheelCommandV2(
+            100_000_000,
+            (1.0, -1.0),
+            (),
+            7,
+            3,
+            2,
+            "manual.keyboard",
+            b"k" * 16,
+            "df_mid",
+            bytes.fromhex("00112233445566778899aabbccddeeff"),
+            descriptor.sha256,
+        )
+        shared_callbacks[0](codec.encode(command).payload, 1.0)
+        assert receiver.process_pending() == 1
+        assert receiver.diagnostics == ()
+    finally:
+        receiver.close()
+
+
 def test_dashboard_receiver_replaces_stale_lidar_before_worker_decodes() -> None:
     """回调只复制最新 LiDAR bytes；worker 才解码并发布同刻三传感器快照。"""
     descriptor = import_module("slope_sim.interfaces.v2.descriptor").load_v2_descriptor()

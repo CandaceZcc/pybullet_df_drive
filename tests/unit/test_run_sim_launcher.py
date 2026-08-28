@@ -148,6 +148,31 @@ def test_installed_run_sim_prevents_release_bytecode_writes(tmp_path: Path) -> N
     assert completed.stdout == "1\n"
 
 
+def test_installed_run_sim_sets_the_release_results_root_for_dashboard_metrics(tmp_path: Path) -> None:
+    """运行指标必须落在实际安装 release 的 results，而非调用目录。"""
+    release = tmp_path / "release"
+    launcher = release / "bin" / "runSim"
+    runtime = release / "runtime" / "bin" / "python"
+    launcher.parent.mkdir(parents=True)
+    runtime.parent.mkdir(parents=True)
+    shutil.copy2(ROOT / "runSim", launcher)
+    (release / "main.py").write_text("# release entrypoint\n", encoding="utf-8")
+    runtime.write_text(
+        "#!/usr/bin/env sh\nprintf '%s\\n' \"${SLOPE_SIM_RESULTS_DIR:-}\"\n",
+        encoding="utf-8",
+    )
+    runtime.chmod(0o755)
+
+    environment = dict(os.environ)
+    environment.pop("SLOPE_SIM_RESULTS_DIR", None)
+    completed = subprocess.run(
+        [str(launcher), "--help"], env=environment, capture_output=True, text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout == f"{release / 'results'}\n"
+
+
 def test_run_sim_defaults_qt_xcb_gl_integration_to_egl(tmp_path: Path) -> None:
     """Qt6 Dashboard 默认避开与 PyBullet GLX 冲突的 xcb-glx 路径。"""
     release = tmp_path / "release"

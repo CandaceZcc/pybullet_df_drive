@@ -11,6 +11,9 @@ import time
 from slope_sim.interfaces.v2.descriptor import DescriptorIdentity
 
 
+_RAW_PUBLISHER_SHM_BUFFER_COUNT = 32
+
+
 @dataclass(frozen=True)
 class RawReceivedFrame:
     """从 native callback 复制出的单帧 owned 数据，不在此层解析 payload。"""
@@ -112,8 +115,20 @@ class EcalRawBindings:
         type_name: str,
         descriptor: DescriptorIdentity,
     ) -> object:
-        """创建 raw publisher；发送端只接受已生成的 bytes。"""
-        return self._core.Publisher(topic, self._type_info(type_name, descriptor))
+        """创建 raw publisher，并保留有限 SHM ring 给慢速跨进程接收者。"""
+        configuration_factory = getattr(self._core, "get_publisher_configuration", None)
+        if not callable(configuration_factory):
+            raise RuntimeError("eCAL raw publisher configuration is unavailable")
+        configuration = configuration_factory()
+        try:
+            configuration.layer.shm.memfile_buffer_count = _RAW_PUBLISHER_SHM_BUFFER_COUNT
+        except AttributeError as error:
+            raise RuntimeError("eCAL raw publisher SHM configuration is unavailable") from error
+        return self._core.Publisher(
+            topic,
+            self._type_info(type_name, descriptor),
+            configuration,
+        )
 
     def create_subscriber(
         self,

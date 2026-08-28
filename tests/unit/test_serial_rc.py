@@ -28,6 +28,26 @@ def test_rc_parser_resynchronizes_and_preserves_partial_reads() -> None:
     assert parser.feed(_frame((1000,) * 15 + (2000,))) == ()
 
 
+@pytest.mark.parametrize("endpoint", (172, 1811))
+def test_rc_parser_accepts_full_sbus_analog_range_endpoints(endpoint: int) -> None:
+    """协议合法端点必须进入控制门禁，不能误报 parser 失步。"""
+    module = import_module("slope_sim.serial_rc")
+    channels = (1002, 1002, endpoint) + (1002,) * 13
+
+    assert module.SbusFrameParser().feed(_frame(channels)) == (channels,)
+
+
+@pytest.mark.parametrize("outside", (171, 1812))
+def test_rc_parser_rejects_values_outside_full_sbus_analog_range(
+    outside: int,
+) -> None:
+    """超出协议范围的通道仍须 fail-closed，不能被饱和映射掩盖。"""
+    module = import_module("slope_sim.serial_rc")
+    channels = (1002, 1002, outside) + (1002,) * 13
+
+    assert module.SbusFrameParser().feed(_frame(channels)) == ()
+
+
 def test_pyserial_opener_requires_dependency_and_uses_sbus_settings() -> None:
     """真实串口只在启用 RC 时导入；缺依赖与连接参数必须可诊断。"""
     module = import_module("slope_sim.serial_rc")
@@ -159,13 +179,13 @@ def test_rc_stick_readout_rejects_invalid_sbus_channels() -> None:
 
 @pytest.mark.parametrize(
     ("channel_3", "expected_linear_velocity"),
-    ((282, -3.0), (1772, 3.0)),
+    ((172, -3.0), (282, -3.0), (1772, 3.0), (1811, 3.0)),
 )
 def test_rc_worker_keeps_driving_at_observed_channel_3_endpoints(
     channel_3: int,
     expected_linear_velocity: float,
 ) -> None:
-    """实机 CH3 到达机械端点时仍是有效帧，不能被 parser 故障停车。"""
+    """合法 SBUS 全量程超出校准端点后仍饱和匀速，不能被误判停车。"""
     module = import_module("slope_sim.serial_rc")
     locked = _frame((1002, 1002, channel_3, 1002, 1002, 448) + (1002,) * 10)
     unlocked = _frame((1002, 1002, channel_3, 1002, 1002, 1002) + (1002,) * 10)
@@ -197,6 +217,27 @@ def test_rc_worker_keeps_driving_at_observed_channel_3_endpoints(
     assert command.linear_velocity_m_s == expected_linear_velocity
     assert renewed == command
     assert snapshot.failure_reason is None
+
+
+def test_rc_full_forward_stays_saturated_for_thirty_seconds_at_100_hz() -> None:
+    """合法高端固定杆位必须连续匀速，不能在长时窗口中插入安全零。"""
+    module = import_module("slope_sim.serial_rc")
+    parser = module.SbusFrameParser()
+    gate = module.RcCommandGate()
+    channels = (1002, 1002, 1811) + (1002,) * 13
+    wire = _frame(channels)
+
+    commands = []
+    for index in range(3_001):
+        (decoded,) = parser.feed(wire)
+        commands.append(gate.observe(decoded, now=index / 100.0))
+
+    assert all(command.active for command in commands)
+    assert all(command.reason == "active" for command in commands)
+    assert all(
+        command.linear_velocity_m_s == module.MAX_LINEAR_VELOCITY_M_S
+        for command in commands
+    )
 
 
 def test_rc_port_qualification_requires_twenty_valid_frames_and_rejects_ambiguity(

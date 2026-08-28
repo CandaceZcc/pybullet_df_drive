@@ -18,7 +18,9 @@ PYBULLET_WINDOW_TITLE = (
     "Bullet Physics ExampleBrowser using OpenGL3+ [btgl] Release build"
 )
 PYBULLET_WINDOW_TOKEN_ENV = "SLOPE_SIM_PYBULLET_WINDOW_TOKEN"
-DASHBOARD_WIDTH_RATIO = Fraction(33, 100)
+DASHBOARD_WIDTH_RATIO = Fraction(2, 5)
+_DASHBOARD_MIN_WIDTH = 720
+_DASHBOARD_MIN_MAIN_WIDTH = 480
 _XRES_CLIENT_ID_PID_MASK = 0x02
 _XRES_CLIENT_ID_PID_TYPE = 1
 
@@ -161,8 +163,20 @@ def _round_positive_fraction_half_up(value: Fraction) -> int:
     return (2 * value.numerator + value.denominator) // (2 * value.denominator)
 
 
+def dashboard_width_for_available(available_width: int) -> int:
+    """在宽屏保留可读工作台，同时为窄屏按比例缩小。"""
+    if type(available_width) is not int or available_width <= 0:
+        raise ValueError("available_width must be a positive integer")
+    proportional = _round_positive_fraction_half_up(
+        available_width * DASHBOARD_WIDTH_RATIO
+    )
+    if available_width >= _DASHBOARD_MIN_WIDTH + _DASHBOARD_MIN_MAIN_WIDTH:
+        return max(_DASHBOARD_MIN_WIDTH, proportional)
+    return proportional
+
+
 def calculate_window_layout(available: Rect, dashboard_enabled: bool) -> WindowLayout:
-    """按可用工作区计算左侧余量主窗和右侧 33% Dashboard。"""
+    """按可用工作区计算主窗和可读的响应式右侧 Dashboard。"""
     if not isinstance(available, Rect):
         raise TypeError("available must be a Rect")
     if type(dashboard_enabled) is not bool:
@@ -170,10 +184,7 @@ def calculate_window_layout(available: Rect, dashboard_enabled: bool) -> WindowL
     if not dashboard_enabled:
         return WindowLayout(main=available, dashboard=None)
 
-    dashboard_width = (
-        available.width * DASHBOARD_WIDTH_RATIO.numerator
-        + DASHBOARD_WIDTH_RATIO.denominator // 2
-    ) // DASHBOARD_WIDTH_RATIO.denominator
+    dashboard_width = dashboard_width_for_available(available.width)
     if dashboard_width <= 0:
         raise WindowLayoutError("available geometry is too narrow for a dashboard")
     main_width = available.width - dashboard_width
@@ -201,7 +212,7 @@ def align_window_layout_to_scale(
 
     available_width = layout.main.width + layout.dashboard.width
     scale_ratio = Fraction(str(scale))
-    target_dashboard_width = available_width * DASHBOARD_WIDTH_RATIO
+    target_dashboard_width = dashboard_width_for_available(available_width)
     logical_dashboard_width = max(
         1,
         _round_positive_fraction_half_up(target_dashboard_width / scale_ratio),

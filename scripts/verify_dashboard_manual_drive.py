@@ -113,8 +113,10 @@ WINDOW_LAYOUT_POLL_INTERVAL_SEC = 0.05
 MANUAL_PROCESS_SHUTDOWN_GRACE_SEC = 20.0
 DASHBOARD_INTERACTION_STARTUP_GRACE_SEC = 20.0
 DASHBOARD_LAYOUT_REPORT_TIMEOUT_SEC = 3.0
-DASHBOARD_RATIO_NUMERATOR = 33
-DASHBOARD_RATIO_DENOMINATOR = 100
+DASHBOARD_RATIO_NUMERATOR = 2
+DASHBOARD_RATIO_DENOMINATOR = 5
+DASHBOARD_MIN_WIDTH = 720
+DASHBOARD_MIN_MAIN_WIDTH = 480
 DASHBOARD_ROOT_MARGIN_LOGICAL_PX = 8
 DASHBOARD_ROOT_SPACING_LOGICAL_PX = 6
 DASHBOARD_MIN_CANVAS_PAGE_WIDTH_PERCENT = 85
@@ -136,6 +138,8 @@ class ManualMotionSummary:
     tail_body_forward_speed: float
     max_body_forward_speed: float
     out_of_bounds: bool
+    interior_zero_command_count: int = 0
+    max_target_drive_speed: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,6 +197,23 @@ def summarize_manual_motion(log_path: Path, tail_samples: int = 60) -> ManualMot
     if missing:
         raise ValueError(f"manual log missing columns: {', '.join(sorted(missing))}")
     tail = frame.tail(min(tail_samples, len(frame)))
+    wheel_target_columns = {
+        "left_target_drive_speed",
+        "right_target_drive_speed",
+    }
+    if wheel_target_columns <= set(frame.columns):
+        target_drive_speed = frame[sorted(wheel_target_columns)].abs().max(axis=1)
+    else:
+        target_drive_speed = pd.Series(0.0, index=frame.index)
+    command_active = (
+        (frame["command_linear_velocity"].abs() > 1e-12)
+        | (target_drive_speed > 1e-12)
+    )
+    active_indices = frame.index[command_active]
+    interior_zero_command_count = 0
+    if len(active_indices) >= 2:
+        held_interval = command_active.loc[active_indices[0] : active_indices[-1]]
+        interior_zero_command_count = int((~held_interval).sum())
     return ManualMotionSummary(
         log_path=log_path,
         dx=float(frame["x"].iloc[-1] - frame["x"].iloc[0]),
@@ -200,6 +221,8 @@ def summarize_manual_motion(log_path: Path, tail_samples: int = 60) -> ManualMot
         tail_body_forward_speed=float(tail["body_forward_speed"].mean()),
         max_body_forward_speed=float(frame["body_forward_speed"].abs().max()),
         out_of_bounds=bool(frame["out_of_bounds"].any()),
+        interior_zero_command_count=interior_zero_command_count,
+        max_target_drive_speed=float(target_drive_speed.max()),
     )
 
 
@@ -213,8 +236,12 @@ def motion_passed(
     """判断 Dashboard 操作是否已经让车辆产生可见移动。"""
     return (
         summary.dx >= min_dx
-        and summary.max_command_linear_velocity >= min_command
+        and (
+            summary.max_command_linear_velocity >= min_command
+            or summary.max_target_drive_speed > 1e-12
+        )
         and summary.max_body_forward_speed >= min_peak_speed
+        and summary.interior_zero_command_count == 0
         and not summary.out_of_bounds
     )
 
@@ -1421,7 +1448,7 @@ def validate_window_layout(
     *,
     device_pixel_ratio: float = 1.0,
 ) -> None:
-    """用独立 33/100 oracle 核对比例、覆盖、公共边和 DPR 对齐。"""
+    """用独立响应式 oracle 核对比例、最小宽度、覆盖和 DPR 对齐。"""
     if isinstance(device_pixel_ratio, bool) or not isinstance(
         device_pixel_ratio,
         (int, float),
@@ -1433,7 +1460,15 @@ def validate_window_layout(
 
     ratio = Fraction(DASHBOARD_RATIO_NUMERATOR, DASHBOARD_RATIO_DENOMINATOR)
     scale_ratio = Fraction(str(scale))
-    ideal_logical_width = available.width * ratio / scale_ratio
+    proportional_width = _round_positive_fraction_half_up(
+        available.width * ratio
+    )
+    target_dashboard_width = (
+        max(DASHBOARD_MIN_WIDTH, proportional_width)
+        if available.width >= DASHBOARD_MIN_WIDTH + DASHBOARD_MIN_MAIN_WIDTH
+        else proportional_width
+    )
+    ideal_logical_width = Fraction(target_dashboard_width) / scale_ratio
     logical_dashboard_width = max(
         1,
         _round_positive_fraction_half_up(ideal_logical_width),
@@ -1443,7 +1478,7 @@ def validate_window_layout(
         _round_positive_fraction_half_up(logical_dashboard_width * scale_ratio),
     )
     if expected_dashboard_width >= available.width:
-        raise ValueError("available geometry is too narrow for 33/100 Dashboard")
+        raise ValueError("available geometry is too narrow for responsive Dashboard")
     expected_main = Rect(
         available.x,
         available.y,
@@ -1473,7 +1508,7 @@ def validate_window_layout(
         reasons.append("windows are not vertically aligned to available geometry")
     if dashboard.width != expected_dashboard_width:
         reasons.append(
-            "dashboard width is not the exact DPR-aligned 33/100 of available width"
+                "dashboard width is not the expected DPR-aligned responsive width"
         )
 
     if reasons:
@@ -1697,6 +1732,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--hold-sec", type=_positive_float, default=4.0, help="How long to hold the dashboard up key.")
     parser.add_argument("--input-method", choices=["key"], default="key", help="Dashboard keyboard control method.")
     parser.add_argument(
+        "--keyboard-window",
+        choices=("dashboard", "pybullet"),
+        default="dashboard",
+        help="Window that receives the held Up key.",
+    )
+    parser.add_argument(
         "--plot-tab",
         choices=list(LEGACY_PLOT_TAB_ORDER),
         default=None,
@@ -1704,7 +1745,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--verify-window-layout",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         default=True,
         help="Verify PyBullet and Dashboard client rectangles against the primary available geometry.",
     )
@@ -1733,6 +1774,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--expected-available-size requires --verify-window-layout")
     if args.verify_dashboard_tabs and args.plot_tab is not None:
         parser.error("--verify-dashboard-tabs cannot be combined with --plot-tab")
+    if args.keyboard_window == "pybullet" and args.verify_dashboard_tabs:
+        parser.error(
+            "--keyboard-window pybullet requires --no-verify-dashboard-tabs"
+        )
     return args
 
 
@@ -1847,28 +1892,34 @@ def _run_verification(args: argparse.Namespace, log_dir: Path) -> int:
             _run_xdotool(("windowfocus", dashboard_window_id))
             _run_xdotool(("key", "Escape"))
         else:
-            initial_report = wait_for_dashboard_layout_report(
-                layout_report_path,
-                0,
-                V2_DASHBOARD_TAB_ORDER[0],
-                DASHBOARD_LAYOUT_REPORT_TIMEOUT_SEC,
-            ).report
-            initial_layout = validate_dashboard_layout_report(
-                initial_report,
-                dashboard_client,
-                expected_tab_order=(
-                    (*V2_DASHBOARD_TAB_ORDER, DEVELOPER_DIAGNOSTIC_TAB_LABEL)
-                    if args.plot_tab is not None
-                    else V2_DASHBOARD_TAB_ORDER
-                ),
-            )
-            if not initial_layout.passed:
-                raise ValueError(
-                    f"initial Dashboard layout failed: {initial_layout.detail}"
+            if args.verify_window_layout or args.plot_tab is not None:
+                initial_report = wait_for_dashboard_layout_report(
+                    layout_report_path,
+                    0,
+                    V2_DASHBOARD_TAB_ORDER[0],
+                    DASHBOARD_LAYOUT_REPORT_TIMEOUT_SEC,
+                ).report
+                initial_layout = validate_dashboard_layout_report(
+                    initial_report,
+                    dashboard_client,
+                    expected_tab_order=(
+                        (*V2_DASHBOARD_TAB_ORDER, DEVELOPER_DIAGNOSTIC_TAB_LABEL)
+                        if args.plot_tab is not None
+                        else V2_DASHBOARD_TAB_ORDER
+                    ),
                 )
+                if not initial_layout.passed:
+                    raise ValueError(
+                        f"initial Dashboard layout failed: {initial_layout.detail}"
+                    )
             if args.plot_tab is not None:
                 _select_dashboard_plot_tab(dashboard_window_id, args.plot_tab)
-            _send_dashboard_up_key(dashboard_window_id, args.hold_sec)
+            keyboard_window_id = (
+                main_window_id
+                if args.keyboard_window == "pybullet"
+                else dashboard_window_id
+            )
+            _send_dashboard_up_key(keyboard_window_id, args.hold_sec)
         return_code = process.wait(timeout=process_wait_timeout(child_run_duration(args)))
         if return_code != 0:
             print(f"manual GUI process exited with {return_code}", file=sys.stderr)
@@ -1895,8 +1946,10 @@ def _run_verification(args: argparse.Namespace, log_dir: Path) -> int:
         f"log={summary.log_path} "
         f"dx={summary.dx:.4f} "
         f"max_cmd={summary.max_command_linear_velocity:.4f} "
+        f"max_target={summary.max_target_drive_speed:.4f} "
         f"tail_v={summary.tail_body_forward_speed:.4f} "
         f"max_v={summary.max_body_forward_speed:.4f} "
+        f"interior_zero_cmd={summary.interior_zero_command_count} "
         f"out_of_bounds={summary.out_of_bounds}"
     )
     return 0 if motion_passed(summary) else 1

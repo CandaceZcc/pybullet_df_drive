@@ -535,6 +535,7 @@ def test_main_closes_command_even_when_arbiter_final_zero_fails(
         ),
     )
     closed: list[str] = []
+    arbiter_options: list[dict[str, object]] = []
 
     class Client:
         @staticmethod
@@ -551,8 +552,8 @@ def test_main_closes_command_even_when_arbiter_final_zero_fails(
             closed.append("command")
 
     class Arbiter:
-        def __init__(self, _client, **_kwargs) -> None:
-            pass
+        def __init__(self, _client, **kwargs) -> None:
+            arbiter_options.append(kwargs)
 
         @staticmethod
         def close(*, now=None) -> None:
@@ -581,6 +582,7 @@ def test_main_closes_command_even_when_arbiter_final_zero_fails(
     with pytest.raises(RuntimeError, match="arbiter close failed"):
         main.main(["--gui", "--manual", "--interface-mode", "ecal"])
 
+    assert arbiter_options == [{}]
     assert closed == ["command"]
 
 

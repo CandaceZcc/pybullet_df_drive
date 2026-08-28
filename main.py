@@ -236,7 +236,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             command_arbiter = None
             try:
                 command_arbiter = (
-                    CommandSourceArbiter(command.client, renewal_hz=50.0)
+                    CommandSourceArbiter(command.client)
                     if callable(getattr(command.client, "send_target", None))
                     else None
                 )

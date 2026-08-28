@@ -28,6 +28,21 @@ class _DataTypeInformation:
 
 
 @dataclass
+class _ShmPublisherConfiguration:
+    memfile_buffer_count: int = 1
+
+
+@dataclass
+class _PublisherLayerConfiguration:
+    shm: _ShmPublisherConfiguration
+
+
+@dataclass
+class _PublisherConfiguration:
+    layer: _PublisherLayerConfiguration
+
+
+@dataclass
 class _RawData:
     buffer: object
     send_timestamp: int
@@ -72,9 +87,15 @@ class _FakeSubscriber:
 
 
 class _FakePublisher:
-    def __init__(self, topic: str, type_info: _DataTypeInformation) -> None:
+    def __init__(
+        self,
+        topic: str,
+        type_info: _DataTypeInformation,
+        configuration: _PublisherConfiguration,
+    ) -> None:
         self.topic = topic
         self.type_info = type_info
+        self.configuration = configuration
         self.sent: list[bytes] = []
 
     def send(self, payload: object) -> None:
@@ -100,8 +121,16 @@ class _FakeCore:
         self.publishers: list[_FakePublisher] = []
         self.monitoring = _FakeMonitoring()
 
-    def Publisher(self, topic: str, type_info: _DataTypeInformation) -> _FakePublisher:
-        publisher = _FakePublisher(topic, type_info)
+    def get_publisher_configuration(self) -> _PublisherConfiguration:
+        return _PublisherConfiguration(_PublisherLayerConfiguration(_ShmPublisherConfiguration()))
+
+    def Publisher(
+        self,
+        topic: str,
+        type_info: _DataTypeInformation,
+        configuration: _PublisherConfiguration,
+    ) -> _FakePublisher:
+        publisher = _FakePublisher(topic, type_info, configuration)
         self.publishers.append(publisher)
         return publisher
 
@@ -200,6 +229,19 @@ def test_raw_publisher_sends_one_owned_payload_without_typed_reserialization(fak
     )
     bindings.send(publisher, bytearray(b"wire-bytes"))
     assert fake_core.publishers[0].sent == [b"wire-bytes"]
+
+
+def test_raw_publisher_uses_a_bounded_shm_ring(fake_core, descriptor) -> None:
+    """满负载 raw LiDAR 不得复用默认单缓冲 SHM 槽位。"""
+    bindings = require_wished_module("slope_sim.interfaces.v2.ecal_raw").EcalRawBindings(fake_core)
+
+    publisher = bindings.create_publisher(
+        "/sim/lidar/points",
+        "slope_sim.interfaces.v2.LidarPointCloud",
+        descriptor,
+    )
+
+    assert publisher.configuration.layer.shm.memfile_buffer_count == 32
 
 
 def test_worker_hashes_before_remote_validation_and_parse(descriptor) -> None:
